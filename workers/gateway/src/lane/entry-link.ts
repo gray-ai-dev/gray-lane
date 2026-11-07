@@ -351,7 +351,9 @@ export class EntryLink {
       if (!this.#current(run) || answer.status !== 200) return [];
       const body = parseSerde(await answer.text()) as { readonly entries?: unknown };
       if (!Array.isArray(body.entries)) return [];
-      const count = (value: unknown): number => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0);
+      // parseSerde gives an integer as a `bigint` (@gray/json): peerlink's counts are Go ints, so `2` arrives as `2n`.
+      const count = (value: unknown): number =>
+        typeof value === "bigint" ? (value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : 0) : typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
       const rows = new Map<string, PeerlinkRow>();
       const unpinned: string[] = [];
       for (const row of body.entries as unknown[]) {

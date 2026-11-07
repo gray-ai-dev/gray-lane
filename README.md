@@ -1,12 +1,12 @@
-# gray-lane 2026.11.07-8672bb8571ba
+# gray-lane 2026.11.07-558fed1e9fc2
 
-The source of Gray's `gray-lane` image built from Gray's commit `8672bb8571ba6bdce0d9ca51d22a3d6fc73dde5f`, published so that a relay, or the
+The source of Gray's `gray-lane` image built from Gray's commit `558fed1e9fc2ab92edfa0b88f08304f903f5720f`, published so that a relay, or the
 coding agent a relay uses, can review each release before it accepts it. The image runs in every lane CVM: in the
 entry's default layout and in each relay's stack VM. This tree holds exactly the 591 files its build reads, at
 the paths they have in Gray's repository, so the build scripts run unchanged. It also holds the measured compose
 templates and pre-launch scripts that decide what the CVM starts. Tests, documentation and Gray's other services
 are not included. Each release is one commit in this repository. Its parent is the release published before it, so
-`git diff <previous tag> 2026.11.07-8672bb8571ba` shows the code that changed between the two.
+`git diff <previous tag> 2026.11.07-558fed1e9fc2` shows the code that changed between the two.
 
 | What runs in the CVM | Where its source is |
 |-|-|
@@ -36,7 +36,7 @@ The question to answer for each release is whether any code path can keep a rela
 the boot that uses them, or send them, or anything derived from them, anywhere except the vendor they belong to.
 Suggested instructions for a coding agent:
 
-> Review this tree (and `git diff <the tag you accepted last> 2026.11.07-8672bb8571ba`) for any way it could retain or transmit a
+> Review this tree (and `git diff <the tag you accepted last> 2026.11.07-558fed1e9fc2`) for any way it could retain or transmit a
 > relay's account keys. Trace: (1) where credentials enter: the sealed account records the lane opens with its
 > per-boot keyset (`workers/gateway/src/lane/state.ts`, `workers/gateway/src/lane/stack-service.ts`,
 > `workers/packages/relay-connector/`, `workers/packages/attest/`) and hands to gray-egress over its unix socket
