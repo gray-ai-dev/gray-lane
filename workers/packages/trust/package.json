@@ -1,0 +1,29 @@
+{
+  "name": "@gray/trust",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./workerd": "./src/workerd.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "measure": "vitest run -c vitest.measure.node.config.ts --silent=false && vitest run -c vitest.measure.workerd.config.ts --silent=false"
+  },
+  "dependencies": {
+    "@gray/json": "0.0.0",
+    "@gray/protocol": "0.0.0",
+    "@hyperjump/json-schema-formats": "1.0.8",
+    "@scure/base": "1.2.6",
+    "json-schema-library": "11.6.6",
+    "tr46": "6.0.0"
+  },
+  "devDependencies": {
+    "@gray/config": "0.0.0",
+    "@gray/conformance": "0.0.0",
+    "jsonc-parser": "3.3.1"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@gray/lane-verify",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./dcap": "./src/node/dcap.ts",
+    "./dcap-offline": {
+      "types": "./src/dcap-offline.d.ts",
+      "default": "./src/dcap.ts"
+    }
+  },
+  "bin": {
+    "gray-lane-verify": "./src/node/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/attest": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane": "0.0.0",
+    "@gray/relay-connector": "0.0.0",
+    "@msgpack/msgpack": "3.1.3",
+    "@noble/hashes": "1.8.0",
+    "@phala/dcap-qvl": "0.7.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@gray/conformance": "0.0.0",
+    "@types/ws": "8.18.2"
+  }
+}

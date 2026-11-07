@@ -1,0 +1,68 @@
+// gray-gateway's confidential-lane bundle (`workers/gateway/src/lane/entry.ts`). This file is a
+// BUNDLING config only: the lane runs as one workerd service inside the dstack CVM, and its runtime
+// config is `deploy/tee/workerd/lane.capnp` (design v2 section D, M23; v3 E1/D18: one `EGRESS`
+// `external` service on the sidecar's unix socket for every vendor request, plus one for the bridge).
+// Nothing here deploys to
+// Cloudflare: there is no account, no route, no workers_dev and no environment block.
+//
+// It exists because wrangler is what compiles the bundle the image runs, and because two facts must
+// be declared in exactly one place and be visible to it:
+//
+// - the interpreter: `@gray/relay-policy/workerd` imports `relay_policy_wasmi.wasm`, and workerd
+//   cannot compile wasm from bytes at run time, so the file is a CompiledWasm module here (B1). The
+//   workerd tests apply the same rule (`vitest.workerd.config.ts`).
+// - the lane entry is `src/lane/entry.ts`, not `src/index.ts`: the main lane's Worker, its Durable
+//   Objects and its Workflows are not part of this bundle at all.
+//
+// No Durable Object, Queue, R2, Pipeline, Analytics Engine, Rate Limiting or Workflow binding: every
+// one of those is replaced by a signed bridge call (design v2 section D) or is off (section A).
+// `enable_request_signal` is on because the gateway detects a client that left (`client.ts`).
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "gray-lane-local",
+  "main": "src/lane/entry.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["enable_request_signal", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "send_metrics": false,
+  // The relay policy interpreter (vendored wasmi), compiled by wrangler at upload time. `**/*.wasm`
+  // rather than one path so a vendor bump that renames nothing keeps working; the test config uses
+  // the same rule.
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"] }],
+  // Every var the lane reads. The bridge URL and the key id are the deployment identity (a var, not
+  // a secret: the private key never appears in a config, it is sealed to the boot); the timings are
+  // the lane's own and are listed with the design section that fixes them.
+  //
+  // Not here, because they are not a var: `LANE_BRIDGE_KEY_SEED` (D17) is the provisioned lane key's
+  // 32-byte seed, a SECRET binding the image (L4) supplies through dstack's encrypted env; a deployed
+  // lane without it answers the fixed 503 rather than signing bridge calls with a key the bridge does
+  // not know. `KEYSET_NOT_AFTER` (D5) is required outside `local` and is the image's to set, and
+  // `LANE_RECEIPT_KEY_ID` is only an optional override: D11 generates the receipt key id randomly per
+  // boot, so a fixed id here would make two boots linkable.
+  "vars": {
+    "DEPLOY_ENV": "local",
+    // The bridge's base URL (design v2 section D). `deploy/tee/workerd/lane.capnp` points this at the
+    // loopback service in the image; a test points it at its in-process fake bridge.
+    "LANE_BRIDGE_URL": "https://lane-bridge.test",
+    // The provisioned lane key's id, as the bridge's configuration lists it (M26). The key material is
+    // sealed to the boot and never in this file.
+    "LANE_KEY_ID": "lane-1",
+    // The CVM's region: workerd has no `request.cf`, so the region comes from config (design v2 section D).
+    "GATEWAY_FALLBACK_REGION": "wnam",
+    // The largest request body the lane accepts (B3, B5): the parse cap until the lane's byte path is
+    // measured. `BODY_PARSE_MAX_BYTES` is the same number, and the lane clamps to it.
+    "BODY_PARSE_MAX_BYTES": "4194304",
+    // The padded policy step (M14): the measured worst case at the body cap plus margin; since D128 the
+    // cap of each request's own budget, ceil(fuel / LANE_POLICY_FUEL_PER_MS) + LANE_POLICY_OVERHEAD_MS.
+    "LANE_POLICY_STEP_MS": "1500",
+    // D128': the compose literals (deploy/tee/compose.yaml), @gray/config's defaults: the build box's
+    // measurement (D128' measurement, 2026-10-22: workers/packages/relay-policy/bench/policy-step.ts,
+    // AMD Ryzen 9 9950X3D, workerd 1.20261006.1). The lane calibrates at boot and never goes faster.
+    "LANE_POLICY_FUEL_PER_MS": "188401",
+    "LANE_POLICY_OVERHEAD_MS": "3",
+    // D109': the scheduler pick budget, also each forward's `budget_ms` at the bridge. The compose
+    // literal (deploy/tee/compose.yaml), which is @gray/config's LANE_SCHEDULER_PICK_MS default, the
+    // connector's former pick budget, until D109'(c)'s staging measurement gives a cited value.
+    "LANE_SCHEDULER_PICK_MS": "1500"
+  }
+}

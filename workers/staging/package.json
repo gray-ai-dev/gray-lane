@@ -1,0 +1,24 @@
+{
+  "name": "gray-staging",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.upstream.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/config": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/protocol": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "@gray/verifier": "0.0.0",
+    "@streamparser/json": "0.0.26",
+    "cloudflare": "7.3.0",
+    "jsonc-parser": "3.3.1",
+    "pg": "8.23.1",
+    "pg-connection-string": "2.14.1",
+    "viem": "2.57.4"
+  }
+}

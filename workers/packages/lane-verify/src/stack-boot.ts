@@ -1,0 +1,227 @@
+/**
+ * What a relay-stack boot measured after `system-ready` (docs/confidential-lane-supply-implementation.md S51,
+ * S52, S54): who the boot says it serves (`gray-stack-identity`, extended by pre-launch before it takes the
+ * quote it sends the relay's token service) and which image the relay chose for it (`gray-relay-image`,
+ * extended after the image is pulled and tagged), then pre-launch's seal (`gray-prelaunch-sealed`).
+ *
+ * One reader for every party: the relay's token service reads a pre-launch quote (`phase: "pre_launch"`,
+ * the identity alone), its credential intake and a customer's `gray-lane-verify` read the lane's later
+ * quotes (`phase: "sealed"`, all three). A default-layout lane has no runtime event after `system-ready`
+ * (`facts: null`). Anything else — another event, a second one, another order, a payload this module
+ * cannot read — is a refusal with a closed code; the caller decides what it means for it.
+ *
+ * The payloads are what pre-launch writes with `jq -cS` (a UTF-8 JSON object, keys sorted); this module
+ * parses them strictly and checks each member's form, never their bytes. Events are only facts when the
+ * log replayed to the quote's RTMR3: the caller checks that first (`replayEventLog`).
+ *
+ * Pure code (`@gray/attest`'s Ed25519 on WebCrypto), so it runs in Node and workerd.
+ */
+import { ed25519Verify, lowerHexBytes } from "@gray/attest";
+import { isObject, parseStrict, type Json } from "@gray/json";
+import { DSTACK_RUNTIME_EVENT_TYPE, type DstackEvent } from "./dstack.ts";
+
+/** The three runtime events pre-launch extends RTMR3 with, in their order. */
+export const STACK_IDENTITY_EVENT = "gray-stack-identity";
+export const RELAY_IMAGE_EVENT = "gray-relay-image";
+export const PRELAUNCH_SEALED_EVENT = "gray-prelaunch-sealed";
+/** The seal's payload: hex("gray-prelaunch-sealed-v1") in pre-launch.stack.sh. */
+export const PRELAUNCH_SEALED_PAYLOAD = "gray-prelaunch-sealed-v1";
+/** S51: the first line of what the relay signs for the image it chose. */
+export const RELAY_IMAGE_SIGNATURE_DOMAIN = "gray-relay-image/v1";
+
+/** The relay id form (app-compose.mjs `RELAY_ID`, `@gray/control` `LANE_RELAY_ID_PATTERN`). */
+export const STACK_RELAY_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+/**
+ * S51: a relay image is `<registry host[:port]>/<repository>@sha256:<64 hex>`, lower case, no tag. The
+ * registry is everything before the first `/`, and it has a dot, a port or is `localhost`: docker reads a first
+ * component as a registry only then (otherwise as a Docker Hub namespace). pre-launch.stack.sh tests the same
+ * pattern with jq.
+ */
+export const STACK_RELAY_IMAGE_PATTERN = /^((?:[a-z0-9][a-z0-9-]*\.)+[a-z0-9-]*[a-z0-9](?::[0-9]{1,5})?|[a-z0-9][a-z0-9.-]*:[0-9]{1,5}|localhost)\/([a-z0-9][a-z0-9._/-]*)@sha256:([0-9a-f]{64})$/;
+/** The longest image reference read (docker's own limit on a repository name is 255). */
+export const STACK_RELAY_IMAGE_MAX_LENGTH = 512;
+/** The challenge nonce pre-launch accepts (16 to 64 bytes, lower hex); gray-relay issues 32. */
+export const STACK_NONCE_PATTERN = /^(?:[0-9a-f]{2}){16,64}$/;
+/** A lower-case DNS name of at least two labels (app-compose.mjs `TLS_HOST`). */
+export const STACK_TLS_DOMAIN_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** The identity a stack boot measured (S52). */
+export interface StackIdentity {
+  readonly relayId: string;
+  /** The relay's pull-token service, an https origin. */
+  readonly tokenUrl: string;
+  /** The relay's Ed25519 public key, 64 lower hex: the key `imageSig` is checked with. */
+  readonly publicKey: string;
+  /**
+   * The lane's TLS name, or null for an identity that names none. Releases before the outbound-only stack layout
+   * (docs/design/relay-outbound-only.md §3.9, stack release B) measure `{public_key, relay_id, tls_domain, token_url}`
+   * and serve a WebPKI certificate for that name; release B's VM has no public name and no inbound door, serves a
+   * per-boot self-signed key bound to no domain, and measures `{public_key, relay_id, token_url}`. A verifier then
+   * holds the identity to the relay it expected (`relay_pin`), never to a host.
+   */
+  readonly tlsDomain: string | null;
+}
+
+/** The image the relay chose for this boot, as pre-launch measured it (S52). */
+export interface RelayImageClaim {
+  readonly relayId: string;
+  readonly image: string;
+  /** 128 lower hex: Ed25519 over `relayImageMessage(nonce, image)`. */
+  readonly imageSig: string;
+  readonly nonce: string;
+}
+
+export type StackBootFacts =
+  | { readonly phase: "pre_launch"; readonly identity: StackIdentity }
+  | { readonly phase: "sealed"; readonly identity: StackIdentity; readonly image: RelayImageClaim };
+
+export type StackBootProblemCode =
+  /** No `system-ready`, or runtime events after it that are not exactly one of the two shapes. */
+  | "stack_events_invalid"
+  /** The identity payload is not the S52 object. */
+  | "stack_identity_invalid"
+  /** The image payload is not the S52 object. */
+  | "relay_image_invalid"
+  /** The image event names another relay than the identity. */
+  | "relay_image_relay_mismatch"
+  /** `imageSig` does not verify with the identity's key (only `verifyStackBoot`). */
+  | "relay_image_signature";
+
+export type StackBootResult =
+  | { readonly ok: true; readonly facts: StackBootFacts | null }
+  | { readonly ok: false; readonly code: StackBootProblemCode; readonly message: string };
+
+/** S51: the bytes the relay signs: `gray-relay-image/v1\n<nonce>\n<image>`, UTF-8, no trailing newline. */
+export function relayImageMessage(nonce: string, image: string): Uint8Array {
+  return new TextEncoder().encode(`${RELAY_IMAGE_SIGNATURE_DOMAIN}\n${nonce}\n${image}`);
+}
+
+/** Whether `image` is an S51 relay image reference. */
+export function isStackRelayImage(image: unknown): image is string {
+  return typeof image === "string" && image.length <= STACK_RELAY_IMAGE_MAX_LENGTH && STACK_RELAY_IMAGE_PATTERN.test(image);
+}
+
+/** The registry host[:port] of an S51 image reference, or null when it is not one. */
+export function relayImageRegistry(image: string): string | null {
+  if (!isStackRelayImage(image)) return null;
+  return (STACK_RELAY_IMAGE_PATTERN.exec(image) as RegExpExecArray)[1] as string;
+}
+
+/** Whether `text` is an https origin written as its own origin (app-compose.mjs `validateRelayTokenUrl`). */
+export function isStackTokenUrl(text: unknown): text is string {
+  if (typeof text !== "string" || !URL.canParse(text)) return false;
+  const url = new URL(text);
+  return url.protocol === "https:" && url.origin === text;
+}
+
+function fail(code: StackBootProblemCode, message: string): StackBootResult {
+  return { ok: false, code, message };
+}
+
+function isRuntime(event: DstackEvent): boolean {
+  return event.imr === 3 && event.event_type === DSTACK_RUNTIME_EVENT_TYPE;
+}
+
+/** A payload as one strict JSON object of string members named exactly `members`, or null. */
+function payloadObject(event: DstackEvent, members: readonly string[]): Readonly<Record<string, string>> | null {
+  const bytes = lowerHexBytes(event.event_payload);
+  if (bytes === null) return null;
+  let value: Json;
+  try {
+    value = parseStrict(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+  } catch {
+    return null;
+  }
+  if (!isObject(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.length !== members.length || keys.some((key, index) => key !== members[index])) return null;
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    const member = value[key];
+    if (typeof member !== "string") return null;
+    out[key] = member;
+  }
+  return out;
+}
+
+/** S52's identity members: release B's (no TLS name, docs/design/relay-outbound-only.md §3.9) and the earlier ones'. */
+const IDENTITY_MEMBERS = ["public_key", "relay_id", "token_url"] as const;
+const IDENTITY_MEMBERS_WITH_DOMAIN = ["public_key", "relay_id", "tls_domain", "token_url"] as const;
+
+/**
+ * S52's identity payload, or null. Exactly one of two forms: `{public_key, relay_id, token_url}` (stack release B,
+ * `tlsDomain: null`) or `{public_key, relay_id, tls_domain, token_url}` (the releases before it). A `tls_domain`
+ * member is always a DNS name: an empty or malformed one is refused, never read as "no name".
+ */
+export function parseStackIdentityPayload(event: DstackEvent): StackIdentity | null {
+  const value = payloadObject(event, IDENTITY_MEMBERS) ?? payloadObject(event, IDENTITY_MEMBERS_WITH_DOMAIN);
+  if (value === null) return null;
+  const { public_key: publicKey, relay_id: relayId, token_url: tokenUrl } = value as Record<string, string>;
+  const tlsDomain = Object.hasOwn(value, "tls_domain") ? (value.tls_domain as string) : null;
+  if (!STACK_RELAY_ID_PATTERN.test(relayId as string)) return null;
+  if (!isStackTokenUrl(tokenUrl)) return null;
+  if (!/^[0-9a-f]{64}$/.test(publicKey as string)) return null;
+  if (tlsDomain !== null && !STACK_TLS_DOMAIN_PATTERN.test(tlsDomain)) return null;
+  return { relayId: relayId as string, tokenUrl, publicKey: publicKey as string, tlsDomain };
+}
+
+/** S52's image payload, or null. */
+export function parseRelayImagePayload(event: DstackEvent): RelayImageClaim | null {
+  const value = payloadObject(event, ["image", "image_sig", "nonce", "relay_id"]);
+  if (value === null) return null;
+  const { image, image_sig: imageSig, nonce, relay_id: relayId } = value as Record<string, string>;
+  if (!isStackRelayImage(image)) return null;
+  if (!/^[0-9a-f]{128}$/.test(imageSig as string)) return null;
+  if (!STACK_NONCE_PATTERN.test(nonce as string)) return null;
+  if (!STACK_RELAY_ID_PATTERN.test(relayId as string)) return null;
+  return { relayId: relayId as string, image, imageSig: imageSig as string, nonce: nonce as string };
+}
+
+/**
+ * The stack facts of a replayed event log (S52), without the signature check. The runtime events after the
+ * one `system-ready` must be none, `[identity]` or `[identity, image, sealed]`; events of other IMRs or
+ * types are firmware events and never follow it in a dstack log, so any event after it counts.
+ */
+export function stackBootFacts(events: readonly DstackEvent[]): StackBootResult {
+  const ready = events.findIndex((event) => isRuntime(event) && event.event === "system-ready");
+  if (ready < 0) return fail("stack_events_invalid", "the event log has no system-ready event");
+  const after = events.slice(ready + 1);
+  if (after.some((event) => isRuntime(event) && event.event === "system-ready")) return fail("stack_events_invalid", "the event log has a second system-ready event");
+  if (after.length === 0) return { ok: true, facts: null };
+  const names = after.map((event) => (isRuntime(event) ? event.event : `${event.imr}:${event.event_type}:${event.event}`));
+  const preLaunch = [STACK_IDENTITY_EVENT];
+  const sealed = [STACK_IDENTITY_EVENT, RELAY_IMAGE_EVENT, PRELAUNCH_SEALED_EVENT];
+  const shape = (expected: readonly string[]): boolean => names.length === expected.length && names.every((name, index) => name === expected[index]);
+  if (!shape(preLaunch) && !shape(sealed)) {
+    return fail("stack_events_invalid", `the runtime events after system-ready are ${names.length} (${names.join(", ")}); a stack boot has ${preLaunch.join(", ")} or ${sealed.join(", ")}`);
+  }
+  const identity = parseStackIdentityPayload(after[0] as DstackEvent);
+  if (identity === null) return fail("stack_identity_invalid", `the ${STACK_IDENTITY_EVENT} payload is not {public_key, relay_id, token_url} (or, before stack release B, with tls_domain) in their forms`);
+  if (after.length === 1) return { ok: true, facts: { phase: "pre_launch", identity } };
+  const image = parseRelayImagePayload(after[1] as DstackEvent);
+  if (image === null) return fail("relay_image_invalid", `the ${RELAY_IMAGE_EVENT} payload is not {image, image_sig, nonce, relay_id} in their forms`);
+  if (image.relayId !== identity.relayId) return fail("relay_image_relay_mismatch", `the ${RELAY_IMAGE_EVENT} event names another relay than ${STACK_IDENTITY_EVENT}`);
+  const seal = lowerHexBytes((after[2] as DstackEvent).event_payload);
+  if (seal === null || new TextDecoder().decode(seal) !== PRELAUNCH_SEALED_PAYLOAD) {
+    return fail("stack_events_invalid", `the ${PRELAUNCH_SEALED_EVENT} payload is not ${PRELAUNCH_SEALED_PAYLOAD}`);
+  }
+  return { ok: true, facts: { phase: "sealed", identity, image } };
+}
+
+/** Whether `claim.imageSig` is the identity's key's signature over `relayImageMessage(claim.nonce, claim.image)`. */
+export async function relayImageSignatureValid(identity: StackIdentity, claim: RelayImageClaim): Promise<boolean> {
+  const key = lowerHexBytes(identity.publicKey);
+  const signature = lowerHexBytes(claim.imageSig);
+  if (key === null || signature === null) return false;
+  return ed25519Verify(key, relayImageMessage(claim.nonce, claim.image), signature);
+}
+
+/** `stackBootFacts`, and for a sealed boot the relay's signature on its image. */
+export async function verifyStackBoot(events: readonly DstackEvent[]): Promise<StackBootResult> {
+  const result = stackBootFacts(events);
+  if (!result.ok || result.facts === null || result.facts.phase !== "sealed") return result;
+  if (!(await relayImageSignatureValid(result.facts.identity, result.facts.image))) {
+    return fail("relay_image_signature", `the ${RELAY_IMAGE_EVENT} signature does not verify with the ${STACK_IDENTITY_EVENT} key`);
+  }
+  return result;
+}

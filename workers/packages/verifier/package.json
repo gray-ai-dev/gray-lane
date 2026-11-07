@@ -1,0 +1,29 @@
+{
+  "name": "@gray/verifier",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./coding-agent": "./src/coding-agent.ts",
+    "./model-check-ticket": "./src/model-check-ticket.ts",
+    "./workerd": "./src/workerd.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/attest": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/media": "0.0.0",
+    "@gray/protocol": "0.0.0",
+    "json-schema-library": "11.6.6",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@gray/conformance": "0.0.0"
+  }
+}

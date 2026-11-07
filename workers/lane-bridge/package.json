@@ -1,0 +1,29 @@
+{
+  "name": "gray-lane-bridge",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "dev": "wrangler dev -c wrangler.jsonc --local"
+  },
+  "dependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/config": "0.0.0",
+    "@gray/endpoint": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane-verify": "0.0.0",
+    "@gray/lane-wire": "0.0.0",
+    "@gray/request-index": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "@phala/dcap-qvl": "0.7.0"
+  },
+  "devDependencies": {
+    "@gray/attest": "0.0.0"
+  }
+}

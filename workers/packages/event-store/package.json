@@ -1,0 +1,16 @@
+{
+  "name": "@gray/event-store",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts"
+  },
+  "dependencies": {
+    "@gray/json": "0.0.0"
+  }
+}

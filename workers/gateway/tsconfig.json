@@ -1,0 +1,10 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"],
+    "resolveJsonModule": true
+  },
+  // ../tooling/workerd: the setup file every workerd test file runs (tooling/vitest.ts workerdConfig), typed here with
+  // the workerd types it runs under (tsconfig.node.json types tooling/*.ts for Node).
+  "include": ["src", "test", "../tooling/workerd"]
+}

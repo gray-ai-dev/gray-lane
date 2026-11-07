@@ -1,0 +1,44 @@
+{
+  "id": "gray-lane-rewrites-v1",
+  "version": 1,
+  "protocols": {
+    "anthropic_messages": [
+      { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "remove_member", "path": "/models" },
+      { "op": "set_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "insert_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "remove_member", "path": "/metadata/user_id" }
+    ],
+    "open_ai_chat": [
+      { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "remove_member", "path": "/models" },
+      { "op": "set_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "insert_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "set_member", "path": "/max_completion_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "remove_member", "path": "/user" },
+      { "op": "remove_member", "path": "/safety_identifier" },
+      { "op": "remove_member", "path": "/metadata" },
+      { "op": "insert_member", "path": "/stream_options", "value": { "kind": "const", "value": { "include_usage": true } } },
+      { "op": "set_member", "path": "/stream_options/include_usage", "value": { "kind": "const", "value": true } },
+      { "op": "insert_member", "path": "/stream_options/include_usage", "value": { "kind": "const", "value": true } },
+      { "op": "set_member", "path": "/store", "value": { "kind": "const", "value": false } },
+      { "op": "insert_member", "path": "/store", "value": { "kind": "const", "value": false } }
+    ],
+    "open_ai_responses": [
+      { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
+      { "op": "remove_member", "path": "/models" },
+      { "op": "set_member", "path": "/max_output_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "insert_member", "path": "/max_output_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
+      { "op": "remove_member", "path": "/user" },
+      { "op": "remove_member", "path": "/safety_identifier" },
+      { "op": "remove_member", "path": "/metadata" },
+      { "op": "set_member", "path": "/stream", "value": { "kind": "const", "value": true } },
+      { "op": "insert_member", "path": "/stream", "value": { "kind": "const", "value": true } },
+      { "op": "set_member", "path": "/store", "value": { "kind": "const", "value": false } },
+      { "op": "insert_member", "path": "/store", "value": { "kind": "const", "value": false } }
+    ]
+  }
+}

@@ -1,0 +1,1346 @@
+{
+  "apps": [
+    {
+      "id": "claude-code",
+      "name": "Claude Code",
+      "kind": "app",
+      "sources": [
+        "https://code.claude.com/docs/en/llm-gateway-protocol#request-headers (x-claude-code-session-id on every request)",
+        "github.com/anthropics/claude-code CHANGELOG.md, 2.1.86: X-Claude-Code-Session-Id added; earlier versions count as claude-code-compatible",
+        "request captured from the client on 2026-10-13 (local listener): Claude Code 2.1.295",
+        "npm @anthropic-ai/claude-code-darwin-arm64@2.1.296 package/claude (User-Agent builder)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/claude.go:1457"
+      ],
+      "confirm": {
+        "header": "x-claude-code-session-id",
+        "otherwise": "claude-code-compatible"
+      }
+    },
+    {
+      "id": "claude-code-compatible",
+      "name": "Claude Code (unconfirmed)",
+      "kind": "app",
+      "sources": [
+        "Requests with Claude Code's User-Agent but without its session header. Clients that send it:",
+        "github.com/QwenLM/qwen-code@c5098a27333b packages/core/src/core/anthropicContentGenerator/anthropicContentGenerator.ts:483-485",
+        "github.com/openclaw/openclaw@4e3b11bf5c8d packages/ai/src/providers/anthropic.ts:371 (Anthropic OAuth credentials)",
+        "github.com/yetone/avante.nvim@4f49656657d0 lua/avante/providers/claude.lua:599-600 (Claude Max sign-in)",
+        "github.com/NousResearch/hermes-agent@63d0b9412002 agent/anthropic_adapter.py:425-428 (claude-code/version on Anthropic sign-in)"
+      ]
+    },
+    {
+      "id": "claude-desktop",
+      "name": "Claude Desktop",
+      "kind": "app",
+      "sources": [
+        "github.com/yetone/magpie@eba7187368a8 internal/gateway/desktop.go:366-369 (Mozilla/ User-Agent containing Claude/)",
+        "github.com/maximhq/bifrost@1c6d1d546cd3 core/schemas/useragents.go:17 (claude/)"
+      ]
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "kind": "app",
+      "sources": [
+        "github.com/openai/codex@f82e36592278 codex-rs/login/src/auth/default_client.rs:152-167 (originator and User-Agent)",
+        "github.com/openai/codex@f82e36592278 codex-rs/exec/src/lib.rs:263 (codex_exec)",
+        "github.com/openai/codex@f82e36592278 sdk/typescript/src/exec.ts:48-49 (codex_sdk_ts)",
+        "github.com/openai/codex@f82e36592278 sdk/python/src/openai_codex/client.py:208-210 (codex_python_sdk)",
+        "github.com/openai/codex@f82e36592278 codex-rs/app-server/src/request_processors/initialize_processor.rs:110-111 (client name becomes the originator)",
+        "request captured from the client on 2026-10-13 (local listener): codex exec 0.162.0",
+        "github.com/openai/codex@78dc2503840d codex-rs/codex-api/src/requests/headers.rs build_session_headers, codex-rs/codex-api/src/endpoint/responses.rs:90 (session-id and thread-id on every Responses request)",
+        "github.com/Wei-Shaw/sub2api@ab80abc6d1f9 backend/internal/pkg/openai/request.go (first-party originator set)",
+        "github.com/yetone/magpie@eba7187368a8 internal/gateway/gateway.go fromCodex (acp-extension-codex, Codex Desktop)"
+      ]
+    },
+    {
+      "id": "gemini-cli",
+      "name": "Gemini CLI",
+      "kind": "app",
+      "sources": [
+        "github.com/google-gemini/gemini-cli@51617c1bcbcb packages/core/src/core/contentGenerator.ts:249-272 (GeminiCLI[-surface]/version/model)",
+        "github.com/google-gemini/gemini-cli@51617c1bcbcb packages/cli/src/config/config.ts:932-936",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/gemini.go:186"
+      ]
+    },
+    {
+      "id": "qwen-code",
+      "name": "Qwen Code",
+      "kind": "app",
+      "sources": [
+        "github.com/QwenLM/qwen-code@c5098a27333b packages/core/src/core/openaiContentGenerator/provider/default.ts:98-101",
+        "github.com/QwenLM/qwen-code@c5098a27333b packages/core/src/providers/presets/openrouter.ts:37-38",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/qwen.go:315"
+      ]
+    },
+    {
+      "id": "kimi-cli",
+      "name": "Kimi CLI",
+      "kind": "app",
+      "sources": [
+        "github.com/MoonshotAI/kimi-cli@9ab1286b8fe4 src/kimi_cli/constant.py:28 and src/kimi_cli/llm.py:318-320",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/kimi.go:245"
+      ]
+    },
+    {
+      "id": "iflow-cli",
+      "name": "iFlow CLI",
+      "kind": "app",
+      "sources": [
+        "npm @iflow-ai/iflow-cli@0.5.19 bundle/iflow.js:880, 956, 974 (iFlow-Cli, x-iflow-signature, iFlowCLI)"
+      ]
+    },
+    {
+      "id": "stepcode",
+      "name": "StepCode",
+      "kind": "app",
+      "sources": [
+        "github.com/stepfun-ai/Step-Code@3ba89e0cbfe6 packages/providers/src/utils/pi-user-agent.ts:17-18 (stepcode User-Agent)",
+        "github.com/stepfun-ai/Step-Code@3ba89e0cbfe6 packages/coding-agent/src/core/provider-attribution.ts:6-10 (sent to every provider)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/stepcode.go:386"
+      ]
+    },
+    {
+      "id": "grok-build",
+      "name": "Grok Build",
+      "kind": "app",
+      "sources": [
+        "github.com/xai-org/grok-build@b189869b7755 crates/codegen/xai-grok-sampler/src/client.rs:36-48, 361-387",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/grok.go:111"
+      ]
+    },
+    {
+      "id": "openclaw",
+      "name": "OpenClaw",
+      "kind": "app",
+      "sources": [
+        "github.com/openclaw/openclaw@4e3b11bf5c8d packages/ai/src/providers/openai-chatgpt-responses.ts:1418-1421 (openclaw User-Agent, originator)",
+        "github.com/openclaw/openclaw@4e3b11bf5c8d src/agents/provider-attribution.ts:339"
+      ]
+    },
+    {
+      "id": "goose",
+      "name": "Goose",
+      "kind": "app",
+      "sources": [
+        "github.com/block/goose@69de89c50cc0 crates/goose/src/session_context.rs:5 (agent-session-id on every request in a session)",
+        "github.com/block/goose@69de89c50cc0 crates/goose/src/providers/openrouter_def.rs:58-59 (HTTP-Referer, X-Title)"
+      ]
+    },
+    {
+      "id": "continue",
+      "name": "Continue",
+      "kind": "app",
+      "sources": [
+        "github.com/continuedev/continue@5522c6f44ca0 packages/openai-adapters/src/apis/OpenRouter.ts:13-17 (OpenRouter provider only)"
+      ]
+    },
+    {
+      "id": "avante-nvim",
+      "name": "avante.nvim",
+      "kind": "app",
+      "sources": [
+        "github.com/yetone/avante.nvim@4f49656657d0 lua/avante/providers/openai.lua:47, 862-863 (OpenRouter endpoint only)"
+      ]
+    },
+    {
+      "id": "lobehub",
+      "name": "LobeHub",
+      "kind": "app",
+      "sources": [
+        "github.com/lobehub/lobe-chat@7243406ba5b4 packages/model-runtime/src/core/anthropicCompatibleFactory/index.ts:293 (lobehub/version)",
+        "github.com/lobehub/lobe-chat@7243406ba5b4 packages/model-runtime/src/core/openaiCompatibleFactory/client.ts:5 (OpenAICompatibleClient)",
+        "github.com/lobehub/lobe-chat@7243406ba5b4 packages/model-runtime/src/providers/openrouter/index.ts:88-89; newapi/index.ts:78-79; aihubmix/index.ts:158-159"
+      ]
+    },
+    {
+      "id": "open-webui",
+      "name": "Open WebUI",
+      "kind": "app",
+      "sources": [
+        "github.com/open-webui/open-webui@f8ae8a6c3289 backend/open_webui/utils/headers.py:186-189 (OpenRouter endpoints only)",
+        "github.com/open-webui/open-webui@f8ae8a6c3289 backend/open_webui/utils/headers.py:79-85 (X-OpenWebUI-User-Id when user info forwarding is on)"
+      ]
+    },
+    {
+      "id": "amp",
+      "name": "Amp",
+      "kind": "app",
+      "sources": [
+        "VS Code extension sourcegraph.amp (marketplace build of 2026-10) dist/extension.cjs: X-Amp-Client-Type and X-Amp-Client-Application on provider requests"
+      ]
+    },
+    {
+      "id": "alma",
+      "name": "Alma",
+      "kind": "app",
+      "sources": [
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/alma.go:692 and internal/agent/useragent_test.go:26",
+        "Alma desktop app bundle: user-agent Alma-Desktop/1.0 on its opencode-go provider; other providers send the Vercel AI SDK's"
+      ]
+    },
+    {
+      "id": "copilot-vscode",
+      "name": "GitHub Copilot (VS Code)",
+      "kind": "app",
+      "sources": [
+        "github.com/microsoft/vscode-copilot-chat@5863f5a70889 src/platform/networking/node/baseFetchFetcher.ts:29",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/vscode.go:52"
+      ]
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "kind": "app",
+      "sources": [
+        "github.com/sst/opencode@d8129ca1e036 packages/core/src/app.ts:24 (opencode/channel/version/client)",
+        "github.com/sst/opencode@d8129ca1e036 packages/core/src/session/model-request.ts:235, 291 (x-opencode-client on every model request)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/agents.go:773"
+      ]
+    },
+    {
+      "id": "crush",
+      "name": "Crush",
+      "kind": "app",
+      "sources": [
+        "github.com/charmbracelet/crush@b7b5522585e7 internal/agent/agent.go:61, 732 (Charm-Crush/version)",
+        "github.com/charmbracelet/crush@b7b5522585e7 internal/config/load.go:284-285 and catwalk v0.52.49 openrouter.json (HTTP-Referer, X-Title)"
+      ]
+    },
+    {
+      "id": "aider",
+      "name": "Aider",
+      "kind": "app",
+      "sources": [
+        "github.com/Aider-AI/aider@5dc9490bb35f aider/llm.py:12-13 (OpenRouter attribution through litellm; other providers send the SDK's User-Agent)",
+        "github.com/BerriAI/litellm@c3ca8a5140ab litellm/main.py:3400"
+      ]
+    },
+    {
+      "id": "cline",
+      "name": "Cline",
+      "kind": "app",
+      "sources": [
+        "github.com/cline/cline@12a4c6bfe263 sdk/packages/llms/src/providers/request-headers.ts:45-47, 93, 141-143 (Cline's own provider and its Codex sign-in only; other providers send the AI SDK's User-Agent)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/cline.go:166"
+      ]
+    },
+    {
+      "id": "roo-code",
+      "name": "Roo Code",
+      "kind": "app",
+      "sources": [
+        "github.com/RooCodeInc/Roo-Code@b867ec914575 src/api/providers/constants.ts:4-6 (RooCode/version, X-Title, HTTP-Referer on OpenAI-style requests)",
+        "github.com/RooCodeInc/Roo-Code@b867ec914575 src/api/providers/openai-native.ts:96-101 (roo-code/version, originator on Responses requests)"
+      ]
+    },
+    {
+      "id": "kilo-code",
+      "name": "Kilo Code",
+      "kind": "app",
+      "sources": [
+        "github.com/Kilo-Org/kilocode@7346371a3f56 packages/opencode/src/kilocode/const.ts:4-6 (Kilo-Code/version, X-Title, HTTP-Referer)",
+        "github.com/Kilo-Org/kilocode@7346371a3f56 packages/opencode/src/installation/index.ts:51-55 (kilo/channel/version/cli on Anthropic requests)",
+        "github.com/Kilo-Org/kilocode@7346371a3f56 packages/kilo-gateway/src/api/constants.ts:40 (opencode-kilo-provider for indexing)"
+      ]
+    },
+    {
+      "id": "zed",
+      "name": "Zed",
+      "kind": "app",
+      "sources": [
+        "github.com/zed-industries/zed@26363aabdb31 crates/zed/src/main.rs:502-512 (Zed/version (os; arch))",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/zed.go:58"
+      ]
+    },
+    {
+      "id": "mistral-vibe",
+      "name": "Mistral Vibe",
+      "kind": "app",
+      "sources": [
+        "github.com/mistralai/mistral-vibe@4ae5c5955da8 vibe/utils/http.py:215-217 (Mistral-Vibe/version; releases on the unified harness send the httpx default instead)"
+      ]
+    },
+    {
+      "id": "hermes-agent",
+      "name": "Hermes Agent",
+      "kind": "app",
+      "sources": [
+        "github.com/NousResearch/hermes-agent@63d0b9412002 plugins/model-providers/fireworks/__init__.py:36-39 (HermesAgent/version, X-Title)",
+        "github.com/NousResearch/hermes-agent@63d0b9412002 plugins/model-providers/opencode-zen/__init__.py:17-20 (HTTP-Referer)",
+        "github.com/NousResearch/hermes-agent@63d0b9412002 agent/codex_headers.py:43-49 (originator, codex_cli_rs/0.0.0 (Hermes Agent))",
+        "github.com/NousResearch/hermes-agent@63d0b9412002 agent/gemini_native_adapter.py:30; hermes_cli/models.py:72 (hermes-agent/, hermes-cli/)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/hermes.go:87"
+      ]
+    },
+    {
+      "id": "copilot-cli",
+      "name": "GitHub Copilot CLI",
+      "kind": "app",
+      "sources": [
+        "npm @github/copilot-darwin-arm64@1.0.96 package/cli-main.js (Copilot-Integration-Id: copilot-developer-cli)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/agents.go:1208"
+      ]
+    },
+    {
+      "id": "cherry-studio",
+      "name": "Cherry Studio",
+      "kind": "app",
+      "sources": [
+        "github.com/CherryHQ/cherry-studio@2e2e2e1b32a1 src/main/utils/http.ts:5-6 (HTTP-Referer, X-Title on its bundled providers)",
+        "github.com/CherryHQ/cherry-studio@2e2e2e1b32a1 src/main/ai/provider/codex.ts:52 (originator)"
+      ]
+    },
+    {
+      "id": "chatbox",
+      "name": "Chatbox",
+      "kind": "app",
+      "sources": [
+        "github.com/chatboxai/chatbox@0ac6385ae1ff src/shared/providers/definitions/models/custom-openai.ts:68-72; openai.ts:56-59 (OpenRouter endpoints only)"
+      ]
+    },
+    {
+      "id": "openhands",
+      "name": "OpenHands",
+      "kind": "app",
+      "sources": [
+        "github.com/OpenHands/software-agent-sdk@v1.54.0 openhands-sdk/openhands/sdk/llm/options/common.py:41-47; llm/llm.py:370-371 (X-Title, HTTP-Referer)",
+        "github.com/OpenHands/software-agent-sdk@v1.54.0 openhands-sdk/openhands/sdk/llm/auth/openai.py:799-802 (openhands-sdk User-Agent)"
+      ]
+    },
+    {
+      "id": "droid",
+      "name": "Factory Droid",
+      "kind": "app",
+      "sources": [
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/droid.go:209-210 (factory-cli)",
+        "github.com/Wei-Shaw/claude-relay-service@cf95ecc5e0ba src/validators/clients/droidCliValidator.js:26"
+      ]
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "kind": "app",
+      "sources": [
+        "github.com/yetone/magpie@eba7187368a8 internal/gateway/gateway.go:63-70 (Cursor, Cursor-CLI on Private Inference)",
+        "github.com/archestra-ai/archestra platform/backend/src/routes/proxy/utils/headers/client-app.ts:84 (Cursor/1.0 on an overridden OpenAI base URL)"
+      ]
+    },
+    {
+      "id": "codebuddy",
+      "name": "CodeBuddy Code",
+      "kind": "app",
+      "sources": [
+        "npm @tencent-ai/codebuddy-code@2.164.0 package/dist/codebuddy.js (CLI/version CodeBuddy/version, X-IDE-Type: CLI)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/codebuddy.go:51"
+      ]
+    },
+    {
+      "id": "workbuddy",
+      "name": "WorkBuddy",
+      "kind": "app",
+      "sources": [
+        "npm @tencent-ai/codebuddy-code@2.164.0 package/dist/codebuddy-lite-wb.mjs (CLI/version WorkBuddy/version, X-IDE-Type: WorkBuddy)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/workbuddy.go:63"
+      ]
+    },
+    {
+      "id": "minimax-code",
+      "name": "MiniMax Code",
+      "kind": "app",
+      "sources": [
+        "npm @minimax-ai/code@0.6.9 chunks (User-Agent: MiniMaxCode)",
+        "github.com/MiniMax-AI/minimax-code packages/local-runtime-v2 (X-Mavis-Session-Id on every model request)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/minimax.go:115"
+      ]
+    },
+    {
+      "id": "zcode",
+      "name": "ZCode",
+      "kind": "app",
+      "sources": [
+        "github.com/zai-org/ZCode@aac4755666d0 apps/zcode-cli/packages (ZCode/version, X-ZCode-Agent, X-ZCode-App-Version, X-Title)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/zcode.go:66"
+      ]
+    },
+    {
+      "id": "deepseek-harness",
+      "name": "DeepSeek Harness",
+      "kind": "app",
+      "sources": [
+        "npm @deepseek-ai/dsh (installed 2026-10-13) node_modules/@deepseek-ai/dsh-llm: deepseek-harness/version (+https://github.com/deepseek-ai/deepseek-harness)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/dsh.go:100"
+      ]
+    },
+    {
+      "id": "atomcode",
+      "name": "AtomCode",
+      "kind": "app",
+      "sources": [
+        "github.com/atomgit_atomcode/atomcode@ad1217e6b1e2 crates/atomcode-capabilities",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/atomcode.go:116"
+      ]
+    },
+    {
+      "id": "command-code",
+      "name": "Command Code",
+      "kind": "app",
+      "sources": [
+        "npm command-code@1.81.0 dist/cli.mjs (byokUserAgent)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/commandcode.go:43"
+      ]
+    },
+    {
+      "id": "muse-code",
+      "name": "Muse Code",
+      "kind": "app",
+      "sources": [
+        "github.com/router-for-me/CLIProxyAPI@bf9341629ef2 internal/runtime/executor/meta_executor.go:27, 55",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/muse.go:81"
+      ]
+    },
+    {
+      "id": "reasonix",
+      "name": "Reasonix",
+      "kind": "app",
+      "sources": [
+        "github.com/esengine/DeepSeek-Reasonix@d460758e7c8b internal/contract/provider, internal/model/openai",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/reasonix.go:301"
+      ]
+    },
+    {
+      "id": "omp",
+      "name": "oh-my-pi",
+      "kind": "app",
+      "sources": [
+        "github.com/can1357/oh-my-pi@818dd42b73ab packages/ai/src/providers/inference-headers.ts:91-103",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/omp.go:448"
+      ]
+    },
+    {
+      "id": "mister-morph",
+      "name": "Mister Morph",
+      "kind": "app",
+      "sources": [
+        "github.com/quailyquaily/mistermorph@4438a470b4e2 internal/llmutil/llmutil.go:327-340",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/morph.go:28"
+      ]
+    },
+    {
+      "id": "openhanako",
+      "name": "OpenHanako",
+      "kind": "app",
+      "sources": [
+        "github.com/liliMozi/openhanako lib/llm/provider-client.ts:11-24",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/hanako.go:101"
+      ]
+    },
+    {
+      "id": "mimo-code",
+      "name": "MiMo Code",
+      "kind": "app",
+      "sources": [
+        "github.com/XiaomiMiMo/MiMo-Code packages/cli/src/provider/provider.ts:543-576, 699 (X-Title, HTTP-Referer on named providers; mimocode User-Agent)",
+        "github.com/yetone/magpie@eba7187368a8 internal/agent/agents.go:790"
+      ]
+    },
+    {
+      "id": "openai-python",
+      "name": "OpenAI Python SDK",
+      "kind": "library",
+      "sources": [
+        "pypi openai 2.48.0 openai/_base_client.py:740"
+      ]
+    },
+    {
+      "id": "openai-node",
+      "name": "OpenAI Node SDK",
+      "kind": "library",
+      "sources": [
+        "npm openai@7.32.0 client.js:441"
+      ]
+    },
+    {
+      "id": "openai-go",
+      "name": "OpenAI Go SDK",
+      "kind": "library",
+      "sources": [
+        "github.com/openai/openai-go internal/requestconfig/requestconfig.go:30"
+      ]
+    },
+    {
+      "id": "openai-java",
+      "name": "OpenAI Java SDK",
+      "kind": "library",
+      "sources": [
+        "github.com/openai/openai-java openai-java-core OpenAIClientImpl.kt:70"
+      ]
+    },
+    {
+      "id": "openai-dotnet",
+      "name": "OpenAI .NET SDK",
+      "kind": "library",
+      "sources": [
+        "github.com/openai/openai-dotnet OpenAI/src/Utility/TelemetryDetails.cs:89-91"
+      ]
+    },
+    {
+      "id": "anthropic-python",
+      "name": "Anthropic Python SDK",
+      "kind": "library",
+      "sources": [
+        "pypi anthropic 0.125.0 anthropic/_base_client.py:742"
+      ]
+    },
+    {
+      "id": "anthropic-node",
+      "name": "Anthropic TypeScript SDK",
+      "kind": "library",
+      "sources": [
+        "npm @anthropic-ai/sdk@0.133.0 client.js:382"
+      ]
+    },
+    {
+      "id": "anthropic-go",
+      "name": "Anthropic Go SDK",
+      "kind": "library",
+      "sources": [
+        "github.com/anthropics/anthropic-sdk-go internal/requestconfig/requestconfig.go"
+      ]
+    },
+    {
+      "id": "anthropic-java",
+      "name": "Anthropic Java SDK",
+      "kind": "library",
+      "sources": [
+        "github.com/anthropics/anthropic-sdk-java anthropic-java-core AnthropicClientImpl.kt"
+      ]
+    },
+    {
+      "id": "google-genai",
+      "name": "Google GenAI SDK",
+      "kind": "library",
+      "sources": [
+        "pypi google-genai 1.47.0 google/genai/_api_client.py:112-123; npm @google/genai@2.29.0 dist/node/index.mjs:13353"
+      ]
+    },
+    {
+      "id": "vercel-ai-sdk",
+      "name": "Vercel AI SDK",
+      "kind": "library",
+      "sources": [
+        "npm ai@7.0.138 src/generate-text/generate-text.ts:640-643; @ai-sdk/provider-utils (ai-sdk/<provider>/<version>)"
+      ]
+    },
+    {
+      "id": "pi-ai",
+      "name": "pi agent library",
+      "kind": "library",
+      "sources": [
+        "npm @earendil-works/pi-ai@1.0.0 dist/utils/pi-user-agent.js (used by pi and by Cherry Studio's pi runtime)"
+      ]
+    },
+    {
+      "id": "litellm",
+      "name": "LiteLLM",
+      "kind": "library",
+      "sources": [
+        "github.com/BerriAI/litellm@c3ca8a5140ab litellm/llms/custom_httpx/http_handler.py:156"
+      ]
+    },
+    {
+      "id": "python-httpx",
+      "name": "Python httpx",
+      "kind": "library",
+      "sources": [
+        "pypi httpx 0.28.1 httpx/_client.py:119"
+      ]
+    },
+    {
+      "id": "python-requests",
+      "name": "Python requests",
+      "kind": "library",
+      "sources": [
+        "pypi requests 2.32.5 requests/utils.py:881-884"
+      ]
+    },
+    {
+      "id": "aiohttp",
+      "name": "Python aiohttp",
+      "kind": "library",
+      "sources": [
+        "pypi aiohttp 3.13.5 aiohttp/http.py:66"
+      ]
+    },
+    {
+      "id": "curl",
+      "name": "curl",
+      "kind": "library",
+      "sources": [
+        "github.com/curl/curl src/config2setopts.c:975-976"
+      ]
+    },
+    {
+      "id": "go-http",
+      "name": "Go net/http",
+      "kind": "library",
+      "sources": [
+        "github.com/golang/go src/net/http/request.go:550"
+      ]
+    },
+    {
+      "id": "node-fetch",
+      "name": "Node.js fetch",
+      "kind": "library",
+      "sources": [
+        "github.com/nodejs/undici lib/web/fetch/index.js:72"
+      ]
+    },
+    {
+      "id": "axios",
+      "name": "axios",
+      "kind": "library",
+      "sources": [
+        "npm axios@1.20.0 lib/adapters/http.js:791-795"
+      ]
+    },
+    {
+      "id": "okhttp",
+      "name": "OkHttp",
+      "kind": "library",
+      "sources": [
+        "github.com/square/okhttp okhttp3/internal/-UtilCommon.kt:370"
+      ]
+    },
+    {
+      "id": "java-http-client",
+      "name": "Java HttpClient",
+      "kind": "library",
+      "sources": [
+        "OpenJDK java.net.http.HttpClient default User-Agent (seen from JetBrains Junie)"
+      ]
+    },
+    {
+      "id": "browser",
+      "name": "Web browser",
+      "kind": "library",
+      "sources": [
+        "RFC 9110 §10.1.5; browser-based clients (NextChat, Open WebUI direct connections) send the browser's own"
+      ]
+    },
+    {
+      "id": "other-agent",
+      "name": "Other agent",
+      "kind": "app",
+      "sources": [
+        "agent.md step 3: an agent the catalog does not list uses the base URL /v1/client/other-agent; any declared id the catalog does not list counts here"
+      ]
+    }
+  ],
+  "user_agent_parsers": [
+    {
+      "regex": "^(claude-cli|claude-code)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "claude-code"
+    },
+    {
+      "regex": "^Mozilla/5\\.0 .*\\b(Claude)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "claude-desktop"
+    },
+    {
+      "regex": "^(codex_cli_rs)/\\d+\\.\\d+\\.\\d+ \\(Hermes Agent\\)",
+      "family_replacement": "hermes-agent"
+    },
+    {
+      "regex": "^(codex-tui|codex_cli_rs|codex_exec|codex_sdk_ts|codex_python_sdk|codex_vscode|codex_vscode_copilot|codex_app|codex_chatgpt_desktop|codex_atlas|Codex Desktop|acp-extension-codex)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "codex"
+    },
+    {
+      "regex": "^(GeminiCLI)(?:-[A-Za-z0-9-]+)?/v?(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "gemini-cli"
+    },
+    {
+      "regex": "^(CloudCodeVSCode)/(\\d+)\\.(\\d+)\\.(\\d+)\\b.*\\bproxy_client=geminicli\\b",
+      "family_replacement": "gemini-cli"
+    },
+    {
+      "regex": "^(QwenCode)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "qwen-code"
+    },
+    {
+      "regex": "^(KimiCLI)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "kimi-cli"
+    },
+    {
+      "regex": "^(iFlow-Cli)(?:-MultimodalHelper)?(?:\\s|$)",
+      "family_replacement": "iflow-cli"
+    },
+    {
+      "regex": "^(iFlowCLI)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "iflow-cli"
+    },
+    {
+      "regex": "^(stepcode) \\(",
+      "family_replacement": "stepcode"
+    },
+    {
+      "regex": "^(grok-shell|grok-pager|grok-code-extension|grok-desktop)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "grok-build"
+    },
+    {
+      "regex": "^(openclaw)(?:/(\\d+)\\.(\\d+)\\.(\\d+))?(?:\\s|$)",
+      "family_replacement": "openclaw"
+    },
+    {
+      "regex": "^([Ll]obe[Hh]ub)(?:/(\\d+)\\.(\\d+)\\.(\\d+))?(?:\\s|$)",
+      "family_replacement": "lobehub"
+    },
+    {
+      "regex": "^(OpenAICompatibleClient)/JS ",
+      "family_replacement": "lobehub"
+    },
+    {
+      "regex": "^(Alma)(?:-Desktop)?/(\\d+)\\.(\\d+)(?:\\.(\\d+))?",
+      "family_replacement": "alma"
+    },
+    {
+      "regex": "^(GitHubCopilotChat)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "copilot-vscode"
+    },
+    {
+      "regex": "^(opencode)/[^/\\s]+/(\\d+)\\.(\\d+)\\.(\\d+)/",
+      "family_replacement": "opencode"
+    },
+    {
+      "regex": "^(Charm-Crush)/v?(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "crush"
+    },
+    {
+      "regex": "^(Cline)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "cline"
+    },
+    {
+      "regex": "^(RooCode|roo-code)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "roo-code"
+    },
+    {
+      "regex": "^(Kilo-Code)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "kilo-code"
+    },
+    {
+      "regex": "^(kilo)/[^/\\s]+/(\\d+)\\.(\\d+)\\.(\\d+)/",
+      "family_replacement": "kilo-code"
+    },
+    {
+      "regex": "^(opencode-kilo-provider)(?:/(\\d+)\\.(\\d+)\\.(\\d+))?(?:\\s|$)",
+      "family_replacement": "kilo-code"
+    },
+    {
+      "regex": "^(Zed)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "zed"
+    },
+    {
+      "regex": "^(?:mistral-client-python/)?(Mistral-Vibe)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "mistral-vibe"
+    },
+    {
+      "regex": "^(HermesAgent|Hermes-Agent|hermes-agent|hermes-cli)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "hermes-agent"
+    },
+    {
+      "regex": "^(openhands-sdk) \\(",
+      "family_replacement": "openhands"
+    },
+    {
+      "regex": "^(factory-cli)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "droid"
+    },
+    {
+      "regex": "^(Cursor)(?:-CLI)?/(\\d+)\\.(\\d+)(?:\\.(\\d+))?",
+      "family_replacement": "cursor"
+    },
+    {
+      "regex": "^CLI/\\S+ (CodeBuddy)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "codebuddy"
+    },
+    {
+      "regex": "^CLI/\\S+ (WorkBuddy)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "workbuddy"
+    },
+    {
+      "regex": "^(MiniMaxCode|minimax-code)(?:/(\\d+)\\.(\\d+)\\.(\\d+))?(?:\\s|$)",
+      "family_replacement": "minimax-code"
+    },
+    {
+      "regex": "^(ZCode)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "zcode"
+    },
+    {
+      "regex": "^(deepseek-harness)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "deepseek-harness"
+    },
+    {
+      "regex": "^(atomcode)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "atomcode"
+    },
+    {
+      "regex": "^(command-code)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "command-code"
+    },
+    {
+      "regex": "^(muse-build|muse-code)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "muse-code"
+    },
+    {
+      "regex": "^(Reasonix)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "reasonix"
+    },
+    {
+      "regex": "^(omp)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "omp"
+    },
+    {
+      "regex": "^(mistermorph)/(\\d+)\\.(\\d+)(?:\\.(\\d+))?",
+      "family_replacement": "mister-morph"
+    },
+    {
+      "regex": "^(HanaAgent)/(\\d+)\\.(\\d+)(?:\\.(\\d+))?",
+      "family_replacement": "openhanako"
+    },
+    {
+      "regex": "^(?:Async)?(OpenAI)/Python (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "openai-python"
+    },
+    {
+      "regex": "^(?:Azure)?(OpenAI)/JS (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "openai-node"
+    },
+    {
+      "regex": "^(OpenAI)/Go (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "openai-go"
+    },
+    {
+      "regex": "^(OpenAIClientImpl)/Java (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "openai-java"
+    },
+    {
+      "regex": "^(OpenAI)/(\\d+)\\.(\\d+)\\.(\\d+) \\(",
+      "family_replacement": "openai-dotnet"
+    },
+    {
+      "regex": "^(?:Async)?(Anthropic)/Python (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "anthropic-python"
+    },
+    {
+      "regex": "^(Anthropic)/JS (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "anthropic-node"
+    },
+    {
+      "regex": "^(Anthropic)/Go (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "anthropic-go"
+    },
+    {
+      "regex": "^(AnthropicClientImpl)/Java (\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "anthropic-java"
+    },
+    {
+      "regex": "^(google-genai-sdk)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "google-genai"
+    },
+    {
+      "regex": "^(ai|ai-sdk/[a-z0-9-]+)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "vercel-ai-sdk"
+    },
+    {
+      "regex": "^(pi) \\(",
+      "family_replacement": "pi-ai"
+    },
+    {
+      "regex": "^(litellm)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "litellm"
+    },
+    {
+      "regex": "^(python-httpx)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "python-httpx"
+    },
+    {
+      "regex": "^(python-requests)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "python-requests"
+    },
+    {
+      "regex": "^Python/\\d+\\.\\d+ (aiohttp)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "aiohttp"
+    },
+    {
+      "regex": "^(curl)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "curl"
+    },
+    {
+      "regex": "^(Go-http-client)/(\\d+)\\.(\\d+)",
+      "family_replacement": "go-http"
+    },
+    {
+      "regex": "^(node|undici)(?:/(\\d+)\\.(\\d+)\\.(\\d+))?$",
+      "family_replacement": "node-fetch"
+    },
+    {
+      "regex": "^(axios)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "axios"
+    },
+    {
+      "regex": "^(okhttp)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "okhttp"
+    },
+    {
+      "regex": "^(Java-http-client)/(\\d+)\\.(\\d+)\\.(\\d+)",
+      "family_replacement": "java-http-client"
+    },
+    {
+      "regex": "^(Mozilla)/5\\.0 ",
+      "family_replacement": "browser"
+    },
+    {
+      "regex": "^([A-Za-z][A-Za-z0-9._-]{0,47})(?:/v?(?:(\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?)?\\S*)?(?:\\s|$)",
+      "family_replacement": "ua:$1"
+    }
+  ],
+  "headers": [
+    {
+      "header": "originator",
+      "equals": [
+        "codex-tui",
+        "codex_cli_rs",
+        "codex_exec",
+        "codex_sdk_ts",
+        "codex_python_sdk",
+        "codex_vscode",
+        "codex_vscode_copilot",
+        "codex_app",
+        "codex_chatgpt_desktop",
+        "codex_atlas",
+        "Codex Desktop",
+        "acp-extension-codex"
+      ],
+      "app": "codex"
+    },
+    {
+      "header": "x-openrouter-title",
+      "equals": [
+        "Qwen Code"
+      ],
+      "app": "qwen-code"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Qwen Code"
+      ],
+      "app": "qwen-code"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://github.com/QwenLM/qwen-code.git"
+      ],
+      "app": "qwen-code"
+    },
+    {
+      "header": "x-msh-platform",
+      "equals": [
+        "kimi_cli"
+      ],
+      "app": "kimi-cli"
+    },
+    {
+      "header": "x-iflow-signature",
+      "present": true,
+      "app": "iflow-cli"
+    },
+    {
+      "header": "x-openrouter-title",
+      "equals": [
+        "StepCode"
+      ],
+      "app": "stepcode"
+    },
+    {
+      "header": "x-grok-client-identifier",
+      "equals": [
+        "grok-shell"
+      ],
+      "app": "grok-build"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "openclaw"
+      ],
+      "app": "openclaw"
+    },
+    {
+      "header": "agent-session-id",
+      "present": true,
+      "app": "goose"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "goose"
+      ],
+      "app": "goose"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://goose-docs.ai"
+      ],
+      "app": "goose"
+    },
+    {
+      "header": "x-openrouter-title",
+      "equals": [
+        "Continue"
+      ],
+      "app": "continue"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://www.continue.dev/"
+      ],
+      "app": "continue"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Avante.nvim"
+      ],
+      "app": "avante-nvim"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://github.com/avante-corp/avante.nvim"
+      ],
+      "app": "avante-nvim"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "LobeHub",
+        "Lobe Chat"
+      ],
+      "app": "lobehub"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://lobehub.com",
+        "https://chat-preview.lobehub.com"
+      ],
+      "app": "lobehub"
+    },
+    {
+      "header": "x-client",
+      "equals": [
+        "LobeHub"
+      ],
+      "app": "lobehub"
+    },
+    {
+      "header": "app-code",
+      "equals": [
+        "LobeHub"
+      ],
+      "app": "lobehub"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Open WebUI"
+      ],
+      "app": "open-webui"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://openwebui.com/"
+      ],
+      "app": "open-webui"
+    },
+    {
+      "header": "x-openwebui-user-id",
+      "present": true,
+      "app": "open-webui"
+    },
+    {
+      "header": "x-amp-client-type",
+      "present": true,
+      "app": "amp"
+    },
+    {
+      "header": "x-opencode-client",
+      "equals": [
+        "cli",
+        "cli-node",
+        "desktop",
+        "acp",
+        "sdk"
+      ],
+      "app": "opencode"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "opencode"
+      ],
+      "app": "opencode"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://opencode.ai/"
+      ],
+      "app": "opencode"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Crush"
+      ],
+      "app": "crush"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://charm.land"
+      ],
+      "app": "crush"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Aider"
+      ],
+      "app": "aider"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://aider.chat"
+      ],
+      "app": "aider"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "cline"
+      ],
+      "app": "cline"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Cline"
+      ],
+      "app": "cline"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://cline.bot"
+      ],
+      "app": "cline"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "roo-code"
+      ],
+      "app": "roo-code"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Roo Code"
+      ],
+      "app": "roo-code"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://github.com/RooVetGit/Roo-Cline"
+      ],
+      "app": "roo-code"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Kilo Code"
+      ],
+      "app": "kilo-code"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://kilocode.ai"
+      ],
+      "app": "kilo-code"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Zed"
+      ],
+      "app": "zed"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://zed.dev"
+      ],
+      "app": "zed"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "hermes-agent"
+      ],
+      "app": "hermes-agent"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Hermes Agent"
+      ],
+      "app": "hermes-agent"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://hermes-agent.nousresearch.com"
+      ],
+      "app": "hermes-agent"
+    },
+    {
+      "header": "copilot-integration-id",
+      "equals": [
+        "copilot-developer-cli"
+      ],
+      "app": "copilot-cli"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "cherry-studio"
+      ],
+      "app": "cherry-studio"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Cherry Studio"
+      ],
+      "app": "cherry-studio"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://cherry-ai.com"
+      ],
+      "app": "cherry-studio"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Chatbox AI"
+      ],
+      "app": "chatbox"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://chatboxai.app"
+      ],
+      "app": "chatbox"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "OpenHands"
+      ],
+      "app": "openhands"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://docs.all-hands.dev/"
+      ],
+      "app": "openhands"
+    },
+    {
+      "header": "x-ide-type",
+      "equals": [
+        "WorkBuddy"
+      ],
+      "app": "workbuddy"
+    },
+    {
+      "header": "x-mavis-session-id",
+      "present": true,
+      "app": "minimax-code"
+    },
+    {
+      "header": "x-zcode-app-version",
+      "present": true,
+      "app": "zcode"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "Z Code@electron",
+        "Z Code@cli"
+      ],
+      "app": "zcode"
+    },
+    {
+      "header": "x-deepseek-harness-user-id",
+      "present": true,
+      "app": "deepseek-harness"
+    },
+    {
+      "header": "originator",
+      "equals": [
+        "omp"
+      ],
+      "app": "omp"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "omp"
+      ],
+      "app": "omp"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://omp.sh/"
+      ],
+      "app": "omp"
+    },
+    {
+      "header": "x-title",
+      "equals": [
+        "mimocode"
+      ],
+      "app": "mimo-code"
+    },
+    {
+      "header": "http-referer",
+      "equals": [
+        "https://mimo.xiaomi.com/coder/"
+      ],
+      "app": "mimo-code"
+    }
+  ]
+}

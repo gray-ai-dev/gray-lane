@@ -1,0 +1,19 @@
+{
+  "name": "gray-provisioner",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/attest": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@noble/curves": "1.9.1",
+    "@noble/hashes": "1.8.0",
+    "@phala/dstack-sdk": "0.5.8"
+  }
+}

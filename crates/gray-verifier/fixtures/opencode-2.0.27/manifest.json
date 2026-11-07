@@ -1,0 +1,42 @@
+{
+  "opencode_version": "2.0.27",
+  "shape": "opencode-2.0.27",
+  "captured_on": "Mon Oct 19 2026",
+  "neutral": {
+    "WORKING_DIRECTORY": "/home/user/project",
+    "WORKSPACE_ROOT": "/home/user/project",
+    "GIT_REPO": "yes",
+    "PLATFORM": "linux",
+    "DATE": "Mon Oct 19 2026"
+  },
+  "apis": {
+    "anthropic_messages": {
+      "package": "@opencode/ai/providers/anthropic",
+      "captured_with": "anthropic/claude-sonnet-5",
+      "system_sha256": "da3c8ea9a8612c596fc7a94fc5041749f2bb4f423ce2b4da1a10397301c38508",
+      "tools_sha256": "f6c8dc3f0c1773701f24edfce3e4d3bc331a87f32acc93103fc4bf82ce85bef5",
+      "tools": 12
+    },
+    "open_ai_responses": {
+      "package": "@opencode/ai/providers/openai",
+      "captured_with": "openai/gpt-6.1-sol",
+      "system_sha256": "b017f5888df56455f6528c40361c14a80f5d8ee99976a2565076460ab7d7e3db",
+      "tools_sha256": "1ef11ffa42ce6e1e9049ca8ca056f55ede485ddd039d4144bedfc228d8c1edb5",
+      "tools": 11
+    },
+    "gemini": {
+      "package": "@opencode/ai/providers/google",
+      "captured_with": "google/gemini-3.8-flash",
+      "system_sha256": "7814ce6b2e7de995fa6f3e70d1c1503c7a4f848c9227ef00c7ced94d4a979ab0",
+      "tools_sha256": "24299bb69a2ef3e1930808e65887fc43a9680125c86c51ba043902b05d1dc6f4",
+      "tools": 1
+    },
+    "open_ai_chat": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "captured_with": "x-ai/grok-4.7",
+      "system_sha256": "23fa3ab64ecbacad4258cac78baeae3af3f8c45f858d69cf0617ef75066d5af2",
+      "tools_sha256": "7185b89dca161b16d679f0b2a53f359a08ea6dbf618f315ffe93584ce54ad94f",
+      "tools": 12
+    }
+  }
+}

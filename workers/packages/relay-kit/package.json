@@ -1,0 +1,44 @@
+{
+  "name": "@gray/relay-kit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node": "./src/node/index.ts"
+  },
+  "bin": {
+    "gray-relay": "./src/node/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "test:smoke": "vitest run -c vitest.smoke.config.ts",
+    "test:tunnel": "test/tunnel-e2e/run.sh",
+    "fixtures": "node test/fixtures/generate.mjs",
+    "assets": "node assets/build.mjs"
+  },
+  "dependencies": {
+    "@gray/attest": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane": "0.0.0",
+    "@gray/lane-compose": "0.0.0",
+    "@gray/lane-verify": "0.0.0",
+    "@gray/relay-connector": "0.0.0",
+    "@gray/relay-policy": "0.0.0",
+    "@noble/hashes": "1.8.0",
+    "@phala/dcap-qvl": "0.7.0",
+    "@simplewebauthn/server": "14.0.3",
+    "jsonc-parser": "3.3.1",
+    "undici": "7.30.1",
+    "ws": "8.21.3",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@msgpack/msgpack": "3.1.3",
+    "@types/ws": "8.18.2",
+    "wabt": "1.0.39"
+  }
+}

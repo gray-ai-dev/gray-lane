@@ -1,0 +1,240 @@
+# The dstack app of gray-lane: the workerd lane (whose entrypoint has gray-acme issue a new TLS
+# certificate for every boot, D133), its gray-egress sidecar, gray-peerlink (the entry's end of the channel stack
+# VMs dial, docs/design/relay-outbound-only.md §3), and the persistent lane-certs volume that holds only the ACME
+# accounts.
+#
+# deploy/tee/app-compose.mjs embeds this file, as text, into app-compose.json's `docker_compose_file`
+# (dstack hands that text to `docker compose up`), and refuses to generate anything unless every image
+# is pinned by `@sha256:` digest and no service has a `build:` section (IMPLEMENTATION_NOTES.md §10).
+#
+# What the operator sets before a release (the generator refuses every `set-at-deploy` placeholder and
+# every `*.invalid` TLS domain — a release must name the real identity):
+# - both `image:` lines: the digest deploy/tee/build.sh printed (the `gray-lane@sha256:000…0`
+#   here is a placeholder that the generator refuses; one digest runs both services);
+# - `TLS_DOMAIN` (lane): the hostname the in-CVM certificate is for;
+# - `KEYSET_NOT_AFTER` and `LANE_BRIDGE_URL`: the u64 the keyset expires at and the bridge origin.
+# - `LANE_RELEASE_PUBLIC_KEY` and `LANE_RELEASE_FRESHNESS_PUBLIC_KEY`: the environment's release-list keys, and
+#   `LANE_PEERS` (with egress's `-peer` and `-peer-link`): whether this lane is an entry for the relay stacks
+#   (routing PR 9; relay-outbound-only §3).
+# - `KEYSET_SUBJECT` is NOT here (D47). The lane entrypoint reads the app id from the guest agent's
+#   v1 Info RPC at boot and sets `dstack:app-id:<app_id>`. A literal would make the measured compose
+#   depend on its own hash, and the app id is in the quote anyway.
+# - `LANE_BRIDGE_KEY_SEED`: not a literal. It comes from the dstack encrypted env (allowed_envs in
+#   app-compose.mjs, D17); the expression below passes it through at `docker compose up` time.
+# - D133: `ACME_EAB_KID`/`ACME_EAB_HMAC_KEY`: not literals either (a literal would publish the
+#   credential in the measured compose). They come from the encrypted env the same way; gray-acme
+#   uses them only to register the Google Trust Services account, and empty values are no EAB.
+# - D44: `DSTACK_DOCKER_REGISTRY`/`_USERNAME`/`_PASSWORD` are read by the measured pre-launch script
+#   (Phala's registry login), never by a service here; no compose service references them.
+#
+# D19, amended by D133: the seed and the two EAB expressions are the only host env this file reads.
+# `DEPLOY_ENV`, `TEE_TYPE`, `KEYSET_NOT_AFTER`, `LANE_BRIDGE_URL`, `LANE_KEY_ID`, `TLS_DOMAIN`,
+# `ACME_DIRECTORY_URLS`, `ACME_STATE_DIR`, `ACME_KEY_DIR`, `ACME_EMAIL`, `GUEST_AGENT_URL` and the
+# gateway vars are literals below, inside the bytes dstack measures; `TLS_SPKI_SHA256` is absent
+# because the entrypoint computes it from this boot's certificate. The app-compose allowlist
+# therefore has the seed and the two EAB names.
+#
+# Why these settings (IMPLEMENTATION_NOTES.md §3 and §9):
+# - D133: there is no separate ACME service. The lane's entrypoint runs gray-acme in the lane
+#   container, before workerd binds 443, so the certificate key is generated in that container's
+#   memory and written only to its /run/lane tmpfs. A one-shot service cannot hand a tmpfs to the
+#   lane: a local tmpfs named volume is empty for the next container once its writer has exited
+#   (measured, D133). A gray-acme failure stops the lane's boot.
+# - The socket mount is the guest agent, the only outbound path the Worker has besides the bridge and
+#   the egress sidecar. No other host path is mounted; `/certs` (the ACME accounts) and the
+#   `egress-socket` volume are the only others, with peerlink's `peerlink-socket` (relay-outbound-only §3.8).
+# - Both services have no capabilities, no new privileges, a read-only root and no core dumps. The
+#   lane binds 443 as root (gray-acme's tls-alpn-01 listener, then workerd), writes the ACME accounts
+#   to `/certs`, and writes this boot's key, certificate and rendered config to the lane-only
+#   `/run/lane` tmpfs and nothing else. Only the lane publishes a port.
+# - D63: `egress` and `lane` share one tmpfs volume, `egress-socket`, mounted at /run/gray. It holds
+#   only the sidecar's /run/gray/egress.sock (0600, same uid); the entrypoint refuses to start workerd
+#   until that socket exists (E1). The rendered workerd config - which carries the bridge seed - is on
+#   a tmpfs at /run/lane that only `lane` mounts; egress cannot reach it.
+# - relay-outbound-only §3.2, §3.8: `peerlink` (gray-peerlink, the same image with its own entrypoint) is the entry's
+#   end of the channel a stack VM dials: the lane's /v1/peer/attach and /v1/peer/tunnel hand their WebSocket upgrades
+#   to it, and egress dials a channel peer through its CONNECT. It has no network (`network_mode: none`), holds no key,
+#   no credential and no customer plaintext (every stream it carries is TLS that ends elsewhere, O4), and reaches
+#   nothing but its own socket on `peerlink-socket`, a tmpfs volume mounted by the lane (the workerd `external`
+#   service `PEERLINK`, PEERLINK_SOCKET), egress (`-peer-link`) and peerlink alone.
+# - Nothing here is a request secret. The per-boot receipt key is generated in memory; the TLS key
+#   is generated per boot and lives only on the /run/lane tmpfs (D133); the bridge seed and the EAB
+#   come from the encrypted env, never from this file.
+name: gray-lane
+
+services:
+  lane:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # D133: every start of this container orders a new certificate, so the entrypoint restarts a
+    # failed workerd itself, in this container with this boot's key, and the container exits (and
+    # Docker restarts it) only under the give-up rule; IMPLEMENTATION_NOTES.md D133 has the arithmetic
+    # against the CAs' order limits.
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    environment:
+      DEPLOY_ENV: "production"
+      TEE_TYPE: "tdx"
+      # D47/D58: a deployment value (the generator's --keyset-not-after); the committed placeholder
+      # is refused by app-compose.mjs, and 4102444800 (year 2100) is refused outright.
+      KEYSET_NOT_AFTER: "set-at-deploy"
+      TLS_DOMAIN: "lane.set-at-deploy.invalid"
+      # D133: gray-acme (run by the entrypoint) tries these CAs in order with a new in-memory key,
+      # writes the pair only to ACME_KEY_DIR on the lane-only /run/lane tmpfs, and keeps only the
+      # ACME accounts (one directory per CA) on the persistent lane-certs volume at ACME_STATE_DIR.
+      ACME_DIRECTORY_URLS: "https://dv.acme-v02.api.pki.goog/directory,https://acme-v02.api.letsencrypt.org/directory"
+      ACME_STATE_DIR: "/certs"
+      ACME_KEY_DIR: "/run/lane/tls"
+      # D45: no e-mail address. Set a measured literal here only if the operator wants one.
+      ACME_EMAIL: "tls@usefallback.com"
+      # D133: Google Trust Services' External Account Binding, from the encrypted env. It only picks
+      # which account registers; it never reaches the certificate key.
+      ACME_EAB_KID: "${ACME_EAB_KID:-}"
+      ACME_EAB_HMAC_KEY: "${ACME_EAB_HMAC_KEY:-}"
+      LISTEN_ADDRESS: "*:443"
+      GUEST_AGENT_SOCKET: "/var/run/dstack.sock"
+      GUEST_AGENT_URL: "http://guest-agent"
+      GUEST_AGENT_TIMEOUT_MS: "5000"
+      EGRESS_SOCKET: "/run/gray/egress.sock"
+      LANE_BRIDGE_URL: "https://lane-bridge.set-at-deploy.invalid"
+      LANE_KEY_ID: "lane-1"
+      # D56: no LANE_RECEIPT_KEY_ID literal and no entrypoint default; the gateway creates a random
+      # receipt key id per boot (D11). An empty binding is absent to the gateway's textBinding.
+      LANE_BRIDGE_KEY_SEED: "${LANE_BRIDGE_KEY_SEED:-}"
+      GATEWAY_FALLBACK_REGION: "wnam"
+      BODY_PARSE_MAX_BYTES: "4194304"
+      LANE_POLICY_STEP_MS: "1500"
+      # D128: the policy step waits ceil(fuel / LANE_POLICY_FUEL_PER_MS) + LANE_POLICY_OVERHEAD_MS for
+      # a request, where fuel is the sandbox's budget for that input's size, at most LANE_POLICY_STEP_MS
+      # (@gray/config). D128' measurement, 2026-10-22 (relay-policy bench/policy-step.ts on the build
+      # box, AMD Ryzen 9 9950X3D, workerd 1.20261006.1, 50 runs per cell): 188,401 fuel per ms on the
+      # slowest module shape (a branch loop) and 3 ms of overhead, the settings' defaults. T is 9 ms
+      # for a 1 KiB prompt and 444 ms at the 4 MiB cap; the lane calibrates at boot and uses the
+      # slower rate and the larger overhead of these and its own.
+      LANE_POLICY_FUEL_PER_MS: "188401"
+      LANE_POLICY_OVERHEAD_MS: "3"
+      # D109': the pick budget; each scheduler.forward carries what is left of it as budget_ms
+      # (D122'). A deployment value (the generator's --scheduler-pick-ms, inside @gray/config's
+      # LANE_SCHEDULER_PICK_MS bounds). 1500 is that setting's default; D123 measured 48 real-TDX
+      # picks on staging (2026-10-22) at a bridge forward wall time of at most 987 ms (p90 866 ms).
+      LANE_SCHEDULER_PICK_MS: "1500"
+      # Routing PR 9 (docs/confidential-lane-stack-routing.md sections 4.2, 4.3): the environment's release-list
+      # public keys, deployment values (the generator's --release-public-key and --release-freshness-public-key,
+      # environments.json's release_public_key and release_freshness_public_key). An entry verifies the stack list
+      # with them before it sends a stack VM any content, so they are measured here, never host env.
+      LANE_RELEASE_PUBLIC_KEY: "set-at-deploy"
+      LANE_RELEASE_FRESHNESS_PUBLIC_KEY: "set-at-deploy"
+      # Whether this lane is an entry that routes the stack routes over the peer hop (the generator's --lane-peers).
+      # "true" needs both keys above and egress's -peer and -peer-link below; the gate refuses either without the other.
+      LANE_PEERS: "false"
+      # relay-outbound-only §3.2: peerlink's socket, which the entrypoint renders as the workerd `external` service
+      # `peerlink` bound as PEERLINK. The lane's attach, tunnel and health routes use it only when LANE_PEERS is "true".
+      PEERLINK_SOCKET: "/run/peerlink/peerlink.sock"
+    volumes:
+      # The dstack guest mounts the guest agent's socket here. Not read-only: connecting to a Unix socket
+      # writes to it.
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      # D133: the ACME accounts gray-acme keeps across boots (account keys and URIs only; no
+      # certificate key, which never leaves the /run/lane tmpfs).
+      - lane-certs:/certs
+      # D63: the socket volume, mounted by lane and egress. It holds only egress.sock.
+      - egress-socket:/run/gray
+      # relay-outbound-only §3.8: peerlink's socket volume. It holds only peerlink.sock.
+      - peerlink-socket:/run/peerlink
+    read_only: true
+    tmpfs:
+      - /tmp
+      # D63: the rendered config (with the bridge seed) lives here, never on the socket volume.
+      # D133: so do this boot's TLS key and certificate (/run/lane/tls).
+      - /run/lane:mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+
+  egress:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    # The same image, without the lane entrypoint: only the egress binary. It has no port, no
+    # certificate and no secret; it receives proxy credentials only in the per-request header.
+    # -max-body-bytes is at least the lane's body cap (BODY_PARSE_MAX_BYTES above; the gate holds it so): an entry
+    # forwards the client's exact bytes to a stack VM through this sidecar. `--lane-peers true` adds -peer, the peer
+    # mode (pinned TLS to attested stack VMs, deploy/tee/egress README "Peer mode"), with `-peer-link
+    # /run/peerlink/peerlink.sock` (a channel peer is dialed through peerlink's CONNECT, relay-outbound-only §3.2), and
+    # nothing else adds either.
+    entrypoint: ["/usr/local/bin/gray-egress"]
+    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304"]
+    volumes:
+      # D63: the egress socket, shared with the lane; it holds only the socket.
+      - egress-socket:/run/gray
+      # relay-outbound-only §3.8: peerlink's socket, which egress dials channel peers through.
+      - peerlink-socket:/run/peerlink
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+
+  peerlink:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    # relay-outbound-only §3.2: the same image, only the peerlink binary, as the entry's end of the channel. The gate
+    # fixes the entrypoint and the command; its settings are peerlink's defaults (deploy/tee/peerlink/README.md).
+    entrypoint: ["/usr/local/bin/gray-peerlink"]
+    command: ["-role", "entry", "-socket", "/run/peerlink/peerlink.sock"]
+    # §3.8: no network address. The VMs' sessions reach it through the lane's workerd, which hands it their upgrades
+    # on the socket.
+    network_mode: "none"
+    volumes:
+      # Its only mount: the socket the lane and egress reach it on.
+      - peerlink-socket:/run/peerlink
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+
+volumes:
+  # D133: persistent (a Docker named volume): the ACME accounts survive restarts, so a CA that
+  # requires a single-use EAB registers once. It holds no certificate key or certificate; gray-acme
+  # removes the ones the pre-D133 layout left here.
+  lane-certs:
+  egress-socket:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  # relay-outbound-only §3.8: peerlink's socket, in memory like egress's.
+  peerlink-socket:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+# How the lane gets its certificate (D45, D133), and what a reviewer has to check:
+#
+# - The lane's entrypoint runs `gray-acme`, lego built from source at the pinned go.mod/go.sum
+#   (v5.6.0), inside this CVM and inside the lane container, before workerd starts. On every boot
+#   it generates a new EC P-256 key in memory and obtains a certificate for `TLS_DOMAIN` with
+#   tls-alpn-01 on 443 — no DNS credential enters the CVM — from the first CA in
+#   `ACME_DIRECTORY_URLS` that issues. It writes `privkey.pem` and `fullchain.pem` (0600) only to
+#   `/run/lane/tls`, and `accounts/<CA host>/account.key` + `account.json` to `lane-certs`. It logs
+#   the issuing CA, the account URI and the certificate SHA-256. The operator authorizes each CA
+#   (and, where the CA supports it, each logged account URI) in the domain's CAA records once per
+#   account; that is operations, outside this file.
+# - Why per boot: the attested keyset binds this certificate's SPKI. A key on `lane-certs` could be
+#   copied out by any other compose of this app and served outside the CVM; a key that only lived
+#   in this container's memory for one boot cannot.
+# - Local host e2e (`deploy/tee/e2e.sh lane`) uses an openssl self-signed certificate instead; the
+#   simulator e2e runs this image's lane, and so its gray-acme, against a local pebble.
+# - There is no DNS-01 client and no certbot sidecar: D45 forbids a DNS credential in the CVM, and a
+#   service whose only working configuration needs a zone token would be untested code in the
+#   measured compose.

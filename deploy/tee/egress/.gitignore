@@ -1,0 +1,2 @@
+# the compiled binary (go build): built into the lane image, never committed
+/egress

@@ -1,0 +1,19 @@
+{
+  "name": "@gray/attest",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/json": "0.0.0",
+    "@noble/hashes": "1.8.0",
+    "zod": "4.6.6"
+  }
+}

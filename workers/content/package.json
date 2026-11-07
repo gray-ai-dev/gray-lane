@@ -1,0 +1,23 @@
+{
+  "name": "gray-content",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.tool.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "dev": "wrangler dev -c wrangler.jsonc --local",
+    "tool": "node src/tool.ts"
+  },
+  "dependencies": {
+    "@gray/config": "0.0.0",
+    "@gray/content": "0.0.0",
+    "@gray/json": "0.0.0",
+    "jose": "6.2.12",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@gray/request-index": "0.0.0"
+  }
+}

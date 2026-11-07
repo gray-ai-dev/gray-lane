@@ -1,0 +1,23 @@
+{
+  "name": "@gray/relay-connector",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./lease": "./src/lease.ts",
+    "./egress": "./src/egress.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/attest": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane": "0.0.0",
+    "@hpke/core": "1.9.0",
+    "zod": "4.6.6"
+  }
+}

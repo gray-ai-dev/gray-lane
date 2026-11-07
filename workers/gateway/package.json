@@ -1,0 +1,53 @@
+{
+  "name": "gray-gateway",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "node ../tooling/vitest-shards.mjs --in-turn vitest.workerd.config.ts,vitest.endpoint-random.workerd.config.ts -- vitest run",
+    "dev": "wrangler dev -c wrangler.jsonc --local",
+    "measure": "vitest run -c vitest.measure.workerd.config.ts --silent=false"
+  },
+  "dependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/attest": "0.0.0",
+    "@gray/client-apps": "0.0.0",
+    "@gray/config": "0.0.0",
+    "@gray/content": "0.0.0",
+    "@gray/continuation": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/endpoint": "0.0.0",
+    "@gray/errors": "0.0.0",
+    "@gray/holds": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane": "0.0.0",
+    "@gray/lane-wire": "0.0.0",
+    "@gray/ledger-keys": "0.0.0",
+    "@gray/limits": "0.0.0",
+    "@gray/media": "0.0.0",
+    "@gray/protocol": "0.0.0",
+    "@gray/relay-connector": "0.0.0",
+    "@gray/relay-policy": "0.0.0",
+    "@gray/routing": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "@gray/tool-ids": "0.0.0",
+    "@gray/translation": "0.0.0",
+    "@gray/trust": "0.0.0",
+    "@gray/verifier": "0.0.0",
+    "@msgpack/msgpack": "3.1.3",
+    "@noble/hashes": "1.8.0",
+    "@streamparser/json": "0.0.26",
+    "lru-cache": "11.5.3",
+    "multipasta": "0.2.8",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@gray/conformance": "0.0.0",
+    "@gray/faults": "0.0.0",
+    "@gray/lane-verify": "0.0.0",
+    "fast-check": "4.10.2",
+    "@gray/relay-kit": "0.0.0"
+  }
+}

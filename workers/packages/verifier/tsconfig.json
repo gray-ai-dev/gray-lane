@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["src", "test"],
+  // Node-only tests (node:worker_threads, node:crypto): vitest runs them in Node; this program has the Workers types only.
+  "exclude": ["test/text-size.test.ts", "test/model-check-ticket.test.ts"]
+}

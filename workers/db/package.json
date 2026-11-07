@@ -1,0 +1,20 @@
+{
+  "name": "@gray/db",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.roles.json",
+    "test": "vitest run -c vitest.config.ts"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/config": "0.0.0"
+  }
+}

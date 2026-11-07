@@ -1,0 +1,192 @@
+import { parseSerde, toJsonString, type Json } from "@gray/json";
+import { z } from "zod";
+import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
+import { attestCollateralAnswerSchema, attestCollateralRequestSchema, releaseListsAnswerSchema, releaseListsRequestSchema } from "./background.ts";
+import { acquireInputSchema, acquireResultSchema, emptyAnswerSchema, endpointReleaseInputSchema, endpointReleaseResultSchema, noteInputSchema, probeAnsweredInputSchema, retryReleaseInputSchema, retryReserveInputSchema, retryReserveResultSchema, warmInputSchema, warmResultSchema } from "./endpoint.ts";
+import { BridgeWireError } from "./error.ts";
+import { laneAcmeFailedAnswerSchema, laneAcmeFailedSchema } from "./lane-acme.ts";
+import { BRIDGE_METHODS, type BridgeOp } from "./ops.ts";
+import { laneEventsSchema, laneIndexMessageSchema, lanePointsSchema, laneServiceEventsSchema, recordsAcceptedSchema } from "./records.ts";
+import { SCHEDULER_FORWARD_REQUEST_MAX_BYTES, schedulerForwardAnswerSchema, schedulerForwardRequestSchema, schedulerForwardRequestV1Schema } from "./scheduler.ts";
+import type { LaneBridgeApiVersion } from "./signing.ts";
+import { SNAPSHOT_RESPONSE_MAX_BYTES, snapshotAnswerSchema, snapshotCurrentRequestSchema } from "./snapshot.ts";
+import { stackConfigAnswerSchema, stackConfigRequestSchema, stackProxyChecksAnswerSchema, stackProxyChecksRequestSchema } from "./stack.ts";
+import { STACK_REPORT_MAX_BYTES, stackReportAnswerSchema, stackReportSchema } from "./stack-report.ts";
+import { stackRulesAnswerSchema, stackRulesRequestSchema } from "./stack-rules.ts";
+import { stackTestsAnswerSchema, stackTestsRequestSchema } from "./stack-tests.ts";
+import { ticketUseAnswerSchema, ticketUseInputSchema } from "./ticket.ts";
+
+/**
+ * The op → document registry, and the one way a document crosses the wire: written by
+ * `@gray/json`'s `toJsonString`, read by its serde reader, then checked by the op's zod schema.
+ *
+ * The read rule is design v2 section D's error table (B6): a transport failure, a timeout, a
+ * non-2xx, a body that is not JSON or a body that is not the op's document is a **throw**. Only a
+ * well-formed answer becomes a result, so the account and endpoint callers keep the branches they
+ * take for a failed Durable Object call (retry, in-doubt, release). The throw is a
+ * `BridgeWireError`; a caller maps its `code` to its own log line, never to a refund decision.
+ *
+ * The GET op (`snapshot.current`) signs an empty body and carries its request in the query; its
+ * request document is the parsed query (`snapshotCurrentRequestOf`), and `encodeBridgeRequest`
+ * returns no bytes for it.
+ */
+
+/** The largest request body a records op carries. The snapshot read has none; the records are the large ones. */
+export const BRIDGE_REQUEST_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * The largest request body an account or endpoint op carries (bridge-13): their documents are a few
+ * KB (a hold token, a permit, a retry ticket), so the bridge reads no more than this before the
+ * signature is checked. The records ops keep `BRIDGE_REQUEST_MAX_BYTES`.
+ */
+export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
+
+/**
+ * The request body bound of `op`: the records ops are the large ones; `scheduler.forward` has its
+ * own bound (a report batch, base64-expanded, which is below the records' 8 MiB and above the small
+ * ops' 64 KiB); `stack.report` has S42's 1 MiB (a relay's 1000 accounts); every other op's document
+ * is a few KB.
+ */
+export function bridgeRequestMaxBytes(op: BridgeOp): number {
+  if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
+  if (op === "stack.report") return STACK_REPORT_MAX_BYTES;
+  return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
+}
+
+/** The largest answer body a bridge op carries, the snapshot included (`SNAPSHOT_RESPONSE_MAX_BYTES`). */
+export const BRIDGE_RESPONSE_MAX_BYTES = SNAPSHOT_RESPONSE_MAX_BYTES;
+
+/**
+ * The default deadline of one bridge call (the gateway's `internalCallTimeoutMs` range), shared so
+ * the bridge's configuration can prove one whole snapshot check fits inside it (bridge-3): two
+ * replicas plus ConfigDO, each `CONFIG_CALL_TIMEOUT_MS`.
+ */
+export const LANE_BRIDGE_CALL_MS = 20_000;
+
+export const BRIDGE_REQUEST_SCHEMAS = {
+  "account.admit": admitInputSchema,
+  "account.count": countInputSchema,
+  "account.settle": settleInputSchema,
+  "account.release": releaseInputSchema,
+  "endpoint.acquire": acquireInputSchema,
+  "endpoint.release": endpointReleaseInputSchema,
+  "endpoint.release_retry": retryReleaseInputSchema,
+  "endpoint.note": noteInputSchema,
+  "endpoint.probe_answered": probeAnsweredInputSchema,
+  "endpoint.reserve_retry": retryReserveInputSchema,
+  "endpoint.warm": warmInputSchema,
+  "snapshot.current": snapshotCurrentRequestSchema,
+  "scheduler.forward": schedulerForwardRequestSchema,
+  "records.index": laneIndexMessageSchema,
+  "records.events": laneEventsSchema,
+  "records.points": lanePointsSchema,
+  "records.service_events": laneServiceEventsSchema,
+  "stack.config": stackConfigRequestSchema,
+  "stack.proxy_checks": stackProxyChecksRequestSchema,
+  "stack.rules": stackRulesRequestSchema,
+  "stack.report": stackReportSchema,
+  "stack.tests": stackTestsRequestSchema,
+  "release.lists": releaseListsRequestSchema,
+  "attest.collateral": attestCollateralRequestSchema,
+  "lane.acme_failed": laneAcmeFailedSchema,
+  "ticket.use": ticketUseInputSchema,
+} as const satisfies Record<BridgeOp, z.ZodType>;
+
+export const BRIDGE_RESPONSE_SCHEMAS = {
+  "account.admit": admitResultSchema,
+  "account.count": countResultSchema,
+  "account.settle": settleResultSchema,
+  "account.release": releaseResultSchema,
+  "endpoint.acquire": acquireResultSchema,
+  "endpoint.release": endpointReleaseResultSchema,
+  "endpoint.release_retry": emptyAnswerSchema,
+  "endpoint.note": emptyAnswerSchema,
+  "endpoint.probe_answered": emptyAnswerSchema,
+  "endpoint.reserve_retry": retryReserveResultSchema,
+  "endpoint.warm": warmResultSchema,
+  "snapshot.current": snapshotAnswerSchema,
+  "scheduler.forward": schedulerForwardAnswerSchema,
+  "records.index": recordsAcceptedSchema,
+  "records.events": recordsAcceptedSchema,
+  "records.points": recordsAcceptedSchema,
+  "records.service_events": recordsAcceptedSchema,
+  "stack.config": stackConfigAnswerSchema,
+  "stack.proxy_checks": stackProxyChecksAnswerSchema,
+  "stack.rules": stackRulesAnswerSchema,
+  "stack.report": stackReportAnswerSchema,
+  "stack.tests": stackTestsAnswerSchema,
+  "release.lists": releaseListsAnswerSchema,
+  "attest.collateral": attestCollateralAnswerSchema,
+  "lane.acme_failed": laneAcmeFailedAnswerSchema,
+  "ticket.use": ticketUseAnswerSchema,
+} as const satisfies Record<BridgeOp, z.ZodType>;
+
+/**
+ * The request schema of `op` at bridge API `version` (D122'): version 2 is "`scheduler.forward`
+ * carries `budget_ms`", so that op alone differs, and version 1 reads its forward without the member.
+ * Every other op is the same document at both versions. The CVM signs version 2 and writes with
+ * `BRIDGE_REQUEST_SCHEMAS`; the bridge reads with this, by the version its header check answered.
+ */
+export function bridgeRequestSchemaAt(op: BridgeOp, version: LaneBridgeApiVersion): z.ZodType {
+  return op === "scheduler.forward" && version === 1 ? schedulerForwardRequestV1Schema : BRIDGE_REQUEST_SCHEMAS[op];
+}
+
+export type BridgeRequestOf<O extends BridgeOp> = z.infer<(typeof BRIDGE_REQUEST_SCHEMAS)[O]>;
+export type BridgeResponseOf<O extends BridgeOp> = z.infer<(typeof BRIDGE_RESPONSE_SCHEMAS)[O]>;
+
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const EMPTY = new Uint8Array(0);
+
+function parseJson(text: string, code: BridgeWireError["code"]): Json {
+  try {
+    return parseSerde(text);
+  } catch {
+    throw new BridgeWireError(code, null, "the body is not JSON");
+  }
+}
+
+function decode(bytes: Uint8Array, maxBytes: number): string {
+  if (bytes.byteLength > maxBytes) throw new BridgeWireError("body_too_large", null, `the body is over ${maxBytes} bytes`);
+  try {
+    return DECODER.decode(bytes);
+  } catch {
+    throw new BridgeWireError("invalid_document", null, "the body is not UTF-8");
+  }
+}
+
+function checked(value: unknown, schema: z.ZodType, what: string): unknown {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const field = issue === undefined ? null : issue.path.map(String).join(".") || null;
+    throw new BridgeWireError("invalid_document", field, `the ${what} is not its wire shape: ${field ?? "(root)"}: ${issue?.message ?? "invalid"}`);
+  }
+  return parsed.data;
+}
+
+/** One request's body bytes: the JSON text of its document, or nothing for the GET op. */
+export function encodeBridgeRequest<O extends BridgeOp>(op: O, value: BridgeRequestOf<O>): Uint8Array {
+  if (BRIDGE_METHODS[op] === "GET") return EMPTY;
+  const bytes = ENCODER.encode(toJsonString(value as unknown as Json));
+  if (bytes.byteLength > BRIDGE_REQUEST_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the ${op} request is over ${BRIDGE_REQUEST_MAX_BYTES} bytes`);
+  return bytes;
+}
+
+/** Check one request document (the snapshot read's query included) before it is signed and sent. */
+export function parseBridgeRequest<O extends BridgeOp>(op: O, value: unknown): BridgeRequestOf<O> {
+  return checked(value, BRIDGE_REQUEST_SCHEMAS[op], "request") as BridgeRequestOf<O>;
+}
+
+
+/** One answer's body bytes. */
+export function encodeBridgeResponse<O extends BridgeOp>(op: O, value: BridgeResponseOf<O>): Uint8Array {
+  const bytes = ENCODER.encode(toJsonString(value as unknown as Json));
+  if (bytes.byteLength > BRIDGE_RESPONSE_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the ${op} answer is over ${BRIDGE_RESPONSE_MAX_BYTES} bytes`);
+  return bytes;
+}
+
+/** Read one answer: size, strict UTF-8, serde JSON, then the op's response schema. Throws `BridgeWireError`. */
+export function parseBridgeResponse<O extends BridgeOp>(op: O, body: Uint8Array): BridgeResponseOf<O> {
+  const value = parseJson(decode(body, BRIDGE_RESPONSE_MAX_BYTES), "invalid_document");
+  return checked(value, BRIDGE_RESPONSE_SCHEMAS[op], `answer to ${op}`) as BridgeResponseOf<O>;
+}

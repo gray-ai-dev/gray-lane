@@ -1,0 +1,16 @@
+{
+  "name": "gray-identity",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "dev": "wrangler dev -c wrangler.jsonc --local"
+  },
+  "dependencies": {
+    "@gray/config": "0.0.0",
+    "@megaeth-labs/wallet-server-verify": "0.1.9"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "gray-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.aux.json",
+    "test:e2e": "vitest run -c vitest.config.ts",
+    "leak": "vitest run -c vitest.leak.config.ts"
+  },
+  "dependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/config": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/endpoint": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/ledger-keys": "0.0.0",
+    "@gray/routing": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "@gray/verifier": "0.0.0",
+    "pg": "8.23.1",
+    "viem": "2.57.4"
+  },
+  "devDependencies": {
+    "@gray/conformance": "0.0.0"
+  }
+}

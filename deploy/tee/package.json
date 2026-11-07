@@ -1,0 +1,13 @@
+{
+  "name": "gray-lane-deploy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Build-time checks for the gray-lane image; the measured compose parser is the only dependency.",
+  "dependencies": {
+    "yaml": "2.9.0"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=23.6.0"
+  }
+}

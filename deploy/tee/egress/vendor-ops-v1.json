@@ -1,0 +1,1291 @@
+{
+ "format": "gray-vendor-ops-v1",
+ "vendors": {
+  "anthropic/api_key": {
+   "constants": {
+    "anthropic_version": "2023-06-01",
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "models": {
+     "method": "GET",
+     "url": "https://api.anthropic.com/v1/models?limit=1000",
+     "headers": {
+      "x-api-key": {
+       "account": "api_key"
+      },
+      "anthropic-version": {
+       "vendor": "anthropic_version"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.claude.com/docs/en/api/models/list"
+    },
+    "test:anthropic_messages": {
+     "method": "POST",
+     "url": "https://api.anthropic.com/v1/messages",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "https://docs.anthropic.com/en/api/messages"
+    }
+   }
+  },
+  "anthropic/oauth_access_token": {
+   "constants": {
+    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    "oauth_beta": "oauth-2025-04-20",
+    "system_text": "You are Claude Code, Anthropic's official CLI for Claude.",
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "refresh": {
+     "method": "POST",
+     "url": "https://platform.claude.com/v1/oauth/token",
+     "headers": {
+      "content-type": {
+       "const": "application/json"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      },
+      "accept": {
+       "const": "application/json"
+      }
+     },
+     "body": {
+      "object": {
+       "grant_type": {
+        "const": "refresh_token"
+       },
+       "refresh_token": {
+        "account": "refresh_token"
+       },
+       "client_id": {
+        "vendor": "client_id"
+       }
+      }
+     },
+     "result": {
+      "access_token": "/access_token",
+      "refresh_token": "/refresh_token",
+      "expires_in": "/expires_in"
+     },
+     "before_expiry_seconds": 600,
+     "confirmed": false,
+     "source": "no public document; open-source clients that mirror Claude Code: router-for-me/CLIProxyAPI internal/auth/claude/anthropic_auth.go, steipete/CodexBar ClaudeOAuthCredentials.swift (refresh token rotates)"
+    },
+    "limits": {
+     "method": "GET",
+     "url": "https://api.anthropic.com/api/oauth/usage",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "access_token"
+        }
+       ]
+      },
+      "anthropic-beta": {
+       "vendor": "oauth_beta"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      },
+      "accept": {
+       "const": "application/json"
+      }
+     },
+     "result": {
+      "fields": {
+       "five_hour_utilization": "/five_hour/utilization",
+       "five_hour_resets_at": "/five_hour/resets_at",
+       "seven_day_utilization": "/seven_day/utilization",
+       "seven_day_resets_at": "/seven_day/resets_at",
+       "seven_day_sonnet_utilization": "/seven_day_sonnet/utilization",
+       "seven_day_sonnet_resets_at": "/seven_day_sonnet/resets_at",
+       "seven_day_opus_utilization": "/seven_day_opus/utilization",
+       "seven_day_opus_resets_at": "/seven_day_opus/resets_at"
+      }
+     },
+     "every_seconds": {
+      "default": 300,
+      "min": 60,
+      "max": 3600
+     },
+     "confirmed": false,
+     "source": "no public document; steipete/CodexBar ClaudeOAuthUsageFetcher.swift and docs/claude.md (needs the user:profile scope)"
+    },
+    "test:anthropic_messages": {
+     "method": "POST",
+     "url": "https://api.anthropic.com/v1/messages",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "system": {
+        "vendor": "system_text"
+       }
+      }
+     },
+     "confirmed": false,
+     "source": "https://docs.anthropic.com/en/api/messages; the system text a subscription token needs is the Claude Code client's"
+    }
+   }
+  },
+  "openai/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "models": {
+     "method": "GET",
+     "url": "https://api.openai.com/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.openai.com/docs/api-reference/models/list"
+    },
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.openai.com/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_completion_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "https://platform.openai.com/docs/api-reference/chat/create"
+    },
+    "test:open_ai_responses": {
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body": {
+      "object": {
+       "input": {
+        "vendor": "test_prompt"
+       },
+       "max_output_tokens": {
+        "const": 16
+       },
+       "model": {
+        "choice": "model"
+       },
+       "store": {
+        "const": false
+       },
+       "stream": {
+        "const": true
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "https://platform.openai.com/docs/api-reference/responses/create"
+    }
+   }
+  },
+  "chatgpt_codex/oauth_access_token": {
+   "constants": {
+    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+    "client_version": "0.50.0",
+    "instructions": "Reply briefly.",
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "refresh": {
+     "method": "POST",
+     "url": "https://auth.openai.com/oauth/token",
+     "headers": {
+      "content-type": {
+       "const": "application/json"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "body": {
+      "object": {
+       "client_id": {
+        "vendor": "client_id"
+       },
+       "grant_type": {
+        "const": "refresh_token"
+       },
+       "refresh_token": {
+        "account": "refresh_token"
+       }
+      }
+     },
+     "result": {
+      "access_token": "/access_token",
+      "refresh_token": "/refresh_token"
+     },
+     "before_expiry_seconds": 3600,
+     "confirmed": true,
+     "source": "openai/codex codex-rs/login/src/auth/manager.rs, login/src/oauth/client.rs (no expires_in: the access token JWT exp; refresh token rotates)"
+    },
+    "limits": {
+     "method": "GET",
+     "url": "https://chatgpt.com/backend-api/wham/usage",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "access_token"
+        }
+       ]
+      },
+      "chatgpt-account-id": {
+       "account": "chatgpt_account_id"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "fields": {
+       "primary_used_percent": "/rate_limit/primary_window/used_percent",
+       "primary_window_seconds": "/rate_limit/primary_window/limit_window_seconds",
+       "primary_reset_at": "/rate_limit/primary_window/reset_at",
+       "secondary_used_percent": "/rate_limit/secondary_window/used_percent",
+       "secondary_window_seconds": "/rate_limit/secondary_window/limit_window_seconds",
+       "secondary_reset_at": "/rate_limit/secondary_window/reset_at",
+       "plan_type": "/plan_type",
+       "limit_reached": "/rate_limit/limit_reached"
+      }
+     },
+     "every_seconds": {
+      "default": 300,
+      "min": 60,
+      "max": 3600
+     },
+     "confirmed": true,
+     "source": "openai/codex codex-rs/backend-client/src/client.rs, rate_limit_resets.rs"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "access_token"
+        }
+       ]
+      },
+      "chatgpt-account-id": {
+       "account": "chatgpt_account_id"
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/models",
+      "id": "/slug"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "openai/codex codex-rs/codex-api/src/endpoint/models.rs (client_version pinned as a constant)"
+    },
+    "test:open_ai_responses": {
+     "method": "POST",
+     "url": "https://chatgpt.com/backend-api/codex/responses",
+     "body": {
+      "object": {
+       "input": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "array": [
+             {
+              "object": {
+               "text": {
+                "vendor": "test_prompt"
+               },
+               "type": {
+                "const": "input_text"
+               }
+              }
+             }
+            ]
+           },
+           "role": {
+            "const": "user"
+           },
+           "type": {
+            "const": "message"
+           }
+          }
+         }
+        ]
+       },
+       "instructions": {
+        "vendor": "instructions"
+       },
+       "model": {
+        "choice": "model"
+       },
+       "store": {
+        "const": false
+       },
+       "stream": {
+        "const": true
+       }
+      }
+     },
+     "confirmed": false,
+     "source": "openai/codex codex-rs (open source client); whether the backend takes short instructions is not documented"
+    }
+   }
+  },
+  "gemini/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://ai.google.dev/gemini-api/docs/openai (List models)"
+    }
+   }
+  },
+  "deepseek/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.deepseek.com/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://api.deepseek.com/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://api-docs.deepseek.com/api/list-models"
+    },
+    "limits": {
+     "method": "GET",
+     "url": "https://api.deepseek.com/user/balance",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "fields": {
+       "is_available": "/is_available",
+       "currency": "/balance_infos/0/currency",
+       "total_balance": "/balance_infos/0/total_balance",
+       "granted_balance": "/balance_infos/0/granted_balance",
+       "topped_up_balance": "/balance_infos/0/topped_up_balance"
+      }
+     },
+     "every_seconds": {
+      "default": 900,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://api-docs.deepseek.com/api/get-user-balance"
+    }
+   }
+  },
+  "moonshot/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.moonshot.ai/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://api.moonshot.ai/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.moonshot.ai/docs/api/list-models"
+    },
+    "limits": {
+     "method": "GET",
+     "url": "https://api.moonshot.ai/v1/users/me/balance",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "fields": {
+       "available_balance": "/data/available_balance",
+       "voucher_balance": "/data/voucher_balance",
+       "cash_balance": "/data/cash_balance"
+      }
+     },
+     "every_seconds": {
+      "default": 900,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.moonshot.ai/docs/api/balance, https://platform.moonshot.cn/docs/api/balance"
+    }
+   }
+  },
+  "moonshot_cn/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.moonshot.cn/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://api.moonshot.cn/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": false,
+     "source": "https://platform.moonshot.ai/docs/api/list-models (the .cn page not read)"
+    },
+    "limits": {
+     "method": "GET",
+     "url": "https://api.moonshot.cn/v1/users/me/balance",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "fields": {
+       "available_balance": "/data/available_balance",
+       "voucher_balance": "/data/voucher_balance",
+       "cash_balance": "/data/cash_balance"
+      }
+     },
+     "every_seconds": {
+      "default": 900,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.moonshot.ai/docs/api/balance, https://platform.moonshot.cn/docs/api/balance"
+    }
+   }
+  },
+  "zhipu/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.z.ai/api/paas/v4/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    }
+   }
+  },
+  "zhipu_cn/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    }
+   }
+  },
+  "minimax/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.minimax.io/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://api.minimax.io/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://platform.minimax.io/docs/api-reference/models/openai/list-models"
+    }
+   }
+  },
+  "minimax_cn/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://api.minimax.cn/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://api.minimax.cn/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/data",
+      "id": "/id"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": false,
+     "source": "https://platform.minimax.io/docs/api-reference/models/openai/list-models (the .cn page not read)"
+    }
+   }
+  },
+  "qwen/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://dashscope-intl.aliyuncs.com/api/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/output/models",
+      "id": "/model"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": true,
+     "source": "https://www.alibabacloud.com/help/en/model-studio/list-models"
+    }
+   }
+  },
+  "qwen_cn/api_key": {
+   "constants": {
+    "test_prompt": "Reply with the single word OK.",
+    "user_agent": "gray-egress-ops/1"
+   },
+   "ops": {
+    "test:open_ai_chat": {
+     "method": "POST",
+     "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+     "body": {
+      "object": {
+       "max_tokens": {
+        "const": 16
+       },
+       "messages": {
+        "array": [
+         {
+          "object": {
+           "content": {
+            "vendor": "test_prompt"
+           },
+           "role": {
+            "const": "user"
+           }
+          }
+         }
+        ]
+       },
+       "model": {
+        "choice": "model"
+       },
+       "stream": {
+        "const": true
+       },
+       "stream_options": {
+        "object": {
+         "include_usage": {
+          "const": true
+         }
+        }
+       }
+      }
+     },
+     "confirmed": true,
+     "source": "docs/relay-openai-compatible-vendors.md"
+    },
+    "models": {
+     "method": "GET",
+     "url": "https://dashscope.aliyuncs.com/api/v1/models",
+     "headers": {
+      "authorization": {
+       "concat": [
+        {
+         "const": "Bearer "
+        },
+        {
+         "account": "api_key"
+        }
+       ]
+      },
+      "user-agent": {
+       "vendor": "user_agent"
+      }
+     },
+     "result": {
+      "list": "/output/models",
+      "id": "/model"
+     },
+     "every_seconds": {
+      "default": 3600,
+      "min": 300,
+      "max": 86400
+     },
+     "confirmed": false,
+     "source": "https://www.alibabacloud.com/help/en/model-studio/list-models (documented for Singapore; Beijing lists a per-workspace host)"
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "gray-console",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "node ../tooling/vitest-shards.mjs CONSOLE_TEST_DATABASE_URL -- vitest run -c vitest.workerd.config.ts",
+    "dev": "wrangler dev -c wrangler.jsonc -c ../identity/wrangler.jsonc --local",
+    "gen:provider-helpers": "node scripts/provider-helpers.mjs"
+  },
+  "dependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/attest": "0.0.0",
+    "@gray/client-apps": "0.0.0",
+    "@gray/config": "0.0.0",
+    "@gray/content": "0.0.0",
+    "@gray/control": "0.0.0",
+    "@gray/endpoint": "0.0.0",
+    "@gray/event-store": "0.0.0",
+    "@gray/errors": "0.0.0",
+    "@gray/holds": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane-wire": "0.0.0",
+    "@gray/ledger-keys": "0.0.0",
+    "@gray/modeltrace": "0.0.0",
+    "@gray/protocol": "0.0.0",
+    "@gray/routing": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "@gray/tool-ids": "0.0.0",
+    "@gray/translation": "0.0.0",
+    "@gray/verifier": "0.0.0",
+    "@noble/hashes": "1.8.0",
+    "hono": "4.13.12",
+    "ipaddr.js": "2.5.0",
+    "jose": "6.2.12",
+    "pg": "8.23.1",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@cfworker/json-schema": "4.1.1",
+    "standardwebhooks": "1.1.1",
+    "@gray/conformance": "0.0.0"
+  }
+}

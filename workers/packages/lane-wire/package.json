@@ -1,0 +1,29 @@
+{
+  "name": "@gray/lane-wire",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./stack-health": "./src/stack-health.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@gray/account": "0.0.0",
+    "@gray/attest": "0.0.0",
+    "@gray/endpoint": "0.0.0",
+    "@gray/json": "0.0.0",
+    "@gray/lane": "0.0.0",
+    "@gray/ledger-keys": "0.0.0",
+    "@gray/request-index": "0.0.0",
+    "@gray/snapshot": "0.0.0",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@gray/conformance": "0.0.0"
+  }
+}

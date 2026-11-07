@@ -1,0 +1,401 @@
+# The relay-stack layout of the gray-lane dstack app (docs/confidential-lane-supply-implementation.md
+# S1-S6 and §9 B): the workerd lane (whose entrypoint has gray-acme make a new self-signed TLS
+# certificate for every boot), its gray-egress sidecar, gray-peerlink, a one-shot isolation check, and a
+# third-party relay's own software as a long-running container between the lane and egress. compose.yaml stays the layout for
+# gray-selfhost and the other sealed-credential relays; one Phala app runs one relay (S1).
+#
+# Outbound only (docs/design/relay-outbound-only.md §3.8, §3.9, O1): nothing here publishes a port, and the
+# app-compose has `gateway_enabled: false` and `port_policy.ports: []`. peerlink dials Gray's entry and keeps
+# sessions to it; the entry's requests arrive as streams peerlink pipes to lane's 10.231.12.2:443. The VM has
+# no public name: the identity carries no TLS name, the lane sets no TLS_DOMAIN, and gray-acme's certificate
+# is self-signed (no CA, no ACME account, no persistent directory, no EAB). The text below about ACME
+# accounts, the EAB and the lane's TLS name describes releases before this one.
+#
+# deploy/tee/app-compose.mjs --layout stack embeds this file, as text, into app-compose.json's
+# `docker_compose_file` together with deploy/tee/pre-launch.stack.sh, and gates it with the stack
+# layout's closed allowlist: every service key below is allowed only on the service that has it here
+# and is checked value by value, so a release cannot move the relay onto another network, give it a
+# volume, change a uid or lift a limit without the gate refusing it.
+#
+# One compose per Gray release per environment (S54): nothing in it names a relay. What the operator sets
+# before a release (the generator refuses every placeholder):
+# - `--image`: the Gray digest deploy/tee/build.sh printed, on lane, egress and isolation-check
+#   (one digest runs all three, as in compose.yaml);
+# - the environment's literals, exactly as in compose.yaml (`--bridge-url`, `--keyset-not-after`,
+#   `--deploy-env`, `--scheduler-pick-ms`, `--release-public-key`, `--release-freshness-public-key`).
+#
+# The relay runs the local slot `gray-relay-slot:boot` (S50): pre-launch asks the relay's token service which
+# image to run, checks the relay's signature on that choice, pulls it by digest and tags it into the slot;
+# `pull_policy: never` keeps compose from ever pulling the slot's name. The relay's identity (its id, token
+# service, public key and the lane's TLS name) is the app's encrypted env, which Gray sets when it deploys the
+# app (S54): pre-launch validates it and measures it into RTMR3 (`gray-stack-identity`) before anything uses
+# it, and the lane reads two of its values through the only interpolations besides the seed and the EAB:
+# `TLS_DOMAIN` and `LANE_STACK_RELAY_ID`. The lane's bridge key id is not here either:
+# the entrypoint derives it from the app id (`app-<app id>`), as it derives the keyset subject (D47).
+#
+# S8/S8a: the host may inject `LANE_BRIDGE_KEY_SEED`, Gray's registry credential (the three registry
+# names of compose.yaml's allowed_envs, D44), the two EAB names (D133, as in compose.yaml: Google Trust
+# Services' External Account Binding, which only picks the account gray-acme registers) and the four
+# `GRAY_STACK_*` identity names (S54). Gray's image is
+# private: the measured pre-launch pulls Gray's images with that credential in its own docker config and
+# deletes it before it asks for the relay's pull token; no service may name it (the gate refuses any
+# reference). The relay's registry login uses the pull token the pre-launch obtains (§4), never env. The seed
+# and EAB expressions on `lane` and the two identity expressions are the only `$` in this file: an
+# interpolation anywhere else would let the encrypted env change what the measured bytes run.
+#
+# Why these settings:
+# - Users (S2, S2b, §9 B). Each Gray service runs as its own non-root uid: 10001 lane, 10002 egress,
+#   10004 isolation-check; the relay is 10003. lane and egress share only the supplementary group 10100,
+#   which owns egress.sock (0660), so the entry reaches the socket and nothing else of egress's.
+#   No two services share a uid. The image keeps USER root for compose.yaml; every service here sets its
+#   own `user`.
+# - The TLS key (D133). There is no separate ACME service: the lane's entrypoint runs gray-acme in the
+#   lane container before workerd binds 443, so every boot's certificate key is generated in that
+#   container's memory and written only to its /run/lane tmpfs (and the docker root is a tmpfs as well,
+#   S9). The challenge listener binds lane's LISTEN_ADDRESS, the front address, never relay_in.
+# - ACME account directory (S2a, D133). The docker root is a tmpfs (S9), so a named volume would be empty
+#   on every boot and every boot would register a new ACME account (a GTS EAB registers one only).
+#   gray-acme keeps the accounts (account keys and URIs, no certificate key) in
+#   /var/lib/gray-persist/lane-certs, the persistent data-disk directory pre-launch binds there and creates
+#   owned 10001:10001, mode 0700 (S2b), mounted read-write on lane at /certs; the gate allows that host
+#   path only there.
+# - Networks (S3). `front` is the only network with a route out: lane (client TLS, the bridge) and
+#   egress (vendor calls) are on it, at fixed addresses in its fixed subnet 10.231.12.0/24. lane listens
+#   for clients on 10.231.12.2:443 only: a `*:443` listener would also answer at 10.231.10.2:443 on
+#   relay_in, and docker's published 443 forwards to the container's front address anyway. egress
+#   listens on no TCP address but its relay_out one. `relay_in` (lane 10.231.10.2, relay .3) and
+#   `relay_out` (egress 10.231.11.2, relay .3) are `internal: true`, so the relay has no default route;
+#   its only peers are the entry's config listener 10.231.10.2:8081 and egress's relay listener
+#   10.231.11.2:8080. The fixed bridge names let pre-launch drop host INPUT on them before they exist
+#   (iptables matches interface names lazily), which closes the bridges' own host addresses. Every
+#   address on the stack's three networks is fixed, so docker's dynamic allocation (which starts at .2)
+#   never hands one container another's.
+# - Order. `relay` starts only after `isolation-check` completed successfully, and isolation-check
+#   starts only after lane and egress started (it waits up to 10 minutes for their two listeners, D133:
+#   lane's listeners come after its certificate order, and a failed first order holds the lane for 5
+#   minutes before its container restarts and orders again): a layout that leaks leaves the relay
+#   stopped.
+# - Limits (S5). The relay gets memory (no swap beyond it), pids and CPU limits and tmpfs sizes, so a
+#   misbehaving relay exhausts only itself; `oom_score_adj` makes the kernel kill the relay (500)
+#   before any Gray service (-500) when the VM runs short.
+# - Logging (S5). The docker root is a tmpfs (S9), so container logs live in RAM: Gray's services use
+#   the local driver capped at 10m x 2. The relay's image is a black box that may log prompts (debug
+#   logs, audits); `driver: none` keeps its output nowhere, and with a read-only root, no volume and
+#   no network out, whatever it writes lives only on its own tmpfs and dies with the container.
+# - Isolation. As in compose.yaml every service has no capabilities, no new privileges, a read-only
+#   root and no core dumps; the only bind mounts are lane's guest-agent socket and the ACME account
+#   directory of S2a.
+name: gray-lane
+
+services:
+  lane:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # D133: every start of this container orders a new certificate, so the entrypoint restarts a failed
+    # workerd itself, in this container with this boot's key; the container exits (and docker restarts
+    # it) only under the give-up rule (deploy/tee/IMPLEMENTATION_NOTES.md D133).
+    restart: unless-stopped
+    # S2: binds 443 as non-root (a container's ip_unprivileged_port_start is 0, measured); the
+    # supplementary group 10100 opens egress.sock and nothing else.
+    user: "10001:10001"
+    # 10100 opens egress.sock, 10101 peerlink.sock (relay-outbound-only §3.8), and nothing else of either.
+    group_add:
+      - "10100"
+      - "10101"
+    # relay-outbound-only §3.8, O1: no published port. The VM accepts no inbound connection: its peerlink
+    # dials the entry, and every request arrives as a stream peerlink pipes to 10.231.12.2:443.
+    # S2/S3/S28: `front` for the streams from peerlink (10.231.12.4) and the bridge; 10.231.10.2 on
+    # relay_in serves the relay its config on 8081 only.
+    networks:
+      front:
+        ipv4_address: 10.231.12.2
+      relay_in:
+        ipv4_address: 10.231.10.2
+    environment:
+      DEPLOY_ENV: "production"
+      TEE_TYPE: "tdx"
+      # D47/D58: a deployment value (the generator's --keyset-not-after); the committed placeholder
+      # is refused by app-compose.mjs, and 4102444800 (year 2100) is refused outright.
+      KEYSET_NOT_AFTER: "set-at-deploy"
+      # relay-outbound-only §3.9: no TLS_DOMAIN. The VM has no public name, so the keyset's TLS key is
+      # bound to no domain (the entry's channel and gray-relay's tunnel accept only such a key), and the
+      # entrypoint refuses a TLS_DOMAIN here. gray-acme runs in its self-signed mode: a new in-memory key
+      # every boot, a certificate signed by that key, written only to ACME_KEY_DIR on the lane-only
+      # /run/lane tmpfs. No CA, no ACME account, no persistent state, no CT entry; the attested SPKI is
+      # the only trust anchor.
+      ACME_SELF_SIGNED: "1"
+      ACME_KEY_DIR: "/run/lane/tls"
+      # S3: the front address only, never `*:443` (that would answer on relay_in too).
+      LISTEN_ADDRESS: "10.231.12.2:443"
+      GUEST_AGENT_SOCKET: "/var/run/dstack.sock"
+      GUEST_AGENT_URL: "http://guest-agent"
+      GUEST_AGENT_TIMEOUT_MS: "5000"
+      EGRESS_SOCKET: "/run/gray/egress.sock"
+      LANE_BRIDGE_URL: "https://lane-bridge.set-at-deploy.invalid"
+      # E1b/S54: no LANE_KEY_ID here: the entrypoint sets `app-<app id>`, one per app, which the bridge's
+      # LANE_BRIDGE_STACK_RELAYS (`keyId:relayId`) binds to the relay; never the default layout's `lane-1`.
+      # D56: no LANE_RECEIPT_KEY_ID literal and no entrypoint default; the gateway creates a random
+      # receipt key id per boot (D11). An empty binding is absent to the gateway's textBinding.
+      LANE_BRIDGE_KEY_SEED: "${LANE_BRIDGE_KEY_SEED:-}"
+      GATEWAY_FALLBACK_REGION: "wnam"
+      BODY_PARSE_MAX_BYTES: "4194304"
+      LANE_POLICY_STEP_MS: "1500"
+      # D128': the policy step's measured rate and overhead, as in compose.yaml.
+      LANE_POLICY_FUEL_PER_MS: "188401"
+      LANE_POLICY_OVERHEAD_MS: "3"
+      # D109': the pick budget (the generator's --scheduler-pick-ms), as in compose.yaml.
+      LANE_SCHEDULER_PICK_MS: "1500"
+      # S23/S28/S54: what makes the entrypoint render the relay-stack layout: the relay's id (the identity
+      # pre-launch measured; the entrypoint refuses one that differs from the event), the relay config
+      # listener on lane's relay_in address only, and the relay container the entry calls. The gate fixes all three.
+      LANE_STACK_RELAY_ID: "${GRAY_STACK_RELAY_ID:?the relay identity is missing}"
+      LANE_STACK_CONFIG_LISTEN: "10.231.10.2:8081"
+      LANE_STACK_RELAY_ADDRESS: "10.231.10.3:3000"
+      # S28: the stack's bridge poll interval, @gray/config's LANE_STACK_POLL_MS (its default, S21's 5 s
+      # version poll); the gate holds it to the row's bounds.
+      LANE_STACK_POLL_MS: "5000"
+      # Routing PR 9 (docs/confidential-lane-stack-routing.md sections 4.3, 4.6): the environment's release-list
+      # public keys, as in compose.yaml (the generator's --release-public-key and --release-freshness-public-key).
+      # With both, the lane is in backend mode: it verifies an entry's hello against the default list, then serves
+      # that entry's enveloped requests; customers keep the direct path while the relay's `direct` is on. This layout
+      # never sets LANE_PEERS: a stack VM is never an entry (the gate refuses it, and egress refuses -peer beside
+      # -relay-listen).
+      LANE_RELEASE_PUBLIC_KEY: "set-at-deploy"
+      LANE_RELEASE_FRESHNESS_PUBLIC_KEY: "set-at-deploy"
+      # relay-outbound-only §3.2/§3.3: peerlink's socket (the lane's PEERLINK binding), and the entries this
+      # VM dials until the bridge's stack.entries names them (the generator's --peer-entries, the
+      # environment's entry name).
+      PEERLINK_SOCKET: "/run/peerlink/peerlink.sock"
+      LANE_PEER_ENTRIES: "lane.set-at-deploy.invalid"
+    volumes:
+      # The dstack guest mounts the guest agent's socket here. Not read-only: connecting to a Unix socket
+      # writes to it.
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      # D63: the socket volume, mounted by lane and egress. It holds only egress.sock.
+      - egress-socket:/run/gray
+      # relay-outbound-only §3.8: peerlink's socket volume, mounted by lane and peerlink. It holds only
+      # peerlink.sock.
+      - peerlink-socket:/run/peerlink
+    read_only: true
+    tmpfs:
+      - /tmp
+      # D63: the rendered config (with the bridge seed) lives here, never on the socket volume. Owned
+      # by the lane's uid, since a tmpfs is mounted root-owned otherwise. D133: so do this boot's TLS
+      # key and certificate (/run/lane/tls).
+      - /run/lane:mode=0700,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    oom_score_adj: -500
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  egress:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    # The same image, without the lane entrypoint: only the egress binary. S14: the unix socket
+    # carries the entry's traffic and control API; the HTTP listener binds only egress's relay_out
+    # address, so neither front nor relay_in reaches it.
+    # S17: -stack-max-bytes is the one budget of what egress holds on the stack path (192 MiB, egress's
+    # default, written here so the gate fixes it), and -memory-limit Go's soft limit at 1.5x it. Measured
+    # in C3's simulator run (deploy/tee/simulator/stack-e2e.sh, 2026-10-29, gray-egress in the stack
+    # layout): with the budget full of registrations egress's resident set reached 369 MiB (1.93x)
+    # without a limit, 276 MiB with 288 MiB; with answers held for their digests through the whole
+    # chain it reached 595 MiB without a limit (the copies made as answers complete are outside the
+    # budget), at most 277 MiB with it. 240 MiB held it at 231 MiB but leaves the collector less room.
+    entrypoint: ["/usr/local/bin/gray-egress"]
+    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888"]
+    user: "10002:10002"
+    group_add:
+      - "10100"
+    # S2: `front` for vendor calls (pinned routes, proxy dialing), at a fixed address so docker's dynamic
+    # allocation never takes lane's; 10.231.11.2 on relay_out for the relay's upstream calls.
+    networks:
+      front:
+        ipv4_address: 10.231.12.3
+      relay_out:
+        ipv4_address: 10.231.11.2
+    volumes:
+      # D63: the only shared mount, and it holds only the socket.
+      - egress-socket:/run/gray
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    oom_score_adj: -500
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  peerlink:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    # relay-outbound-only §3.2/§3.8: the same image, gray-peerlink in its VM role. It dials the entries the
+    # lane pins (the lane attests each entry first, §3.3) through Cloudflare, keeps two sessions to each,
+    # and pipes every stream the entry opens to lane's 10.231.12.2:443. It holds no key and no credential
+    # (O4): every stream is TLS that ends in the lane's workerd. Its flags are peerlink's defaults
+    # (deploy/tee/peerlink/README.md "Settings"), written here only where the gate fixes them.
+    entrypoint: ["/usr/local/bin/gray-peerlink"]
+    command: ["-role", "vm", "-socket", "/run/peerlink/peerlink.sock", "-lane", "10.231.12.2:443"]
+    user: "10005:10005"
+    # 10101 owns /run/peerlink (setgid), so peerlink.sock is in the group the lane has.
+    group_add:
+      - "10101"
+    # §3.8: `front` only, at a fixed address the isolation check proves the relay cannot reach. Neither relay
+    # network includes it.
+    networks:
+      front:
+        ipv4_address: 10.231.12.4
+    volumes:
+      # §3.8: the only mount, and it holds only peerlink.sock.
+      - peerlink-socket:/run/peerlink
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    oom_score_adj: -500
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  isolation-check:
+    image: gray-lane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # §9 B: one-shot. It runs from the relay's position (both internal networks, no volume, the
+    # relay's isolation) and exits non-zero unless there is no route out (IPv4 or IPv6), no DNS, no
+    # reachable bridge host port (over IPv4 or the bridges' IPv6 link-local addresses) and no socket,
+    # and only 10.231.10.2:8081 and 10.231.11.2:8080 answer (every other port of those two hosts is
+    # scanned). lane and egress only have to have started, so it waits for both listeners, up to the
+    # check's maximum of 10 minutes (D133: lane's come after its certificate order; a failed first order
+    # holds 5 minutes before the second). Its item list is in deploy/tee/isolation-check/main.go.
+    # relay-outbound-only §3.8: `-deny` names front's hosts (its bridge, lane, egress and peerlink); no port of
+    # any of them may answer from the relay's position. That no host port is published is the gate's (no
+    # `ports` here, `port_policy.ports: []`), since an internal network drops a published port's traffic
+    # like any other.
+    restart: "no"
+    depends_on:
+      lane:
+        condition: service_started
+      egress:
+        condition: service_started
+      peerlink:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/gray-isolation-check"]
+    command: ["-allow", "10.231.10.2:8081,10.231.11.2:8080", "-deny", "10.231.12.1,10.231.12.2,10.231.12.3,10.231.12.4", "-wait", "10m"]
+    user: "10004:10004"
+    # Fixed addresses beside the relay's (.3), so the check never takes the relay's.
+    networks:
+      relay_in:
+        ipv4_address: 10.231.10.4
+      relay_out:
+        ipv4_address: 10.231.11.4
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    oom_score_adj: -500
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  relay:
+    # S50: the local slot pre-launch tags the relay's signed choice into (S51); compose never pulls it, so
+    # a boot whose pre-launch did not fill it does not start the relay.
+    image: gray-relay-slot:boot
+    pull_policy: never
+    # S21: the relay exits when its config version changes, and the restart policy brings it back.
+    restart: unless-stopped
+    depends_on:
+      isolation-check:
+        condition: service_completed_successfully
+    user: "10003:10003"
+    # S4: literals only. Relay-specific settings come through the config (§8 `settings`).
+    environment:
+      GRAY_RELAY_LISTEN: "0.0.0.0:3000"
+      GRAY_RELAY_CONFIG_URL: "http://10.231.10.2:8081/v1/relay/config"
+      GRAY_EGRESS_URL: "http://10.231.11.2:8080"
+      TMPDIR: "/tmp"
+      GRAY_DATA_DIR: "/data"
+    # S2: only the two internal networks; the entry reaches it at 10.231.10.3:3000.
+    networks:
+      relay_in:
+        ipv4_address: 10.231.10.3
+      relay_out:
+        ipv4_address: 10.231.11.3
+    read_only: true
+    # S5: the only writable paths, both sized (the pages also count against mem_limit). S21a: owned by
+    # the relay's uid whatever the image holds there (docker gives a tmpfs mount the owner of the
+    # image's directory at that path; new-api's /data is root's): /tmp as /tmp is everywhere, /data the
+    # relay's alone.
+    tmpfs:
+      - /tmp:size=256m,uid=10003,gid=10003,mode=1777
+      - /data:size=512m,uid=10003,gid=10003,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    # S5: memswap_limit equal to mem_limit means no swap beyond the memory limit.
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    pids_limit: 512
+    cpus: 1.5
+    oom_score_adj: 500
+    logging:
+      driver: none
+
+networks:
+  front:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.231.12.0/24
+  relay_in:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: gr-relay-in
+    ipam:
+      config:
+        - subnet: 10.231.10.0/24
+  relay_out:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: gr-relay-out
+    ipam:
+      config:
+        - subnet: 10.231.11.0/24
+
+volumes:
+  # D63/S2b: the egress socket's volume, the only named volume (S2a replaced lane-certs with a bind). A
+  # plain local volume: docker fills it from the image's /run/gray on first use, ownership and mode
+  # included, so it starts as 10002:10100 2750 and egress.sock is created in group 10100; on the tmpfs
+  # docker root (S9) it lives in RAM and is fresh every boot. compose.yaml's tmpfs-driver volume would be
+  # mounted empty, root-owned 1777 (measured on docker 26.1 and 29.7), and lane could not open the socket.
+  egress-socket: {}
+  # relay-outbound-only §3.8: peerlink's socket volume, the same kind: filled from the image's /run/peerlink
+  # (10005:10101, 2750), so peerlink.sock is in group 10101, which only lane and peerlink have.
+  peerlink-socket: {}
