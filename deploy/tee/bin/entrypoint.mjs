@@ -46,8 +46,10 @@
 //   key) before its seal; this file reads both, checks the relay's signature, refuses a LANE_STACK_RELAY_ID that
 //   differs from the identity and any TLS_DOMAIN (docs/design/relay-outbound-only.md §3.9: the stack VM has no
 //   public name, so its identity names none and its keyset's TLS key is bound to no domain), and passes the image to the entry as
-//   LANE_STACK_RELAY_IMAGE. A stack compose without a LANE_KEY_ID literal (S54) gets `app-<app id>`, the
-//   bridge key id this app's own, as KEYSET_SUBJECT is derived (D47).
+//   LANE_STACK_RELAY_IMAGE. A stack compose without a LANE_KEY_ID literal (S54) gets `app-<app id>-<key>`, the
+//   bridge key id this VM's own: the app's id, as KEYSET_SUBJECT is derived (D47), and the first 16 hex digits of the
+//   bridge key's Ed25519 public key, so two instances of one app (an image rollout's, docs/design/relay-zero-downtime.md)
+//   never share a key id and neither replaces the other's key on the console's list.
 //
 // The entrypoint refuses to start when a value is missing or malformed, and when a placeholder
 // survives rendering. It also fails closed if gray-egress never creates its socket: a lane that starts
@@ -302,7 +304,7 @@ function stackBoot(info) {
   if (!verifySignature(null, message, key, Buffer.from(image.image_sig, "hex"))) {
     fail("the gray-relay-image signature does not verify with the gray-stack-identity key (S52)");
   }
-  return { relayId: identity.relay_id, image: image.image };
+  return { relayId: identity.relay_id, image: image.image, publicKey: identity.public_key };
 }
 
 /** The external service's address and certificate host from the bridge URL (https, no path). */
@@ -397,6 +399,9 @@ export function stackFragments(stack) {
     `          ( name = "LANE_STACK_POLL_MS", text = "${stack.pollMs ?? ""}" ),`,
     "          # S52/S55: the image the relay chose for this boot, as pre-launch measured it (gray-relay-image).",
     `          ( name = "LANE_STACK_RELAY_IMAGE", text = "${stack.relayImage ?? ""}" ),`,
+    "          # docs/design/relay-debug-sharing.md: the relay key the boot measured (gray-stack-identity), which gray-relay's",
+    "          # debug fetch is checked against: never a key Gray's snapshot serves.",
+    `          ( name = "LANE_STACK_RELAY_KEY", text = "${stack.relayKey ?? ""}" ),`,
   ];
   const sockets = [
     ",",
@@ -629,6 +634,18 @@ export function acmeReport({ appId, domain, composeHash, attemptMs, exitCode, si
 const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 
 /**
+ * A relay-stack VM's bridge key id: `app-<app id>-<the first 16 hex digits of the bridge key's Ed25519 public key>`
+ * (`@gray/control/stack-provision` `stackBridgeKeyId`, which the provisioner installs the key under before the VM
+ * exists). Without a seed (a `local` host test), `app-<app id>`.
+ */
+export function stackBridgeKeyId(appId, seed) {
+  if (seed === "") return `app-${appId}`;
+  const privateKey = createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed, "hex")]), format: "der", type: "pkcs8" });
+  const publicKey = createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32);
+  return `app-${appId}-${publicKey.toString("hex").slice(0, 16)}`;
+}
+
+/**
  * The headers of one signed bridge call (`@gray/lane-wire` signing.ts): the canonical string `gray-lane-bridge-v1`, op,
  * target, method, path, timestamp, nonce and the body's SHA-256, one per line, signed with the bridge key's seed.
  */
@@ -850,6 +867,7 @@ export async function main({
     if ((env.TLS_DOMAIN ?? "") !== "") fail("TLS_DOMAIN is set in the relay-stack layout: a stack VM has no public name, and its TLS key is bound to no domain (relay-outbound-only §3.9)");
     if (stack.relayId !== boot.relayId) fail("LANE_STACK_RELAY_ID is not the gray-stack-identity event's relay_id (S54)");
     stack.relayImage = boot.image;
+    stack.relayKey = boot.publicKey;
   }
 
   // D133: everything rendered but the certificate's SPKI is read and checked before gray-acme runs, so
@@ -870,8 +888,9 @@ export async function main({
     LANE_BRIDGE_ADDRESS: bridge.address,
     LANE_BRIDGE_HOST: bridge.certificateHost,
     LANE_BRIDGE_EXTRA_TRUST: "",
-    // S54: a stack compose without the literal gets this app's own bridge key id, as KEYSET_SUBJECT above.
-    LANE_KEY_ID: stack !== null && (env.LANE_KEY_ID ?? "") === "" ? `app-${appId}` : fromEnvironment(env, "LANE_KEY_ID"),
+    // S54: a stack compose without the literal gets this VM's own bridge key id: the app's, as KEYSET_SUBJECT above, and
+    // its bridge key's (docs/design/relay-zero-downtime.md: one key id per instance of the app).
+    LANE_KEY_ID: stack !== null && (env.LANE_KEY_ID ?? "") === "" ? stackBridgeKeyId(appId, seed) : fromEnvironment(env, "LANE_KEY_ID"),
     // D56/D11: no default and no compose literal; an empty text binding is absent to the gateway,
     // which then generates a random receipt key id per boot.
     LANE_RECEIPT_KEY_ID: env.LANE_RECEIPT_KEY_ID ?? "",

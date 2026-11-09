@@ -106,8 +106,14 @@ func writeRefusal(w http.ResponseWriter, code string) {
 	writeError(w, refusalStatus(code), errorBody{Error: code})
 }
 
+// The sign-in channel's own codes (stack_login.go) keep their statuses there; refusalStatus answers them too, so no
+// code means two things.
+
 // refusalStatus is the one status of each refusal code; a code never answers with two statuses.
 func refusalStatus(code string) int {
+	if status, ok := loginRefusalStatus(code); ok {
+		return status
+	}
 	switch code {
 	case errBodyTooLarge:
 		return http.StatusRequestEntityTooLarge

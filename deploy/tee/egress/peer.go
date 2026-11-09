@@ -559,6 +559,14 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
+			// The peer's answer ended, but an entry that left first never read its end: net/http's transport returns
+			// a body's last chunk as io.EOF even when it comes after the request was canceled. The cancel's TLS
+			// close_notify can end the peer's answer before egress has closed the connection, so the end arrives in
+			// that window (gate 5f46d5249, 2026-11-09: TestPeerClientCancelClosesTheUpstream logged a whole answer).
+			// The entry's own context says whether it left first.
+			if r.Context().Err() != nil {
+				entry.Error = errClientWrite
+			}
 			return
 		}
 		if readErr != nil {

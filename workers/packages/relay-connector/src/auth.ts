@@ -103,6 +103,9 @@ export function authHeaders(vendor: Vendor, credential: Credential): Readonly<Re
       headers["chatgpt-account-id"] = chatgptTokenClaims(credential.value).accountId;
       headers["originator"] = CHATGPT_CODEX_ORIGINATOR;
       break;
+    // A password signs in; it is never sent as an auth header (the account serves with its sign-in's token).
+    case "chatgpt_codex_password":
+    case "anthropic_password":
     case null:
       throw new RelayConnectorError("invalid_credential", "credential.type");
   }

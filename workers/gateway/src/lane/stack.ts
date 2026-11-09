@@ -30,12 +30,21 @@ import {
 import { ApiError, ERROR_BODY_LIMIT } from "@gray/errors";
 import { get, isObject, parseStrict, parseStrictBytes, type Json, type JsonObject } from "@gray/json";
 import { DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_REWRITES_V1, isPositionForProtocol, stackBodyDigest, stackEventDigest, stackStoreOff, type LaneProtocol } from "@gray/lane";
-import { STACK_ATTEMPT_CLASSES, STACK_VENDOR_CODES, type StackAttemptClass, type StackFaultBy, type StackFaultWhy, type StackVendorCode } from "@gray/lane-wire";
+import {
+  STACK_ATTEMPT_CLASSES,
+  STACK_VENDOR_CODES,
+  STACK_VIOLATION_BODY_FIELD_PATTERN,
+  STACK_VIOLATION_HEADER_FIELD_PATTERN,
+  type StackAttemptClass,
+  type StackFaultBy,
+  type StackFaultWhy,
+  type StackVendorCode,
+} from "@gray/lane-wire";
 import type { StackTrace, StackTraceAttempt } from "@gray/request-index";
 import { SseDecoder, SseFrames, type SseEvent } from "@gray/protocol";
 import type { StreamTimers } from "../client.ts";
 import { bytesBase64 } from "../crypto.ts";
-import type { StackRelayAppend, StackRelayConfig, StackRelayRoute, StackVendor } from "./stack-config.ts";
+import type { StackRelayAppend, StackRelayConfig, StackRelayRoute, StackVendor, StackViolationFound } from "./stack-config.ts";
 import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rewrite.ts";
 
 /**
@@ -337,6 +346,12 @@ export interface StackFeedAttempt {
   readonly events: string[];
   body: { readonly digest: string; readonly bytes: number } | null;
   errorBody: Uint8Array | null;
+  /**
+   * The body egress forwarded to the vendor, the relay's changes included (`forwarded`, asked for by a backend's
+   * registration only: docs/design/relay-debug-sharing.md): its bytes, or null bytes when egress left them out for its
+   * budget; null without the record.
+   */
+  forwarded: { readonly bytes: Uint8Array | null; readonly size: number } | null;
   end: { readonly reason: StackEndReason; readonly bytes: number } | null;
   /**
    * How the call ended (S34 `STACK_ATTEMPT_CLASSES`), as egress wrote it on the last record (`end` or
@@ -353,11 +368,18 @@ export interface StackFeedAttempt {
 const LOWER_HEX_32 = /^[0-9a-f]{64}$/;
 
 /**
- * The most bytes of one feed line: the largest record is an `error_body`, base64 of at most
- * ERROR_BODY_LIMIT (64 KiB, S17) bytes; an `attempt` record with its ops and appends is far smaller.
- * Twice the limit covers the base64 and the record around it.
+ * The largest body a `forwarded` record carries: egress's -max-body-bytes, the lane's BODY_PARSE_MAX_BYTES (4 MiB): a
+ * body over it is refused before it is forwarded (`egress_body_too_large`).
  */
-const FEED_LINE_MAX = 2 * ERROR_BODY_LIMIT;
+export const STACK_FORWARDED_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The most bytes of one feed line: the largest record is a `forwarded` one, base64 of at most
+ * STACK_FORWARDED_MAX_BYTES with a few members around it; without it, an `error_body`, base64 of at most
+ * ERROR_BODY_LIMIT (64 KiB, S17) bytes (twice the limit covers the base64 and the record). An `attempt` record with its
+ * ops and appends is far smaller.
+ */
+const FEED_LINE_MAX = Math.max(2 * ERROR_BODY_LIMIT, 4 * Math.ceil(STACK_FORWARDED_MAX_BYTES / 3) + 1024);
 
 /**
  * One rid's records, as the background reader takes them. Egress is Gray's own program, so a record
@@ -460,7 +482,7 @@ export class StackFeed {
     if (n < 1) throw new Error("n");
     let found = this.attempts.get(n);
     if (found === undefined) {
-      found = { n, accepted: null, refused: null, response: null, events: [], body: null, errorBody: null, end: null, class: null, vendorCode: null, at: this.#clock(), responseAt: null, endedAt: null };
+      found = { n, accepted: null, refused: null, response: null, events: [], body: null, errorBody: null, forwarded: null, end: null, class: null, vendorCode: null, at: this.#clock(), responseAt: null, endedAt: null };
       this.attempts.set(n, found);
     }
     return found;
@@ -544,6 +566,22 @@ export class StackFeed {
       case "body": {
         if (attempt.response === null || attempt.body !== null) throw new Error("body");
         attempt.body = { digest: hex32(get(record, "digest")), bytes: num(get(record, "bytes")) };
+        return null;
+      }
+      case "forwarded": {
+        // Right after the attempt's own record, before its vendor call (egress `recordForwarded`).
+        if (attempt.accepted === null || attempt.forwarded !== null || attempt.response !== null) throw new Error("forwarded");
+        const size = num(get(record, "bytes"));
+        const omitted = get(record, "omitted");
+        if (omitted === true) {
+          attempt.forwarded = { bytes: null, size };
+          return null;
+        }
+        // An empty body's base64 is "", which egress leaves out (`omitempty`).
+        const b64 = get(record, "b64");
+        const bytes = b64 === undefined && size === 0 ? new Uint8Array(0) : base64Bytes(str(b64));
+        if (bytes.length !== size || size > STACK_FORWARDED_MAX_BYTES) throw new Error("forwarded");
+        attempt.forwarded = { bytes, size };
         return null;
       }
       case "error_body": {
@@ -714,6 +752,11 @@ export interface StackCallInput {
   readonly conversation?: string;
   readonly rewrite: StackRewriteSpec;
   /** Section 8 `limits.attempts_max`: what egress enforces, as the relay was told (S15). */
+  /**
+   * Ask egress for each accepted call's forwarded body (`forwarded` records, docs/design/relay-debug-sharing.md): a
+   * backend's call, whose debug record the stack VM keeps. Absent: none, as before.
+   */
+  readonly captureForwarded?: boolean;
   readonly attemptsMax: number;
   /** The request's deadline, Unix seconds rounded up (S15: TTL = request deadline). */
   readonly expiresAt: number;
@@ -763,6 +806,29 @@ export interface StackFault {
   readonly by: StackFaultBy;
   /** A closed, content-free word (`@gray/lane-wire` STACK_FAULT_WHYS, the trace's): what failed, never a value. */
   readonly why: StackFaultWhy;
+}
+
+/**
+ * A closed call's non-compliant change, if any, to `sink` (docs/design/relay-ejection.md). Never fails the answer: a
+ * defect in reading the record is logged and the call stands as it ended.
+ */
+export function reportViolation(call: StackCall, sink: ((found: StackViolationFound) => void) | undefined, rid: string): void {
+  if (sink === undefined) return;
+  try {
+    const found = call.violation();
+    if (found !== null) sink(found);
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "lane_stack_violation_failed", rid, error: error instanceof Error ? error.name : "error" }));
+  }
+}
+
+/** A body's S19 digest, or null when it has none (not one JSON text). */
+function bodyDigestOrNull(bytes: Uint8Array): string | null {
+  try {
+    return stackBodyDigest(bytes);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -901,6 +967,16 @@ export class StackCall {
   /** The current attempt the position counts in, and the position (S24). */
   #matching: StackFeedAttempt | null = null;
   #position = 0;
+  /** The container event the stream stopped at (its S19 digest, where it stood), for `violation`. */
+  #unmatched: {
+    readonly why: "event_mismatch" | "event_unrecorded" | "event_hold_bound";
+    readonly digest: string;
+    readonly attempt: StackFeedAttempt | null;
+    readonly position: number;
+    readonly released: number;
+  } | null = null;
+  /** The S19 digest of a non-stream body that was not the record's (`body_mismatch`), for `violation`. */
+  #unmatchedBody: string | null = null;
 
   constructor(input: StackCallInput) {
     this.rid = input.rid;
@@ -930,6 +1006,7 @@ export class StackCall {
           rewrite: input.rewrite,
           attempts_max: input.attemptsMax,
           expires_at: input.expiresAt,
+          ...(input.captureForwarded === true ? { forwarded: true } : {}),
         }),
         signal: input.signal,
       });
@@ -1195,6 +1272,51 @@ export class StackCall {
   }
 
   /**
+   * The non-compliant change this call shows (docs/design/relay-ejection.md section 1), read after `close`; null when
+   * none. Only Gray's own record decides:
+   *
+   * - **request**: egress refused a call of the rid `422 stack_rewrite_refused` with a path, or `stack_header_refused`,
+   *   and the rid was registered with `relay_changes: true`. Those refusals are then only at a kept limit (P1-P4, P6),
+   *   which the relay standard names. On a rid without it (the customer's opt-out, which the container is not told) a
+   *   refusal is the customer's choice, not a violation; a refusal without a path is not a kept limit (a forwarded body
+   *   that is not one JSON object, a member name past the receipt bound, a check of Gray's own that failed).
+   * - **answer**: the S24 check stopped at a container event or body, and egress's whole record (the feed reached
+   *   `done`) does not hold its digest where the container put it: once an event was released, the matched attempt's
+   *   event at the same position; before any, any attempt's first event; a body, any attempt's `body` or `error_body`.
+   *   A lag in reading the feed therefore never counts, and a record that is not whole decides nothing.
+   */
+  violation(): StackViolationFound | null {
+    if (this.#input.rewrite.relay_changes === true) {
+      for (const attempt of [...this.feed.attempts.values()].sort((left, right) => left.n - right.n)) {
+        const refused = attempt.refused;
+        if (refused === null) continue;
+        if (refused.code === "stack_rewrite_refused" && refused.path !== null && refused.path !== "") {
+          const field = `/${refused.path.split("/")[1] ?? ""}`;
+          if (STACK_VIOLATION_BODY_FIELD_PATTERN.test(field)) return { kind: "request", code: "stack_rewrite_refused", field };
+        }
+        if (refused.code === "stack_header_refused" && refused.header !== null && STACK_VIOLATION_HEADER_FIELD_PATTERN.test(refused.header)) {
+          return { kind: "request", code: "stack_header_refused", field: refused.header };
+        }
+      }
+    }
+    if (!this.feed.done || this.feed.broken) return null;
+    const unmatched = this.#unmatched;
+    if (unmatched !== null) {
+      const vendors =
+        unmatched.released > 0
+          ? unmatched.attempt?.events[unmatched.position] === unmatched.digest
+          : [...this.feed.attempts.values()].some((attempt) => attempt.events[0] === unmatched.digest);
+      if (!vendors) return { kind: "answer", code: unmatched.why, field: null };
+    }
+    const body = this.#unmatchedBody;
+    if (body !== null) {
+      const vendors = [...this.feed.attempts.values()].some((attempt) => attempt.body?.digest === body || (attempt.errorBody !== null && bodyDigestOrNull(attempt.errorBody) === body));
+      if (!vendors) return { kind: "answer", code: "body_mismatch", field: null };
+    }
+    return null;
+  }
+
+  /**
    * Ends the call: the rid at egress first (S32), which cancels its vendor calls and writes `end`
    * (`entry_closed`, Gray's own ending) for each attempt still in flight before `done`; then the
    * container's connection (the relay standard promises relays that Gray closes it when it ends an
@@ -1429,6 +1551,8 @@ export class StackCall {
     };
     const unmatched = (why: StackFaultWhy): never => {
       this.dropped.push({ seq, kind: "unmatched" });
+      // Where the stream stopped, for `violation` to hold against the whole record once the rid ended.
+      if (why === "event_mismatch" || why === "event_unrecorded" || why === "event_hold_bound") this.#unmatched ??= { why, digest, attempt: this.#matching, position: this.#position, released: this.released };
       throw new StackFaultError({ by: "relay", why });
     };
     for (;;) {
@@ -1518,7 +1642,11 @@ export class StackCall {
     if (this.feed.limited !== null) throw new StackFaultError({ by: "egress", why: "egress_limit" });
     const target = this.feed.dialed().at(-1);
     if (target === undefined || target.body === null || target.response === null) throw new StackFaultError({ by: "relay", why: "body_unrecorded" });
-    if (target.body.digest !== stackBodyDigest(bytes)) throw new StackFaultError({ by: "relay", why: "body_mismatch" });
+    const digest = stackBodyDigest(bytes);
+    if (target.body.digest !== digest) {
+      this.#unmatchedBody = digest;
+      throw new StackFaultError({ by: "relay", why: "body_mismatch" });
+    }
     this.served = target;
     if (target.response.status < 200 || target.response.status > 299) {
       this.fault ??= { by: "relay", why: "relay_error_as_success" };

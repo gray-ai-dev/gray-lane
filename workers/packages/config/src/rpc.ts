@@ -107,7 +107,7 @@ export const RPC_SURFACES = {
   setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog"] },
   publicSetup: { callee: "console", target: "PublicSetup", kind: "entrypoint", callers: ["gateway"], calls: ["fetch", "keyStatus"] },
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
-  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests"] },
+  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut"] },
   laneStackSignals: { callee: "console", target: "LaneStackSignals", kind: "entrypoint", callers: ["lane-watch"], calls: ["releaseList"] },
   identity: { callee: "identity", target: "IdentityService", kind: "entrypoint", callers: ["console"], calls: ["challenge", "verify"] },
   content: { callee: "content", target: "ContentService", kind: "entrypoint", callers: ["console"], calls: ["open", "ensureWorkspace"] },
@@ -129,6 +129,13 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // The lane bridge asks a lane route's shard to hold its standing permit before the route's first request (M13): a shard
   // of a release before `warm` throws, the bridge answers unavailable, and the lane serves as before (its first request borrows).
   "endpointShard.warm": "lane-bridge/test/workerd/bridge.test.ts > a shard of a release before warm answers that it has no such method: unavailable, and the lane serves as before",
+  // A relay's VM reports its debug shares (docs/design/relay-debug-sharing.md section 7): a gray-console of a release before
+  // `debugShares` throws, the bridge answers unavailable, and the VM sends the shares again with its next poll.
+  "laneStackConfig.debugShares": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before debugShares answers that it has no such method: unavailable, and the VM sends the shares again",
+  // Gray's copy of a relay VM's sealed records (docs/design/relay-no-always-on-host.md §3.1, 13.4): a gray-console of a
+  // release before `vaultGet` or `vaultPut` throws, the bridge answers unavailable, and the VM tries again.
+  "laneStackConfig.vaultGet": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before vaultGet answers that it has no such method: unavailable, and the VM reads again",
+  "laneStackConfig.vaultPut": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before vaultPut answers that it has no such method: unavailable, and the VM writes again",
 };
 
 /** Each call taken off a list since the previous release's lists, as `<surface>.<call>`: why no release that runs calls it. */

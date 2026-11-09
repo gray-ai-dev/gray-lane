@@ -11,6 +11,8 @@ import { SCHEDULER_FORWARD_REQUEST_MAX_BYTES, schedulerForwardAnswerSchema, sche
 import type { LaneBridgeApiVersion } from "./signing.ts";
 import { SNAPSHOT_RESPONSE_MAX_BYTES, snapshotAnswerSchema, snapshotCurrentRequestSchema } from "./snapshot.ts";
 import { stackConfigAnswerSchema, stackConfigRequestSchema, stackProxyChecksAnswerSchema, stackProxyChecksRequestSchema } from "./stack.ts";
+import { stackDebugSharesAnswerSchema, stackDebugSharesRequestSchema } from "./stack-debug.ts";
+import { STACK_VAULT_PUT_MAX_BYTES, stackVaultGetAnswerSchema, stackVaultGetRequestSchema, stackVaultPutAnswerSchema, stackVaultPutRequestSchema } from "./stack-vault.ts";
 import { STACK_REPORT_MAX_BYTES, stackReportAnswerSchema, stackReportSchema } from "./stack-report.ts";
 import { stackRulesAnswerSchema, stackRulesRequestSchema } from "./stack-rules.ts";
 import { stackTestsAnswerSchema, stackTestsRequestSchema } from "./stack-tests.ts";
@@ -43,12 +45,13 @@ export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
 /**
  * The request body bound of `op`: the records ops are the large ones; `scheduler.forward` has its
  * own bound (a report batch, base64-expanded, which is below the records' 8 MiB and above the small
- * ops' 64 KiB); `stack.report` has S42's 1 MiB (a relay's 1000 accounts); every other op's document
- * is a few KB.
+ * ops' 64 KiB); `stack.report` has S42's 1 MiB (a relay's 1000 accounts); `stack.vault.put` carries a sealed
+ * record of up to 1 MiB (`STACK_VAULT_PUT_MAX_BYTES`); every other op's document is a few KB.
  */
 export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
   if (op === "stack.report") return STACK_REPORT_MAX_BYTES;
+  if (op === "stack.vault.put") return STACK_VAULT_PUT_MAX_BYTES;
   return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
 }
 
@@ -85,6 +88,9 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "stack.rules": stackRulesRequestSchema,
   "stack.report": stackReportSchema,
   "stack.tests": stackTestsRequestSchema,
+  "stack.debug_shares": stackDebugSharesRequestSchema,
+  "stack.vault.get": stackVaultGetRequestSchema,
+  "stack.vault.put": stackVaultPutRequestSchema,
   "release.lists": releaseListsRequestSchema,
   "attest.collateral": attestCollateralRequestSchema,
   "lane.acme_failed": laneAcmeFailedSchema,
@@ -114,6 +120,9 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "stack.rules": stackRulesAnswerSchema,
   "stack.report": stackReportAnswerSchema,
   "stack.tests": stackTestsAnswerSchema,
+  "stack.debug_shares": stackDebugSharesAnswerSchema,
+  "stack.vault.get": stackVaultGetAnswerSchema,
+  "stack.vault.put": stackVaultPutAnswerSchema,
   "release.lists": releaseListsAnswerSchema,
   "attest.collateral": attestCollateralAnswerSchema,
   "lane.acme_failed": laneAcmeFailedAnswerSchema,

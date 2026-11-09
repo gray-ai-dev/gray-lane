@@ -1,14 +1,19 @@
 import { bytesToLowerHex, jcsBytes, peerCommitment, sha256BareHex, type PeerFailedCode } from "@gray/attest";
 import type { GatewayConfig } from "@gray/config";
-import { parseSerde, toJsonString, type Json } from "@gray/json";
+import { get, isObject, parseSerde, parseStrict, toJsonString, type Json } from "@gray/json";
 import { verifyPeerAttestation, type PeerReleaseList, type QuoteVerifier } from "@gray/lane-verify";
 import {
   parsePeerAttemptsAnswer,
+  parsePeerDebugAnswer,
+  parsePeerDebugRefusal,
   parsePeerFrame,
   parsePeerRefusal,
   peerEnvelopeBytes,
   PEER_BUDGET_MAX_MS,
+  PEER_DEBUG_PREFIX,
   PEER_HEADER,
+  PEER_REQUEST_ID_HEADER,
+  signPeerDebugEnvelope,
   signPeerEnvelope,
   stackTraceOf,
   type BridgeSigner,
@@ -33,6 +38,8 @@ import {
   type LanePeerRegistry,
   type PeerAttemptsReply,
   type PeerCallInput,
+  type PeerDebugInput,
+  type PeerDebugReply,
   type PeerPin,
   type PeerSent,
   type PeerTarget,
@@ -80,6 +87,22 @@ export const PEER_PINS_URL = `${PEER_EGRESS_ORIGIN}/v1/peer/pins`;
 
 /** The longest a pin or a hello holds (section 4.3: `now + 1 h`); egress refuses a pin further away. */
 export const PEER_PIN_MAX_MS = 3_600_000;
+
+/**
+ * How often a pinned boot not yet known to hold the relay's sealed credentials is probed (docs/design/relay-zero-
+ * downtime.md): a new boot of an image rollout is sent requests once a probe finds it sealed, so it is looked at more
+ * often than the timing's `probeMs` until then. A probe is one small GET over the boot's own session.
+ */
+export const PEER_UNSEALED_PROBE_MS = 5_000;
+
+/** A dstack app or instance id as the boots route names it: 40 lower-case hex. */
+export const PEER_APP_ID = /^[0-9a-f]{40}$/;
+
+/** The app or instance id a verified report names, lower-cased, or null for none or another form. */
+export function peerAppIdOf(value: string | null | undefined): string | null {
+  const id = typeof value === "string" ? value.toLowerCase() : "";
+  return PEER_APP_ID.test(id) ? id : null;
+}
 
 /**
  * The registry's timing, `@gray/config`'s PEER_* rows (each with its bounds and source there; routing PR 9):
@@ -191,6 +214,12 @@ export interface PeerChannel {
   refused(relay: string, keyset: string, forMs?: number): Promise<unknown>;
   /** A pin mismatch on `session`: close that session only. */
   mismatch(session: string): Promise<void>;
+  /**
+   * When this entry boot first saw (relay, keyset) attach, or null when it has had no session within the last 60 s: the
+   * boot's age as the entry knows it, for the order of two boots of one relay. Optional: a channel without it orders by
+   * the pin alone.
+   */
+  bornOf?(relay: string, keyset: string): number | null;
 }
 
 /** The codes of a channel peer that rests until its next signed attach (section 3.6, 3.7). */
@@ -253,9 +282,14 @@ export class PeerRegistry implements LanePeerRegistry {
   }
 
   /**
-   * The usable peers of `relayId` (L1): its peers with a promoted session, newest pin first. A peer resting on
+   * The usable peers of `relayId` (L1): its peers with a promoted session. A peer resting on
    * `peer_session_missing`/`peer_session_refused` is usable again once a promoted session is back (section 3.6: no
    * re-attestation while the pin lasts). Nothing is attested here (L5).
+   *
+   * The order is the image rollout's handover (docs/design/relay-zero-downtime.md): boots a probe found holding the
+   * relay's sealed credentials first, the newest of them first, so a new boot takes new requests once it can serve them;
+   * then the others, the oldest first, so a boot still starting is tried last. A request goes to the first and moves on
+   * only after a dial that sent nothing, which is how the older boot drains: what it holds finishes, nothing new starts.
    */
   usable(relayId: string): Peer[] {
     const now = this.#deps.clock();
@@ -272,10 +306,27 @@ export class PeerRegistry implements LanePeerRegistry {
         }
         if (peer.usable(now)) sessions.push(peer);
       }
-      sessions.sort((a, b) => (b.pin?.notAfterMs ?? 0) - (a.pin?.notAfterMs ?? 0));
+      const born = (peer: Peer): number => channel.bornOf?.(relayId, peer.target.keyset!) ?? 0;
+      sessions.sort((a, b) => {
+        const ready = Number(b.sealed === true) - Number(a.sealed === true);
+        if (ready !== 0) return ready;
+        const age = a.sealed === true ? born(b) - born(a) : born(a) - born(b);
+        return age !== 0 ? age : (b.pin?.notAfterMs ?? 0) - (a.pin?.notAfterMs ?? 0);
+      });
       out.push(...sessions);
     }
     return out;
+  }
+
+  /**
+   * What the entry knows of one boot of `relay` (`keyset` as 64 hex), for the boots route (docs/design/relay-zero-
+   * downtime.md): its app and instance ids, its relay image, whether it is usable, and whether it holds the relay's
+   * sealed credentials. Null when no channel peer of that boot is held.
+   */
+  bootOf(relay: string, keyset: string): { readonly appId: string | null; readonly instanceId: string | null; readonly relayImage: string | null; readonly usable: boolean; readonly sealed: boolean | null } | null {
+    const peer = this.#peers.get(peerKey(relay, channelOrigin(keyset)));
+    if (peer === undefined || !peer.channel) return null;
+    return { appId: peer.pin?.appId ?? null, instanceId: peer.pin?.instanceId ?? null, relayImage: peer.pin?.relayImage ?? null, usable: peer.usable(this.#deps.clock()), sealed: peer.sealed };
   }
 
   /** Whether `relayId` has a usable channel peer now (the warm's wait, section 8.1 row 1). */
@@ -408,7 +459,8 @@ export class PeerRegistry implements LanePeerRegistry {
         const pin = peer.pin!;
         if (pin.notAfterMs - this.#deps.timing.renewMs <= now) return () => this.#attest(peer);
         if (peer.helloUntil - this.#deps.timing.renewMs <= now) return () => this.#hello(peer).then(() => undefined);
-        if (now - peer.probedAt >= this.#deps.timing.probeMs) return () => this.#probe(peer);
+        const probeMs = peer.sealed === true ? this.#deps.timing.probeMs : Math.min(this.#deps.timing.probeMs, PEER_UNSEALED_PROBE_MS);
+        if (now - peer.probedAt >= probeMs) return () => this.#probe(peer);
         return null;
       }
     }
@@ -609,11 +661,16 @@ export class PeerRegistry implements LanePeerRegistry {
       composeHash: v.composeHash,
       osImageHash: v.osImageHash,
       relayImage: facts.image.image,
+      appId: peerAppIdOf(v.appId),
+      instanceId: peerAppIdOf(v.instanceId),
       report,
       nonce,
       receiptKeys: v.keyset.receipt_signing_keys,
     };
-    if (!sameBoot) peer.helloUntil = 0;
+    if (!sameBoot) {
+      peer.helloUntil = 0;
+      peer.sealed = null;
+    }
     peer.probedAt = clock();
     // A channel peer's sessions are promoted (their attach signatures checked under this keyset's receipt key) before
     // egress may dial them for content: the hello below rides a promoted session (O5).
@@ -674,19 +731,23 @@ export class PeerRegistry implements LanePeerRegistry {
     return false;
   }
 
-  /** `GET /peer/<digest>/healthz` on the pinned session: a reboot is found as `peer_pin_mismatch` before a request finds it. */
+  /**
+   * `GET /peer/<digest>/healthz?relay=<relay>` on the pinned session: a reboot is found as `peer_pin_mismatch` before a
+   * request finds it, and the answer's `relay.sealed_version` says whether the boot holds the relay's credentials.
+   */
   async #probe(peer: Peer): Promise<void> {
     const pin = peer.pin;
     if (pin === null) return;
     peer.probedAt = this.#deps.clock();
     let answer: Response;
     try {
-      answer = await this.#call(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}/healthz`, { method: "GET" });
+      answer = await this.#call(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}/healthz?relay=${encodeURIComponent(peer.target.relayId)}`, { method: "GET" });
     } catch {
       this.#down(peer, "peer_probe_failed", this.#deps.clock());
       return;
     }
     if (answer.status === 200) {
+      peer.sealed = await sealedOf(answer, peer.target.relayId);
       if (peer.status === "down") {
         peer.status = "pinned";
         peer.code = null;
@@ -777,6 +838,21 @@ async function refusalCode(answer: Response): Promise<string> {
     // Not a closed body.
   }
   return `status_${answer.status}`;
+}
+
+/**
+ * Whether a VM's `/healthz?relay=` answer says it holds the relay's sealed credentials: `relay.sealed_version` a
+ * string for that relay. Null for an answer that does not say (a body that is not that shape): unknown, not unsealed.
+ */
+async function sealedOf(answer: Response, relayId: string): Promise<boolean | null> {
+  try {
+    const relay = get(parseStrict(await answer.text()), "relay");
+    if (!isObject(relay) || get(relay, "relay_id") !== relayId) return null;
+    const version = get(relay, "sealed_version");
+    return typeof version === "string" ? true : version === null ? false : null;
+  } catch {
+    return null;
+  }
 }
 
 function attestCode(answer: Response): string {
@@ -885,6 +961,7 @@ export class PeerCall implements LanePeerCall {
       inner,
       receipt: inner === null ? null : jcsBytes(this.end!.receipt as unknown as Json),
       fetchLate: (untilMs) => peerFollowUp(target, deps, untilMs, Math.max(1, untilMs - deps.clock())),
+      shareDebug: (debug) => peerDebug(target, deps, debug),
     };
   }
 
@@ -936,7 +1013,7 @@ export class PeerCall implements LanePeerCall {
     try {
       response = await input.egress(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}${input.path}`, {
         method: "POST",
-        headers: { ...input.headers, "content-type": "application/json", [PEER_HEADER]: header },
+        headers: { ...input.headers, "content-type": "application/json", [PEER_HEADER]: header, ...(input.requestId === undefined ? {} : { [PEER_REQUEST_ID_HEADER]: input.requestId }) },
         body: input.body,
         signal: input.signal,
       });
@@ -1133,6 +1210,45 @@ async function peerFollowUp(target: FollowUpTarget, deps: FollowUpDeps, untilMs:
     return { state: answer.state, receipt: (answer.receipt ?? null) as Json | null };
   } catch {
     return null;
+  } finally {
+    deps.timers.clearTimeout(timer);
+  }
+}
+
+/**
+ * The debug hop of one attempt on the pinned session (`/peer/<digest>/v1/peer/debug/<rid>`, docs/design/relay-debug-sharing.md
+ * §4), signed under the debug domain line, within `untilMs`. The share comes back as sent; the caller verifies it under
+ * the stack VM's receipt keys. Never throws.
+ */
+async function peerDebug(target: FollowUpTarget, deps: FollowUpDeps, input: PeerDebugInput): Promise<PeerDebugReply> {
+  if (input.untilMs <= deps.clock()) return { outcome: "unavailable", code: "timeout" };
+  const controller = new AbortController();
+  const timer = deps.timers.setTimeout(() => controller.abort("peer_debug_timeout"), Math.max(0, input.untilMs - deps.clock()));
+  try {
+    const header = await signPeerDebugEnvelope(
+      {
+        aud: target.pin.keysetDigest,
+        entry: target.entry,
+        rid: target.rid,
+        n: BigInt(target.n),
+        receipt_id: input.receiptId,
+        inner_receipt_id: input.innerReceiptId,
+        request_id: input.requestId,
+        issued_ms: BigInt(Math.floor(deps.clock())),
+        nonce: bytesToLowerHex(crypto.getRandomValues(new Uint8Array(16))),
+      },
+      deps.signer,
+    );
+    const response = await deps.egress(`${PEER_EGRESS_ORIGIN}/peer/${target.pin.digest}${PEER_DEBUG_PREFIX}${target.rid}`, { method: "POST", headers: { [PEER_HEADER]: header }, signal: controller.signal });
+    const body = new Uint8Array(await response.arrayBuffer());
+    // Egress's own answer (the pin is gone, the dial failed) is not the stack VM's.
+    if (response.headers.has("x-gray-peer-sent")) return { outcome: "unavailable", code: "egress" };
+    if (response.status === 200) return { outcome: "shared", value: parsePeerDebugAnswer(body).value };
+    const code = parsePeerDebugRefusal(body);
+    if (code === "debug_rate_limited" || code === "debug_store_full") return { outcome: "refused", code };
+    return { outcome: "unavailable", code: code ?? `status_${response.status}` };
+  } catch {
+    return { outcome: "unavailable", code: controller.signal.aborted ? "timeout" : "failed" };
   } finally {
     deps.timers.clearTimeout(timer);
   }

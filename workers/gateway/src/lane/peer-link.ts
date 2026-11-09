@@ -26,9 +26,15 @@ import {
  *   is, so workerd pumps the two sockets natively and no JavaScript runs per message (X-O3);
  * - `GET /v1/peer/tunnel/<relay>[?keyset=<digest>]` (WebSocket, public, R3): gray-relay, a customer or Gray's tools run
  *   TLS through it to the VM's workerd; the entry picks a session and hands the upgrade to peerlink's `/tunnel`; it
- *   carries bytes only (O7);
+ *   carries bytes only (O7). `?keyset=` names one boot: while an image rollout runs two instances of the relay's app,
+ *   gray-relay reaches each of its replicas' VMs by it. Without it, the relay's newest boot (docs/design/relay-zero-
+ *   downtime.md): its newest pinned one, else (a VM that just started) peerlink's newest unverified session;
  * - `GET /v1/peer/relays/<relay>/healthz` (public, R4): the VM's own `/healthz` through egress's pinned stream, with
- *   `x-gray-peer-keyset` and `x-gray-peer-sessions`.
+ *   `x-gray-peer-keyset` and `x-gray-peer-sessions`;
+ * - `GET /v1/peer/relays/<relay>/boots` (public): every boot of the relay with a session, newest first: its keyset, app
+ *   and instance ids, relay image, sessions, open streams, and whether it is ready (pinned, usable, holding the relay's
+ *   sealed credentials). The provisioner's image rollout reads it to know the new instance serves and the old one has
+ *   drained; gray-relay reads it to find a new instance's boot to seal beside the one it serves.
  *
  * peerlink's unix socket (the workerd `external` service `PEERLINK`) also serves the lane's session control, as PR #377's
  * `deploy/tee/peerlink/README.md` ("Interface") defines it: `GET /v1/sessions` (its table),
@@ -62,6 +68,8 @@ export interface PeerLinkDeps extends Omit<PeerSessionsDeps, "pinOf"> {
   readonly keysetDigest: string;
   /** The registry's pin of (relay, keyset), or null. */
   readonly pinOf: (relay: string, keyset: string) => KeysetPin | null;
+  /** What the registry knows of one boot (`PeerRegistry.bootOf`), for the boots route. */
+  readonly bootOf?: (relay: string, keyset: string) => { readonly appId: string | null; readonly instanceId: string | null; readonly relayImage: string | null; readonly usable: boolean; readonly sealed: boolean | null } | null;
 }
 
 /** The entry's channel: its sessions and its three routes; the registry's `PeerChannel`. */
@@ -86,17 +94,26 @@ export class PeerLink implements PeerChannel {
     if (path === PEER_ATTACH_PATH) return this.attach(request, url);
     if (path.startsWith(PEER_TUNNEL_PREFIX)) {
       const relay = path.slice(PEER_TUNNEL_PREFIX.length);
-      // `?keyset=` takes the digest as 64 hex or as `sha256:<hex>`.
+      // `?keyset=` takes the digest as 64 hex or as `sha256:<hex>`. Without one, the relay's newest pinned boot: while an
+      // image rollout runs two instances, the new one (docs/design/relay-zero-downtime.md); with none pinned, peerlink's
+      // newest unverified session (a VM that just started, which gray-relay attests itself).
       const asked = url.searchParams.get("keyset");
       const keyset = asked === null ? null : channelKeyset(asked);
       if (!isRelayId(relay) || (keyset !== null && !isKeysetDigest(keyset))) return this.#error(404, "peer_relay_unknown", "No relay by that name is routed here.");
-      return this.tunnel(request, relay, keyset ?? undefined);
+      return this.tunnel(request, relay, keyset ?? this.#newestPinned(relay) ?? undefined);
     }
     const rest = path.slice(PEER_RELAYS_PREFIX.length);
     const slash = rest.indexOf("/");
     const relay = slash < 0 ? rest : rest.slice(0, slash);
-    if (slash < 0 || rest.slice(slash) !== "/healthz" || !isRelayId(relay)) return this.#error(404, "not_found", "No such route.");
-    return this.health(relay);
+    if (slash < 0 || !isRelayId(relay)) return this.#error(404, "not_found", "No such route.");
+    if (rest.slice(slash) === "/healthz") return this.health(relay);
+    if (rest.slice(slash) === "/boots") return this.boots(relay);
+    return this.#error(404, "not_found", "No such route.");
+  }
+
+  /** The relay's newest boot with a pinned session (64 hex), or null. */
+  #newestPinned(relay: string): string | null {
+    return this.sessions.keysetsOf(relay).find((row) => row.pinned > 0)?.keyset ?? null;
   }
 
   /** `GET /v1/peer/attach` (section 3.5). */
@@ -155,6 +172,31 @@ export class PeerLink implements PeerChannel {
     return new Response(answer.body, { status: 200, headers });
   }
 
+  /**
+   * `GET /v1/peer/relays/<relay>/boots` (docs/design/relay-zero-downtime.md): every boot of the relay with a session,
+   * newest first. Counts and public values only (keyset digests and app ids are in every receipt and attestation).
+   */
+  async boots(relay: string): Promise<Response> {
+    if (!this.#deps.isStackRelay(relay)) return this.#error(404, "peer_relay_unknown", "No relay by that name is routed here.");
+    if (!(await this.sync())) return this.#error(503, "peer_link_unavailable", "The entry cannot reach its sessions right now; try again shortly.");
+    const boots = this.sessions.keysetsOf(relay).map((row) => {
+      const known = this.#deps.bootOf?.(relay, row.keyset) ?? null;
+      const usable = known !== null && known.usable && row.pinned > 0;
+      return {
+        keyset: row.keyset,
+        app_id: known?.appId ?? null,
+        instance_id: known?.instanceId ?? null,
+        relay_image: known?.relayImage ?? null,
+        first_seen_ms: row.firstSeenMs,
+        sessions: { pinned: row.pinned, unverified: row.unverified },
+        streams: row.streams,
+        sealed: known?.sealed ?? null,
+        ready: usable && known.sealed === true,
+      };
+    });
+    return aciJson(200, { relay_id: relay, boots }, this.#deps.keysetDigest, { "cache-control": "no-store" });
+  }
+
   /** Reads peerlink's table into the sessions, and closes the unverified sessions held too long. False when peerlink did not answer. */
   async sync(): Promise<boolean> {
     let rows: LiveSession[];
@@ -204,6 +246,10 @@ export class PeerLink implements PeerChannel {
 
   pinWanted(relay: string, keyset: string): boolean {
     return this.sessions.pinWanted(relay, keyset);
+  }
+
+  bornOf(relay: string, keyset: string): number | null {
+    return this.sessions.firstSeenOf(relay, keyset);
   }
 
   /** Tells peerlink the promotions and closes. A failure is logged; the next sync shows what peerlink holds. */

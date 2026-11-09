@@ -161,6 +161,8 @@ export function createReceiptStore(
   const now = options.now ?? (() => Date.now());
   // Insertion-ordered: the sweep from the front, the cap from the front, and `get` hashes nothing.
   const entries = new Map<string, StoredReceipt>();
+  // An entry's outer receipts by the customer's request id (docs/design/relay-debug-sharing.md §3): dropped with them.
+  const byRequest = new Map<string, string>();
   let peerBytes = 0;
   const heldBytes = (entry: StoredReceipt): number => {
     let total = 0;
@@ -172,6 +174,7 @@ export function createReceiptStore(
     if (entry === undefined) return;
     peerBytes -= heldBytes(entry);
     entries.delete(id);
+    if (entry.requestId !== null && byRequest.get(entry.requestId) === id) byRequest.delete(entry.requestId);
   };
   const sweep = (at: number): void => {
     for (const [id, entry] of entries) {
@@ -181,7 +184,7 @@ export function createReceiptStore(
   };
   const noPeers: ReadonlyMap<number, StoredPeerAttempt> = new Map();
   return {
-    put(receipt, owner, peers = []) {
+    put(receipt, owner, peers = [], meta) {
       const at = now();
       sweep(at);
       drop(receipt.receiptId);
@@ -195,7 +198,16 @@ export function createReceiptStore(
         if (hold) peerBytes += bytes;
         kept.set(peer.n, { ...peer, receipt: hold ? peer.receipt : null });
       }
-      entries.set(receipt.receiptId, { receipt, owner, storedAt: at, expiresAt: at + ttlMs, peers: kept.size === 0 ? noPeers : kept });
+      entries.set(receipt.receiptId, {
+        receipt,
+        owner,
+        storedAt: at,
+        expiresAt: at + ttlMs,
+        peers: kept.size === 0 ? noPeers : kept,
+        requestId: meta?.requestId ?? null,
+        workspaceId: meta?.workspaceId ?? null,
+      });
+      if (meta !== undefined) byRequest.set(meta.requestId, receipt.receiptId);
       while (entries.size > maxEntries) {
         const oldest = entries.keys().next();
         if (oldest.done === true) break;
@@ -208,6 +220,13 @@ export function createReceiptStore(
       const entry = entries.get(id);
       if (entry === undefined) return null;
       return entry.owner === owner ? entry : null;
+    },
+    byRequest(requestId, owner) {
+      const at = now();
+      sweep(at);
+      const id = byRequest.get(requestId);
+      const entry = id === undefined ? undefined : entries.get(id);
+      return entry !== undefined && entry.owner === owner ? entry : null;
     },
     holdPeerReceipt(id, n, bytes) {
       const entry = entries.get(id);

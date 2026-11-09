@@ -26,6 +26,9 @@ import { snapshots, snapshotTiming } from "../snapshot.ts";
 import { LaneRouteWarmer, laneRoutesOf } from "./warm.ts";
 import { backendOf, isPeerRequest, peerRoute } from "./peer-routes.ts";
 import { serveReceipt } from "./receipt-route.ts";
+import { DEBUG_REQUESTS_PREFIX, debugCorsOrigin, debugGrantsOf, debugRequestIdOf, serveDebugGrant } from "./debug-route.ts";
+import { answerRelayDebug, stackDebugOf } from "./stack-debug.ts";
+import { RELAY_DEBUG_PATH } from "@gray/relay-connector";
 import type { LaneRequestState } from "./deps.ts";
 import { BridgePeerVerifier, peerListKeys, type PeerVerifier } from "./peer.ts";
 import { PeerCall, PeerRegistry, peerTimingOf, stackRelayKeysOf } from "./peer-client.ts";
@@ -49,6 +52,9 @@ import type { LanePeers } from "./types.ts";
  * - `GET /v1/aci/receipts/{id}` → the receipt store, owner checked (§7.6); on an entry,
  *   `GET /v1/aci/receipts/{id}/peers/{n}` → a peer attempt's stack VM report and inner receipt, the same owner check
  *   (`receipt-route.ts`, docs/confidential-lane-stack-routing.md §4.8).
+ * - `POST|GET /v1/aci/requests/{request_id}/debug` → on an entry, a customer's authorization of one request for
+ *   debugging at its relay, owner checked as the receipts are (`debug-route.ts`, docs/design/relay-debug-sharing.md).
+ * - `POST /v1/aci/relay-debug` → on a stack VM, gray-relay's fetch of a record a customer authorized (`stack-debug.ts`).
  * - `POST /v1/aci/relay-credentials`, `POST /v1/aci/relay-policy/bundle` → the intake routes.
  * - `GET /v1/aci/relay-policy/{relay_id}` → the accepted bundle's templates (M22).
  * - `GET /healthz` → liveness and whether this boot's identity parsed.
@@ -138,6 +144,11 @@ export interface LaneGatewayEnv extends LaneEnv {
   readonly LANE_STACK_RELAY_ID?: unknown;
   /** S52/S55: the boot's measured relay image, which the entrypoint read from `gray-relay-image`; stack layout only. */
   readonly LANE_STACK_RELAY_IMAGE?: unknown;
+  /**
+   * The boot's measured relay key (`gray-stack-identity`'s `public_key`, 64 hex), which the entrypoint read from the
+   * guest agent; stack layout only. What gray-relay's debug fetch is checked against (docs/design/relay-debug-sharing.md).
+   */
+  readonly LANE_STACK_RELAY_KEY?: unknown;
   /** `true`: this default-layout lane is an entry that routes stack routes over the peer hop (`peersOf`); off otherwise. */
   readonly LANE_PEERS?: unknown;
   readonly [name: string]: unknown;
@@ -592,6 +603,7 @@ function peerLinkOf(state: LaneProcessState, env: LaneGatewayEnv, peers: EntryPe
     stackRelays: () => registry.stackRelays().size,
     // The channel names a keyset by its 64 hex; the registry's pins by the digest.
     pinOf: (relay, keyset) => registry.keysetPin(relay, `sha256:${keyset}`),
+    bootOf: (relay, keyset) => registry.bootOf(relay, keyset),
     log: (line) => console.log(JSON.stringify(line)),
     peerlink: (request) => binding.fetch(request),
     egress,
@@ -789,7 +801,7 @@ export default {
       return bootFailure(thrown);
     }
     const url = new URL(request.url);
-    const origin = allowedOrigin(request, cfg.consoleOrigin);
+    const origin = allowedOrigin(request, cfg.consoleOrigin) ?? debugCorsOrigin(request, declaredPath(url.pathname)?.path ?? url.pathname);
     // §D/M23: every Cloudflare-bound path of a deployed lane is a binding. `local` (a test) may use the
     // platform's `fetch`; anywhere else a missing binding is a boot error the entry answers itself.
     const missing = deployed ? [...identityRead.missing, ...missingLaneBindings(env)] : [];
@@ -856,6 +868,12 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
   if (path === HEALTH_PATH) return health(request, url, identity, state, warmerOf(state, env, cfg), peers);
   if (path === ATTESTATION_PATH) return attestation(request, env, url, state, identity);
   if (path.startsWith(RECEIPTS_PATH)) return serveReceipt(request, { receipts: state.receipts, keysetDigest: state.keysetDigest, followUpMs: cfg.peerFollowUpMs, clock: state.now }, path.slice(RECEIPTS_PATH.length));
+  if (path.startsWith(DEBUG_REQUESTS_PREFIX)) {
+    const requestId = debugRequestIdOf(path.slice(DEBUG_REQUESTS_PREFIX.length));
+    if (requestId === null) return unmatched(request, cfg, url, path);
+    return serveDebugGrant(request, { receipts: state.receipts, grants: debugGrantsOf(state), keysetDigest: state.keysetDigest, receiptKeyId: state.receiptKeyId, signer: state.signer, followUpMs: cfg.peerFollowUpMs, clock: state.now }, requestId);
+  }
+  if (path === RELAY_DEBUG_PATH) return relayDebug(request, env, cfg, state, ctx);
   if (path === RELAY_CREDENTIALS_PATH) return credentials(request, env, cfg, state, ctx);
   if (path === RELAY_REFRESHED_PATH) return refreshed(request, env, cfg, state, ctx);
   if (path === RELAY_POLICY_BUNDLE_PATH) return policyBundle(request, env, cfg, state);
@@ -1027,6 +1045,22 @@ async function refreshed(request: Request, env: LaneGatewayEnv, cfg: GatewayConf
   return aciJson(200, answered.answer, state.keysetDigest);
 }
 
+/**
+ * `POST /v1/aci/relay-debug` (docs/design/relay-debug-sharing.md §6): gray-relay's signed ask for a record a customer
+ * authorized, through the entry's tunnel on the attested TLS session; answered sealed to the ask's reply key. A lane
+ * outside the relay-stack layout, or a stack VM whose boot measured no relay key it could read, has no such records.
+ */
+async function relayDebug(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, ctx: ExecutionContext): Promise<Response> {
+  if (request.method !== "POST") return methodNotAllowed(state.keysetDigest, "POST");
+  const store = stackDebugOf(state, env, cfg);
+  if (store === null || store.relayKey === null) return aciJson(404, { error: { code: "debug_unsupported", message: "this VM holds no debug records" } }, state.keysetDigest);
+  const body = await readIntakeBody(request, cfg, state);
+  if (!body.ok) return body.response;
+  const answered = await answerRelayDebug(store, body.value, state.now());
+  ctx.waitUntil(store.report());
+  return aciJson(answered.status, answered.body, state.keysetDigest);
+}
+
 /** `POST /v1/aci/relay-policy/bundle`: one signed policy bundle. */
 async function policyBundle(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState): Promise<Response> {
   if (request.method !== "POST") return methodNotAllowed(state.keysetDigest, "POST");
@@ -1150,6 +1184,9 @@ export const relayConfig = {
       // them the VM would wait for a request that only the link can let in.
       const entryLink = entryLinkOf(state, env, cfg);
       if (entryLink !== null) ctx.waitUntil(entryLink.maintain());
+      // docs/design/relay-debug-sharing.md §7: a debug share's report that failed goes again with the polls.
+      const debug = stackDebugOf(state, env, cfg);
+      if (debug !== null) ctx.waitUntil(debug.report());
     } catch (thrown) {
       // The boot's own log line (binding names and the reason, never a value); the relay sees the fixed 503.
       bootFailure(thrown);

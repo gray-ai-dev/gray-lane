@@ -19,7 +19,10 @@ import { BridgeWireError } from "./error.ts";
  * `stack.proxy_checks` reports and fetches the proxy checks the VM runs; both end at the console, which holds the
  * control plane's tables (stack.ts). Account health (S41-S44, package H) adds `stack.rules` (the cooling rules and the
  * entries to restore, stack-rules.ts), `stack.report` (the VM's live state, stack-report.ts) and `stack.tests` (account
- * tests, stack-tests.ts), which end there too.
+ * tests, stack-tests.ts), which end there too, and so does `stack.debug_shares` (the requests customers authorized for
+ * debugging at the relay, metadata only: stack-debug.ts, docs/design/relay-debug-sharing.md). `stack.vault.get` and
+ * `stack.vault.put` read and write Gray's ciphertext copy of the VM's sealed records, with a compare-and-swap on the
+ * version (stack-vault.ts, docs/design/relay-no-always-on-host.md §3.1 and 13.4).
  *
  * `endpoint.release_retry` and `endpoint.probe_answered` are ops too (bridge-2): both are
  * best-effort in the gateway (each failure is swallowed, `endpoints.ts` `releaseRetry` /
@@ -67,6 +70,9 @@ export const BRIDGE_OPS = [
   "stack.rules",
   "stack.report",
   "stack.tests",
+  "stack.debug_shares",
+  "stack.vault.get",
+  "stack.vault.put",
   "release.lists",
   "attest.collateral",
   "lane.acme_failed",
@@ -99,6 +105,9 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "stack.rules": "POST",
   "stack.report": "POST",
   "stack.tests": "POST",
+  "stack.debug_shares": "POST",
+  "stack.vault.get": "POST",
+  "stack.vault.put": "POST",
   "release.lists": "POST",
   "attest.collateral": "POST",
   "lane.acme_failed": "POST",
@@ -129,6 +138,9 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "stack.rules": "/v1/lane-bridge/stack/rules",
   "stack.report": "/v1/lane-bridge/stack/report",
   "stack.tests": "/v1/lane-bridge/stack/tests",
+  "stack.debug_shares": "/v1/lane-bridge/stack/debug-shares",
+  "stack.vault.get": "/v1/lane-bridge/stack/vault/get",
+  "stack.vault.put": "/v1/lane-bridge/stack/vault/put",
   "release.lists": "/v1/lane-bridge/release/lists",
   "attest.collateral": "/v1/lane-bridge/attest/collateral",
   "lane.acme_failed": "/v1/lane-bridge/lane/acme-failed",

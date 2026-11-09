@@ -6,11 +6,13 @@
  * What is here:
  * - **Ops** (`ops.ts`): `account.admit|count|settle|release`, `endpoint.acquire|release|note|reserveRetry`,
  *   `snapshot.current`, `scheduler.forward`, `records.index|events|points|service_events`, `stack.config`,
- *   `stack.proxy_checks`, `stack.rules`, `stack.report`, `stack.tests`, `release.lists`, `attest.collateral`, with
+ *   `stack.proxy_checks`, `stack.rules`, `stack.report`, `stack.tests`, `stack.debug_shares`, `stack.vault.get|put` (Gray's
+ *   ciphertext copy of a VM's sealed records, stack-vault.ts), `release.lists`, `attest.collateral`, with
  *   `lane.acme_failed` and `ticket.use` (a model-check ticket's one-time id, ticket.ts), with their paths, methods and target addresses; a relay stack's account-health words are the closed lists of
  *   `stack-health.ts` (S34); the two background reads a lane VM verifies a peer with are `background.ts`'s.
  * - **The peer hop** (`peer.ts`): the entry's signed envelope to a relay's stack VM, the stack VM's `head`/`data`/`end`
- *   frames and refusals, and the late-facts answer (docs/confidential-lane-stack-routing.md section 4.5). Not a bridge
+ *   frames and refusals, and the late-facts answer (docs/confidential-lane-stack-routing.md section 4.5); `peer-debug.ts`
+ *   is its debug hop (docs/design/relay-debug-sharing.md). Not a bridge
  *   op: both ends are lanes, and egress carries the bytes.
  * - **Documents** (`account.ts`, `endpoint.ts`, `snapshot.ts`, `records.ts`): zod schemas over
  *   `@gray/json`, every integer a `bigint` (ints.ts), written by `toJsonString` and read by
@@ -46,9 +48,12 @@ export * from "./stack-health.ts";
 export * from "./stack-rules.ts";
 export * from "./stack-report.ts";
 export * from "./stack-tests.ts";
+export * from "./stack-debug.ts";
+export * from "./stack-vault.ts";
 export * from "./stack-trace.ts";
 export * from "./background.ts";
 export * from "./lane-acme.ts";
 export * from "./ticket.ts";
 export * from "./peer.ts";
+export * from "./peer-debug.ts";
 export * from "./wire.ts";

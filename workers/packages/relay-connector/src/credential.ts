@@ -38,15 +38,23 @@ import { RelayConnectorError } from "./errors.ts";
 export const VENDORS = LANE_STACK_VENDORS;
 export type Vendor = (typeof VENDORS)[number];
 
-export const CREDENTIAL_TYPES = ["api_key", "oauth_access_token"] as const;
+/**
+ * `password` is a ChatGPT or Claude subscription account's sign-in, sealed so the relay's own software signs it in
+ * inside the VM (docs/design/relay-in-cvm-login.md): `value` is the password, `username` the sign-in e-mail,
+ * `totp_secret` the optional TOTP secret. It is never an auth header: the account serves with the access token that
+ * sign-in ends with.
+ */
+export const CREDENTIAL_TYPES = ["api_key", "oauth_access_token", "password"] as const;
 export type CredentialType = (typeof CREDENTIAL_TYPES)[number];
 
 /** The credential class of one `(vendor, type)` pair; the matrix is closed. */
 export type CredentialClass =
   | "anthropic_api_key"
   | "anthropic_oauth_access_token"
+  | "anthropic_password"
   | "openai_api_key"
   | "chatgpt_codex_oauth_access_token"
+  | "chatgpt_codex_password"
   | "openai_compatible_api_key";
 
 /** The longest secret this lane accepts (the largest real JWT is a few kilobytes). */
@@ -62,6 +70,44 @@ export interface Credential {
   readonly value: string;
   readonly expires_at?: bigint;
   readonly refresh_token?: string;
+  /** A `password` credential's sign-in e-mail. */
+  readonly username?: string;
+  /** A `password` credential's TOTP secret: RFC 4648 base32, upper case, no padding (`normalizeTotpSecret`). */
+  readonly totp_secret?: string;
+}
+
+/** The longest password (UTF-8 bytes) and sign-in e-mail a `password` credential carries; its TOTP secret's bounds in bytes. */
+export const MAX_PASSWORD_LENGTH = 1024;
+export const MAX_USERNAME_LENGTH = 254;
+export const TOTP_SECRET_MIN_BYTES = 10;
+export const TOTP_SECRET_MAX_BYTES = 64;
+
+/**
+ * A TOTP secret as an authenticator app shows it, in the sealed form: spaces and `=` padding dropped, upper case. Null
+ * when what is left is not RFC 4648 base32 of 10 to 64 bytes (an `otpauth://` URI's `secret` parameter is the text to
+ * give).
+ */
+export function normalizeTotpSecret(text: string): string | null {
+  const secret = text.replace(/[\s=]/g, "").toUpperCase();
+  if (!/^[A-Z2-7]+$/.test(secret) || ![0, 2, 4, 5, 7].includes(secret.length % 8)) return null;
+  const bytes = Math.floor((secret.length * 5) / 8);
+  return bytes >= TOTP_SECRET_MIN_BYTES && bytes <= TOTP_SECRET_MAX_BYTES ? secret : null;
+}
+
+/** A sign-in e-mail: printable ASCII without a space, exactly one `@`, with text on both sides. */
+const USERNAME = /^[\x21-\x3f\x41-\x7e]+@[\x21-\x3f\x41-\x7e]+$/;
+
+function assertPasswordCredential(credential: Credential): void {
+  const { value, username, totp_secret: secret } = credential;
+  // A password may hold any printable character, spaces and letters beyond ASCII included; never a control character.
+  if (value.length === 0 || new TextEncoder().encode(value).length > MAX_PASSWORD_LENGTH || /[\u0000-\u001f\u007f-\u009f]/.test(value)) {
+    throw new RelayConnectorError("invalid_credential", "credential.value");
+  }
+  if (username === undefined || username.length < 3 || username.length > MAX_USERNAME_LENGTH || !USERNAME.test(username)) {
+    throw new RelayConnectorError("invalid_credential", "credential.username");
+  }
+  if (secret !== undefined && normalizeTotpSecret(secret) !== secret) throw new RelayConnectorError("invalid_credential", "credential.totp_secret");
+  if (credential.expires_at !== undefined || credential.refresh_token !== undefined) throw new RelayConnectorError("invalid_credential", "credential.type");
 }
 
 /** Anthropic API keys: `sk-ant-api` + two version digits + a dash + the secret. */
@@ -84,11 +130,11 @@ const ACCOUNT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 export function credentialClass(vendor: Vendor, type: CredentialType): CredentialClass | null {
   switch (vendor) {
     case "anthropic":
-      return type === "api_key" ? "anthropic_api_key" : "anthropic_oauth_access_token";
+      return type === "api_key" ? "anthropic_api_key" : type === "oauth_access_token" ? "anthropic_oauth_access_token" : type === "password" ? "anthropic_password" : null;
     case "openai":
       return type === "api_key" ? "openai_api_key" : null;
     case "chatgpt_codex":
-      return type === "oauth_access_token" ? "chatgpt_codex_oauth_access_token" : null;
+      return type === "oauth_access_token" ? "chatgpt_codex_oauth_access_token" : type === "password" ? "chatgpt_codex_password" : null;
     default:
       return isOpenAiCompatibleVendor(vendor) && type === "api_key" ? "openai_compatible_api_key" : null;
   }
@@ -101,6 +147,11 @@ export function credentialClass(vendor: Vendor, type: CredentialType): Credentia
 export function assertCredentialFormat(vendor: Vendor, credential: Credential): CredentialClass {
   const klass = credentialClass(vendor, credential.type);
   if (klass === null) throw new RelayConnectorError("invalid_credential", "credential.type");
+  if (klass === "chatgpt_codex_password" || klass === "anthropic_password") {
+    assertPasswordCredential(credential);
+    return klass;
+  }
+  if (credential.username !== undefined || credential.totp_secret !== undefined) throw new RelayConnectorError("invalid_credential", "credential.type");
   const value = credential.value;
   if (value.length === 0 || value.length > MAX_CREDENTIAL_LENGTH || !/^[\u0021-\u007e]+$/.test(value)) {
     throw new RelayConnectorError("invalid_credential", "credential.value");

@@ -163,6 +163,8 @@ export interface AttestationVerification {
    * quote's RTMR3; null otherwise. This module does not pin it.
    */
   readonly appId: string | null;
+  /** The pre-`system-ready` `instance-id` payload (hex), under the same rule as `appId`: one VM of the app. */
+  readonly instanceId?: string | null;
   /** The raw `key-provider` payload (hex), under the same rule as `appId`. */
   readonly keyProviderPayload: string | null;
   /** That payload parsed as dstack's `{name, id}`; null when absent, unparseable or not quote-bound. */
@@ -200,6 +202,7 @@ export async function verifyAttestation(report: Json, options: VerifyAttestation
     osPinned: options.expectedOsImageHashes.length > 0,
     pinned: options.expectedComposeHashes.length > 0 && options.expectedOsImageHashes.length > 0,
     appId: null,
+    instanceId: null,
     keyProviderPayload: null,
     keyProvider: null,
     stackBoot: null,
@@ -319,7 +322,7 @@ export async function verifyAttestation(report: Json, options: VerifyAttestation
   // A value read from an event the quote does not bind proves nothing, so the instance identity is
   // reported only for a log that replayed to the quote's RTMR3.
   const identity = rtmr3Bound
-    ? { appId: dstack.appId, keyProviderPayload: dstack.keyProviderPayload, keyProvider: dstack.keyProvider }
+    ? { appId: dstack.appId, instanceId: dstack.instanceId, keyProviderPayload: dstack.keyProviderPayload, keyProvider: dstack.keyProvider }
     : {};
 
   checkAppCompose(verdictEvidence, dstack.composeHash, checks);

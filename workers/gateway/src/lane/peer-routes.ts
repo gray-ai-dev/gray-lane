@@ -1,7 +1,7 @@
 import type { GatewayConfig } from "@gray/config";
 import { parseStrict, type Json } from "@gray/json";
 import { requestLimit } from "@gray/limits";
-import { encodePeerAttemptsAnswer, PEER_HEADER } from "@gray/lane-wire";
+import { encodePeerAttemptsAnswer, encodePeerDebugAnswer, encodePeerDebugRefusal, PEER_DEBUG_PREFIX, PEER_DEBUG_REFUSAL_STATUS, PEER_HEADER, peerRequestIdOf, type PeerDebugRefusalCode } from "@gray/lane-wire";
 import { readBody } from "../body.ts";
 import { platformTimers, type StreamTimers } from "../client.ts";
 import { servedProtocol } from "../paths.ts";
@@ -12,6 +12,8 @@ import { BridgePeerVerifier, PEER_HELLO_REFUSAL_STATUS, PeerAttempts, PeerState,
 import { BackgroundClient } from "./remote/background.ts";
 import type { LaneProcessState } from "./state.ts";
 import { aciJson } from "./receipts.ts";
+import { stackDebugOf } from "./stack-debug.ts";
+import type { CapturedCall } from "./stack-debug-record.ts";
 
 /**
  * The peer routes of a stack VM in backend mode (docs/confidential-lane-stack-routing.md sections 4.3, 4.5, 4.6), on
@@ -19,6 +21,8 @@ import { aciJson } from "./receipts.ts";
  *
  * - `GET /v1/peer/challenge` → `{nonce}`; `POST /v1/peer/hello {nonce, report}` → `{entry, not_after_ms}`;
  * - `GET /v1/peer/attempts/<rid>` (enveloped under the follow-up's domain line) → the attempts answer;
+ * - `POST /v1/peer/debug/<rid>` (enveloped under the debug hop's domain line) → the attempt's debug share
+ *   (docs/design/relay-debug-sharing.md §4, `stack-debug.ts`);
  * - an inference path with `x-gray-peer` → checks 1 to 6, then the attempt's frames (`backend.ts`).
  *
  * Backend mode is on in the relay-stack layout when the VM has the environment's list public keys
@@ -85,6 +89,18 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
     if (request.method !== "POST") return methodNotAllowed(state, "POST");
     return hello(request, cfg, state, peer);
   }
+  if (path.startsWith(PEER_DEBUG_PREFIX)) {
+    if (request.method !== "POST") return methodNotAllowed(state, "POST");
+    const checked = await peer.checkDebug(request.headers.get(PEER_HEADER));
+    if (!checked.ok) return debugRefusal(checked.code);
+    if (checked.envelope.rid !== path.slice(PEER_DEBUG_PREFIX.length)) return debugRefusal("peer_malformed");
+    const store = stackDebugOf(state, env as LaneEnv & Readonly<Record<string, unknown>>, cfg);
+    if (store === null) return debugRefusal("debug_unsupported");
+    const granted = await store.grant(checked.envelope);
+    ctx.waitUntil(store.report());
+    if (!granted.ok) return debugRefusal(granted.code);
+    return new Response(encodePeerDebugAnswer(granted.share), { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+  }
   if (path.startsWith(PEER_ATTEMPTS_PREFIX)) {
     if (request.method !== "GET") return methodNotAllowed(state, "GET");
     const checked = await peer.check(request.headers.get(PEER_HEADER), "attempts");
@@ -120,6 +136,9 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
     clock: state.now,
     timers: backend.timers,
     waitUntil: (promise) => ctx.waitUntil(promise),
+    // Gray's request id, for the console's account of a violation only (docs/design/relay-ejection.md section 3).
+    violation: (found) => state.stackConfig.violation?.(found, peerRequestIdOf(request.headers), ctx),
+    ...debugCapture(state, env, cfg),
   });
 }
 
@@ -139,6 +158,16 @@ async function hello(request: Request, cfg: GatewayConfig, state: LaneProcessSta
   const accepted = await peer.hello(body.nonce, body.report);
   if (!accepted.ok) return refused(accepted.code);
   return aciJson(200, { entry: accepted.entry, not_after_ms: accepted.notAfterMs }, state.keysetDigest);
+}
+
+/** The debug store's capture of a backend call (docs/design/relay-debug-sharing.md §2), when this VM can share one. */
+function debugCapture(state: LaneProcessState, env: LaneEnv, cfg: GatewayConfig): { readonly debug?: (call: CapturedCall) => void } {
+  const store = stackDebugOf(state, env as LaneEnv & Readonly<Record<string, unknown>>, cfg);
+  return store === null || store.relayKey === null ? {} : { debug: (call) => store.capture(call) };
+}
+
+function debugRefusal(code: PeerDebugRefusalCode): Response {
+  return new Response(encodePeerDebugRefusal(code), { status: PEER_DEBUG_REFUSAL_STATUS[code], headers: { "content-type": "application/json", "cache-control": "no-store" } });
 }
 
 function methodNotAllowed(state: LaneProcessState, allow: string): Response {

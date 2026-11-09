@@ -101,9 +101,13 @@ function errorCode(error: unknown): string {
   return error instanceof Error ? error.name : "error";
 }
 
-/** The credential fields egress's templates read, from a sealed credential (stack_ops_table.go stackOpsAccountFields). */
+/**
+ * The credential fields egress's templates read, from a sealed credential (stack_ops_table.go stackOpsAccountFields). A
+ * `password` account before its first sign-in has none: its token comes from the sign-in.
+ */
 export function opsCredentialFields(vendor: string, credential: Credential): Record<string, string> {
   if (credential.type === "api_key") return { api_key: credential.value };
+  if (credential.type === "password") return {};
   const fields: Record<string, string> = { access_token: credential.value };
   if (vendor === "chatgpt_codex") fields.chatgpt_account_id = chatgptAccountId(credential.value);
   if (credential.refresh_token !== undefined) fields.refresh_token = credential.refresh_token;
@@ -153,25 +157,32 @@ export class StackOpsService {
       if (held === undefined || notHeld.has(account.id) || held.vendor !== account.vendor) continue;
       let fields: Record<string, string>;
       try {
-        authHeaders(account.vendor, held.credential);
+        if (held.credential.type !== "password") authHeaders(account.vendor, held.credential);
         fields = opsCredentialFields(account.vendor, held.credential);
       } catch {
         continue;
       }
+      // A password account (docs/design/relay-in-cvm-login.md): egress holds its sign-in for the relay's sign-in calls;
+      // the account is an access-token account (ChatGPT or Claude), refreshed by egress alone (its token exists only in
+      // the VM).
+      const login = held.login;
       const every: Record<string, bigint> = {};
       if (settings.everySeconds.limits !== undefined) every.limits = BigInt(settings.everySeconds.limits);
       if (settings.everySeconds.models !== undefined) every.models = BigInt(settings.everySeconds.models);
       accounts.push({
         account_id: account.id,
         vendor: account.vendor,
-        credential_type: held.credential.type,
+        credential_type: login === undefined ? held.credential.type : "oauth_access_token",
         credential_version: held.version.toString(),
         credential: fields,
         ...(held.credential.expires_at === undefined ? {} : { expires_at_s: held.credential.expires_at }),
         ...(held.egress === undefined || account.proxy_id === null ? {} : { proxy: egressValue(held.egress), proxy_id: account.proxy_id }),
-        refresh: settings.refresh.get(account.id) ?? "source",
+        refresh: login === undefined ? (settings.refresh.get(account.id) ?? "source") : "gray",
         every_seconds: every,
         models: [...account.models],
+        ...(login === undefined
+          ? {}
+          : { login: { username: login.username, password: login.password, ...(login.totp_secret === undefined ? {} : { totp_secret: login.totp_secret }) } }),
       });
     }
     return toJsonString({ accounts });
@@ -224,7 +235,10 @@ export class StackOpsService {
     }
     const seq = Math.max(token.seq, (held?.seq ?? 0) + 1);
     this.#taken.set(token.account_id, { seq, value: token.credential.value });
-    this.#writeBack.set(token.account_id, { account_id: token.account_id, seq, credential });
+    // A password account's tokens stay in the VM: nothing is written back to the relay's source, which holds the
+    // password (docs/design/relay-in-cvm-login.md §1).
+    const login = this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now()).some((a) => a.account_id === token.account_id && a.login !== undefined);
+    if (!login) this.#writeBack.set(token.account_id, { account_id: token.account_id, seq, credential });
     return true;
   }
 

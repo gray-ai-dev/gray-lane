@@ -57,6 +57,14 @@ export type ImageUsageUnsplit = (typeof IMAGE_USAGE_UNSPLIT_POLICIES)[number];
 /** ACCOUNT_CLIENT_KEY_FALLBACK values (@gray/account client.ts ClientKeyFallback). */
 export const CLIENT_KEY_FALLBACKS = ["local", "none"] as const;
 export type ClientKeyFallbackSetting = (typeof CLIENT_KEY_FALLBACKS)[number];
+/**
+ * LANE_STACK_EJECTION values (docs/design/relay-ejection.md): `enforce` takes a relay whose VM reported a non-compliant
+ * change out of routing; `record` only records it and tells the relay.
+ */
+export const LANE_STACK_EJECTION_MODES = ["enforce", "record"] as const;
+export type LaneStackEjectionMode = (typeof LANE_STACK_EJECTION_MODES)[number];
+export const LANE_STACK_RELEASE_MOVE_MODES = ["off", "on"] as const;
+export type LaneStackReleaseMoveMode = (typeof LANE_STACK_RELEASE_MOVE_MODES)[number];
 /** ALERT_PAGING values: whether gray-alerts sends its pages (workers/alerts/src/paging.ts). */
 export const ALERT_PAGING_MODES = ["on", "off"] as const;
 export type AlertPaging = (typeof ALERT_PAGING_MODES)[number];
@@ -3568,6 +3576,24 @@ export const SETTINGS: readonly SettingSpec[] = [
       "it the test reads expired, no longer counts toward the 64 pending, and a result that arrives later is dropped.",
   },
   {
+    name: "LANE_STACK_EJECTION",
+    key: "laneStackEjection",
+    workers: ["console"],
+    type: "enum",
+    values: LANE_STACK_EJECTION_MODES,
+    default: "enforce",
+    source:
+      "docs/design/relay-ejection.md: the owner's rule (\"Once Gray detects a non-compliant change to a request or an answer, it " +
+      "automatically takes your CVM out of routing\") is `enforce`. `record` is the coordinator's switch of 2026-11-09, so a fault in " +
+      "Gray's own detection can be stopped by a configuration change instead of a release.",
+    doc:
+      "What the console does when a relay's VM reports a non-compliant change (stack.report `violation`). `enforce`: records it in " +
+      "lane_stack_ejections, quarantines every stack endpoint of the relay (no snapshot routes to it, and the VM's configuration lists no " +
+      "route) and opens the relay's `relay_ejected` alert, until an operator restores it. `record`: records it and opens the " +
+      "`relay_violation` alert, and leaves the relay routing. A change of mode applies to the next violation; an ejection already made " +
+      "stays until an operator restores it.",
+  },
+  {
     name: "LANE_STACK_TEST_KEEP_DAYS",
     key: "laneStackTestKeepDays",
     workers: ["console"],
@@ -3578,6 +3604,22 @@ export const SETTINGS: readonly SettingSpec[] = [
     source:
       "S46: a relay's account tests are kept 8 days, as its usage minutes and traces; at most a month, as the traces [estimated].",
     doc: "How many days a relay stack's account tests and their results are kept; the console's cron deletes older ones a page at a time.",
+  },
+  {
+    name: "LANE_STACK_DEBUG_SHARE_KEEP_DAYS",
+    key: "laneStackDebugShareKeepDays",
+    workers: ["console"],
+    type: "int",
+    default: "30",
+    min: 1,
+    max: 90,
+    source:
+      "Relay debug sharing (docs/design/relay-debug-sharing.md section 7; decided 2026-11-09): a share's metadata (lane_stack_debug_shares, " +
+      "migration 0055) is kept 30 days after its last report, so the customer's request detail and the relay's trace lookup still mark a " +
+      "request shared well after the VM let its record go; at most 90 days, the longest usage range a customer reads [estimated].",
+    doc:
+      "How many days the metadata of a request a customer authorized for debugging at a relay is kept after the relay's VM last reported it " +
+      "(never the record, which only the VM holds); the console's cron deletes older rows a page at a time.",
   },
   {
     name: "LANE_STACK_VM_PAYER",
@@ -3634,31 +3676,6 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc:
       "The most automatically approved relay VM quotas whose relay has not deleted its VM, across the platform; past it a request waits for " +
       "Gray's operators.",
-  },
-  {
-    name: "LANE_STACK_AUTO_OFFERS",
-    key: "laneStackAutoOffers",
-    workers: ["console"],
-    type: "enum",
-    values: ["off", "on"],
-    default: "off",
-    source:
-      "The owner's decision of 2026-11-02: while Gray tests relay stacks, a relay stack's price at or below Gray's catalog list price is " +
-      "approved at once; a higher one still waits for an operator. Off, the default, is the operator's decision alone (D125: lane relays " +
-      "are the Workers' alone); the deployments turn it on in their values.",
-    doc:
-      "Whether a relay stack's submitted offer is approved at once, through the operator's decision, when every price it sets is at or below " +
-      "the reference catalog's list price for the model times LANE_STACK_AUTO_OFFER_LIST_RATIO; other providers' offers are unchanged.",
-  },
-  {
-    name: "LANE_STACK_AUTO_OFFER_LIST_RATIO",
-    key: "laneStackAutoOfferListRatio",
-    workers: ["console"],
-    type: "text",
-    default: "1.0",
-    textCheck: (v) => (/^(0|[1-9][0-9]{0,2})(\.[0-9]{1,6})?$/.test(v) && /[1-9]/.test(v) ? null : "is not a ratio above 0 with at most 6 decimals (1.0)"),
-    source: "The owner's decision of 2026-11-02: at or below the list price, so 1.0.",
-    doc: "The multiple of the catalog list price a relay stack's offer may reach and still be approved at once (LANE_STACK_AUTO_OFFERS).",
   },
   {
     name: "LANE_STACK_ALERT_FROM",
@@ -3731,6 +3748,56 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc:
       "The lowest gray-relay kit version (agent status agent_version) whose relay may Deploy an outbound-only release (one whose VM takes no " +
       "inbound connection). Below it, or with no version reported, Deploy is refused with lane_stack_provision_kit_outdated.",
+  },
+  {
+    name: "LANE_STACK_ROLLOUT_MIN_KIT",
+    key: "laneStackRolloutMinKit",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/.test(v) ? null : "is empty or a kit version (major.minor.patch, such as 1.2.0)"),
+    source:
+      "docs/design/relay-zero-downtime.md: a relay's image rollout boots the new image in a second VM and moves the relay to it once it serves, " +
+      "which needs a gray-relay that seals that VM before it adopts its app (and keeps the old one sealed while it drains); an older one " +
+      "revokes the old VM as soon as the new boot gets its token. The number is the first kit with it, set once that kit is released and the " +
+      "entry serves the boots route, so it is configuration; empty until then.",
+    doc:
+      "The lowest gray-relay kit version (agent status agent_version) whose relay's signed rollouts and rollbacks run without downtime (a " +
+      "second VM, then the first drains and goes). Empty: none do; every rollout restarts the VM with the new image, as before.",
+  },
+  {
+    name: "LANE_STACK_RELEASE_MOVES",
+    key: "laneStackReleaseMoves",
+    workers: ["console"],
+    type: "enum",
+    values: LANE_STACK_RELEASE_MOVE_MODES,
+    default: "off",
+    source:
+      "docs/design/relay-release-zero-downtime.md: the owner's request of 2026-11-09 (a relay must not stop each time it takes a Gray " +
+      "release). The moves run on the rollout's mechanisms (LANE_STACK_ROLLOUT_MIN_KIT) and start by themselves, so they are switched on " +
+      "after the console, the provisioner and the first release that names each VM's key are out; off until then.",
+    doc:
+      "`on`: the console's minute pass moves each relay's running VM to the newest Gray release the relay accepted, without downtime (a " +
+      "second instance of its Phala app given that release, then the first drains and goes), when the rollout gate holds for the relay " +
+      "and the release can be moved to (docs/design/relay-release-zero-downtime.md section 2). `off`: no move; an accepted release waits " +
+      "for a Delete and Deploy, as before.",
+  },
+  {
+    name: "LANE_STACK_RELEASE_MOVE_RETRY_MS",
+    key: "laneStackReleaseMoveRetryMs",
+    workers: ["console"],
+    type: "int",
+    default: "21600000",
+    min: 600000,
+    max: 604800000,
+    source:
+      "docs/design/relay-release-zero-downtime.md: a failed move cost about 5 minutes of a second VM (Phala's replica after about 82 s and " +
+      "an instance's compose update in about 117 s, measured 2026-11-09, then the boot watch); every 6 hours is 20 minutes of a VM a day " +
+      "for a release that cannot boot, and a transient refusal (capacity) waits at most that long. At least 10 minutes (two moves never " +
+      "overlap a relay's drain bound of 15), at most a week.",
+    doc:
+      "How long after a failed move of a relay's VM to a Gray release (LANE_STACK_RELEASE_MOVES) the console tries that release again. A " +
+      "newer release the relay accepts is moved to at once.",
   },
   {
     name: "LANE_STACK_RELEASE_LIST",
@@ -5063,10 +5130,6 @@ export interface ConsoleConfig {
   readonly laneStackAutoVmInstanceType: string;
   /** LANE_STACK_AUTO_VM_MAX: the most automatically approved, not deleted relay VMs. */
   readonly laneStackAutoVmMax: number;
-  /** LANE_STACK_AUTO_OFFERS: whether a relay stack's offer at or below the list price is approved at once (owner, 2026-11-02). */
-  readonly laneStackAutoOffers: "off" | "on";
-  /** LANE_STACK_AUTO_OFFER_LIST_RATIO: the multiple of the list price LANE_STACK_AUTO_OFFERS approves up to. */
-  readonly laneStackAutoOfferListRatio: string;
   /** LANE_STACK_ALERT_FROM: the sender of relay alert e-mails; empty: none sent. */
   readonly laneStackAlertFrom: string;
   /** LANE_STACK_TUNNEL_ZONE: the relays zone of Gray's tunnel rendezvous; empty: none. */
@@ -5077,6 +5140,12 @@ export interface ConsoleConfig {
   readonly laneStackEntryTimeoutMs: number;
   /** LANE_STACK_OUTBOUND_MIN_KIT: the lowest gray-relay kit an outbound-only release may boot for (R10). */
   readonly laneStackOutboundMinKit: string;
+  /** LANE_STACK_ROLLOUT_MIN_KIT: the lowest gray-relay kit whose rollouts run without downtime; empty: none. */
+  readonly laneStackRolloutMinKit: string;
+  /** LANE_STACK_RELEASE_MOVES: whether the console moves running VMs to the relay's newest accepted release. */
+  readonly laneStackReleaseMoves: LaneStackReleaseMoveMode;
+  /** LANE_STACK_RELEASE_MOVE_RETRY_MS: how long after a failed move to a release the console tries it again. */
+  readonly laneStackReleaseMoveRetryMs: number;
   /** LANE_STACK_RELEASE_LIST (S57): the relay stacks' signed release list the pairing answers; empty: none. */
   readonly laneStackReleaseList: string;
   /** LANE_STACK_RELEASE_PUBLIC_KEY: the list's signing key, 64 hex; empty: none. */
@@ -5103,6 +5172,10 @@ export interface ConsoleConfig {
   readonly laneStackTestExpiryMs: number;
   /** LANE_STACK_TEST_KEEP_DAYS (S46): the days of lane_stack_tests the console keeps. */
   readonly laneStackTestKeepDays: number;
+  /** LANE_STACK_DEBUG_SHARE_KEEP_DAYS: the days of lane_stack_debug_shares the console keeps after a share's last report. */
+  readonly laneStackDebugShareKeepDays: number;
+  /** LANE_STACK_EJECTION: whether a relay's reported violation takes it out of routing (docs/design/relay-ejection.md). */
+  readonly laneStackEjection: LaneStackEjectionMode;
   /** Always off on Workers (DEBT_MODE_RULE). */
   readonly debtMode: "off";
   readonly creditFailureAdvances: "off" | "on";

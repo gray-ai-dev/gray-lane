@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./lease": "./src/lease.ts",
-    "./egress": "./src/egress.ts"
+    "./egress": "./src/egress.ts",
+    "./vault": "./src/vault.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

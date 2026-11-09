@@ -67,7 +67,7 @@ function attemptNumber(text: string): number | null {
  * The inner receipt the entry does not hold, from the stack VM: its JCS bytes when it answered one that checks, null
  * when it holds none and the outer receipt names none.
  */
-async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: ReceiptRouteDeps): Promise<Uint8Array | null | "unavailable" | "mismatch"> {
+export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: Pick<ReceiptRouteDeps, "receipts" | "keysetDigest" | "followUpMs" | "clock">): Promise<Uint8Array | null | "unavailable" | "mismatch"> {
   const answer = await peer.fetchLate(deps.clock() + deps.followUpMs);
   if (answer === null) return "unavailable";
   if (answer.state !== "done" || answer.receipt === null) return peer.inner === null ? null : "unavailable";

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,8 @@ type stackRequest struct {
 	size        int64 // the registration's share of the budget, held until the rid ends
 	budget      *stackBudget
 	health      *stackHealth
+	// forwarded: the registration asked for each accepted call's forwarded body in the feed (recordForwarded).
+	forwarded bool
 	// ctx ends when the rid does (DELETE or expiry); every vendor call for the rid is cancelled with it.
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -331,6 +334,23 @@ func (req *stackRequest) record(records ...any) bool {
 	return req.putLocked(false, records...)
 }
 
+// recordForwarded queues an accepted call's body as egress forwards it to the vendor, the relay's changes included
+// (docs/design/relay-debug-sharing.md): the lane in the relay's VM keeps it, with the rest of the request's records, as
+// the request's debug record, which leaves the VM only for a request its customer authorized, sealed to the relay's
+// gray-relay. Only for a registration that asked for it, right after the call's `attempt` record and before its
+// vendor call, so before its `response`. Best effort: when the budget cannot hold the body, the record says only that
+// it was left out and how long the body was (a forced line of a few bytes); the call is never refused for it.
+func (req *stackRequest) recordForwarded(n int, body []byte) {
+	if !req.forwarded {
+		return
+	}
+	req.mu.Lock()
+	defer req.mu.Unlock()
+	if !req.putLocked(false, feedForwarded{T: "forwarded", N: n, B64: base64.StdEncoding.EncodeToString(body), Bytes: len(body)}) {
+		req.putLocked(true, feedForwarded{T: "forwarded", N: n, Bytes: len(body), Omitted: true})
+	}
+}
+
 // refused numbers a counted call and queues its refusal. It always reaches the entry: when the budget cannot
 // hold its path (a JSON pointer as long as the body's names), it goes without the path. A closed feed takes
 // no record, so the call gets no number.
@@ -500,6 +520,15 @@ type feedBody struct {
 	N      int    `json:"n"`
 	Digest string `json:"digest"`
 	Bytes  int64  `json:"bytes"`
+}
+
+// feedForwarded is a call's body as egress forwarded it (recordForwarded): standard base64, or omitted with its size.
+type feedForwarded struct {
+	T       string `json:"t"`
+	N       int    `json:"n"`
+	B64     string `json:"b64,omitempty"`
+	Bytes   int    `json:"bytes"`
+	Omitted bool   `json:"omitted,omitempty"`
 }
 
 type feedErrorBody struct {

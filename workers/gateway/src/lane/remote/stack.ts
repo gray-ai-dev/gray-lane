@@ -5,8 +5,14 @@ import {
   stackConfigAnswerOf,
   stackReportDtoOf,
   stackRulesAnswerOf,
+  stackDebugSharesRequestDtoOf,
   stackTarget,
+  stackVaultCopyOf,
+  stackVaultGetRequestDtoOf,
+  stackVaultPutRequestDtoOf,
+  stackVaultPutResultOf,
   type PendingProxyCheck,
+  type StackDebugShare,
   type ProxyCheckResult,
   type StackConfigAnswer,
   type StackReport,
@@ -14,6 +20,9 @@ import {
   type StackTestResult,
   type StackTestsAnswer,
   type StackTestsRequestDto,
+  type StackVaultCopy,
+  type StackVaultKind,
+  type StackVaultPutResult,
 } from "@gray/lane-wire";
 import { BridgeClient, type BridgeClientOptions } from "./client.ts";
 
@@ -24,7 +33,8 @@ import { BridgeClient, type BridgeClientOptions } from "./client.ts";
  * now). A relay the console does not have is the bridge's 404 `unknown_relay`, which `call` throws as
  * a `BridgeCallError` with that status, like every other failure. `stack.proxy_checks` is the same
  * relay's proxy checks, bound to it the same way (LANE_BRIDGE_STACK_RELAYS), and so are account health's
- * three (S41, S42, S44): `stack.rules`, `stack.report` and `stack.tests`.
+ * three (S41, S42, S44): `stack.rules`, `stack.report` and `stack.tests`, and Gray's copy of the VM's sealed records,
+ * `stack.vault.get` and `stack.vault.put`.
  */
 export class StackConfigClient extends BridgeClient {
   constructor(options: BridgeClientOptions) {
@@ -78,5 +88,33 @@ export class StackConfigClient extends BridgeClient {
     const call = bridgeCall("stack.tests", stackTarget(relayId));
     const answer = await this.call("stack.tests", call, { relay_id: relayId, results: integersOfJson(results, "results") as StackTestsRequestDto["results"] });
     return numbersOfJson(answer, "") as StackTestsAnswer;
+  }
+
+  /** `stack.debug_shares` (docs/design/relay-debug-sharing.md §7): the shares this VM made or delivered, metadata only. */
+  async debugShares(relayId: string, shares: readonly StackDebugShare[]): Promise<number> {
+    const call = bridgeCall("stack.debug_shares", stackTarget(relayId));
+    return Number((await this.call("stack.debug_shares", call, stackDebugSharesRequestDtoOf(relayId, shares))).accepted);
+  }
+
+  /**
+   * `stack.vault.get` (docs/design/relay-no-always-on-host.md §3.1, 13.4): Gray's ciphertext copy of this app's `kind`
+   * record, version 0 and no record when Gray holds none. The caller opens it (`@gray/relay-connector/vault`
+   * `newestRecord`) beside its disk's; Gray cannot.
+   */
+  async vaultGet(relayId: string, appId: string, kind: StackVaultKind): Promise<StackVaultCopy> {
+    const call = bridgeCall("stack.vault.get", stackTarget(relayId));
+    return stackVaultCopyOf(await this.call("stack.vault.get", call, stackVaultGetRequestDtoOf(relayId, appId, kind)));
+  }
+
+  /**
+   * `stack.vault.put`: upload `record` (`serializeRecord` text, at most STACK_VAULT_RECORD_MAX_CHARS), built on Gray's
+   * version `baseVersion` (0 when Gray held none). `stored: false` is a lost compare-and-swap, with Gray's current
+   * version: read it, apply the change again and retry (13.4, "Two instances, one vault"). A record Gray will not keep
+   * (another app, a header that does not fit the call, a version not above the base) is the bridge's 422
+   * `vault_record_refused`, thrown as a `BridgeCallError`.
+   */
+  async vaultPut(relayId: string, appId: string, kind: StackVaultKind, baseVersion: number, record: string): Promise<StackVaultPutResult> {
+    const call = bridgeCall("stack.vault.put", stackTarget(relayId));
+    return stackVaultPutResultOf(await this.call("stack.vault.put", call, stackVaultPutRequestDtoOf(relayId, appId, kind, baseVersion, record)));
   }
 }

@@ -7,6 +7,7 @@ import { laneReportedUsageSchema } from "./records.ts";
 import { decodeSchedulerBody, encodeSchedulerBody } from "./scheduler.ts";
 import type { BridgeSigner } from "./signing.ts";
 import { STACK_FAULT_WHYS } from "./stack-health.ts";
+import { STACK_VIOLATION_REQUEST_ID_PATTERN } from "./stack-report.ts";
 import { stackTraceSchema } from "./stack-trace.ts";
 
 /**
@@ -33,6 +34,18 @@ import { stackTraceSchema } from "./stack-trace.ts";
 
 /** The request header that carries the signed envelope. */
 export const PEER_HEADER = "x-gray-peer";
+/**
+ * Gray's public request id (`x-request-id`) beside the envelope, outside it (docs/design/relay-ejection.md section 3):
+ * the stack VM names it when it reports a violation, so the relay and Gray find the request. The hop is TLS to the
+ * attested VM; the value is shown, never used to decide, and a stack VM older than it ignores it.
+ */
+export const PEER_REQUEST_ID_HEADER = "x-gray-peer-request-id";
+
+/** The request id `headers` carry in PEER_REQUEST_ID_HEADER, or null when there is none or it is not one (32 lower hex). */
+export function peerRequestIdOf(headers: Headers): string | null {
+  const value = headers.get(PEER_REQUEST_ID_HEADER);
+  return value !== null && STACK_VIOLATION_REQUEST_ID_PATTERN.test(value) ? value : null;
+}
 /** The envelope header's version, its first dot-separated part. */
 export const PEER_HEADER_VERSION = "v1";
 

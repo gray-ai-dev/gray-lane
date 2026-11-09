@@ -1,6 +1,6 @@
 import { get, isObject, type Json, type JsonObject } from "@gray/json";
 import { z } from "zod";
-import { MAX_CREDENTIAL_LENGTH, VENDORS, assertCredentialFormat, type Credential, type Vendor } from "./credential.ts";
+import { CREDENTIAL_TYPES, MAX_CREDENTIAL_LENGTH, VENDORS, assertCredentialFormat, type Credential, type Vendor } from "./credential.ts";
 import { wireEgressSchema, egressValue, type EgressSpec } from "./egress.ts";
 import { RelayConnectorError } from "./errors.ts";
 import { MAX_CREDENTIAL_LEASE_SECONDS } from "./lease.ts";
@@ -89,7 +89,7 @@ const idSchema = z.string().regex(RESOURCE_ID);
 const u64Schema = z.bigint().min(0n).max(U64_MAX);
 const versionSchema = z.bigint().min(1n).max(U64_MAX);
 
-const credentialTypeSchema = z.enum(["api_key", "oauth_access_token"]);
+const credentialTypeSchema = z.enum(CREDENTIAL_TYPES);
 
 const credentialSchema = z
   .object({
@@ -97,9 +97,14 @@ const credentialSchema = z
     value: z.string().min(1).max(MAX_CREDENTIAL_LENGTH),
     expires_at: u64Schema.optional(),
     refresh_token: z.string().min(1).max(MAX_CREDENTIAL_LENGTH).regex(/^[\x21-\x7e]+$/).optional(),
+    // A `password` credential's sign-in e-mail and TOTP secret (credential.ts checks their form).
+    username: z.string().min(1).max(MAX_CREDENTIAL_LENGTH).optional(),
+    totp_secret: z.string().min(1).max(MAX_CREDENTIAL_LENGTH).optional(),
   })
   .strict()
-  .refine((credential) => credential.refresh_token === undefined || credential.type === "oauth_access_token", { message: "only an access token has a refresh token" });
+  .refine((credential) => credential.refresh_token === undefined || credential.type === "oauth_access_token", { message: "only an access token has a refresh token" })
+  .refine((credential) => (credential.type === "password") === (credential.username !== undefined), { message: "a password, and only a password, has a username" })
+  .refine((credential) => credential.totp_secret === undefined || credential.type === "password", { message: "only a password has a TOTP secret" });
 
 const accountSchema = z
   .object({
@@ -212,6 +217,8 @@ export function credentialValue(credential: Credential): JsonObject {
   const out: JsonObject = { type: credential.type, value: credential.value };
   if (credential.expires_at !== undefined) out.expires_at = credential.expires_at;
   if (credential.refresh_token !== undefined) out.refresh_token = credential.refresh_token;
+  if (credential.username !== undefined) out.username = credential.username;
+  if (credential.totp_secret !== undefined) out.totp_secret = credential.totp_secret;
   return out;
 }
 

@@ -51,6 +51,14 @@ export interface PeerPin {
   readonly composeHash: string;
   readonly osImageHash: string;
   readonly relayImage: string;
+  /** The boot's dstack app id (its `app-id` event, 40 lower-case hex), null when the report names none. */
+  readonly appId?: string | null;
+  /**
+   * The boot's dstack instance id (its `instance-id` event, 40 lower-case hex), null when the report names none: during
+   * an image rollout two instances of the relay's app run (docs/design/relay-zero-downtime.md), and the provisioner
+   * tells their boots apart by it (the boots route). Absent on a pin made before it.
+   */
+  readonly instanceId?: string | null;
   /** The report the entry verified, served beside the outer receipt (`GET /v1/aci/receipts/{id}/peers/{n}`, section 4.8). */
   readonly report: Json;
   /** The nonce the report was verified for, so a customer can verify it again. */
@@ -87,7 +95,33 @@ export interface StoredPeerAttempt {
   readonly receipt: Uint8Array | null;
   /** `GET /v1/peer/attempts/<rid>` on the pinned session within `untilMs`; null when no answer came. */
   readonly fetchLate: (untilMs: number) => Promise<PeerAttemptsReply | null>;
+  /**
+   * `POST /v1/peer/debug/<rid>` on the pinned session within `untilMs` (docs/design/relay-debug-sharing.md §4): the
+   * stack VM takes the attempt's record from the relay's container for its gray-relay. Asked only for a request whose
+   * customer authorized it; the envelope names the customer's request id and the attempt's inner receipt.
+   */
+  readonly shareDebug: (input: PeerDebugInput) => Promise<PeerDebugReply>;
 }
+
+/** What the entry names in a debug hop besides the attempt's own facts. */
+export interface PeerDebugInput {
+  /** The customer's `x-request-id`. */
+  readonly requestId: string;
+  /** The outer receipt's id. */
+  readonly receiptId: string;
+  /** The attempt's inner receipt id (`rcpt_` and the container's rid). */
+  readonly innerReceiptId: string;
+  readonly untilMs: number;
+}
+
+/**
+ * The stack VM's answer to a debug hop: its signed share (as sent, and as read; not yet verified), a refusal of its own
+ * limits (`refused`), or nothing usable (`unavailable`: no session, a reboot, a timeout, another refusal).
+ */
+export type PeerDebugReply =
+  | { readonly outcome: "shared"; readonly value: Json }
+  | { readonly outcome: "refused"; readonly code: string }
+  | { readonly outcome: "unavailable"; readonly code: string };
 
 /** One peer the registry holds. */
 export class Peer {
@@ -102,6 +136,11 @@ export class Peer {
   retryAt = 0;
   backoffMs = 0;
   probedAt = 0;
+  /**
+   * Whether the boot holds this relay's sealed credentials (its `/healthz?relay=` `sealed_version`), from the last probe;
+   * null before one answered. Of two boots of a relay, a sealed one is sent requests first (`PeerRegistry.usable`).
+   */
+  sealed: boolean | null = null;
   work: Promise<void> | null = null;
   /** When the job in `work` is let go (`PeerRegistry.maintain`): its start plus its calls' bounds. */
   workUntil = 0;
@@ -182,6 +221,11 @@ export interface PeerCallInput {
    * `relay_changes`. Absent otherwise.
    */
   readonly relayChanges?: "exclude";
+  /**
+   * Gray's public request id, sent beside the envelope (`PEER_REQUEST_ID_HEADER`) so a violation the stack VM reports
+   * names the request (docs/design/relay-ejection.md section 3). Absent, none is sent.
+   */
+  readonly requestId?: string;
   readonly egress: (input: string, init: RequestInit) => Promise<Response>;
   readonly clock: () => number;
   readonly timers: StreamTimers;

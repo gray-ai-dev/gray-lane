@@ -15,7 +15,7 @@
 //     --tls-domain lane-staging.usefallback.com \
 //     --bridge-url https://gray-lane-staging.example.workers.dev \
 //     --keyset-not-after 1798761600 \
-//     --image ghcr.io/kiyoakii/gray-lane@sha256:<64 hex>
+//     --image ghcr.io/gray-ai-dev/gray-lane@sha256:<64 hex>
 //
 // and, when the deployment measures its own pick budget (D109'), `--scheduler-pick-ms <ms>`.
 //
@@ -99,7 +99,9 @@
 //   (`docs/security/cvm-boundaries.md:127-129`). It holds the bridge seed (D17) plus the three
 //   `DSTACK_DOCKER_*` names the measured `pre_launch_script` uses for `docker login`. No compose
 //   service may reference those three (asserted below), so the host cannot use them to overwrite a
-//   value the measured compose fixed. When the image becomes public, all three and the script go away.
+//   value the measured compose fixed. The image is public (ghcr.io/gray-ai-dev/gray-lane), so a lane's
+//   env seals the three empty and the script skips the login; the names and the script stay measured as
+//   they were, so the stack set every relay's gray-relay checks (@gray/lane-compose) does not change.
 //   D133 adds `ACME_EAB_KID`/`ACME_EAB_HMAC_KEY`, the lane's External Account Binding for Google Trust
 //   Services: they only choose which account registers at a CA that requires EAB, never the key.
 // - `pre_launch_script` (D44): the text of `deploy/tee/pre-launch.sh`, embedded verbatim. dstack
@@ -327,7 +329,8 @@ export const STACK_PRE_LAUNCH_PATH = join(here, "pre-launch.stack.sh");
 
 /**
  * S8/S8a/S54: the stack's host-injected env is the bridge seed, Gray's registry credential (which only the measured
- * pre-launch reads to pull Gray's private image; no service may reference it, REGISTRY_ENVS) and the relay's
+ * pre-launch reads; empty for the public image, which it then pulls without a login, and set only for a release on the
+ * earlier private image, deploy/tee/release/stack-env.mjs; no service may reference it, REGISTRY_ENVS) and the relay's
  * identity, which pre-launch validates and measures into RTMR3 before lane reads its relay id
  * (STACK_INTERPOLATIONS). The relay's registry login uses the pull token (§4), never env. relay-outbound-only §3.9:
  * no EAB (gray-acme is self-signed in this layout) and no GRAY_STACK_TLS_DOMAIN (the VM has no public name).

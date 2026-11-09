@@ -14,6 +14,8 @@
  * - Receipts (`receipt.ts`, `events.ts`): the §7 document, its event vocabulary, the builder that
  *   signs it, the verifier, Gray's `relay_policy.*` and `request.modified` extension events, and the
  *   relay-stack attempt events (plan S26) with their grammar.
+ * - Debug sharing (`debug.ts`): the stack VM's signed share and the entry's signed grant of a request a customer
+ *   authorized for debugging at its relay (docs/design/relay-debug-sharing.md).
  * - Relay-stack digests (`stack-hash.ts`): the `events_sha256` hash chain over S19 event digests and
  *   the `headers_sha256` line form.
  * - Reading served documents (`wire.ts` behind `parseReceiptText`, `parseKeysetText`,
@@ -29,6 +31,7 @@
  * the HTTP server, DCAP quote verification, TLS, and the gateway integration.
  */
 export * from "./canonical.ts";
+export * from "./debug.ts";
 export * from "./digest.ts";
 export * from "./ed25519.ts";
 export * from "./events.ts";

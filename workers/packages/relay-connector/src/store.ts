@@ -117,9 +117,22 @@ interface StoredAccount {
 export interface StackSealedAccount {
   readonly account_id: string;
   readonly vendor: Vendor;
+  /**
+   * The sealed credential, or the token egress refreshed from it. For a `password` account: the token its last sign-in
+   * inside the VM ended with, or the sealed `password` credential itself before the first one.
+   */
   readonly credential: Credential;
   readonly egress?: EgressSpec;
   readonly version: bigint;
+  /** A `password` account's sealed sign-in, for egress alone (docs/design/relay-in-cvm-login.md). */
+  readonly login?: StackLogin;
+}
+
+/** A `password` account's sealed sign-in: the e-mail, the password and the optional TOTP secret. */
+export interface StackLogin {
+  readonly username: string;
+  readonly password: string;
+  readonly totp_secret?: string;
 }
 
 export interface RelayCredentialStoreOptions {
@@ -153,7 +166,7 @@ export class RelayCredentialStore implements AccountMembership {
    * Tokens egress refreshed inside the VM (docs/relay-changes-v2.md §6, `refresh: "gray"`), by account id: each
    * stands in for the sealed credential it was refreshed from, until a sealed version past that one arrives.
    */
-  readonly #refreshed = new Map<string, { readonly relayId: string; readonly basedOn: bigint; readonly credential: Credential }>();
+  readonly #refreshed = new Map<string, { readonly relayId: string; readonly basedOn: bigint; readonly credential: Credential; readonly username?: string }>();
 
   constructor(options: RelayCredentialStoreOptions) {
     if (!KEYSET_DIGEST.test(options.keysetDigest)) throw new Error("a keyset digest is sha256: plus 64 lowercase hex");
@@ -417,6 +430,15 @@ export class RelayCredentialStore implements AccountMembership {
           credential: this.#currentCredential(relayId, account),
           ...(account.egress === undefined ? {} : { egress: account.egress }),
           version: account.version,
+          ...(account.credential.type !== "password" || account.credential.username === undefined
+            ? {}
+            : {
+                login: Object.freeze({
+                  username: account.credential.username,
+                  password: account.credential.value,
+                  ...(account.credential.totp_secret === undefined ? {} : { totp_secret: account.credential.totp_secret }),
+                }),
+              }),
         }),
       )
       .sort((left, right) => (left.account_id < right.account_id ? -1 : left.account_id > right.account_id ? 1 : 0));
@@ -427,25 +449,34 @@ export class RelayCredentialStore implements AccountMembership {
    * credential of version `basedOn` and any older one, so the container's `/credentials` and egress's table follow
    * it; a sealed version past `basedOn` (the relay's own refresh, or the write-back sealed again) wins. False when
    * the account is not this relay's, the token is not an access token of it, or a newer sealed version is held.
+   *
+   * A `password` account's token (its sign-in inside the VM, or egress's refresh of it) exists only in the VM, so no
+   * sealed version replaces it: it stands in for as long as the sealed credential is a password for the same e-mail
+   * (a lease renewal or a new password re-seals it, and the token stays).
    */
   applyRefreshed(relayId: string, accountId: string, basedOn: bigint, credential: Credential): boolean {
     const account = this.#accounts.get(accountId);
-    if (account === undefined || account.relay_id !== relayId || account.version > basedOn) return false;
-    if (account.credential.type !== "oauth_access_token" || credential.type !== account.credential.type) return false;
+    if (account === undefined || account.relay_id !== relayId || credential.type !== "oauth_access_token") return false;
+    const login = account.credential.type === "password";
+    if (!login && (account.version > basedOn || account.credential.type !== "oauth_access_token")) return false;
     try {
       assertCredentialFormat(account.vendor, credential);
     } catch {
       return false;
     }
-    this.#refreshed.set(accountId, Object.freeze({ relayId, basedOn, credential: Object.freeze({ ...credential }) }));
+    this.#refreshed.set(
+      accountId,
+      Object.freeze({ relayId, basedOn, credential: Object.freeze({ ...credential }), ...(login ? { username: account.credential.username } : {}) }),
+    );
     return true;
   }
 
-  /** The account's sealed credential, or the token egress refreshed from it. */
+  /** The account's sealed credential, or the token egress refreshed from it (for a password account, signed in). */
   #currentCredential(relayId: string, account: StoredAccount): Credential {
     const refreshed = this.#refreshed.get(account.account_id);
     if (refreshed === undefined || refreshed.relayId !== relayId) return account.credential;
-    if (account.version > refreshed.basedOn) {
+    const sameLogin = refreshed.username !== undefined && account.credential.type === "password" && account.credential.username === refreshed.username;
+    if (refreshed.username !== undefined ? !sameLogin : account.version > refreshed.basedOn) {
       this.#refreshed.delete(account.account_id);
       return account.credential;
     }

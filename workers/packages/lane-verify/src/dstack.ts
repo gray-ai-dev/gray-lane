@@ -78,6 +78,11 @@ export interface DstackMeasurements {
   readonly osImageHash: string | null;
   /** The dstack app id payload, when present (20 bytes in current dstack). */
   readonly appId: string | null;
+  /**
+   * The dstack instance id payload, when present (an app with `no_instance_id: false`): one VM of an app with several
+   * (Phala replicas), each its own (docs/design/relay-zero-downtime.md).
+   */
+  readonly instanceId: string | null;
   /** The raw `key-provider` payload (hex), when the log carries one. */
   readonly keyProviderPayload: string | null;
   /** That payload parsed; null when there is no event or the payload is not dstack's `{name, id}` JSON. */
@@ -237,13 +242,16 @@ export function extractMeasurements(events: readonly DstackEvent[]): Measurement
   const appIdEvent = findPreSystemReady(events, "app-id");
   if (!appIdEvent.ok) return appIdEvent;
   const appId = appIdEvent.event === null ? null : appIdEvent.event.event_payload;
+  const instanceIdEvent = findPreSystemReady(events, "instance-id");
+  if (!instanceIdEvent.ok) return instanceIdEvent;
+  const instanceId = instanceIdEvent.event === null || instanceIdEvent.event.event_payload === "" ? null : instanceIdEvent.event.event_payload;
   const keyProviderEvent = findPreSystemReady(events, "key-provider");
   if (!keyProviderEvent.ok) return keyProviderEvent;
   const keyProviderPayload = keyProviderEvent.event === null ? null : keyProviderEvent.event.event_payload;
   const keyProvider = keyProviderPayload === null ? null : parseKeyProviderPayload(keyProviderPayload);
   return {
     ok: true,
-    measurements: { events, rtmr3: replay.rtmr3, composeHash: composeHash.value, osImageHash, appId, keyProviderPayload, keyProvider },
+    measurements: { events, rtmr3: replay.rtmr3, composeHash: composeHash.value, osImageHash, appId, instanceId, keyProviderPayload, keyProvider },
   };
 }
 

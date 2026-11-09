@@ -7,6 +7,9 @@ import {
   STACK_COOLING_KINDS,
   STACK_COOLING_MODES,
   STACK_CREDENTIAL_TYPES,
+  STACK_LOGIN_BY,
+  STACK_LOGIN_CODES,
+  STACK_LOGIN_STATES,
   STACK_REFRESH_CODES,
   STACK_REFRESH_MODES,
   STACK_REFRESH_PROBLEMS,
@@ -20,6 +23,8 @@ import {
   type StackCoolingKind,
   type StackCoolingMode,
   type StackExclusionReasonWord,
+  type StackLoginCode,
+  type StackLoginState,
   type StackRefreshCode,
   type StackRefreshMode,
   type StackVendorCode,
@@ -76,6 +81,59 @@ const model = z.string().min(1).max(256);
 const minute = uintSchema.refine((v) => v % MINUTE_MS === 0n, { message: "a time in stack.report is a whole minute" });
 const u32 = uintSchema.max(BigInt(U32_MAX));
 
+/**
+ * A non-compliant change the lane found (docs/design/relay-ejection.md section 1): egress refused the relay's change to a
+ * kept request field (`stack_rewrite_refused` at a kept member, `stack_header_refused` for a P6 header) on a rid that
+ * allowed relay changes, or the relay's answer was not the vendor's (`event_mismatch`, `event_unrecorded`,
+ * `event_hold_bound`, `body_mismatch`, each confirmed against egress's whole record). The console takes the relay out of
+ * routing on the first one it has not taken.
+ */
+export const STACK_VIOLATION_KINDS = ["request", "answer"] as const;
+export type StackViolationKind = (typeof STACK_VIOLATION_KINDS)[number];
+export const STACK_VIOLATION_REQUEST_CODES = ["stack_rewrite_refused", "stack_header_refused"] as const;
+export const STACK_VIOLATION_ANSWER_CODES = ["event_mismatch", "event_unrecorded", "event_hold_bound", "body_mismatch"] as const;
+export const STACK_VIOLATION_CODES = [...STACK_VIOLATION_REQUEST_CODES, ...STACK_VIOLATION_ANSWER_CODES] as const;
+export type StackViolationCode = (typeof STACK_VIOLATION_CODES)[number];
+/** A kept body member as the refusal path's first token (`/model`, `/stream_options`, `/tools`): names from egress's lists. */
+export const STACK_VIOLATION_BODY_FIELD_PATTERN = /^\/[A-Za-z0-9_]{1,64}$/;
+/** A refused header's name (egress writes it lower-case): `openai-organization`, `cookie`, `x-api-key`. */
+export const STACK_VIOLATION_HEADER_FIELD_PATTERN = /^[a-z0-9-]{1,64}$/;
+/** Gray's public request id (`x-request-id`, @gray/ledger-keys `newRequestId`): a UUIDv7's 32 lower-case hex digits. */
+export const STACK_VIOLATION_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+export const stackViolationSchema = z
+  .object({
+    /** A random id of the lane's: the console takes a violation once. */
+    id: z.string().regex(/^[0-9a-f]{32}$/),
+    kind: z.enum(STACK_VIOLATION_KINDS),
+    code: z.enum(STACK_VIOLATION_CODES),
+    /** The kept member (`/model`) or the header name a request violation names; null for an answer. */
+    field: z.string().max(65).nullable(),
+    /** Gray's request id the entry named, or null (a direct client's lane always knows it). */
+    request_id: z.string().regex(STACK_VIOLATION_REQUEST_ID_PATTERN).nullable(),
+    at_minute_ms: minute,
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    const request = (STACK_VIOLATION_REQUEST_CODES as readonly string[]).includes(v.code);
+    if (request !== (v.kind === "request")) ctx.addIssue({ code: "custom", path: ["code"], message: "a request violation has a request code, an answer one an answer code" });
+    if (v.kind === "answer" && v.field !== null) ctx.addIssue({ code: "custom", path: ["field"], message: "an answer violation names no field" });
+    if (v.kind === "request") {
+      const pattern = v.code === "stack_header_refused" ? STACK_VIOLATION_HEADER_FIELD_PATTERN : STACK_VIOLATION_BODY_FIELD_PATTERN;
+      if (v.field === null || !pattern.test(v.field)) ctx.addIssue({ code: "custom", path: ["field"], message: "a request violation names the kept member or the header" });
+    }
+  });
+
+/** One violation as the report carries it, with JS numbers. */
+export interface StackViolation {
+  readonly id: string;
+  readonly kind: StackViolationKind;
+  readonly code: StackViolationCode;
+  readonly field: string | null;
+  readonly request_id: string | null;
+  readonly at_minute_ms: number;
+}
+
 /** The exclusions of an account (`StackExclusionReason`'s account words). */
 export const STACK_ACCOUNT_EXCLUSIONS = [
   "not_sealed",
@@ -86,6 +144,7 @@ export const STACK_ACCOUNT_EXCLUSIONS = [
   "proxy_mismatch",
   "proxy_waiting",
   "duplicate_credential",
+  "login_waiting",
 ] as const satisfies readonly StackExclusionReasonWord[];
 
 const coolingSchema = z
@@ -144,6 +203,29 @@ export const stackReportRefreshSchema = z
   })
   .strict();
 
+const HOUR_MS = 3_600_000n;
+/** A sign-in's time in the report: a whole hour (the container chooses when it signs in: relay-changes-v2 V8). */
+const hour = uintSchema.refine((v) => v % HOUR_MS === 0n, { message: "a sign-in time in stack.report is a whole hour" });
+
+/**
+ * A password account's sign-in inside the VM (egress stack_login.go `loginHealth`): who signs in, the state, the failed
+ * token exchanges in a row, the last one's outcome and hour, and the hour of the last one that gave a token. Absent for
+ * every other account, and from an entry older than it.
+ */
+export const stackReportLoginSchema = z
+  .object({
+    by: z.enum(STACK_LOGIN_BY),
+    state: z.enum(STACK_LOGIN_STATES),
+    failures: u32,
+    last: z
+      .object({ outcome: z.enum(["ok", "failed"]), code: z.enum(STACK_LOGIN_CODES).nullable(), hour_ms: hour })
+      .strict()
+      .refine((l) => (l.outcome === "ok") === (l.code === null), { message: "an ok sign-in has no code, a failed one names one", path: ["code"] })
+      .nullable(),
+    last_ok_hour_ms: hour.nullable(),
+  })
+  .strict();
+
 const accountSchema = z
   .object({
     account_id: id,
@@ -155,6 +237,7 @@ const accountSchema = z
     cooling: z.array(coolingSchema).max(STACK_REPORT_COOLING_MAX),
     windows: stackWindowsSchema,
     refresh: stackReportRefreshSchema.nullable().optional(),
+    login: stackReportLoginSchema.nullable().optional(),
   })
   .strict()
   .refine((a) => (a.served === "excluded") === (a.reason !== null), { message: "an excluded account names why, a served or paused one does not", path: ["reason"] });
@@ -190,6 +273,8 @@ export const stackReportSchema = z
       .max(STACK_REPORT_ROUTES_MAX),
     appends_excluded: z.array(z.object({ append_id: id, reason: z.enum(["append_digest_mismatch", "appends_over_limit"]) }).strict()).max(STACK_REPORT_APPENDS_MAX),
     relay_image: z.string().max(512).regex(STACK_REPORT_RELAY_IMAGE_PATTERN).nullable().optional(),
+    /** The boot's first violation the console has not taken (docs/design/relay-ejection.md); absent when none. */
+    violation: stackViolationSchema.optional(),
   })
   .strict();
 export type StackReportDto = z.infer<typeof stackReportSchema>;
@@ -242,6 +327,16 @@ export interface StackReportAccount {
   readonly windows: readonly StackReportWindow[];
   /** Egress's refresh of the account; absent from an entry older than it. */
   readonly refresh?: StackReportRefresh | null;
+  /** A password account's sign-in inside the VM; absent for every other account and from an entry older than it. */
+  readonly login?: StackReportLogin | null;
+}
+/** A password account's sign-in as the report carries it, with JS numbers. */
+export interface StackReportLogin {
+  readonly by: (typeof STACK_LOGIN_BY)[number];
+  readonly state: StackLoginState;
+  readonly failures: number;
+  readonly last: { readonly outcome: "ok" | "failed"; readonly code: StackLoginCode | null; readonly hour_ms: number } | null;
+  readonly last_ok_hour_ms: number | null;
 }
 /** The report with JS numbers. */
 /**
@@ -270,6 +365,8 @@ export interface StackReport {
   readonly appends_excluded: readonly { readonly append_id: string; readonly reason: "append_digest_mismatch" | "appends_over_limit" }[];
   /** S55: the boot's relay image; absent from an entry older than S55. */
   readonly relay_image?: string | null;
+  /** The boot's first violation the console has not taken; absent when none (docs/design/relay-ejection.md). */
+  readonly violation?: StackViolation;
 }
 
 /** The report the console stores: the wire report with JS numbers. */

@@ -220,6 +220,8 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		writeRefusal(rec, code)
 		return
 	}
+	// docs/design/relay-debug-sharing.md: the body as the vendor gets it, for a registration that asked for it.
+	req.recordForwarded(attempt.n, body)
 	s.stack.health.relayChanges(accepted.Changed, len(headerChanges) > 0)
 	// The vendor call ends with the relay's connection or with the rid, whichever ends first.
 	ctx, cancel := context.WithCancel(r.Context())

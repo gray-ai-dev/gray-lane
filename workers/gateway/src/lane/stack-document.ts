@@ -106,6 +106,7 @@ export type StackExclusionReason =
   | "proxy_mismatch"
   | "proxy_waiting"
   | "duplicate_credential"
+  | "login_waiting"
   | "route_unserved"
   | "route_conflict"
   | "append_digest_mismatch"
@@ -282,14 +283,16 @@ export function buildStackDocument(input: StackDocumentInput): StackDocument {
       if (sealed === undefined) return "not_sealed";
       if (sealed.vendor !== account.vendor) return "vendor_mismatch";
       if (sealed.version < BigInt(account.credential_version)) return "credential_waiting";
-      if (account.credential_type !== undefined && account.credential_type !== sealed.credential.type) return "invalid_credential";
+      // A password account serves with its sign-in's access token: the panel's type for it is that.
+      const servedType = sealed.login === undefined ? sealed.credential.type : "oauth_access_token";
+      if (account.credential_type !== undefined && account.credential_type !== servedType) return "invalid_credential";
       if (account.proxy_id === null) return sealed.egress === undefined ? null : "proxy_mismatch";
       const proxy = proxies.get(account.proxy_id);
       if (proxy === undefined) return "proxy_unknown";
       if (sealed.egress === undefined || !proxyMatches(proxy, sealed.egress)) return "proxy_mismatch";
       if (sealed.version < BigInt(proxy.credential_version)) return "proxy_waiting";
       return null;
-    })();
+    })() ?? (sealed?.credential.type === "password" ? "login_waiting" : null);
     if (reason !== null || sealed === undefined) {
       excluded.push({ kind: "account", id: account.id, reason: reason ?? "not_sealed" });
       continue;

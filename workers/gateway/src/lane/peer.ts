@@ -3,12 +3,14 @@ import type { Json } from "@gray/json";
 import { verifyPeerAttestation, type PeerReleaseList, type QuoteVerifier } from "@gray/lane-verify";
 import { collateralQuoteVerifier, collateralWithChain, quoteCollateralKey, type Collateral } from "@gray/lane-verify/dcap-offline";
 import {
+  checkPeerDebugEnvelope,
   checkPeerEnvelope,
   collateralNextUpdateMs,
   PEER_ISSUED_SKEW_MS,
   type CollateralCa,
   type CollateralDto,
   type PeerAttemptState,
+  type PeerDebugEnvelopeDto,
   type PeerEnvelopeDto,
   type PeerEnvelopeUse,
   type PeerRefusalCode,
@@ -340,6 +342,20 @@ export class PeerState {
     const issued = Number(envelope.issued_ms);
     if (Math.abs(issued - now) > PEER_ISSUED_SKEW_MS || !this.#freshNonce(envelope.nonce, now)) return { ok: false, code: "peer_replayed" };
     if (use === "request" && this.attempts.has(PeerAttempts.key(envelope), now)) return { ok: false, code: "peer_replayed" };
+    return { ok: true, envelope };
+  }
+
+  /**
+   * A debug hop's envelope (docs/design/relay-debug-sharing.md §4): checks 1 to 3 as for the follow-up, under the debug
+   * domain line (`@gray/lane-wire` `peer-debug.ts`). The envelope names no body; a hop asked twice answers the first share.
+   */
+  async checkDebug(header: string | null): Promise<{ readonly ok: true; readonly envelope: PeerDebugEnvelopeDto } | { readonly ok: false; readonly code: "peer_malformed" | "peer_unknown" | "peer_audience" | "peer_replayed" }> {
+    const now = this.#options.now();
+    const signed = await checkPeerDebugEnvelope(header, (entry) => this.#keyFor(entry));
+    if (!signed.ok) return signed;
+    const envelope = signed.envelope;
+    if (envelope.aud !== this.#options.keysetDigest) return { ok: false, code: "peer_audience" };
+    if (Math.abs(Number(envelope.issued_ms) - now) > PEER_ISSUED_SKEW_MS || !this.#freshNonce(envelope.nonce, now)) return { ok: false, code: "peer_replayed" };
     return { ok: true, envelope };
   }
 

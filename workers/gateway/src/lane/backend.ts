@@ -33,6 +33,7 @@ import {
   addStackReceipt,
   LANE_RELAY_FAILED,
   newStackRid,
+  reportViolation,
   StackCall,
   stackBehaviourHeaders,
   stackRawQuery,
@@ -42,7 +43,9 @@ import {
   type StackOutcome,
   type StackReturned,
 } from "./stack.ts";
-import type { StackRelayConfig, StackRelayRoute } from "./stack-config.ts";
+import type { StackRelayConfig, StackRelayRoute, StackViolationFound } from "./stack-config.ts";
+import { DEBUG_ANSWER_CAPTURE_MAX_BYTES } from "./stack-debug.ts";
+import type { CapturedCall } from "./stack-debug-record.ts";
 import { stackRequestBody } from "./stack-rewrite.ts";
 import type { LaneState, StackTransport } from "./types.ts";
 
@@ -107,6 +110,13 @@ export interface BackendInput {
   readonly clock: () => number;
   readonly timers: StreamTimers;
   readonly waitUntil: (promise: Promise<unknown>) => void;
+  /** Where a closed call's non-compliant change goes (`StackRelayConfigProvider.violation`, docs/design/relay-ejection.md). */
+  readonly violation?: (found: StackViolationFound) => void;
+  /**
+   * The stack VM's debug store (docs/design/relay-debug-sharing.md §2): what Gray's programs saw of the call, once it
+   * ended. Present, the call asks egress for its forwarded bodies too. Absent (a VM that shares nothing): neither.
+   */
+  readonly debug?: (call: CapturedCall) => void;
 }
 
 /** How the attempt ended, for `end`. */
@@ -234,6 +244,10 @@ class BackendRun {
   readonly #digester = new StackEventDigester();
   readonly #chain = new StackEventsChain();
   readonly #body: Uint8Array[] = [];
+  /** The client's bytes for the debug capture, up to DEBUG_ANSWER_CAPTURE_MAX_BYTES, and how many were written. */
+  readonly #captured: Uint8Array[] = [];
+  #capturedBytes = 0;
+  #writtenBytes = 0;
   #stream = false;
   /**
    * Whether what the client is written is an event stream: the head's `stream` once it is written. The request's
@@ -277,8 +291,10 @@ class BackendRun {
     const call = this.#call;
     // The rid ends at egress and the feed is read through `done` before the receipt is written (S26).
     await call?.close();
+    if (call !== null) reportViolation(call, this.#input.violation, this.#input.envelope.rid);
     const receipt = call === null ? null : await this.#receipt(call, ended);
     this.#input.peer.attempts.done(this.#key, receipt === null ? null : receiptDocument(receipt));
+    if (call !== null) this.#capture(call, ended);
     if (!this.#headed) await this.#head(this.#status, false);
     let frame: Uint8Array | null = null;
     try {
@@ -290,6 +306,42 @@ class BackendRun {
     }
     if (frame !== null) await this.#hop.write(frame);
     this.#hop.close();
+  }
+
+  /**
+   * The call's debug capture (docs/design/relay-debug-sharing.md §2): the client's request as the entry forwarded it,
+   * egress's records of the rid's calls, and what the client was written. Diagnostics: a capture that fails is logged
+   * and left out, never the answer's concern.
+   */
+  #capture(call: StackCall, ended: Ended): void {
+    const input = this.#input;
+    if (input.debug === undefined) return;
+    try {
+      const headers: Record<string, string> = { ...stackBehaviourHeaders(input.request.headers, input.protocol) };
+      for (const name of ["user-agent", "accept"]) {
+        const value = input.request.headers.get(name);
+        if (value !== null) headers[name] = value;
+      }
+      const answer = new Uint8Array(this.#capturedBytes);
+      let at = 0;
+      for (const chunk of this.#captured) {
+        answer.set(chunk, at);
+        at += chunk.length;
+      }
+      input.debug({
+        rid: call.rid,
+        startedAt: call.startedAt,
+        protocol: input.protocol,
+        path: input.path,
+        query: stackRawQuery(input.request.url),
+        headers,
+        body: input.body,
+        attempts: [...call.feed.attempts.values()].sort((left, right) => left.n - right.n),
+        answer: { status: this.#status, stream: this.#answerStream, outcome: ended.outcome, code: ended.code, servedAttempt: call.served?.n ?? null, bytes: answer, size: this.#writtenBytes },
+      });
+    } catch (error) {
+      console.error(JSON.stringify({ level: "error", event: "lane_debug_capture_failed", rid: input.envelope.rid, error: error instanceof Error ? error.name : "error" }));
+    }
   }
 
   /** The `end` frame, held to `peerEndSchema`'s rules by its outcome. */
@@ -375,6 +427,8 @@ class BackendRun {
       headers: stackRelayHeaders(input.request.headers, protocol, input.config.inboundToken, rid, body.routeModel, conversation),
       egress: input.transport.egress,
       relay: input.transport.relay,
+      // docs/design/relay-debug-sharing.md: egress writes each forwarded body into the feed for the debug capture.
+      ...(input.debug === undefined ? {} : { captureForwarded: true }),
       signal: controller.signal,
       timers: input.timers,
       clock,
@@ -627,6 +681,12 @@ class BackendRun {
   /** Every byte the client is written, as `InferenceRun`'s lane tap hears it: the receipt's `response.returned`. */
   #tap(bytes: Uint8Array): void {
     this.#hash.update(bytes);
+    this.#writtenBytes += bytes.length;
+    if (this.#input.debug !== undefined && this.#capturedBytes < DEBUG_ANSWER_CAPTURE_MAX_BYTES) {
+      const kept = bytes.slice(0, DEBUG_ANSWER_CAPTURE_MAX_BYTES - this.#capturedBytes);
+      this.#captured.push(kept);
+      this.#capturedBytes += kept.length;
+    }
     if (this.#headed ? this.#answerStream : this.#stream) {
       for (const digest of this.#digester.write(bytes)) this.#chain.push(digest);
       return;

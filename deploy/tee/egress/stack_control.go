@@ -258,6 +258,9 @@ type wireRegistration struct {
 	Headers      *map[string]string `json:"headers"`
 	Vendor       *string            `json:"vendor"`
 	Conversation *string            `json:"conversation"`
+	// Forwarded, optional (docs/design/relay-debug-sharing.md): true asks for each accepted call's body as the vendor
+	// got it, in a `forwarded` record after its `attempt` (stackRequest.recordForwarded); absent or false, none.
+	Forwarded *bool `json:"forwarded"`
 }
 
 func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, entry *requestLog) {
@@ -325,6 +328,7 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 		attemptsMax: *wire.AttemptsMax,
 		expiresAt:   expiresAt,
 		size:        size,
+		forwarded:   wire.Forwarded != nil && *wire.Forwarded,
 	})
 	if code != "" {
 		refuse(code)

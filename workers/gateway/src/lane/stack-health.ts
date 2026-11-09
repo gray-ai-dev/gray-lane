@@ -9,6 +9,9 @@ import {
   STACK_ATTEMPT_CLASSES,
   STACK_COOLING_KINDS,
   STACK_COOLING_MODES,
+  STACK_LOGIN_BY,
+  STACK_LOGIN_CODES,
+  STACK_LOGIN_STATES,
   STACK_REFRESH_CODES,
   STACK_REFRESH_MODES,
   STACK_REFRESH_PROBLEMS,
@@ -34,6 +37,7 @@ import {
   type StackReport,
   type StackReportAccount,
   type StackReportCooling,
+  type StackReportLogin,
   type StackReportRefresh,
   type StackRelayChangeCounters,
   type StackReportWindow,
@@ -43,6 +47,7 @@ import {
   type StackTestCode,
   type StackTestResult,
   type StackTestsAnswer,
+  type StackViolation,
 } from "@gray/lane-wire";
 import { authHeaders, credentialExpiry, egressValue, type StackSealedAccount } from "@gray/relay-connector";
 import { z } from "zod";
@@ -206,6 +211,17 @@ const egressRefreshSchema = z
   })
   .strict();
 
+/** A password account's sign-in (egress stack_login.go `loginHealth`): its times are already whole hours. */
+const egressLoginSchema = z
+  .object({
+    by: z.enum(STACK_LOGIN_BY),
+    state: z.enum(STACK_LOGIN_STATES),
+    failures: uintSchema.max(4_294_967_295n),
+    last: z.object({ outcome: z.enum(["ok", "failed"]), code: z.enum(STACK_LOGIN_CODES).nullable(), hour_ms: uintSchema }).strict().nullable(),
+    last_ok_hour_ms: uintSchema.nullable(),
+  })
+  .strict();
+
 /** `GET /v1/stack/health` (S37, egress `stack_health.go`), its integers as `parseStrict` reads them. */
 const egressHealthSchema = z
   .object({
@@ -233,6 +249,8 @@ const egressHealthSchema = z
           windows: z.array(egressWindowSchema),
           // The account's token refresh (egress stack_ops.go `refreshHealth`); null when egress does not refresh its kind.
           refresh: egressRefreshSchema.nullable().optional(),
+          // A password account's sign-in inside the VM (docs/design/relay-in-cvm-login.md §4); absent for the others.
+          login: egressLoginSchema.optional(),
         })
         .strict(),
     ),
@@ -273,6 +291,7 @@ interface EgressHealth {
     }[];
     readonly windows: readonly EgressWindow[];
     readonly refresh?: EgressRefresh | null;
+    readonly login?: StackReportLogin;
   }[];
 }
 
@@ -337,7 +356,17 @@ const STACK_TEST_CREDENTIAL_FORMS: Readonly<Record<string, readonly string[]>> =
  * (S44 `not_sealed`): a test of what the VM does hold would not be the account's. A duplicate credential is the
  * account's own, so it is tested.
  */
-const NOT_SEALED_FOR_TEST: ReadonlySet<StackExclusionReason> = new Set(["not_sealed", "vendor_mismatch", "credential_waiting", "invalid_credential", "proxy_unknown", "proxy_mismatch", "proxy_waiting"]);
+const NOT_SEALED_FOR_TEST: ReadonlySet<StackExclusionReason> = new Set([
+  "not_sealed",
+  "vendor_mismatch",
+  "credential_waiting",
+  "invalid_credential",
+  "proxy_unknown",
+  "proxy_mismatch",
+  "proxy_waiting",
+  // A password account before its first sign-in has no token to test with.
+  "login_waiting",
+]);
 
 /** The protocol word a report's excluded route may carry (the bridge's schema). */
 const REPORT_PROTOCOL = /^[a-z0-9_]{1,64}$/;
@@ -440,6 +469,8 @@ export class StackHealthService {
   #settled = new Map<string, { readonly cooling: readonly StackReportCooling[]; readonly windows: readonly StackReportWindow[] }>();
   /** Each account's refresh as egress was last read: a round that cannot read egress reports these. */
   #refresh = new Map<string, StackReportRefresh>();
+  /** Each password account's sign-in as egress was last read, the same way. */
+  #login = new Map<string, StackReportLogin>();
   /** Egress's `started_ms` as last read. */
   #egressStarted: number | null = null;
   /** The last cooling push number used or seen at egress (S40's sequence). */
@@ -455,11 +486,31 @@ export class StackHealthService {
   /** The container's view (S40): the last body egress gave and when, and a read in flight. */
   #view: { readonly body: string; readonly at: number } | null = null;
   #viewRead: Promise<string | null> | null = null;
+  /**
+   * The boot's first violation the console has not taken (docs/design/relay-ejection.md section 2): the report carries
+   * it until a report that carried it is recorded. One is enough: a later one waits until the console took it.
+   */
+  #violation: StackViolation | null = null;
+  /** Whether a report carried the held violation yet: its first send does not wait for LANE_STACK_REPORT_MIN_MS. */
+  #violationSent = false;
 
   constructor(options: StackHealthOptions) {
     this.#options = options;
     this.#log = options.log ?? ((line) => console.log(JSON.stringify(line)));
     this.#bootedAt = options.now();
+  }
+
+  /** Holds `violation` for the next report unless one is held already; true when it is now held. */
+  hold(violation: StackViolation): boolean {
+    if (this.#violation !== null) return false;
+    this.#violation = violation;
+    this.#violationSent = false;
+    return true;
+  }
+
+  /** A violation is held: the console has not taken it yet. */
+  get holding(): boolean {
+    return this.#violation !== null;
   }
 
   /**
@@ -480,6 +531,7 @@ export class StackHealthService {
         if (health !== null) this.#observe(health);
       }
       if (health !== null) this.#refresh = new Map(health.accounts.flatMap((a) => (a.refresh ? [[a.account_id, reportRefresh(a.refresh)] as const] : [])));
+      if (health !== null) this.#login = new Map(health.accounts.flatMap((a) => (a.login ? [[a.account_id, a.login] as const] : [])));
       if (health !== null && this.#holdsOwn(health)) {
         this.#settled = new Map(health.accounts.map((a) => [a.account_id, { cooling: a.cooling.map(reportCooling), windows: a.windows.map(reportWindow) }]));
         this.#entriesKnown = true;
@@ -630,20 +682,30 @@ export class StackHealthService {
   async #maybeReport(view: StackHealthView, health: EgressHealth | null): Promise<void> {
     const options = this.#options;
     const now = options.now();
-    if (this.#reportTriedAt !== null && now - this.#reportTriedAt < options.reportMinMs) return;
+    // A violation's first report goes at once; any other waits LANE_STACK_REPORT_MIN_MS after the last try.
+    const urgent = this.#violation !== null && !this.#violationSent;
+    if (!urgent && this.#reportTriedAt !== null && now - this.#reportTriedAt < options.reportMinMs) return;
     // What changed is what the console would store: the report without its sequence number (still 0 here), as fitting
     // it serialized it.
     const { report, text } = this.#fitted(this.#buildReport(view, health, now));
     const reported = this.#reported;
     if (reported !== null && reported.text === text && now - reported.at < options.reportHeartbeatMs) return;
     this.#reportTriedAt = now;
+    const carried = report.violation ?? null;
+    if (carried !== null) this.#violationSent = true;
     // Per boot and growing; past every earlier boot's too (milliseconds), so an entry restarted within one boot minute
     // is not refused as older than the boot before it (S42's order: boot minute, then seq).
     this.#seq = Math.max(this.#seq + 1, now);
     try {
       const recorded = await options.source.report({ ...report, seq: this.#seq });
-      this.#reported = { text, at: now };
+      // A violation the console did not record is sent again after LANE_STACK_REPORT_MIN_MS, not at the heartbeat.
+      if (recorded || carried === null) this.#reported = { text, at: now };
       if (!recorded) this.#log({ level: "warn", event: "lane_stack_report_not_recorded", relay_id: options.relayId });
+      // The console took the violation, and decided whether the relay routes.
+      if (recorded && carried !== null && this.#violation?.id === carried.id) {
+        this.#violation = null;
+        this.#log({ level: "info", event: "lane_stack_violation_taken", relay_id: options.relayId, code: carried.code });
+      }
     } catch (error) {
       this.#log({ level: "warn", event: "lane_stack_report_failed", relay_id: options.relayId, code: errorCode(error) });
     }
@@ -674,17 +736,23 @@ export class StackHealthService {
       const held = sealedById.get(account.id);
       const live = egressById.get(account.id);
       const refresh = this.#refresh.get(account.id);
+      const login = this.#login.get(account.id);
       return {
         account_id: account.id,
         served: reason !== null ? "excluded" : account.status === "paused" ? "paused" : "served",
         reason: reason as StackReportAccount["reason"],
-        sealed: held === undefined ? null : { version: safeNumber(held.version), type: held.credential.type, expires_at_s: sealedExpiry(held) },
+        // A password account serves with its sign-in's access token, the type the report names.
+        sealed:
+          held === undefined
+            ? null
+            : { version: safeNumber(held.version), type: held.credential.type === "password" ? "oauth_access_token" : held.credential.type, expires_at_s: sealedExpiry(held) },
         proxy_id: account.proxy_id,
         in_flight_peak: live === undefined || live.peak === null ? null : { minute_ms: floorMinute(live.peak.minute_ms), value: live.peak.in_flight },
         cooling: (own ? (live?.cooling ?? []).map(reportCooling) : carried(account.id)).slice(0, STACK_REPORT_COOLING_MAX),
         windows: (health === null ? (this.#settled.get(account.id)?.windows ?? []) : (live?.windows ?? []).map(reportWindow)).slice(0, STACK_REPORT_WINDOWS_MAX),
         // Only for an account egress refreshes or could: an API key's object stays as an older entry wrote it.
         ...(refresh === undefined ? {} : { refresh }),
+        ...(login === undefined ? {} : { login }),
       };
     });
     return {
@@ -707,6 +775,7 @@ export class StackHealthService {
         .flatMap((e) => (e.kind === "append" && STACK_WIRE_ID_PATTERN.test(e.id) ? [{ append_id: e.id, reason: e.reason as "append_digest_mismatch" | "appends_over_limit" }] : []))
         .slice(0, STACK_REPORT_APPENDS_MAX),
       relay_image: options.relayImage,
+      ...(this.#violation === null ? {} : { violation: this.#violation }),
     };
   }
 

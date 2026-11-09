@@ -1,12 +1,12 @@
 import { sha256BareHex } from "@gray/attest";
 import { parsePlain as parsePlainJson, toJsonString } from "@gray/json";
-import { PROXY_CHECK_CODES, PROXY_CHECK_RESULTS_MAX, type PendingProxyCheck, type ProxyCheckCode, type ProxyCheckResult, type StackConfigAnswer, type StackConfigDocument } from "@gray/lane-wire";
+import { floorMinute, PROXY_CHECK_CODES, PROXY_CHECK_RESULTS_MAX, type PendingProxyCheck, type ProxyCheckCode, type ProxyCheckResult, type StackConfigAnswer, type StackConfigDocument } from "@gray/lane-wire";
 import { egressValue, type EgressSpec, type StackSealedAccount } from "@gray/relay-connector";
 import type { Snapshot } from "@gray/snapshot";
 import { BridgeCallError, LANE_BRIDGE_CALL_MS, type BridgeClientOptions } from "./remote/client.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { StackConfigClient } from "./remote/stack.ts";
-import type { StackRelayConfig, StackRelayConfigProvider } from "./stack-config.ts";
+import type { StackRelayConfig, StackRelayConfigProvider, StackViolationFound } from "./stack-config.ts";
 import { buildStackDocument, inboundTokenText, stackTableBody, StackDocumentError, type StackAccountRow, type StackDocument } from "./stack-document.ts";
 import { StackHealthService, type StackHealthView } from "./stack-health.ts";
 
@@ -157,6 +157,11 @@ interface Versions {
   readonly credentials: Numbered;
 }
 
+/** 16 random bytes as 32 lower-case hex: a violation's id, by which the console takes it once. */
+function randomHex32(): string {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** `max(previous + 1, now)`: a boot's versions only grow, and a later boot's start above an earlier one's. */
 function nextVersion(previous: Numbered | undefined, digest: string, now: bigint): Numbered {
   const after = (previous?.value ?? 0n) + 1n;
@@ -234,6 +239,21 @@ export class StackConfigService implements StackRelayConfigProvider {
   current(ctx?: { waitUntil(promise: Promise<unknown>): void }): StackRelayConfig | null {
     if (ctx !== undefined && this.#pollDue()) ctx.waitUntil(this.refresh());
     return this.#fetched?.config ?? null;
+  }
+
+  /**
+   * A closed call showed a non-compliant change (`StackRelayConfigProvider.violation`): logged, and held by account
+   * health for the next report, which runs now. The VM does not stop on its own (docs/design/relay-ejection.md section
+   * 2): the console decides (LANE_STACK_EJECTION), and its decision reaches the entries through the snapshot and this VM
+   * through its configuration, so the two never disagree.
+   */
+  violation(found: StackViolationFound, requestId: string | null, ctx?: { waitUntil(promise: Promise<unknown>): void }): void {
+    const now = this.#options.now();
+    this.#log({ level: "error", event: "lane_stack_violation", relay_id: this.#options.relayId, kind: found.kind, code: found.code, field: found.field, request_id: requestId });
+    const health = this.#options.health;
+    if (health === undefined) return;
+    const held = health.hold({ id: randomHex32(), kind: found.kind, code: found.code, field: found.field, request_id: requestId, at_minute_ms: floorMinute(now) });
+    if (held && ctx !== undefined) ctx.waitUntil(this.refresh());
   }
 
   /** The versions `GET …/version` answers now, or null before egress acknowledged any. */

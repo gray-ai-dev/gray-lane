@@ -33,9 +33,9 @@ import {
  * `base_url` is an official vendor origin, and whose `lane` record names its relay and its scheduler.
  * Admission is the existing provider approval (`POST /api/v1/ops/providers/{workspace}/approve`, or the
  * admission policy's account/quote pass): a lane relay's mappings and offers go through the same
- * offer/approval flow as any other endpoint, and an offer on it needs a current passing verification —
- * which a lane relay cannot obtain by probing, so it is approved by an operator only, and the lane's own
- * attestation is what serves in place of the console's probe (see `laneRelayNeedsOperatorOffer`).
+ * offer flow as any other endpoint, but its price takes effect when it is submitted: relays set their own
+ * prices (the owner's free-market decision of 2026-11-09), and the lane's own attestation is what serves in
+ * place of the console's probe and its passing verification (see `laneRelayPricesAtOnce`).
  */
 
 /** One value per OpenAI-compatible vendor, keyed by its id. */
@@ -93,8 +93,9 @@ export const LANE_KIND_RULE =
   "An endpoint is a confidential-lane relay or a direct endpoint for its whole life: its auth kind, and the relay its stored credential names, cannot change. Register a new endpoint for the other kind, or for another relay.";
 export const LANE_CREDENTIAL_ROTATION_RULE =
   "A confidential-lane endpoint holds no upstream key to rotate: its credential is the sentinel lane:<relay_id>, fixed by its lane record, and the relay's accounts are sealed to the TEE.";
+/** The reason a lane relay's price is approved with when it is submitted, and the rule admission applies to one. */
 export const LANE_OFFER_RULE =
-  "A confidential-lane relay's quote is admitted by an operator's decision, not automatically: the console cannot probe a relay, and the lane verifies it by attestation and signatures.";
+  "A confidential-lane relay's price takes effect when it is submitted: relays set their own prices (a free market), and the lane verifies the relay by attestation and signatures, not by a console probe.";
 
 /** The vendor a lane endpoint's base URL names, or null when it names none (`@gray/lane` `checkOfficialUpstream`). */
 export function laneVendorOf(baseUrl: string): OfficialVendor | null {
@@ -168,13 +169,12 @@ export function probeRefusalFor(config: Pick<EndpointConfig, "auth">): string | 
 }
 
 /**
- * Whether a lane relay's offer must be decided by an operator rather than admitted automatically. A lane
- * relay has no console-obtained verification (its route serves on the lane's own attestation), so the
- * automatic offer admission's "fresh passing verification" rule cannot pass; the operator decides with
- * `POST /api/v1/ops/provider-offers/{id}/decision`, and the lane filters the relay out of the main-lane
- * snapshot meantime.
+ * Whether an offer on this endpoint takes effect when it is submitted, with no operator and no passing
+ * verification (`LANE_OFFER_RULE`): a lane relay sets its own price (the owner's free-market decision of
+ * 2026-11-09), and has no console-obtained verification to wait for (its route serves on the lane's own
+ * attestation). `submitOffer` approves one at once; admission approves one it finds still submitted.
  */
-export function laneRelayNeedsOperatorOffer(config: Pick<EndpointConfig, "auth">): boolean {
+export function laneRelayPricesAtOnce(config: Pick<EndpointConfig, "auth">): boolean {
   return config.auth === "lane_relay";
 }
 

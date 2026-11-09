@@ -156,6 +156,7 @@ export const STACK_EXCLUSION_REASONS = [
   "proxy_mismatch",
   "proxy_waiting",
   "duplicate_credential",
+  "login_waiting",
   "route_unserved",
   "route_conflict",
   "append_digest_mismatch",
@@ -163,8 +164,11 @@ export const STACK_EXCLUSION_REASONS = [
 ] as const;
 export type StackExclusionReasonWord = (typeof STACK_EXCLUSION_REASONS)[number];
 
-/** The exclusions of an account that wait for gray-relay's sealing (S46 state 2); the others are `not_served`. */
-export const STACK_WAITING_EXCLUSIONS = ["not_sealed", "credential_waiting", "proxy_waiting"] as const;
+/**
+ * The exclusions of an account that wait for its credential (S46 state 2): gray-relay's sealing, or a password account's
+ * first sign-in inside the VM (`login_waiting`, docs/design/relay-in-cvm-login.md); the others are `not_served`.
+ */
+export const STACK_WAITING_EXCLUSIONS = ["not_sealed", "credential_waiting", "proxy_waiting", "login_waiting"] as const;
 
 /** Whose a container call's fault is (`stack.ts` `StackFault.by`). */
 export const STACK_FAULT_BY = ["relay", "vendor", "egress", "gray"] as const;
@@ -251,6 +255,7 @@ export const STACK_ACCOUNT_STATE_REASONS = [
   "not_sealed",
   "credential_waiting",
   "proxy_waiting",
+  "login_waiting",
   "paused",
   "window_exhausted",
   "window_rejected",
@@ -302,6 +307,21 @@ export const STACK_REFRESH_PROBLEMS = ["no_refresh_token"] as const;
  */
 export const STACK_REFRESH_CODES = ["vendor_rejected", "vendor_error", "proxy_failed", "connect_failed", "timeout", "invalid_answer", "input_missing", "egress_error"] as const;
 export type StackRefreshCode = (typeof STACK_REFRESH_CODES)[number];
+
+/**
+ * A password account's sign-in inside the VM (egress stack_login.go, docs/design/relay-in-cvm-login.md §4): who signs
+ * in (`relay`: the relay's software, through egress), and its state: `signed_in` (egress holds a token good for 5 more
+ * minutes whose last refresh was not refused) or `needed`.
+ */
+export const STACK_LOGIN_BY = ["relay"] as const;
+export const STACK_LOGIN_STATES = ["signed_in", "needed"] as const;
+export type StackLoginState = (typeof STACK_LOGIN_STATES)[number];
+/**
+ * Why a token exchange gave egress no token: the vendor refused it, its answer held no usable token, or the call met a
+ * proxy, connection, time or egress fault.
+ */
+export const STACK_LOGIN_CODES = ["vendor_rejected", "invalid_answer", "proxy_failed", "connect_failed", "timeout", "egress_error"] as const;
+export type StackLoginCode = (typeof STACK_LOGIN_CODES)[number];
 
 /**
  * The client identity a relay registers per account (S32a, egress `stack_identity.go`): the static headers of the

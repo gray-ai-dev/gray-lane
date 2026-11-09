@@ -212,6 +212,7 @@ import {
   newStackRid,
   RELAY_DECLINED,
   peerTraceOf,
+  reportViolation,
   StackCall,
   stackAppendReserveBytes,
   STACK_KEEP_ALIVE,
@@ -1506,6 +1507,9 @@ export class InferenceRun {
       let timer: unknown = null;
       await Promise.race([Promise.all(this.stackCalls.map((call) => call.close())), new Promise<void>((resolve) => (timer = timers.setTimeout(resolve, ERROR_BODY_WAIT_MS)))]);
       timers.clearTimeout(timer);
+      // A direct client's call that showed a non-compliant change (docs/design/relay-ejection.md), with this request's id.
+      const provider = this.lane?.stackConfig;
+      for (const call of this.stackCalls) reportViolation(call, provider?.violation === undefined ? undefined : (found) => provider.violation?.(found, this.requestId, this.ctx), call.rid);
       const stackTrace = stackTraceOf({ relayId, requestStart: this.started, calls: this.stackCalls });
       return stackTrace === null ? record : { ...record, stackTrace };
     } catch (error) {
@@ -1688,7 +1692,7 @@ export class InferenceRun {
       });
       const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
       if (this.laneOwner === null) throw new Error("a lane receipt without a key hash");
-      lane.state.receipts.put(signed, this.laneOwner, peers);
+      lane.state.receipts.put(signed, this.laneOwner, peers, { requestId: this.requestId, workspaceId: this.key?.workspaceId ?? null });
     } catch (error) {
       const issues = builder === null ? [] : [...new Set(checkEventLog(builder.events()).map((issue) => issue.code))];
       console.error(JSON.stringify({ level: "error", event: "lane_finish_failed", request_id: this.requestId, receipt_id: receiptId, ...failureNames(error), ...(issues.length > 0 ? { issues } : {}) }));
@@ -4841,6 +4845,8 @@ export class InferenceRun {
       ...(conversation === undefined ? {} : { conversation }),
       // The customer's opt-out from relays' own changes, which the stack VM registers (docs/relay-request-changes.md).
       ...(this.preference.relayChanges === "exclude" ? { relayChanges: "exclude" as const } : {}),
+      // Named by a violation the stack VM reports (docs/design/relay-ejection.md section 3).
+      requestId: this.requestId,
       egress: this.outbound.fetch(peers.egress),
       clock: this.deps.clock,
       timers: this.deps.timers ?? platformTimers,

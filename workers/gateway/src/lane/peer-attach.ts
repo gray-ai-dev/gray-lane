@@ -207,6 +207,11 @@ export class PeerSessions {
   readonly #refused = new Map<string, number>();
   /** When each (relay, keyset) last had a session: its pin ends `pinIdleMs` after (O6). */
   readonly #lastSeen = new Map<string, number>();
+  /**
+   * When each (relay, keyset) first attached since it last went `pinIdleMs` without a session: the boot's age as this
+   * entry boot knows it (docs/design/relay-zero-downtime.md, the order of two boots of one relay).
+   */
+  readonly #firstSeen = new Map<string, number>();
 
   constructor(deps: PeerSessionsDeps) {
     this.#deps = deps;
@@ -275,6 +280,7 @@ export class PeerSessions {
       state = "unverified";
     }
     this.#sessions.set(claims.session, { session: claims.session, relay: claims.relay, keyset: claims.keyset, state, attachedMs: now, claims, signature, tunnels: 0, seen: false });
+    if (this.firstSeenOf(claims.relay, claims.keyset) === null) this.#firstSeen.set(pairKey(claims.relay, claims.keyset), now);
     this.#lastSeen.set(pairKey(claims.relay, claims.keyset), now);
     this.#deps.log({ level: "info", event: "lane_peer_attached", relay: claims.relay, keyset_digest: claims.keyset, session: claims.session, state });
     return { ok: true, state };
@@ -329,18 +335,35 @@ export class PeerSessions {
     return this.#expire(this.#deps.clock());
   }
 
-  /** The keysets of `relay` that have sessions, newest attach first, each with its sessions by state. */
-  keysetsOf(relay: string): readonly { readonly keyset: string; readonly pinned: number; readonly unverified: number }[] {
-    const by = new Map<string, { keyset: string; pinned: number; unverified: number; newest: number }>();
+  /**
+   * The keysets of `relay` that have sessions, the newest boot first (first seen, then latest attach), each with its
+   * sessions by state, its open streams (peerlink's count at the last sync: requests and tunnels) and when it was first
+   * seen.
+   */
+  keysetsOf(relay: string): readonly { readonly keyset: string; readonly pinned: number; readonly unverified: number; readonly streams: number; readonly firstSeenMs: number }[] {
+    const by = new Map<string, { keyset: string; pinned: number; unverified: number; streams: number; firstSeenMs: number; newest: number }>();
     for (const s of this.#sessions.values()) {
       if (s.relay !== relay) continue;
-      const row = by.get(s.keyset) ?? { keyset: s.keyset, pinned: 0, unverified: 0, newest: 0 };
+      const row = by.get(s.keyset) ?? { keyset: s.keyset, pinned: 0, unverified: 0, streams: 0, firstSeenMs: this.firstSeenOf(relay, s.keyset) ?? s.attachedMs, newest: 0 };
       if (s.state === "pinned") row.pinned += 1;
       else row.unverified += 1;
+      row.streams += s.tunnels;
       row.newest = Math.max(row.newest, s.attachedMs);
       by.set(s.keyset, row);
     }
-    return [...by.values()].sort((a, b) => b.newest - a.newest).map(({ keyset, pinned, unverified }) => ({ keyset, pinned, unverified }));
+    return [...by.values()]
+      .sort((a, b) => b.firstSeenMs - a.firstSeenMs || b.newest - a.newest)
+      .map(({ keyset, pinned, unverified, streams, firstSeenMs }) => ({ keyset, pinned, unverified, streams, firstSeenMs }));
+  }
+
+  /** When (relay, keyset) first attached, or null when it has had no session within `pinIdleMs` (it is forgotten). */
+  firstSeenOf(relay: string, keyset: string): number | null {
+    const key = pairKey(relay, keyset);
+    if (!this.pinWanted(relay, keyset)) {
+      this.#firstSeen.delete(key);
+      return null;
+    }
+    return this.#firstSeen.get(key) ?? null;
   }
 
   /** Whether (relay, keyset) has a pinned session now (routing prefers such a peer; O5). */

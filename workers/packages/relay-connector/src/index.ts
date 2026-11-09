@@ -30,6 +30,7 @@ export * from "./auth.ts";
 export * from "./bundle.ts";
 export * from "./bytes.ts";
 export * from "./credential.ts";
+export * from "./debug.ts";
 export * from "./egress.ts";
 export * from "./envelope.ts";
 export * from "./errors.ts";
