@@ -41,6 +41,12 @@ const PEERLINK_SOCKET = `${PEERLINK_MOUNT}/peerlink.sock`;
 /** S2b: lane's uid:gid. */
 const LANE_USER = "10001:10001";
 const DSTACK_SOCKET = "/var/run/dstack.sock";
+/**
+ * P2e (docs/design/relay-no-always-on-host.md §3.1): the relay's vault directory on the data disk, bound read-write into
+ * lane at the same path for an app with a KMS lease (lane's LANE_KMS_URL), and for no other (app-compose.mjs VAULT_BIND).
+ */
+const VAULT_PATH = "/var/lib/gray-persist/relay";
+const KMS_URL_NAME = "LANE_KMS_URL";
 const EGRESS_VOLUME = "egress-socket";
 const EGRESS_MOUNT = "/run/gray";
 /** S5: every Gray service. */
@@ -114,6 +120,13 @@ export const STACK_LAYOUT = deepFreeze({
   relaySlot: RELAY_SLOT,
   /** The guest agent's socket: bind-mounted only on `lane`. */
   dstackSocket: DSTACK_SOCKET,
+  /**
+   * P2e: the relay vault's directory, bind-mounted read-write on `lane` at the same path exactly when lane sets
+   * `kmsUrlName` (an app on an on-chain KMS, which keeps a KMS lease); lane's mounts are then `laneVaultVolumes`.
+   */
+  vaultPath: VAULT_PATH,
+  kmsUrlName: KMS_URL_NAME,
+  laneVaultVolumes: [`${DSTACK_SOCKET}:${DSTACK_SOCKET}`, `${VAULT_PATH}:${VAULT_PATH}`, `${EGRESS_VOLUME}:${EGRESS_MOUNT}`, `${PEERLINK_VOLUME}:${PEERLINK_MOUNT}`],
 
   /** S3: the top-level networks, exactly. Only `front` routes out; the relay bridges' names are fixed. */
   networks: {

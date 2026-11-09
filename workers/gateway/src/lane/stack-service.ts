@@ -1,6 +1,6 @@
 import { sha256BareHex } from "@gray/attest";
 import { parsePlain as parsePlainJson, toJsonString } from "@gray/json";
-import { floorMinute, PROXY_CHECK_CODES, PROXY_CHECK_RESULTS_MAX, type PendingProxyCheck, type ProxyCheckCode, type ProxyCheckResult, type StackConfigAnswer, type StackConfigDocument } from "@gray/lane-wire";
+import { floorMinute, PROXY_CHECK_CODES, PROXY_CHECK_RESULTS_MAX, type PendingProxyCheck, type ProxyCheckCode, type ProxyCheckResult, type StackConfigAnswer, type StackConfigDocument, type StackReportVault } from "@gray/lane-wire";
 import { egressValue, type EgressSpec, type StackSealedAccount } from "@gray/relay-connector";
 import type { Snapshot } from "@gray/snapshot";
 import { BridgeCallError, LANE_BRIDGE_CALL_MS, type BridgeClientOptions } from "./remote/client.ts";
@@ -8,6 +8,7 @@ import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { StackConfigClient } from "./remote/stack.ts";
 import type { StackRelayConfig, StackRelayConfigProvider, StackViolationFound } from "./stack-config.ts";
 import { buildStackDocument, inboundTokenText, stackTableBody, StackDocumentError, type StackAccountRow, type StackDocument } from "./stack-document.ts";
+import { LEASE_UNTIL_HEADER, type KmsLeaseGate } from "./kms-lease.ts";
 import { StackHealthService, type StackHealthView } from "./stack-health.ts";
 
 /**
@@ -116,6 +117,11 @@ export interface StackConfigServiceOptions {
    * rather than after LANE_RELAY_ABSENCE_MS. True when there was something to clear.
    */
   readonly onUnknownRelay?: (relayId: string) => boolean;
+  /**
+   * P2c-2, review 11-09: the KMS lease's end each table is pushed with (`LEASE_UNTIL_HEADER`), egress's own bound on the
+   * table; a changed end is a new push. Absent without a lease (phase 1): no header.
+   */
+  readonly leaseUntil?: () => number;
 }
 
 /** Egress's control route for the account table (S15), on the unix socket. The host is not read there. */
@@ -265,11 +271,12 @@ export class StackConfigService implements StackRelayConfigProvider {
    * One refresh in the queue: the bridge when due, a rebuild, and the table push when needed; then, when
    * due, a round of proxy checks after it (outside the queue: a check may take a minute; after the step,
    * so the round reads the metadata the step polled). The promise covers both, so the caller's
-   * `waitUntil` keeps a round alive to its end.
+   * `waitUntil` keeps a round alive to its end. `poll` false asks the bridge nothing (P2c-2: a KMS lease that stopped
+   * serving empties egress's table without waiting on a bridge call).
    */
-  refresh(): Promise<void> {
+  refresh(poll = true): Promise<void> {
     const step = this.#enqueue(async () => {
-      await this.#poll(false);
+      if (poll) await this.#poll(false);
       this.#rebuild();
       await this.#push(false);
     });
@@ -630,7 +637,9 @@ export class StackConfigService implements StackRelayConfigProvider {
     const version = versions.routing.value > versions.credentials.value ? versions.routing.value : versions.credentials.value;
     const desired = this.#desired(exact);
     const body = stackTableBody(desired.rows);
-    const digest = sha256BareHex(new TextEncoder().encode(body));
+    const until = options.leaseUntil?.();
+    // The lease's end is part of what egress holds: a changed end (a renewal, a refusal) is pushed even with the same rows.
+    const digest = `${sha256BareHex(new TextEncoder().encode(body))}${until === undefined ? "" : `:${until}`}`;
     const acked = this.#acked;
     if (acked !== null && acked.digest === digest && options.now() - acked.at < options.pollMs) {
       this.#announce(versions, desired.rotated);
@@ -647,7 +656,12 @@ export class StackConfigService implements StackRelayConfigProvider {
     try {
       const response = await egress.fetch(STACK_ACCOUNTS_URL, {
         method: "PUT",
-        headers: { "content-type": "application/json", [STACK_VERSION_HEADER]: version.toString(), [STACK_PUSH_HEADER]: (this.#pushes += 1n).toString() },
+        headers: {
+          "content-type": "application/json",
+          [STACK_VERSION_HEADER]: version.toString(),
+          [STACK_PUSH_HEADER]: (this.#pushes += 1n).toString(),
+          ...(until === undefined ? {} : { [LEASE_UNTIL_HEADER]: String(until) }),
+        },
         body,
         signal: controller.signal,
       });
@@ -698,8 +712,8 @@ function json(status: number, body: string): Response {
 /** What a boot passes to build its stack service (`createLaneState`'s `stack` option, filled by the entry). */
 export interface LaneStackOptions {
   readonly relayId: string;
-  /** S52/S55: the boot's measured relay image (LANE_STACK_RELAY_IMAGE). */
-  readonly relayImage: string;
+  /** S52/S55: the boot's measured relay image (LANE_STACK_RELAY_IMAGE); null in the empty slot (P2d, LANE_STACK_EMPTY_SLOT). */
+  readonly relayImage: string | null;
   readonly pollMs: number;
   readonly attemptsMax: number;
   readonly rotationGraceMs: number;
@@ -723,8 +737,13 @@ export function laneStackService(
     readonly onSnapshot: (snapshot: Snapshot) => void;
     readonly onUnknownRelay: (relayId: string) => boolean;
     readonly now: () => number;
+    /** P2c-2: the KMS lease's gate (`credentials` already reads through it); the report carries its state. Null without one. */
+    readonly kmsLease?: KmsLeaseGate | null;
+    /** P2e: the vault's versions for the report's `vault`; absent without a vault. */
+    readonly vault?: () => StackReportVault;
   },
 ): StackConfigService {
+  const kmsLease = options.kmsLease ?? null;
   const metadata = new StackConfigClient(options.bridge);
   const snapshots = new RemoteSnapshotSource({ ...options.bridge, onSnapshot: options.onSnapshot });
   let have = 0;
@@ -744,6 +763,7 @@ export function laneStackService(
     egress: options.egress,
     onUnknownRelay: options.onUnknownRelay,
     now: options.now,
+    ...(kmsLease === null ? {} : { leaseUntil: () => kmsLease.servesUntil(options.now()) }),
     pollMs: options.pollMs,
     attemptsMax: options.attemptsMax,
     rotationGraceMs: options.rotationGraceMs,
@@ -757,6 +777,8 @@ export function laneStackService(
       pollMs: options.pollMs,
       reportMinMs: options.reportMinMs,
       reportHeartbeatMs: options.reportHeartbeatMs,
+      ...(kmsLease === null ? {} : { kmsLease: (nowMs: number) => kmsLease.report(nowMs) }),
+      ...(options.vault === undefined ? {} : { vault: options.vault }),
     }),
   });
 }

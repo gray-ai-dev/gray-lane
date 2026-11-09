@@ -1,12 +1,12 @@
-# gray-lane 2026.11.09-745af9427725
+# gray-lane 2026.11.09-0e69fc6edfb8
 
-The source of Gray's `gray-lane` image built from Gray's commit `745af9427725a2f20df55ba9060d7ad2d744d8af`, published so that a relay, or the
+The source of Gray's `gray-lane` image built from Gray's commit `0e69fc6edfb84599157dd6515fe606436961b33d`, published so that a relay, or the
 coding agent a relay uses, can review each release before it accepts it. The image runs in every lane CVM: in the
-entry's default layout and in each relay's stack VM. This tree holds exactly the 600 files its build reads, at
+entry's default layout and in each relay's stack VM. This tree holds exactly the 619 files its build reads, at
 the paths they have in Gray's repository, so the build scripts run unchanged. It also holds the measured compose
 templates and pre-launch scripts that decide what the CVM starts. Tests, documentation and Gray's other services
 are not included. Each release is one commit in this repository. Its parent is the release published before it, so
-`git diff <previous tag> 2026.11.09-745af9427725` shows the code that changed between the two.
+`git diff <previous tag> 2026.11.09-0e69fc6edfb8` shows the code that changed between the two.
 
 | What runs in the CVM | Where its source is |
 |-|-|
@@ -33,7 +33,7 @@ published manifest and compare: `docker manifest inspect <stack.gray_image>` nee
 before the image moved there name an earlier, private repository in `stack.gray_image`; their digests are checked
 the same way, by rebuilding.
 
-`gray-relay releases` lists the releases your agent has seen, with their compose hashes and commits.
+`gray-assistant releases` lists the releases your agent has seen, with their compose hashes and commits.
 
 ## What to review
 
@@ -41,7 +41,7 @@ The question to answer for each release is whether any code path can keep a rela
 the boot that uses them, or send them, or anything derived from them, anywhere except the vendor they belong to.
 Suggested instructions for a coding agent:
 
-> Review this tree (and `git diff <the tag you accepted last> 2026.11.09-745af9427725`) for any way it could retain or transmit a
+> Review this tree (and `git diff <the tag you accepted last> 2026.11.09-0e69fc6edfb8`) for any way it could retain or transmit a
 > relay's account keys. Trace: (1) where credentials enter: the sealed account records the lane opens with its
 > per-boot keyset (`workers/gateway/src/lane/state.ts`, `workers/gateway/src/lane/stack-service.ts`,
 > `workers/packages/relay-connector/`, `workers/packages/attest/`) and hands to gray-egress over its unix socket

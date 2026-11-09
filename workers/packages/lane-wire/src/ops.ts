@@ -22,7 +22,10 @@ import { BridgeWireError } from "./error.ts";
  * tests, stack-tests.ts), which end there too, and so does `stack.debug_shares` (the requests customers authorized for
  * debugging at the relay, metadata only: stack-debug.ts, docs/design/relay-debug-sharing.md). `stack.vault.get` and
  * `stack.vault.put` read and write Gray's ciphertext copy of the VM's sealed records, with a compare-and-swap on the
- * version (stack-vault.ts, docs/design/relay-no-always-on-host.md §3.1 and 13.4).
+ * version (stack-vault.ts, docs/design/relay-no-always-on-host.md §3.1 and 13.4). `stack.vault.share_nonce` and
+ * `stack.vault.share` release Gray's share of the record keys (H5) to a VM whose TDX quote the bridge verified.
+ * `stack.instance` tells a relay stack VM whether it is its relay's serving instance or a draining one during a
+ * rollout (stack-instance.ts, 13.4, P7).
  *
  * `endpoint.release_retry` and `endpoint.probe_answered` are ops too (bridge-2): both are
  * best-effort in the gateway (each failure is swallowed, `endpoints.ts` `releaseRetry` /
@@ -73,6 +76,9 @@ export const BRIDGE_OPS = [
   "stack.debug_shares",
   "stack.vault.get",
   "stack.vault.put",
+  "stack.vault.share_nonce",
+  "stack.vault.share",
+  "stack.instance",
   "release.lists",
   "attest.collateral",
   "lane.acme_failed",
@@ -108,6 +114,9 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "stack.debug_shares": "POST",
   "stack.vault.get": "POST",
   "stack.vault.put": "POST",
+  "stack.vault.share_nonce": "POST",
+  "stack.vault.share": "POST",
+  "stack.instance": "POST",
   "release.lists": "POST",
   "attest.collateral": "POST",
   "lane.acme_failed": "POST",
@@ -141,6 +150,9 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "stack.debug_shares": "/v1/lane-bridge/stack/debug-shares",
   "stack.vault.get": "/v1/lane-bridge/stack/vault/get",
   "stack.vault.put": "/v1/lane-bridge/stack/vault/put",
+  "stack.vault.share_nonce": "/v1/lane-bridge/stack/vault/share-nonce",
+  "stack.vault.share": "/v1/lane-bridge/stack/vault/share",
+  "stack.instance": "/v1/lane-bridge/stack/instance",
   "release.lists": "/v1/lane-bridge/release/lists",
   "attest.collateral": "/v1/lane-bridge/attest/collateral",
   "lane.acme_failed": "/v1/lane-bridge/lane/acme-failed",

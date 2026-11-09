@@ -50,6 +50,19 @@
 //   bridge key id this VM's own: the app's id, as KEYSET_SUBJECT is derived (D47), and the first 16 hex digits of the
 //   bridge key's Ed25519 public key, so two instances of one app (an image rollout's, docs/design/relay-zero-downtime.md)
 //   never share a key id and neither replaces the other's key on the console's list.
+// - P2c-2 (docs/design/relay-no-always-on-host.md H9): a relay stack app on an on-chain KMS names that KMS in its
+//   measured compose (LANE_KMS_URL). This process then keeps the KMS lease (kms-lease.mjs): it asks the KMS for the app
+//   key again every 10 minutes and pushes each change of the lease to the lane Worker on a unix socket of its own
+//   tmpfs, which workerd serves on the Worker's `kmsLease` entrypoint; the Worker serves the relay's accounts only
+//   while the lease serves. Without LANE_KMS_URL (a phase-1 app) nothing of it is rendered or run.
+// - P2e (docs/design/relay-no-always-on-host.md §3.1, 13.11): the same app keeps the relay's vault on the data disk
+//   (/var/lib/gray-persist/relay, bound into lane by the stack layout for an app with LANE_KMS_URL). workerd has no disk,
+//   so this process serves it (vault-disk.mjs) on a second unix socket of its own tmpfs, which workerd binds as the
+//   external service LANE_VAULT_DISK: the Worker reads the record and writes each new version through it (atomic, fsynced,
+//   never a version the disk has seen). A phase-1 app renders and runs none of it.
+// - P2d (the same docs, §3.5): a phase-2 app's pre-launch takes the image from the sealed boot box and measures
+//   `gray-relay-image` v2 (the relay-signed designation, no nonce), or the empty slot (`image: null`) when no boot box
+//   opened; `stackBoot` reads v2 in a phase-2 app only, and an empty slot renders LANE_STACK_EMPTY_SLOT for the Worker.
 //
 // The entrypoint refuses to start when a value is missing or malformed, and when a placeholder
 // survives rendering. It also fails closed if gray-egress never creates its socket: a lane that starts
@@ -65,8 +78,11 @@ import { request as httpsRequest } from "node:https";
 import { isIPv4 } from "node:net";
 import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { uptime as osUptime } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { kmsLeaseInputsFromInfo, kmsLeaseSettings, startKmsLease } from "./kms-lease.mjs";
+import { startVaultDisk, VAULT_DIR } from "./vault-disk.mjs";
 
 /** What a rendered value may contain: no quote, no backslash, no newline, no `__` sequence. */
 const SAFE = /^[A-Za-z0-9._:/@+=,*\[\]-]*$/;
@@ -94,6 +110,8 @@ const RUNTIME_EVENT_TYPE = 0x08000001;
 /** S52: the runtime events a sealed stack boot has after `system-ready`, in this order. */
 const STACK_BOOT_EVENTS = Object.freeze(["gray-stack-identity", "gray-relay-image", "gray-prelaunch-sealed"]);
 const SEALED_PAYLOAD = "gray-prelaunch-sealed-v1";
+/** P2d: what the relay signs for a phase-2 designation (`@gray/relay-connector/vault` DESIGNATION_DOMAIN). */
+const DESIGNATION_DOMAIN = "gray-relay-designation/v1";
 /** S51: `<registry host[:port]>/<repository>@sha256:<64 hex>` (@gray/lane-verify `STACK_RELAY_IMAGE_PATTERN`). */
 const RELAY_IMAGE = /^((?:[a-z0-9][a-z0-9-]*\.)+[a-z0-9-]*[a-z0-9](?::[0-9]{1,5})?|[a-z0-9][a-z0-9.-]*:[0-9]{1,5}|localhost)\/([a-z0-9][a-z0-9._/-]*)@sha256:([0-9a-f]{64})$/;
 
@@ -243,6 +261,44 @@ function stackPayload(hex, members) {
   return value;
 }
 
+/**
+ * P2d: a phase-2 `gray-relay-image` payload (docs/design/relay-no-always-on-host.md §3.5), or null. Pre-launch writes it with
+ * `jq -cSj` from the boot box's designation: `{image, image_sig, issued_ms, previous, relay_id, seq}` (strings, two safe
+ * integers, `previous` a string or null), or for the empty slot `{image: null, relay_id, seq: 0}`. As `stackPayload`, only
+ * the form JSON.stringify writes for the parsed object with sorted keys is read.
+ */
+function stackImagePayloadV2(hex) {
+  if (typeof hex !== "string" || !/^([0-9a-f]{2})*$/.test(hex)) return null;
+  let text;
+  let value;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.from(hex, "hex"));
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (JSON.stringify(Object.fromEntries(keys.map((key) => [key, value[key]]))) !== text) return null;
+  const relayId = value.relay_id;
+  if (typeof relayId !== "string" || !RELAY_ID.test(relayId)) return null;
+  if (keys.join(",") === "image,relay_id,seq") {
+    return value.image === null && value.seq === 0 ? { relayId, image: null, seq: 0 } : null;
+  }
+  if (keys.join(",") !== "image,image_sig,issued_ms,previous,relay_id,seq") return null;
+  const { image, image_sig: imageSig, issued_ms: issuedMs, previous, seq } = value;
+  const isImage = (text) => typeof text === "string" && text.length <= 512 && RELAY_IMAGE.test(text);
+  if (!isImage(image) || !(previous === null || isImage(previous)) || typeof imageSig !== "string" || !/^[0-9a-f]{128}$/.test(imageSig)) return null;
+  if (!Number.isSafeInteger(seq) || seq < 1 || !Number.isSafeInteger(issuedMs) || issuedMs < 0) return null;
+  return { relayId, image, imageSig, issuedMs, previous, seq };
+}
+
+/** P2d: the designation's signed bytes, `gray-relay-designation/v1\n` ‖ JCS (sorted keys; checked strings, safe integers, null). */
+function designationMessage(claim) {
+  const jcs = JSON.stringify({ image: claim.image, issued_ms: claim.issuedMs, previous: claim.previous, relay_id: claim.relayId, seq: claim.seq });
+  return Buffer.from(`${DESIGNATION_DOMAIN}\n${jcs}`, "utf8");
+}
+
 /** An https origin written as its own origin (@gray/lane-verify `isStackTokenUrl`). */
 function isTokenUrl(text) {
   if (!URL.canParse(text)) return false;
@@ -258,8 +314,13 @@ function isTokenUrl(text) {
  * `gray-relay-image/v1\n<nonce>\n<image>`. The guest agent is this CVM's own, so its log is read as it
  * is; a party that relies on the image checks the quote (gray-lane-verify, gray-relay's intake). Every
  * refusal names the rule, never a value from the log.
+ *
+ * P2d: a phase-2 app (`phase2`, its measured compose names LANE_KMS_URL) has the v2 image event instead, and only it:
+ * the designation and its signature (`image_sig` over `gray-relay-designation/v1\n` ‖ the designation's JCS, with the
+ * identity's key), or the empty slot (`image: null`, `seq: 0`), which answers `image: null`. A v1 event in a phase-2 app,
+ * or a v2 event in a phase-1 app, is refused: pre-launch picks the path by the same compose literal.
  */
-function stackBoot(info) {
+function stackBoot(info, phase2 = false) {
   const tcbText = info !== null && typeof info === "object" ? info.tcb_info : undefined;
   if (typeof tcbText !== "string" || tcbText === "") fail("the guest agent's Info answer carries no tcb_info: a relay-stack boot reads its relay image from the event log (S52)");
   let tcb;
@@ -290,16 +351,27 @@ function stackBoot(info) {
   if (identity === null || !RELAY_ID.test(identity.relay_id) || !/^[0-9a-f]{64}$/.test(identity.public_key) || !isTokenUrl(identity.token_url)) {
     fail("the gray-stack-identity payload is not {public_key, relay_id, token_url} in their forms (S52, relay-outbound-only §3.9)");
   }
+  const sealed = after[2].event_payload;
+  if (typeof sealed !== "string" || sealed !== Buffer.from(SEALED_PAYLOAD, "utf8").toString("hex")) fail(`the gray-prelaunch-sealed payload is not ${SEALED_PAYLOAD}`);
+  // Node's own Ed25519 (the raw key as a JWK): nothing here builds a DER key by hand.
+  const key = createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: Buffer.from(identity.public_key, "hex").toString("base64url") }, format: "jwk" });
+  if (phase2) {
+    const claim = stackImagePayloadV2(after[1].event_payload);
+    if (claim === null) {
+      fail("the gray-relay-image payload is not v2's {image, image_sig, issued_ms, previous, relay_id, seq} or the empty slot's {image: null, relay_id, seq: 0} in their forms (P2d)");
+    }
+    if (claim.relayId !== identity.relay_id) fail("the gray-relay-image event names another relay than gray-stack-identity (S52)");
+    if (claim.image !== null && !verifySignature(null, designationMessage(claim), key, Buffer.from(claim.imageSig, "hex"))) {
+      fail("the gray-relay-image designation's signature does not verify with the gray-stack-identity key (P2d)");
+    }
+    return { relayId: identity.relay_id, image: claim.image, publicKey: identity.public_key, seq: claim.seq };
+  }
   const image = stackPayload(after[1].event_payload, ["image", "image_sig", "nonce", "relay_id"]);
   if (image === null || image.image.length > 512 || !RELAY_IMAGE.test(image.image) || !/^[0-9a-f]{128}$/.test(image.image_sig)
     || !/^([0-9a-f]{2}){16,64}$/.test(image.nonce) || !RELAY_ID.test(image.relay_id)) {
     fail("the gray-relay-image payload is not {image, image_sig, nonce, relay_id} in their forms (S52)");
   }
   if (image.relay_id !== identity.relay_id) fail("the gray-relay-image event names another relay than gray-stack-identity (S52)");
-  const sealed = after[2].event_payload;
-  if (typeof sealed !== "string" || sealed !== Buffer.from(SEALED_PAYLOAD, "utf8").toString("hex")) fail(`the gray-prelaunch-sealed payload is not ${SEALED_PAYLOAD}`);
-  // Node's own Ed25519 (the raw key as a JWK): nothing here builds a DER key by hand.
-  const key = createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: Buffer.from(identity.public_key, "hex").toString("base64url") }, format: "jwk" });
   const message = Buffer.from(`gray-relay-image/v1\n${image.nonce}\n${image.image}`, "utf8");
   if (!verifySignature(null, message, key, Buffer.from(image.image_sig, "hex"))) {
     fail("the gray-relay-image signature does not verify with the gray-stack-identity key (S52)");
@@ -399,6 +471,11 @@ export function stackFragments(stack) {
     `          ( name = "LANE_STACK_POLL_MS", text = "${stack.pollMs ?? ""}" ),`,
     "          # S52/S55: the image the relay chose for this boot, as pre-launch measured it (gray-relay-image).",
     `          ( name = "LANE_STACK_RELAY_IMAGE", text = "${stack.relayImage ?? ""}" ),`,
+    // P2d: a phase-2 boot with no boot box to open runs the empty slot (gray-relay-image v2 with `image: null`); the
+    // Worker then starts without a relay image. Rendered only then, so every other boot's config is as before.
+    ...(stack.emptySlot === true
+      ? ["          # P2d: no relay image this boot (gray-relay-image v2 `image: null`): the relay's slot runs gray-idle.", '          ( name = "LANE_STACK_EMPTY_SLOT", text = "1" ),']
+      : []),
     "          # docs/design/relay-debug-sharing.md: the relay key the boot measured (gray-stack-identity), which gray-relay's",
     "          # debug fetch is checked against: never a key Gray's snapshot serves.",
     `          ( name = "LANE_STACK_RELAY_KEY", text = "${stack.relayKey ?? ""}" ),`,
@@ -509,6 +586,89 @@ export function peerlinkFragments(link) {
     bindings.push("          # §3.2: the entries this stack VM dials until the bridge's stack.entries names them.", `          ( name = "LANE_PEER_ENTRIES", text = "${link.entries}" ),`);
   }
   return { PEERLINK_SERVICES: services.join("\n"), PEERLINK_BINDINGS: bindings.join("\n") };
+}
+
+/**
+ * P2c-2 (docs/design/relay-no-always-on-host.md H9, 13.11): the KMS lease, or null when the measured compose names no
+ * KMS to re-check. `LANE_KMS_URL` is a lane literal of the measured compose (app-compose.mjs `--kms-url`), which the
+ * provisioner renders only for an app on an on-chain KMS: the relay's contract decides there whether the KMS gives
+ * this app its keys, so the VM asks again every 10 minutes (kms-lease.mjs). Unset, the boot is a phase-1 one (Phala's
+ * own KMS, the relay's host) and renders and runs exactly as before. Only a relay stack VM holds a relay's
+ * accounts, so the default layout refuses it. The URL is checked here only for its form; `kmsAppKeyCheck` pins the
+ * KMS's certificate to the measured key provider whatever the URL names.
+ */
+export function kmsLeaseLayout(env, stack) {
+  const url = env.LANE_KMS_URL ?? "";
+  if (url === "") return null;
+  if (stack === null) fail("LANE_KMS_URL is set in the default layout: only a relay stack VM keeps a KMS lease");
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    fail("LANE_KMS_URL is not a URL");
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname === "" || parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
+    fail("LANE_KMS_URL is https://<host>[:port][/path] without credentials, query or fragment (the KMS of the measured key provider)");
+  }
+  return { kmsUrl: url };
+}
+
+/**
+ * P2c-2: the template fragments of the KMS lease: a socket on the lane-only tmpfs bound to the Worker's `kmsLease`
+ * entrypoint, which the supervisor pushes the lease's state to (kms-lease.mjs `startKmsLease`), and the binding that
+ * tells the Worker a lease gates the relay's accounts. Each placeholder starts a line of its own in the template, so
+ * both are empty for null and a phase-1 boot renders exactly the text it rendered before. Exported for the host e2e's
+ * renderers, as `stackFragments` is.
+ */
+export function kmsLeaseFragments(lease, socketPath) {
+  if (lease === null) return { KMS_LEASE_BINDINGS: "", KMS_LEASE_SOCKETS: "" };
+  if (!socketPath.startsWith("/") || !SAFE.test(socketPath)) fail("the KMS lease socket is an absolute path a workerd config string can carry");
+  const bindings = [
+    "          # P2c-2 (docs/design/relay-no-always-on-host.md H9): the relay's accounts are served only while the KMS lease the",
+    "          # supervisor keeps serves; its state arrives on the kms-lease socket below.",
+    '          ( name = "LANE_KMS_LEASE", text = "required" ),',
+    "",
+  ];
+  const sockets = [
+    "    # P2c-2: the supervisor's pushes of the KMS lease's state, on the lane container's own tmpfs (nothing else mounts",
+    "    # it), bound to the `kmsLease` entrypoint (PUT /v1/lane/kms-lease, 404 for every other path).",
+    '  , ( name = "kms-lease",',
+    `      address = "unix:${socketPath}",`,
+    "      http = (),",
+    '      service = ( name = "lane", entrypoint = "kmsLease" )',
+    "    )",
+    "",
+  ];
+  return { KMS_LEASE_BINDINGS: bindings.join("\n"), KMS_LEASE_SOCKETS: sockets.join("\n") };
+}
+
+/**
+ * P2e: the template fragments of the relay's vault for a lease app (the vault exists exactly when the lease does): the
+ * external service on the supervisor's vault-disk socket (vault-disk.mjs `startVaultDisk`) and the Worker's binding to
+ * it. Both are empty for null, and each placeholder sits where the template had an empty line or a line's start, so a
+ * phase-1 boot renders exactly the text it rendered before. Exported for the host e2e's renderers.
+ */
+export function vaultDiskFragments(lease, socketPath) {
+  if (lease === null) return { VAULT_DISK_SERVICES: "", VAULT_DISK_BINDINGS: "" };
+  if (!socketPath.startsWith("/") || !SAFE.test(socketPath)) fail("the vault disk socket is an absolute path a workerd config string can carry");
+  const services = [
+    "    # P2e (docs/design/relay-no-always-on-host.md §3.1): the relay's vault on the data disk, served by the supervisor",
+    "    # (vault-disk.mjs) on the lane container's own tmpfs: GET and PUT /v1/lane/vault, plain HTTP.",
+    '    ( name = "vault-disk",',
+    "      external = (",
+    `        address = "unix:${socketPath}",`,
+    "        http = ()",
+    "      )",
+    "    ),",
+    "",
+  ];
+  const bindings = [
+    "          # P2e: the relay's vault disk (the supervisor's socket above); the Worker writes every version of the vault there.",
+    '          ( name = "LANE_VAULT_DISK", service = "vault-disk" ),',
+    "",
+    "",
+  ];
+  return { VAULT_DISK_SERVICES: services.join("\n"), VAULT_DISK_BINDINGS: bindings.join("\n") };
 }
 
 /** Wait until the egress service has created its socket; fail closed after the deadline. */
@@ -798,6 +958,10 @@ export async function main({
   spawnWorker = spawn,
   postBridge = postBridgeHttps,
   wallNow = Date.now,
+  uptime = osUptime,
+  startLease = startKmsLease,
+  startDisk = startVaultDisk,
+  vaultDir = VAULT_DIR,
 } = {}) {
   const templatePath = env.LANE_TEMPLATE ?? "/srv/lane/config.capnp";
   // D63: the rendered config carries the bridge seed, so it lives on the lane-only /run/lane tmpfs,
@@ -836,6 +1000,16 @@ export async function main({
   const stack = stackLayout(env);
   const peers = peerLayout(env, stack);
   const peerlink = peerlinkLayout(env, stack);
+  const kmsLease = kmsLeaseLayout(env, stack);
+  // P2c-2: the lease's tunables are read before anything runs, so a bad value stops the boot here (kmsLeaseSettings).
+  let kmsLeaseTuning = null;
+  if (kmsLease !== null) {
+    try {
+      kmsLeaseTuning = kmsLeaseSettings(env);
+    } catch (thrown) {
+      fail(thrown instanceof Error ? thrown.message : String(thrown));
+    }
+  }
 
   // D47: the app id is read from the guest agent at boot, before anything is rendered. There is no
   // default and no environment override: a boot that cannot read it must not serve a keyset whose
@@ -863,11 +1037,22 @@ export async function main({
     } catch (thrown) {
       fail(`cannot read this boot's event log from the guest agent at unix:${guestSocket} (POST /Info): ${thrown instanceof Error ? thrown.message : String(thrown)}`);
     }
-    const boot = stackBoot(v0Info);
+    const boot = stackBoot(v0Info, kmsLease !== null);
     if ((env.TLS_DOMAIN ?? "") !== "") fail("TLS_DOMAIN is set in the relay-stack layout: a stack VM has no public name, and its TLS key is bound to no domain (relay-outbound-only §3.9)");
     if (stack.relayId !== boot.relayId) fail("LANE_STACK_RELAY_ID is not the gray-stack-identity event's relay_id (S54)");
     stack.relayImage = boot.image;
     stack.relayKey = boot.publicKey;
+    stack.emptySlot = boot.image === null;
+  }
+  // P2c-2: the re-check's inputs are the guest agent's own (vm_config and the measured key provider's CA, from the same
+  // v1 Info answer as the app id): a lease app that cannot read them does not serve.
+  let kmsLeaseInputs = null;
+  if (kmsLease !== null) {
+    try {
+      kmsLeaseInputs = kmsLeaseInputsFromInfo(info);
+    } catch (thrown) {
+      fail(`cannot read the KMS lease's inputs from the guest agent's Info: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+    }
   }
 
   // D133: everything rendered but the certificate's SPKI is read and checked before gray-acme runs, so
@@ -934,8 +1119,21 @@ export async function main({
     .map((name) => `,\n          ( name = "${name}", wasm = embed "${relative(dirname(renderedPath), resolve(workerDir, name))}" )`)
     .join("");
 
+  // P2c-2: the socket the supervisor pushes the lease's state to, beside the rendered config on the lane-only tmpfs.
+  const kmsLeaseSocket = join(dirname(renderedPath), "kms-lease.sock");
+  // P2e: the vault disk's socket, beside it.
+  const vaultDiskSocket = join(dirname(renderedPath), "vault-disk.sock");
   const template = readFileSync(templatePath, "utf8");
-  const renderable = { ...values, TLS_SPKI_SHA256: "", WASM_MODULES: wasmModules, ...stackFragments(stack), ...peerFragments(peers), ...peerlinkFragments(peerlink) };
+  const renderable = {
+    ...values,
+    TLS_SPKI_SHA256: "",
+    WASM_MODULES: wasmModules,
+    ...stackFragments(stack),
+    ...peerFragments(peers),
+    ...peerlinkFragments(peerlink),
+    ...kmsLeaseFragments(kmsLease, kmsLeaseSocket),
+    ...vaultDiskFragments(kmsLease, vaultDiskSocket),
+  };
   // D57: one pass over the template. A value that itself contains `__NAME__` is data and is never
   // substituted again; the placeholders are checked against the template, before rendering.
   for (const match of template.matchAll(/__([A-Z0-9_]+)__/g)) {
@@ -1013,9 +1211,48 @@ export async function main({
     log(`lane: ${role} / release lists ${peers.releasePublicKey === "" ? "(no keys)" : `release key ${peers.releasePublicKey} freshness key ${peers.releaseFreshnessPublicKey}`}${Object.keys(peers.tunables).length === 0 ? "" : ` / ${Object.entries(peers.tunables).map(([name, value]) => `${name}=${value}`).join(" ")}`}`);
   }
 
-  // D133: the CLI wrapper supervises this child (superviseWorkerd) and restarts it with `restart`.
-  const restart = () => spawnWorker(workerd, ["serve", renderedPath], { stdio: "inherit" });
-  return { child: restart(), restart, orderedAt };
+  // P2c-2: the lease starts from the boot's own key fetch, which came after the VM started: the VM's start (the kernel's
+  // uptime, which a container shares) is never later, so the first lease ends no later than the KMS's answer allows. A
+  // container started again late in the VM's life therefore begins past its lease, not serving, and checks at once.
+  let lease = null;
+  if (kmsLease !== null) {
+    const bootAllowedAtMs = wallNow() - Math.ceil(uptime() * 1000);
+    log(`lane: KMS lease on ${kmsLease.kmsUrl}: re-check every ${kmsLeaseTuning.recheckMs} ms, lease ${kmsLeaseTuning.leaseMs} ms from the VM's start at ${new Date(bootAllowedAtMs).toISOString()}; state to the Worker on unix:${kmsLeaseSocket}`);
+    lease = startLease({
+      kmsUrl: kmsLease.kmsUrl,
+      guestSocket,
+      vmConfig: kmsLeaseInputs.vmConfig,
+      caPublicKeyHex: kmsLeaseInputs.caPublicKeyHex,
+      settings: kmsLeaseTuning,
+      bootAllowedAtMs,
+      workerSocket: kmsLeaseSocket,
+      now: wallNow,
+      log,
+      error,
+    });
+  }
+
+  // P2e: the vault's disk is served before workerd starts, so the Worker's first read finds it.
+  let vaultDisk = null;
+  if (kmsLease !== null) {
+    try {
+      vaultDisk = await startDisk({ dir: vaultDir, socketPath: vaultDiskSocket, log, error });
+    } catch (thrown) {
+      await lease?.stop();
+      fail(`cannot serve the vault disk on unix:${vaultDiskSocket}: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+    }
+  }
+
+  // D133: the CLI wrapper supervises this child (superviseWorkerd) and restarts it with `restart`. P2c-2: workerd binds
+  // the lease socket itself, so a socket file a previous workerd left is removed first, and the lease's state is pushed
+  // to each new workerd as soon as it listens.
+  const restart = () => {
+    if (lease !== null) rmSync(kmsLeaseSocket, { force: true });
+    const child = spawnWorker(workerd, ["serve", renderedPath], { stdio: "inherit" });
+    lease?.wake();
+    return child;
+  };
+  return { child: restart(), restart, orderedAt, kmsLease: lease, vaultDisk };
 }
 
 // The CLI wrapper: production gets the process defaults; the deploy-tee tests import main() and
@@ -1055,8 +1292,11 @@ if (isMainModule()) {
     });
     return child;
   };
-  main().then(async ({ child, restart, orderedAt }) => {
-    process.exit(await superviseWorkerd({ first: track(child), restart: () => track(restart()), orderedAt, stopped: () => state.stopping }));
+  main().then(async ({ child, restart, orderedAt, kmsLease, vaultDisk }) => {
+    const code = await superviseWorkerd({ first: track(child), restart: () => track(restart()), orderedAt, stopped: () => state.stopping });
+    await kmsLease?.stop();
+    await vaultDisk?.close();
+    process.exit(code);
   }).catch((thrown) => {
     console.error(`lane: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
     process.exit(1);

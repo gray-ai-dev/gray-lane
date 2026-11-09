@@ -41,7 +41,7 @@ import {
 } from "@gray/attest";
 import { DSTACK_RUNTIME_EVENT_TYPE, measurementsFromEvidence, type DstackEvent, type DstackKeyProvider, type DstackMeasurements } from "./dstack.ts";
 import type { OsImageProvenance } from "./release-list.ts";
-import { PRELAUNCH_SEALED_EVENT, RELAY_IMAGE_EVENT, STACK_IDENTITY_EVENT, verifyStackBoot, type StackBootResult } from "./stack-boot.ts";
+import { PRELAUNCH_SEALED_EVENT, RELAY_IMAGE_EVENT, STACK_IDENTITY_EVENT, isRelayDesignationClaim, verifyStackBoot, type StackBootResult } from "./stack-boot.ts";
 import {
   DSTACK_V1_ATTESTATION_FORMAT,
   decodeDstackV1AttestationHex,
@@ -138,6 +138,13 @@ export interface VerifyAttestationOptions {
    * `--relay-image`). Given, a lane without the stack events, or with another image, fails `relay_image_pin`.
    */
   readonly expectedRelayImage?: string;
+  /**
+   * P2d: accept a phase-2 lane in the empty slot (`gray-relay-image` v2 with `image: null`): the relay's own tool, which
+   * delivers the first boot box to it, sets this; every other caller leaves it unset, and the empty slot fails
+   * `stack_boot` (it serves nothing, so nothing should be sent to it). With it, an empty slot passes `stack_boot` and
+   * still fails `relay_image_pin`.
+   */
+  readonly allowEmptySlot?: boolean;
   /** The Intel DCAP (or test-double) quote verifier. */
   readonly quoteVerifier: QuoteVerifier;
 }
@@ -386,12 +393,26 @@ function checkStackBoot(stackBoot: StackBootResult | null, options: VerifyAttest
     for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane is not a relay-stack lane: it measured no relay identity or image"));
     return;
   }
+  if (facts.phase === "empty_slot") {
+    // P2d: a phase-2 boot with no boot box to open runs Gray's idle program in the relay's slot and serves nothing.
+    if (options.allowEmptySlot === true) {
+      checks.push(pass("stack_boot", `relay ${facts.identity.relayId}'s lane runs the empty slot: it waits for the relay's delivery`));
+      if (options.expectedRelayId !== undefined) {
+        checks.push(facts.identity.relayId === options.expectedRelayId ? pass("relay_pin", facts.identity.relayId) : fail("relay_pin", `the lane serves relay ${facts.identity.relayId}, not ${options.expectedRelayId}`));
+      }
+      if (options.expectedRelayImage !== undefined) checks.push(fail("relay_image_pin", "the lane runs the empty slot: no relay image"));
+      return;
+    }
+    checks.push(fail("stack_boot", `relay ${facts.identity.relayId}'s lane runs the empty slot: no relay image was delivered to this boot, so it serves nothing`));
+    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane runs the empty slot"));
+    return;
+  }
   if (facts.phase !== "sealed") {
     checks.push(fail("stack_boot", "the quote was taken before pre-launch's seal: a relay-stack lane serves only after it"));
     for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane's relay-stack boot is not sealed"));
     return;
   }
-  checks.push(pass("stack_boot", `relay ${facts.identity.relayId} runs ${facts.image.image}, signed by the relay key`));
+  checks.push(pass("stack_boot", `relay ${facts.identity.relayId} runs ${facts.image.image}, ${isRelayDesignationClaim(facts.image) ? `designated (seq ${facts.image.seq}) and signed` : "signed"} by the relay key`));
   const host = options.host;
   if (facts.identity.tlsDomain === null) {
     // Stack release B (docs/design/relay-outbound-only.md §3.9): the VM has no public name and its TLS key is bound to

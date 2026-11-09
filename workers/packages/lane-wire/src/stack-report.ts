@@ -2,6 +2,8 @@ import { z } from "zod";
 import { BridgeWireError } from "./error.ts";
 import { integersOfJson, numbersOfJson, uintSchema } from "./ints.ts";
 import {
+  KMS_LEASE_OUTCOMES,
+  KMS_LEASE_REASON_MAX,
   STACK_ATTEMPT_CLASSES,
   STACK_CONFIG_ABSENT,
   STACK_COOLING_KINDS,
@@ -19,6 +21,7 @@ import {
   STACK_WINDOW_CLAIMS,
   STACK_WINDOW_KEYS,
   STACK_WINDOW_STATUSES,
+  type KmsLeaseOutcome,
   type StackAttemptClass,
   type StackCoolingKind,
   type StackCoolingMode,
@@ -48,6 +51,18 @@ import { STACK_ACCOUNTS_MAX, STACK_RULE_ID_PATTERN, STACK_WIRE_ID_PATTERN } from
  * `cooling.digest` and `counters` null, and its accounts without cooling entries or windows. A cooling entry is egress's
  * health entry (S37) with its times as minutes: its class and vendor code (a window rule's are `window_exhausted`),
  * whether it was made in observe mode, and what clears it, which the console hands back to restore (S41).
+ *
+ * `kms_lease` (docs/design/relay-no-always-on-host.md H9, P2c-2) is the KMS lease of a VM on an on-chain KMS: whether the
+ * relay's accounts are served, the lease's end and the last re-check in seconds, the last re-check's outcome (closed
+ * words) and the KMS's refusal reason, cut to KMS_LEASE_REASON_MAX printable characters (`Boot denied: paused`; never
+ * key material). Absent from a VM without a lease (a phase-1 app, Phala's own KMS) and from an entry older than it;
+ * `boot.lease_expires_at_s` keeps its meaning, the accepted bundle's end.
+ *
+ * `vault` (docs/design/relay-no-always-on-host.md §3.1 and 13.4, P2e) is the relay's vault in a VM that keeps one (an app
+ * on an on-chain KMS): the version it holds (null before it opened), when that version was written to the VM's disk
+ * (null when it was not: RAM-only, or a version an earlier boot wrote), Gray's copy's version as last known and
+ * whether Gray holds this VM's version. Versions only grow, so the panel alerts on one that went down (a new instance
+ * that opened an older copy). Absent from a VM without a vault and from an entry older than it.
  *
  * `relay_image` (S55) is the image the relay chose for this boot, as pre-launch measured it in RTMR3
  * (`gray-relay-image`, S52): the entrypoint reads it from the guest agent and the entry repeats it. Null when the boot
@@ -242,6 +257,56 @@ const accountSchema = z
   .strict()
   .refine((a) => (a.served === "excluded") === (a.reason !== null), { message: "an excluded account names why, a served or paused one does not", path: ["reason"] });
 
+/** A refusal reason: printable ASCII on one line. */
+export const KMS_LEASE_REASON_PATTERN = /^[\x20-\x7e]+$/;
+
+export const stackReportKmsLeaseSchema = z
+  .object({
+    /** Whether the relay's accounts are served now: the last answer allowed and the lease has not ended. */
+    serving: z.boolean(),
+    /** When the lease ends (Unix seconds); null before the VM's supervisor told the entry its lease. */
+    lease_until_s: uintSchema.nullable(),
+    /** When the last re-check started (Unix seconds); null before the first. */
+    last_check_s: uintSchema.nullable(),
+    last_outcome: z.enum(KMS_LEASE_OUTCOMES).nullable(),
+    /** The KMS's refusal, while one holds; null otherwise. */
+    refused_reason: z.string().max(KMS_LEASE_REASON_MAX).regex(KMS_LEASE_REASON_PATTERN).nullable(),
+  })
+  .strict()
+  .refine((l) => l.refused_reason === null || !l.serving, { message: "a refused lease does not serve", path: ["refused_reason"] })
+  .refine((l) => (l.last_check_s === null) === (l.last_outcome === null), { message: "a re-check has an outcome, and only a re-check", path: ["last_outcome"] });
+
+/** The KMS lease as the report carries it, with JS numbers. */
+export interface StackReportKmsLease {
+  readonly serving: boolean;
+  readonly lease_until_s: number | null;
+  readonly last_check_s: number | null;
+  readonly last_outcome: KmsLeaseOutcome | null;
+  readonly refused_reason: string | null;
+}
+
+export const stackReportVaultSchema = z
+  .object({
+    /** The version the VM holds; null before its vault opened. */
+    version: uintSchema.nullable(),
+    /** When the VM wrote that version to its disk (ms); null when it did not. */
+    persisted_ms: uintSchema.nullable(),
+    /** Gray's copy's version as the VM last learned it; null before it read it. */
+    copy_version: uintSchema.nullable(),
+    /** Whether Gray holds the VM's version; null before the VM read Gray's copy. */
+    copy_ok: z.boolean().nullable(),
+  })
+  .strict()
+  .refine((v) => v.version !== null || v.persisted_ms === null, { message: "a write needs a version", path: ["persisted_ms"] });
+
+/** The vault as the report carries it, with JS numbers. */
+export interface StackReportVault {
+  readonly version: number | null;
+  readonly persisted_ms: number | null;
+  readonly copy_version: number | null;
+  readonly copy_ok: boolean | null;
+}
+
 export const stackReportSchema = z
   .object({
     relay_id: id,
@@ -275,6 +340,10 @@ export const stackReportSchema = z
     relay_image: z.string().max(512).regex(STACK_REPORT_RELAY_IMAGE_PATTERN).nullable().optional(),
     /** The boot's first violation the console has not taken (docs/design/relay-ejection.md); absent when none. */
     violation: stackViolationSchema.optional(),
+    /** P2c-2: the VM's KMS lease (H9); absent without one. */
+    kms_lease: stackReportKmsLeaseSchema.optional(),
+    /** P2e: the VM's vault (§3.1, 13.4); absent without one. */
+    vault: stackReportVaultSchema.optional(),
   })
   .strict();
 export type StackReportDto = z.infer<typeof stackReportSchema>;
@@ -367,6 +436,10 @@ export interface StackReport {
   readonly relay_image?: string | null;
   /** The boot's first violation the console has not taken; absent when none (docs/design/relay-ejection.md). */
   readonly violation?: StackViolation;
+  /** P2c-2: the VM's KMS lease (H9); absent from a VM without one and from an entry older than it. */
+  readonly kms_lease?: StackReportKmsLease;
+  /** P2e: the VM's vault (§3.1, 13.4); absent from a VM without one and from an entry older than it. */
+  readonly vault?: StackReportVault;
 }
 
 /** The report the console stores: the wire report with JS numbers. */

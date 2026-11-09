@@ -29,6 +29,7 @@
     "packages/relay-policy",
     "packages/relay-connector",
     "packages/lane-verify",
+    "packages/relay-app-auth",
     "packages/relay-kit",
     "packages/rendezvous",
     "packages/request-index",

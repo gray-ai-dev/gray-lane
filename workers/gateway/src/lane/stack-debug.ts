@@ -200,8 +200,33 @@ export class StackDebugStore {
     const record = captured === undefined ? null : debugRecordOf(captured.call, this.#deps.relayId, DEBUG_RECORD_MAX_BYTES);
     if (record !== null && this.#heldBytes + record.length > DEBUG_HELD_MAX_BYTES) return { ok: false, code: "debug_store_full" };
     this.#grants.push(now);
+    // The record's room is taken before the signature is awaited, so a grant of another rid meanwhile counts it; a
+    // signature that fails gives it back.
+    const reserved = record?.length ?? 0;
+    this.#heldBytes += reserved;
     const sharedMs = this.#deps.now();
-    const share = await signDebugShare(
+    let share: DebugShare;
+    try {
+      share = await this.#sign(envelope, record, sharedMs);
+    } catch (error) {
+      this.#heldBytes -= reserved;
+      throw error;
+    }
+    // The capture becomes the record: one copy, held for gray-relay; none is kept after it.
+    if (captured !== undefined) {
+      this.#captures.delete(rid);
+      this.#captureBytes -= captured.size;
+    }
+    const held: HeldDebugRecord = { rid, requestId: envelope.request_id, share, record, sharedMs, expiresAt: sharedMs + DEBUG_HOLD_MS, fetchedMs: null };
+    this.#held.set(rid, held);
+    const current = this.#byRequest.get(envelope.request_id);
+    if (current === undefined || record !== null || this.#held.get(current)?.record === null) this.#byRequest.set(envelope.request_id, rid);
+    this.#queue(envelope.request_id, rid, share, null);
+    return { ok: true, share };
+  }
+
+  #sign(envelope: PeerDebugEnvelopeDto, record: Uint8Array | null, sharedMs: number): Promise<DebugShare> {
+    return signDebugShare(
       {
         relay_id: this.#deps.relayId,
         workload_keyset_digest: this.#deps.keysetDigest,
@@ -217,18 +242,6 @@ export class StackDebugStore {
       },
       this.#deps.signer,
     );
-    // The capture becomes the record: one copy, held for gray-relay; none is kept after it.
-    if (captured !== undefined) {
-      this.#captures.delete(rid);
-      this.#captureBytes -= captured.size;
-    }
-    const held: HeldDebugRecord = { rid, requestId: envelope.request_id, share, record, sharedMs, expiresAt: sharedMs + DEBUG_HOLD_MS, fetchedMs: null };
-    this.#held.set(rid, held);
-    this.#heldBytes += record?.length ?? 0;
-    const current = this.#byRequest.get(envelope.request_id);
-    if (current === undefined || record !== null || this.#held.get(current)?.record === null) this.#byRequest.set(envelope.request_id, rid);
-    this.#queue(envelope.request_id, rid, share, null);
-    return { ok: true, share };
   }
 
   #queue(requestId: string, rid: string, share: DebugShare, fetchedMs: number | null): void {

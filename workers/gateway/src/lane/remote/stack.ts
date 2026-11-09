@@ -6,13 +6,17 @@ import {
   stackReportDtoOf,
   stackRulesAnswerOf,
   stackDebugSharesRequestDtoOf,
+  stackInstanceRequestDtoOf,
   stackTarget,
   stackVaultCopyOf,
   stackVaultGetRequestDtoOf,
   stackVaultPutRequestDtoOf,
   stackVaultPutResultOf,
+  stackVaultShareNonceRequestDtoOf,
+  stackVaultShareRequestDtoOf,
   type PendingProxyCheck,
   type StackDebugShare,
+  type StackInstanceRole,
   type ProxyCheckResult,
   type StackConfigAnswer,
   type StackReport,
@@ -116,5 +120,37 @@ export class StackConfigClient extends BridgeClient {
   async vaultPut(relayId: string, appId: string, kind: StackVaultKind, baseVersion: number, record: string): Promise<StackVaultPutResult> {
     const call = bridgeCall("stack.vault.put", stackTarget(relayId));
     return stackVaultPutResultOf(await this.call("stack.vault.put", call, stackVaultPutRequestDtoOf(relayId, appId, kind, baseVersion, record)));
+  }
+
+  /**
+   * `stack.instance` (docs/design/relay-no-always-on-host.md 13.4, P7): whether this VM (its bridge key) is the relay's
+   * serving instance or a draining one during a rollout. A bridge or console from before the op is a `BridgeCallError`,
+   * which the caller reads as an unknown role.
+   */
+  async instance(relayId: string): Promise<{ readonly role: StackInstanceRole }> {
+    const call = bridgeCall("stack.instance", stackTarget(relayId));
+    return { role: (await this.call("stack.instance", call, stackInstanceRequestDtoOf(relayId))).role };
+  }
+
+  /**
+   * `stack.vault.share_nonce` (docs/design/relay-no-always-on-host.md §3.1, H5): Gray's nonce for a share of `appId`'s
+   * record keys, accepted for STACK_VAULT_SHARE_NONCE_TTL_MS. The quote for `vaultShare` binds it
+   * (`@gray/relay-connector/vault-share` `vaultShareRequest`).
+   */
+  async vaultShareNonce(relayId: string, appId: string): Promise<string> {
+    const call = bridgeCall("stack.vault.share_nonce", stackTarget(relayId));
+    return (await this.call("stack.vault.share_nonce", call, stackVaultShareNonceRequestDtoOf(relayId, appId))).nonce;
+  }
+
+  /**
+   * `stack.vault.share` (H5): Gray's share, sealed to `ephemeralPublicKey` (`openVaultShare` opens it). `quote` is the
+   * guest agent's quote of `vaultShareRequest(appId, nonce).reportData` as hex and `eventLog` its event log as it
+   * answered it. A quote Gray will not answer (it does not verify, is not this request's, its TCB is not up to date, its
+   * compose hash is not effective on the relay's contract, the nonce is too old) is the bridge's 403
+   * `vault_share_refused`, thrown as a `BridgeCallError`: ask for a new nonce and quote. A 5xx is a retry.
+   */
+  async vaultShare(relayId: string, appId: string, quote: string, eventLog: string, ephemeralPublicKey: string, nonce: string): Promise<string> {
+    const call = bridgeCall("stack.vault.share", stackTarget(relayId));
+    return (await this.call("stack.vault.share", call, stackVaultShareRequestDtoOf(relayId, appId, quote, eventLog, ephemeralPublicKey, nonce))).sealed;
   }
 }

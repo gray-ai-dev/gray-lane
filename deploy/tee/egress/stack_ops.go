@@ -31,6 +31,14 @@ import (
 //     the relay refreshed outside, or the write-back sealed again) replaces it.
 //   - `GET /v1/stack/ops/tokens`: the tokens egress refreshed, by account, with the credential version each was
 //     refreshed from.
+//   - `POST /v1/stack/ops/tokens/ack` (P2e-2, persist first, stack_persist.go): the lane has written a pending token
+//     family to the VM's vault; egress starts using it.
+//
+// Persist first (docs/design/relay-no-always-on-host.md H12, I9): a push with `"persist_first": true` (the lane of a VM
+// that keeps a vault) makes every new token family, a refresh's or a sign-in's, pending: egress lists it with
+// `"pending": true`, keeps using the access token it had, and installs the family only when the lane acknowledges it
+// (`tokens/ack` with its seq), so a crash cannot lose a rotation the vendor already made. Without it (phase 1) a family is
+// installed at once, as before. stack_persist.go has the rest.
 //
 // The schedule: `refresh` (only `refresh: "gray"` accounts with a refresh token) before expiry by the table's
 // `before_expiry_seconds` less up to a tenth of it, backing off from 60 s to 15 min after a failure; `limits` and
@@ -77,7 +85,12 @@ type stackOps struct {
 	accounts map[string]*opsAccount
 	running  int
 	tokenSeq uint64
-	wg       sync.WaitGroup
+	// persistFirst is the last push's `persist_first` (stack_persist.go): new token families wait for the lane's ack.
+	persistFirst bool
+	// hold is the last push's `hold` (P7, docs/design/relay-no-always-on-host.md 13.4): this VM is not its relay's
+	// serving instance during a rollout, so egress runs no refresh and no sign-in and keeps the tokens it holds.
+	hold bool
+	wg   sync.WaitGroup
 	// loginSlots bounds the sign-in calls in flight (stack_login.go).
 	loginSlots loginSlots
 }
@@ -97,7 +110,13 @@ type opsAccount struct {
 	busy     bool
 	results  map[string]*opsResult
 	token    *opsToken
-	test     *opsTestResult
+	// pending is a token family egress holds but does not use until the lane acknowledges it persisted it (persist
+	// first, stack_persist.go); nil otherwise.
+	pending *opsToken
+	// generation is the seq of the last token family egress made for the account, by a sign-in or a refresh: a
+	// refresh records its outcome only if no other family was made while it ran (run).
+	generation uint64
+	test       *opsTestResult
 	// login is a `password` account's sealed sign-in (stack_login.go); nil for every other account.
 	login *opsLogin
 }
@@ -107,6 +126,10 @@ type opsToken struct {
 	access       string
 	refresh      string
 	expiresAt    int64
+	// A pending family's (stack_persist.go): whether a sign-in made it (it is installed as one), and the ChatGPT account
+	// id its token names.
+	login     bool
+	accountID string
 }
 
 // opsResult is one operation's last outcome as the container reads it.
@@ -162,6 +185,12 @@ func (o *stackOps) loop(ctx context.Context) {
 func (o *stackOps) tick(ctx context.Context) {
 	now := o.now()
 	o.mu.Lock()
+	// Past the KMS lease's end nothing starts, and the set goes (stack_lease.go).
+	if o.leaseEnded(now) {
+		o.dropForLeaseLocked()
+		o.mu.Unlock()
+		return
+	}
 	ids := make([]string, 0, len(o.accounts))
 	for id := range o.accounts {
 		ids = append(ids, id)
@@ -249,9 +278,10 @@ func (o *stackOps) scheduleLocked(account *opsAccount, now time.Time) {
 	}
 }
 
-// refreshes is an account egress refreshes: `refresh: "gray"`, an operation in the table and a refresh token.
+// refreshes is an account egress refreshes: `refresh: "gray"`, an operation in the table and a refresh token, and no
+// hold (P7: only the relay's serving instance refreshes).
 func (o *stackOps) refreshes(account *opsAccount) bool {
-	return account.refreshMode == "gray" && o.table.op(account.vendor, account.credentialType, opRefresh) != nil && account.fields["refresh_token"] != ""
+	return !o.hold && account.refreshMode == "gray" && o.table.op(account.vendor, account.credentialType, opRefresh) != nil && account.fields["refresh_token"] != ""
 }
 
 // refreshAt is the next refresh: before expiry by the table's lead less up to a tenth of it; with no expiry known,
@@ -275,9 +305,18 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	entry := o.table[account.vendor+"/"+account.credentialType]
 	template := entry.ops[op]
 	inputs := opInputs{account: copyFields(account.fields)}
-	spec, vendor, id, version := account.spec, account.vendor, account.id, account.credentialVersion
+	spec, vendor, id, version, generation := account.spec, account.vendor, account.id, account.credentialVersion, account.generation
 	o.mu.Unlock()
 
+	// The lease may have ended since the tick: checked again just before the vendor call, which is then not made.
+	if o.leaseEnded(o.now()) {
+		o.mu.Lock()
+		o.running--
+		account.busy = false
+		o.dropForLeaseLocked()
+		o.mu.Unlock()
+		return
+	}
 	status, answer, code := o.call(ctx, vendor, spec, entry, template, inputs)
 	now := o.now()
 	result := &opsResult{Outcome: "failed", AsOfMS: now.UnixMilli()}
@@ -312,15 +351,34 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 		return
 	}
 	account.busy = false
+	if op == opRefresh && account.generation != generation {
+		// A sign-in made the account's tokens while the refresh ran, from the refresh token it read before: its
+		// outcome, a token or a failure, is of a family the account no longer holds. The sign-in scheduled the next
+		// refresh.
+		return
+	}
 	account.results[op] = result
 	switch op {
 	case opRefresh:
 		switch {
 		case !o.refreshes(account):
 			delete(account.next, opRefresh)
+		case refreshed != nil && account.credentialVersion == version && o.persistFirst:
+			// Persist first: the family waits for the lane's ack, and no refresh runs until it is installed (the vendor
+			// may have rotated the refresh token egress holds).
+			o.tokenSeq++
+			refreshed.seq, refreshed.basedOn = o.tokenSeq, account.credentialVersion
+			account.generation = refreshed.seq
+			account.pending = refreshed
+			if refreshed.expiresAt != 0 {
+				result.ExpiresAt = &refreshed.expiresAt
+			}
+			account.failures = 0
+			delete(account.next, opRefresh)
 		case refreshed != nil && account.credentialVersion == version:
 			o.tokenSeq++
 			refreshed.seq, refreshed.basedOn = o.tokenSeq, account.credentialVersion
+			account.generation = refreshed.seq
 			account.token = refreshed
 			account.fields["access_token"] = refreshed.access
 			if refreshed.refresh != "" {
@@ -568,6 +626,10 @@ func readLimits(spec opResultSpec, answer []byte) (map[string]any, string) {
 
 type wireOpsPush struct {
 	Accounts *[]wireOpsAccount `json:"accounts"`
+	// PersistFirst (P2e-2, stack_persist.go): the lane of a VM with a vault; absent or false in phase 1.
+	PersistFirst *bool `json:"persist_first"`
+	// Hold (P7): the VM is not its relay's serving instance; only with persist_first.
+	Hold *bool `json:"hold"`
 }
 
 type wireOpsAccount struct {
@@ -609,9 +671,14 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 			refuse(code)
 			return
 		}
-		if !s.ops.put(body) {
+		until, hasUntil, untilOK := leaseUntilOf(r.Header)
+		if !untilOK || !s.ops.put(body) {
 			refuse(errStackControlInvalid)
 			return
+		}
+		// The set's lease end (stack_lease.go): the same bound as the request table's.
+		if hasUntil {
+			s.stack.lease.setUntil(until)
 		}
 		rec.WriteHeader(http.StatusNoContent)
 	case stackOpsTokensPath:
@@ -620,6 +687,22 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 			return
 		}
 		writeControlJSON(rec, s.ops.tokens())
+	case stackOpsTokensAckPath:
+		if r.Method != http.MethodPost {
+			refuse(errMethodRefused)
+			return
+		}
+		body, readBytes, err := readRequestBody(r, stackOpsAckMax)
+		entry.RequestBytes = readBytes
+		if code := bodyReadCode(err); code != "" {
+			refuse(code)
+			return
+		}
+		if code := s.ops.ack(body); code != "" {
+			refuse(code)
+			return
+		}
+		rec.WriteHeader(http.StatusNoContent)
 	default:
 		refuse(errRouteRefused)
 	}
@@ -629,6 +712,10 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 func (o *stackOps) put(body []byte) bool {
 	var wire wireOpsPush
 	if checkStrictJSON(body) != nil || !decodeControl(body, &wire) || wire.Accounts == nil || len(*wire.Accounts) > stackOpsAccountsMax {
+		return false
+	}
+	hold := wire.Hold != nil && *wire.Hold
+	if hold && (wire.PersistFirst == nil || !*wire.PersistFirst) {
 		return false
 	}
 	pushed := make(map[string]*opsAccount, len(*wire.Accounts))
@@ -642,14 +729,19 @@ func (o *stackOps) put(body []byte) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	now := o.now()
+	// Set before the accounts are scheduled: a held VM's schedule has no refresh.
+	o.hold = hold
 	next := make(map[string]*opsAccount, len(pushed))
 	for id, account := range pushed {
 		held := o.accounts[id]
+		carried := false
 		if held != nil && held.vendor == account.vendor && held.credentialType == account.credentialType {
 			account.next, account.results, account.test, account.failures = held.next, held.results, held.test, held.failures
+			account.generation = held.generation
 			sameLogin := account.login.sameIdentity(held.login)
 			if sameLogin {
 				account.login.carry(held.login)
+				carried = true
 			}
 			// egress's own refresh is newer than any push from the version it was refreshed from. A password
 			// account's token exists only in the VM: egress's own (from a sign-in or a refresh of one) is always the
@@ -668,14 +760,27 @@ func (o *stackOps) put(body []byte) bool {
 			} else if account.expiresAt != held.expiresAt {
 				delete(account.next, opRefresh) // a new expiry moves the refresh
 			}
+			// A pending family (persist first) stays pending on the same terms as egress's token: the lane has not
+			// written it yet. A newer sealed credential drops it.
+			if held.pending != nil && (sameLogin || account.credentialVersion <= held.pending.basedOn) {
+				account.pending = held.pending
+			}
 			// An operation still running on the held account records into this one when it ends (run).
 			account.busy = held.busy
 			o.rescheduleLocked(account, held, now)
 		}
+		// Persist first: a sign-in's pacing from the VM's vault, only when egress holds none of its own (stack_persist.go).
+		if account.login != nil && !carried {
+			account.login.adoptPushedPacing()
+		}
 		o.scheduleLocked(account, now)
+		if account.pending != nil {
+			delete(account.next, opRefresh) // no refresh while a family waits for the lane
+		}
 		next[id] = account
 	}
 	o.accounts = next
+	o.persistFirst = wire.PersistFirst != nil && *wire.PersistFirst
 	return true
 }
 
@@ -770,6 +875,8 @@ type opsTokenAnswer struct {
 	Seq            uint64             `json:"seq"`
 	Credential     opsTokenCredential `json:"credential"`
 	RefreshToken   *string            `json:"refresh_token"`
+	// Pending (persist first): egress does not use this family until the lane acknowledges it; absent otherwise.
+	Pending bool `json:"pending,omitempty"`
 }
 
 type opsTokenCredential struct {
@@ -783,23 +890,34 @@ func (o *stackOps) tokens() map[string]any {
 	defer o.mu.Unlock()
 	answers := []opsTokenAnswer{}
 	for _, account := range o.accounts {
-		token := account.token
-		if token == nil {
-			continue
+		if token := account.token; token != nil {
+			answer := opsTokenAnswer{AccountID: account.id, BasedOnVersion: strconv.FormatUint(token.basedOn, 10), Seq: token.seq,
+				Credential: opsTokenCredential{Type: account.credentialType, Value: token.access}}
+			if token.expiresAt != 0 {
+				expires := token.expiresAt
+				answer.Credential.ExpiresAt = &expires
+			}
+			if refresh := account.fields["refresh_token"]; refresh != "" {
+				answer.RefreshToken = &refresh
+			}
+			answers = append(answers, answer)
 		}
-		answer := opsTokenAnswer{AccountID: account.id, BasedOnVersion: strconv.FormatUint(token.basedOn, 10), Seq: token.seq,
-			Credential: opsTokenCredential{Type: account.credentialType, Value: token.access}}
-		if token.expiresAt != 0 {
-			expires := token.expiresAt
-			answer.Credential.ExpiresAt = &expires
+		if account.pending != nil {
+			answers = append(answers, pendingAnswer(account))
 		}
-		if refresh := account.fields["refresh_token"]; refresh != "" {
-			answer.RefreshToken = &refresh
-		}
-		answers = append(answers, answer)
 	}
-	sort.Slice(answers, func(i, j int) bool { return answers[i].AccountID < answers[j].AccountID })
-	return map[string]any{"tokens": answers}
+	// By account; one account's installed token before its pending one.
+	sort.SliceStable(answers, func(i, j int) bool {
+		if answers[i].AccountID != answers[j].AccountID {
+			return answers[i].AccountID < answers[j].AccountID
+		}
+		return !answers[i].Pending && answers[j].Pending
+	})
+	out := map[string]any{"tokens": answers}
+	if o.persistFirst {
+		out["logins"] = o.loginPacingLocked()
+	}
+	return out
 }
 
 // recordTest keeps an account's last panel test for the container's view.
@@ -829,6 +947,8 @@ type opsAccountState struct {
 type opsRefreshView struct {
 	Mode string     `json:"mode"`
 	Last *opsResult `json:"last"`
+	// PendingPersist (persist first): a new token family waits for the lane to write it; the token in use is the old one.
+	PendingPersist bool `json:"pending_persist,omitempty"`
 }
 
 // state is `GET /v1/relay/account-state`: per account, the last result of each operation. Results come from the
@@ -839,7 +959,7 @@ func (o *stackOps) state() map[string]any {
 	defer o.mu.Unlock()
 	accounts := []opsAccountState{}
 	for _, account := range o.accounts {
-		accounts = append(accounts, opsAccountState{ID: account.id, Refresh: &opsRefreshView{Mode: account.refreshMode, Last: account.results[opRefresh]},
+		accounts = append(accounts, opsAccountState{ID: account.id, Refresh: &opsRefreshView{Mode: account.refreshMode, Last: account.results[opRefresh], PendingPersist: account.pending != nil},
 			Limits: account.results[opLimits], Models: account.results[opModels], Test: account.test, Login: o.loginViewLocked(account, now)})
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
@@ -860,6 +980,8 @@ const (
 	refreshCodeInputMissing   = "input_missing"
 	refreshCodeEgressError    = "egress_error"
 	refreshProblemNoToken     = "no_refresh_token"
+	// refreshProblemNotPersisted: a new token family waits for the lane to write it to the VM's vault (persist first).
+	refreshProblemNotPersisted = "not_persisted"
 )
 
 // opsRefreshHealth is one account's token refresh as `GET /v1/stack/health` carries it to the entry, which reports it
@@ -898,6 +1020,11 @@ func (o *stackOps) refreshHealth() map[string]*opsRefreshHealth {
 			// login view says, not a problem of its refresh.
 			if !view.HasRefreshToken && account.login == nil {
 				problem := refreshProblemNoToken
+				view.Problem = &problem
+			}
+			// Persist first: a family the lane has not written yet (stack_persist.go); egress keeps the token it had.
+			if account.pending != nil {
+				problem := refreshProblemNotPersisted
 				view.Problem = &problem
 			}
 			if last := account.results[opRefresh]; last != nil {

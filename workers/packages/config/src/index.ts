@@ -2899,7 +2899,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 1000,
     max: 60000,
     source: "crates/gray-gateway/src/payments.rs `rpc`: each JSON-RPC call times out after 15 s (a chain error, 502 chain_unavailable).",
-    doc: "How long one call to MOSS_RPC_URL may take.",
+    doc: "How long one call to MOSS_RPC_URL, or to a RELAY_SHARE_RPC_URLS endpoint, may take.",
   },
   {
     name: "SETUP_CLAIMS_PER_NETWORK",
@@ -3594,6 +3594,106 @@ export const SETTINGS: readonly SettingSpec[] = [
       "stays until an operator restores it.",
   },
   {
+    name: "RELAY_SHARE_RPC_URLS",
+    key: "relayShareRpcUrls",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: relayShareRpcUrlsProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md H5 and 13.11: Gray releases its share of a relay's record keys only for a compose hash " +
+      "effective on the relay's contract on Base (`GrayRelayAppAuth.effective`). Two endpoints of different providers that must agree, " +
+      "as the provisioner's and the relay tool's chain checks read it (13.4, P4); one is accepted, so a deployment can start with one. " +
+      "Unset by default: the share service answers unavailable until an environment names its chain. A URL that carries an API key is " +
+      "set as a secret of the same name, as MOSS_RPC_URL is.",
+    doc:
+      "One or two comma-separated JSON-RPC endpoints of the chain the relays' contracts are on (Base). The share service asks every one " +
+      "with eth_call whether the VM's compose hash is effective on the relay's contract, and releases the share only when every one says " +
+      "yes; one that cannot be read makes the answer unavailable, which the VM retries. Empty: the share service is off.",
+  },
+  {
+    name: "RELAY_SHARE_CHAIN_ID",
+    key: "relayShareChainId",
+    workers: ["console"],
+    type: "int",
+    default: "8453",
+    min: 1,
+    max: 9007199254740991,
+    source: "docs/design/relay-no-always-on-host.md H2: the relays' contracts are on Base, chain 8453 (Base Sepolia, 84532, for a test chain).",
+    doc:
+      "The chain the relays' contracts are on: every RELAY_SHARE_RPC_URLS endpoint must answer it (eth_chainId) before its contract read " +
+      "counts, and a phase-2 pairing's terms and guardian part name it (RELAY_PHASE2_RELAYS).",
+  },
+  {
+    name: "RELAY_PHASE2_RELAYS",
+    key: "relayPhase2Relays",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: relayPhase2RelaysProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md 13.11 P5a: phase 2 (the relay's own contract on Base, Deploy on Base's KMS, Gray's relayer) " +
+      "is built switched off; turning it on for a relay or for every relay is the owner's decision (13.9, 13.10), and P8 moves the relays.",
+    doc:
+      "Which relays pair and deploy in phase 2: empty (none, the default), `*` (every relay) or relay ids separated by commas. For such a " +
+      "relay POST /v1/lane-stack/pair/chain answers the chain terms, its pairing takes the guardian part, and Deploy deploys its contract and " +
+      "provisions on the relays' chain's KMS. Takes effect only with RELAY_CHAIN_PROPOSER set and a current phase-2 release profile for " +
+      "the relay; a relay without either pairs and deploys as in phase 1.",
+  },
+  {
+    name: "RELAY_CHAIN_PROPOSER",
+    key: "relayChainProposer",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: optionalAddressProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md H3, H11, 13.8: Gray's release proposer, an offline key, is every relay's contract's " +
+      "immutable `proposer` and part of its CREATE2 address (C12). Unset by default: no relay pairs in phase 2.",
+    doc:
+      "Gray's release proposer address (0x and 40 hex digits). A phase-2 pairing's terms name it, and the console recomputes the relay's " +
+      "contract address with it. Changing it changes the address of every contract not yet deployed: relays paired before then pair again.",
+  },
+  {
+    name: "RELAY_CHAIN_DSTACK_KMS",
+    key: "relayChainDstackKms",
+    workers: ["console"],
+    type: "text",
+    default: "0x2f83172A49584C017F2B256F0FB2Dca14126Ba9C",
+    textCheck: addressProblem,
+    source: "docs/design/relay-no-always-on-host.md 13.2: Phala's DstackKms on Base (v0.6.1), read with phala-deploy.mjs nodes on 2026-11-09.",
+    doc: "Phala's DstackKms on the relays' chain, which a phase-2 pairing's terms name for the kit's chain checks (`registeredApps`).",
+  },
+  {
+    name: "RELAY_CHAIN_KMS_IDS",
+    key: "relayChainKmsIds",
+    workers: ["console"],
+    type: "text",
+    default: "kms_kpw4DwWL,kms_23e2EjXz",
+    textCheck: kmsIdListProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md 13.2: Phala's Base KMS records on our nodes, kms-base-prod9 (kms_kpw4DwWL) and " +
+      "kms-base-prod5 (kms_23e2EjXz), read on 2026-11-09; A1 step 0 provisioned on the first.",
+    doc:
+      "The Phala KMS ids (`kms_…`, comma-separated) on the relays' chain: a phase-2 release profile must name one of them as its kms_id " +
+      "and a phase-1 profile none, so a phase-2 VM is provisioned on an on-chain KMS and a phase-1 VM never is.",
+  },
+  {
+    name: "RELAY_CHAIN_KIT_RPC_URLS",
+    key: "relayChainKitRpcUrls",
+    workers: ["console"],
+    type: "text",
+    default: "https://mainnet.base.org,https://base-rpc.publicnode.com",
+    textCheck: kitRpcUrlsProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md 13.3, 13.11 P4a: the relay's tool checks its contract on two endpoints of different " +
+      "providers that must agree. Base's own public endpoint and PublicNode's, both keyless; the relay may name others in its kit's " +
+      "`chain.rpc` [chosen 2026-11-09, replaceable].",
+    doc:
+      "The two Base JSON-RPC endpoints (different origins, no key in them: the relay's kit stores them) a phase-2 pairing's terms give " +
+      "gray-assistant for its `chain.rpc`.",
+  },
+  {
     name: "LANE_STACK_TEST_KEEP_DAYS",
     key: "laneStackTestKeepDays",
     workers: ["console"],
@@ -3689,6 +3789,23 @@ export const SETTINGS: readonly SettingSpec[] = [
       "sender must be an address of an onboarded domain and is the binding's allowed_sender_addresses (developers.cloudflare.com/email-service, " +
       "read 2026-10-29). Empty: no e-mail is sent; the panel says e-mail alerts are off and webhooks still work.",
     doc: "The sender of relay-stack alert and confirmation e-mails (one of ALERT_EMAIL's allowed sender addresses); empty turns e-mail alerts off.",
+  },
+  {
+    name: "LANE_STACK_EJECTION_CONTACT",
+    key: "laneStackEjectionContact",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) =>
+      v === "" || (v.length <= 2048 && v.startsWith("https://") && httpUrlProblem(v) === null) || /^[A-Za-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/.test(v)
+        ? null
+        : "is not an https link or an e-mail address",
+    source:
+      "docs/design/relay-ejection.md: only Gray's operators restore an ejected relay. The owner has not chosen the channel relays reach " +
+      "them by yet (2026-11-09), so it is configuration: empty until then, and the panel and the alert say that Gray reviews every ejection.",
+    doc:
+      "Where an ejected relay asks Gray to restore it: a support link (https) or an e-mail address, shown in the relay's panel and its " +
+      "relay_ejected alert. Empty: no contact is shown; they say \"Gray reviews every ejection; you will hear from us\".",
   },
   {
     name: "LANE_STACK_TUNNEL_ZONE",
@@ -4287,6 +4404,56 @@ export function httpUrlProblem(value: string): string | null {
   } catch {
     return "is not a URL";
   }
+}
+
+/** RELAY_SHARE_RPC_URLS: empty, or one or two distinct comma-separated http(s) URLs. */
+export function relayShareRpcUrlsProblem(value: string): string | null {
+  if (value === "") return null;
+  const urls = value.split(",").map((url) => url.trim());
+  if (urls.length > 2) return "names more than two endpoints";
+  if (new Set(urls).size !== urls.length) return "names one endpoint twice";
+  for (const url of urls) {
+    const problem = url === "" ? "has an empty entry" : httpUrlProblem(url);
+    if (problem !== null) return problem;
+  }
+  return null;
+}
+
+/** RELAY_PHASE2_RELAYS: empty, `*`, or relay ids (LANE_RELAY_ID_PATTERN's characters) separated by commas. */
+export function relayPhase2RelaysProblem(value: string): string | null {
+  if (value === "" || value === "*") return null;
+  const ids = value.split(",").map((id) => id.trim());
+  if (ids.some((id) => !/^[A-Za-z0-9._:-]{1,128}$/.test(id))) return "is not empty, * or relay ids separated by commas";
+  if (new Set(ids).size !== ids.length) return "names one relay twice";
+  return null;
+}
+
+/** Whether RELAY_PHASE2_RELAYS's value names `relayId` (or every relay). */
+export function relayOnPhase2(value: string, relayId: string): boolean {
+  if (value === "*") return true;
+  return value !== "" && value.split(",").some((id) => id.trim() === relayId);
+}
+
+/** RELAY_CHAIN_KMS_IDS: Phala KMS ids (`kms_…`), comma-separated, at least one. */
+export function kmsIdListProblem(value: string): string | null {
+  const ids = value.split(",").map((id) => id.trim());
+  if (ids.some((id) => !/^kms_[A-Za-z0-9]{1,64}$/.test(id))) return "is not Phala KMS ids (kms_…) separated by commas";
+  return new Set(ids).size === ids.length ? null : "names one KMS twice";
+}
+
+/** RELAY_CHAIN_KIT_RPC_URLS: exactly two http(s) URLs of different origins, with no user or password in them. */
+export function kitRpcUrlsProblem(value: string): string | null {
+  const urls = value.split(",").map((url) => url.trim());
+  if (urls.length !== 2) return "does not name exactly two endpoints";
+  const origins: string[] = [];
+  for (const url of urls) {
+    const problem = url === "" ? "has an empty entry" : httpUrlProblem(url);
+    if (problem !== null) return problem;
+    const parsed = new URL(url);
+    if (parsed.username !== "" || parsed.password !== "") return "names a user or password in a URL";
+    origins.push(parsed.origin);
+  }
+  return origins[0] === origins[1] ? "names one origin twice" : null;
 }
 
 /** An EVM address (0x and 40 hex digits, any case). */
@@ -5176,6 +5343,19 @@ export interface ConsoleConfig {
   readonly laneStackDebugShareKeepDays: number;
   /** LANE_STACK_EJECTION: whether a relay's reported violation takes it out of routing (docs/design/relay-ejection.md). */
   readonly laneStackEjection: LaneStackEjectionMode;
+  readonly laneStackEjectionContact: string;
+  /** RELAY_SHARE_RPC_URLS: "" when unset, else one or two comma-separated http(s) URLs. */
+  readonly relayShareRpcUrls: string;
+  readonly relayShareChainId: number;
+  /** RELAY_PHASE2_RELAYS: "", "*" or relay ids (relayOnPhase2 reads it). */
+  readonly relayPhase2Relays: string;
+  /** RELAY_CHAIN_PROPOSER: Gray's release proposer address; "" when unset (no phase-2 pairing). */
+  readonly relayChainProposer: string;
+  readonly relayChainDstackKms: string;
+  /** RELAY_CHAIN_KMS_IDS: the Phala KMS ids on the relays' chain, comma-separated. */
+  readonly relayChainKmsIds: string;
+  /** RELAY_CHAIN_KIT_RPC_URLS: the two endpoints a phase-2 pairing gives gray-assistant, comma-separated. */
+  readonly relayChainKitRpcUrls: string;
   /** Always off on Workers (DEBT_MODE_RULE). */
   readonly debtMode: "off";
   readonly creditFailureAdvances: "off" | "on";

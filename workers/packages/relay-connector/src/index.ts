@@ -63,4 +63,5 @@ export * from "./refreshed.ts";
 export * from "./seal.ts";
 export * from "./signature.ts";
 export * from "./store.ts";
+export * from "./vault-state.ts";
 export * from "./scheduler/index.ts";

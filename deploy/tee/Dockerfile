@@ -1,5 +1,5 @@
 # The gray-lane image: workerd, the gateway's confidential-lane bundle, gray-egress, gray-acme,
-# gray-isolation-check, the rendered workerd config and the entrypoint. The same image runs every Gray
+# gray-isolation-check, gray-peerlink, gray-idle, the rendered workerd config, the entrypoint and pre-launch's boot box helper. The same image runs every Gray
 # compose service (lane, egress and the one-shot acme; in the relay-stack layout also the one-shot
 # isolation-check); egress, acme and isolation-check override the entrypoint.
 #
@@ -12,7 +12,8 @@
 #   an empty build id, in the pinned Go image; go.mod has no requirements, so that stage makes no
 #   network request;
 # - gray-isolation-check is built from deploy/tee/isolation-check like gray-egress (standard library
-#   only, no network);
+#   only, no network); so is gray-idle from deploy/tee/idle;
+# - boot-box.mjs is esbuild's bundle of deploy/tee/boot-box/main.mjs from the same lockfile (build.sh);
 # - gray-acme is built from deploy/tee/acme the same way. Its go.mod pins lego v5.6.0 and its
 #   go.sum pins every module content hash, so the Go stage downloads exactly those bytes from the
 #   module proxy (the only network step in the Go stages); `-mod=readonly` makes a missing go.sum entry
@@ -56,6 +57,18 @@ WORKDIR /src
 COPY isolation-check/ /src/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/gray-isolation-check .
+
+# ---------------------------------------------------------------------------------------------------
+# gray-idle (deploy/tee/idle): the empty slot's program (docs/design/relay-no-always-on-host.md 13.11 P2d), standard
+# library only, static, flags as egress. Pre-launch imports this one file as the relay's slot of a phase-2 boot that has
+# no boot box to open, so it must run alone in an otherwise empty image.
+# ---------------------------------------------------------------------------------------------------
+FROM ${GO_IMAGE} AS idle
+ARG TARGETARCH=amd64
+WORKDIR /src
+COPY idle/ /src/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/gray-idle .
 
 # ---------------------------------------------------------------------------------------------------
 # gray-acme (deploy/tee/acme): lego as a library at the go.mod/go.sum pin, same flags as egress.
@@ -102,6 +115,7 @@ COPY --from=egress /out/gray-egress /usr/local/bin/gray-egress
 COPY --from=acme /out/gray-acme /usr/local/bin/gray-acme
 COPY --from=isolation-check /out/gray-isolation-check /usr/local/bin/gray-isolation-check
 COPY --from=peerlink /out/gray-peerlink /usr/local/bin/gray-peerlink
+COPY --from=idle /out/gray-idle /usr/local/bin/gray-idle
 # D55: gray-egress verifies vendor TLS with Go's system roots at the Go path.
 COPY --from=egress /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 # D97: workerd's trustBrowserCas reads BoringSSL's default file path. The file lookup loads this
@@ -113,6 +127,10 @@ COPY --from=egress /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
 COPY config.capnp /srv/lane/config.capnp
 COPY worker/ /srv/lane/worker/
 COPY entrypoint.mjs /srv/lane/entrypoint.mjs
+COPY kms-lease.mjs /srv/lane/kms-lease.mjs
+COPY vault-disk.mjs /srv/lane/vault-disk.mjs
+# P2d: pre-launch's boot box helper, one esbuild bundle (deploy/tee/boot-box), run by a phase-2 pre-launch only.
+COPY boot-box.mjs /srv/lane/boot-box.mjs
 
 # The build provenance the report serves as `source_provenance`: the commit the bundle came from.
 COPY build.env /etc/lane/build.env
@@ -127,8 +145,8 @@ COPY build.env /etc/lane/build.env
 # peerlink.sock and nothing else of peerlink's, and the relay, which mounts neither volume, reaches neither socket.
 RUN echo "${WORKERD_SHA256}  /usr/local/bin/workerd" | sha256sum -c - \
  && chmod 0755 /usr/local/bin/workerd /usr/local/bin/gray-egress /usr/local/bin/gray-acme \
-      /usr/local/bin/gray-isolation-check /usr/local/bin/gray-peerlink /srv/lane/entrypoint.mjs \
- && chmod 0644 /srv/lane/config.capnp /srv/lane/worker/* /etc/lane/build.env \
+      /usr/local/bin/gray-isolation-check /usr/local/bin/gray-peerlink /usr/local/bin/gray-idle /srv/lane/entrypoint.mjs \
+ && chmod 0644 /srv/lane/config.capnp /srv/lane/worker/* /srv/lane/kms-lease.mjs /srv/lane/vault-disk.mjs /srv/lane/boot-box.mjs /etc/lane/build.env \
  && mkdir -p /run/lane /run/gray /run/peerlink /certs \
  && chmod 0700 /run/lane \
  && chown 10002:10100 /run/gray \

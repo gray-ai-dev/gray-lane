@@ -231,6 +231,12 @@ export const STACK_SERVED = ["served", "paused", "excluded"] as const;
 /** Why the entry has no configuration to report (S42 `config.absent`). */
 export const STACK_CONFIG_ABSENT = ["unknown_relay", "stack_config_refused"] as const;
 
+/** The outcomes of a KMS re-check (S42 `kms_lease.last_outcome`; deploy/tee/bin/kms-lease.mjs `KmsCheckResult`). */
+export const KMS_LEASE_OUTCOMES = ["allowed", "refused", "unreachable"] as const;
+export type KmsLeaseOutcome = (typeof KMS_LEASE_OUTCOMES)[number];
+/** The longest refusal reason the report carries: `Boot denied: ` and the KMS's reason, as kms-lease.mjs cuts it. */
+export const KMS_LEASE_REASON_MAX = 160;
+
 /** The protocols an account test speaks (S44): the lane's protocols. */
 export const STACK_TEST_PROTOCOLS = ["anthropic_messages", "open_ai_responses", "open_ai_chat"] as const;
 
@@ -298,8 +304,12 @@ export type StackAccountStateReason = (typeof STACK_ACCOUNT_STATE_REASONS)[numbe
  */
 export const STACK_REFRESH_MODES = ["source", "gray"] as const;
 export type StackRefreshMode = (typeof STACK_REFRESH_MODES)[number];
-/** Why egress cannot refresh a `gray` account at all: the sealed credential carries no refresh token. */
-export const STACK_REFRESH_PROBLEMS = ["no_refresh_token"] as const;
+/**
+ * Why egress's refresh of a `gray` account is not in use: the sealed credential carries no refresh token
+ * (`no_refresh_token`), or (P2e-2, persist first) a new token family waits for the lane to write it to the VM's vault and
+ * the previous token is still in use (`not_persisted`).
+ */
+export const STACK_REFRESH_PROBLEMS = ["no_refresh_token", "not_persisted"] as const;
 /**
  * Why egress's last refresh failed (egress `refreshCode`): the vendor refused it (400/401/403: sign in again) or answered
  * another error, the proxy or the direct connection failed, it timed out, the answer was not a token, the template

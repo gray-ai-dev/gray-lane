@@ -28,6 +28,11 @@ import { appendReserveTokens } from "./hooks.ts";
 import { remoteSchedulerFetch } from "./remote/scheduler.ts";
 import { laneRelaysOf, stackRelayOf } from "./remote/snapshot.ts";
 import type { StackRelayConfigProvider } from "./stack-config.ts";
+import { gatedStackConfig, gatedStackCredentials, KmsLeaseGate } from "./kms-lease.ts";
+import { StackConfigClient } from "./remote/stack.ts";
+import { LaneVault, vaultCopy, vaultDiskClient, vaultKeys } from "./vault.ts";
+import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
+import { bootCopy, bootDiskClient, LaneBootBox } from "./boot-intake.ts";
 import { laneStackService, type LaneStackOptions, type StackConfigService } from "./stack-service.ts";
 import type { StoredPeerAttempt } from "./peer-model.ts";
 import type { LanePolicyRecord, LanePolicySource, LaneReceiptStore, LaneRelay, LaneRelayRegistry, LaneScheduler, LaneState, LaneTiming, StoredReceipt } from "./types.ts";
@@ -129,6 +134,31 @@ export interface LaneStateOptions {
    * pushes its account table to egress. Absent in the default layout.
    */
   readonly stack?: LaneStackOptions;
+  /**
+   * P2c-2 (docs/design/relay-no-always-on-host.md H9): the deployment keeps a KMS lease (LANE_KMS_LEASE), so the relay's
+   * accounts are served only while it serves (`kms-lease.ts`).
+   */
+  readonly kmsLease?: boolean;
+  /**
+   * P2e (docs/design/relay-no-always-on-host.md §3.1, 13.11): the relay's vault, for a stack boot with a KMS lease whose
+   * supervisor serves the vault's disk (LANE_VAULT_DISK). The store is then lease-gated, its accounts come from the vault
+   * and every change is written there (`vault.ts`). Absent: memory only, as before.
+   */
+  readonly vault?: LaneVaultSettings;
+}
+
+/** What the vault needs beyond the stack's settings: the measured relay key, the app id and its two sockets. */
+export interface LaneVaultSettings {
+  /** LANE_STACK_RELAY_KEY: the measured relay key, 64 lower hex. */
+  readonly relayKey: string;
+  /** The dstack app id (KEYSET_SUBJECT's), 40 lower hex. */
+  readonly appId: string;
+  /** The supervisor's disk service (`LANE_VAULT_DISK`). */
+  readonly disk: { fetch(input: string, init?: RequestInit): Promise<Response> };
+  /** The guest agent (`GUEST_AGENT`), its base URL and the bound on one call. */
+  readonly guest: { fetch(input: string, init?: RequestInit): Promise<Response> };
+  readonly guestUrl: string;
+  readonly guestTimeoutMs: number;
 }
 
 // The store's types are the seam's (`types.ts`), re-exported for the files that import them from here.
@@ -279,6 +309,20 @@ export interface LaneProcessState extends LaneState {
   readonly stackConfig: StackRelayConfigProvider;
   /** The stack layout's config service (the relay listener's two GETs, the egress table); null otherwise. */
   readonly stack: StackConfigService | null;
+  /** P2c-2: the KMS lease's gate when the deployment keeps one (LANE_KMS_LEASE); null for a phase-1 boot. */
+  readonly kmsLease: KmsLeaseGate | null;
+  /** P2e: the relay's vault when the deployment keeps one (LANE_VAULT_DISK); null for a phase-1 boot and the empty slot. */
+  readonly vault: LaneVault | null;
+  /**
+   * P4b: the boot box intake of a phase-2 boot (LANE_VAULT_DISK), in the empty slot as well as serving; null for a
+   * phase-1 boot.
+   */
+  readonly bootBox: LaneBootBox | null;
+  /**
+   * P7 (docs/design/relay-no-always-on-host.md 13.4): whether this boot is its relay's serving instance, for a boot with a
+   * vault; null for a phase-1 boot and the empty slot (one instance, nothing to share).
+   */
+  readonly instanceRole: LaneInstanceRole | null;
 }
 
 /**
@@ -341,7 +385,9 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
       return bytes !== null && bytes.length === 32 ? bytes : null;
     },
   };
-  const credentials = new RelayCredentialStore({ intakeKey, keys: relayKeys, keysetDigest: keyset.digest });
+  // P2e: with a vault, the KMS lease bounds the relay's accounts, not a bundle's end (`leaseGated`).
+  const vaultSettings = options.vault !== undefined && options.stack !== undefined && options.kmsLease === true ? options.vault : null;
+  const credentials = new RelayCredentialStore({ intakeKey, keys: relayKeys, keysetDigest: keyset.digest, ...(vaultSettings === null ? {} : { leaseGated: true }) });
   const policies = createLanePolicyStore();
   const now = options.now ?? (() => Date.now());
   const receipts = createReceiptStore({
@@ -435,19 +481,76 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     },
     closeScheduler,
   );
+  // P2c-2: with a KMS lease, the stack services read the store through its gate (no account while it does not serve).
+  const kmsLease = options.kmsLease === true ? new KmsLeaseGate() : null;
+  const bridgeOptions = { baseUrl: options.bridgeUrl, keyId: options.laneKeyId, signingKey: bridgeSigner, ...(options.fetch === undefined ? {} : { fetch: options.fetch }), now };
+  let vault: LaneVault | null = null;
+  let bootBox: LaneBootBox | null = null;
+  let instanceRole: LaneInstanceRole | null = null;
+  // P7: a merge with another instance's version changed the store: the document follows (set once the stack service exists).
+  let restored: () => Promise<void> = async () => {};
+  // P2d: a phase-2 boot in the empty slot has no relay image, so no K_vault of its own: it keeps no vault. P4b: it takes
+  // the relay's boot box (`boot-intake.ts`), and after one, the accounts for the designated image in a vault of their own
+  // (`stagedVault`, over a store nothing serves), which the boot on that image opens after the restart.
+  const stackImage = options.stack?.relayImage ?? null;
+  if (vaultSettings !== null && options.stack !== undefined) {
+    const relayId = options.stack.relayId;
+    const bridge = new StackConfigClient(bridgeOptions);
+    const keys = vaultKeys({ guest: vaultSettings.guest, guestUrl: vaultSettings.guestUrl, timeoutMs: vaultSettings.guestTimeoutMs, bridge, relayId, appId: vaultSettings.appId });
+    const vaultFor = (image: string, store: RelayCredentialStore, role?: LaneInstanceRole): LaneVault =>
+      new LaneVault({
+        relayId,
+        relayKey: vaultSettings.relayKey,
+        image,
+        appId: vaultSettings.appId,
+        store,
+        disk: vaultDiskClient(vaultSettings.disk),
+        keys,
+        copy: vaultCopy(bridge, relayId, vaultSettings.appId),
+        now,
+        // P7 (13.4): only the serving instance writes; a merge's accounts reach the document at once.
+        ...(role === undefined ? {} : { writer: role, onRestored: () => restored() }),
+      });
+    if (stackImage !== null) {
+      const role = new LaneInstanceRole({ relayId, source: bridge, now, pollMs: options.stack.pollMs, ttlMs: LANE_ROLE_TTL_MS });
+      const served = vaultFor(stackImage, credentials, role);
+      // Becoming serving (a rollout's new instance at its shift, an instance a rollback serves again): Gray's newest copy
+      // is read, and merged when another instance wrote it, before this one writes.
+      role.onChange((now) => (now === "serving" ? served.becameServing() : undefined));
+      instanceRole = role;
+      vault = served;
+    }
+    bootBox = new LaneBootBox({
+      relayId,
+      relayKey: vaultSettings.relayKey,
+      appId: vaultSettings.appId,
+      runningImage: stackImage,
+      disk: bootDiskClient(vaultSettings.disk),
+      keys,
+      copy: bootCopy(bridge, relayId, vaultSettings.appId),
+      now,
+      ...(stackImage !== null
+        ? {}
+        : { stagedVault: (image: string) => vaultFor(image, new RelayCredentialStore({ intakeKey, keys: relayKeys, keysetDigest: keyset.digest, leaseGated: true })) }),
+    });
+  }
+  const laneVault = vault;
   const stack =
     options.stack === undefined
       ? null
       : laneStackService({
           ...options.stack,
-          bridge: { baseUrl: options.bridgeUrl, keyId: options.laneKeyId, signingKey: bridgeSigner, ...(options.fetch === undefined ? {} : { fetch: options.fetch }), now },
-          credentials,
+          bridge: bridgeOptions,
+          credentials: gatedStackCredentials(credentials, kmsLease),
+          kmsLease,
+          ...(laneVault === null ? {} : { vault: () => laneVault.report() }),
           onSnapshot: (snapshot) => {
             registry.refresh(snapshot);
           },
           onUnknownRelay: (relayId) => registry.clearRelay(relayId),
           now,
         });
+  if (stack !== null) restored = () => stack.refresh();
   const timing: LaneTiming = Object.freeze({
     policyStepMs: options.policyStepMs,
     policyFuelPerMs: options.policyFuelPerMs,
@@ -474,8 +577,13 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     bridgeUrl: options.bridgeUrl,
     laneKeyId: options.laneKeyId,
     now,
-    stackConfig: stack ?? { relayId: null, relayImage: null, current: () => null },
+    // P2c-2: the request path plans on no config while the KMS lease does not serve (`gatedStackConfig`).
+    stackConfig: stack === null ? { relayId: null, relayImage: null, current: () => null } : gatedStackConfig(stack, kmsLease, now),
     stack,
+    kmsLease,
+    vault,
+    bootBox,
+    instanceRole,
   };
 }
 

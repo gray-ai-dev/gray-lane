@@ -146,7 +146,8 @@ func (s *server) putAccounts(rec *responseRecorder, r *http.Request, entry *requ
 	}
 	version, versionOK := stackU64Header(r.Header, stackVersionHeader)
 	push, pushOK := stackU64Header(r.Header, stackPushHeader)
-	if !versionOK || !pushOK {
+	until, hasUntil, untilOK := leaseUntilOf(r.Header)
+	if !versionOK || !pushOK || !untilOK {
 		refuse()
 		return
 	}
@@ -177,6 +178,10 @@ func (s *server) putAccounts(rec *responseRecorder, r *http.Request, entry *requ
 		entry.Error = errStackAccountsStale
 		writeRefusal(rec, errStackAccountsStale)
 		return
+	}
+	// The table's lease end (stack_lease.go), with the table it came with; a stale table's is not taken.
+	if hasUntil {
+		s.stack.lease.setUntil(until)
 	}
 	rec.WriteHeader(http.StatusNoContent)
 }
@@ -421,7 +426,7 @@ func (s *server) streamFeed(rec *responseRecorder, r *http.Request, rid string, 
 			entry.Error = errClientWrite
 			return
 		}
-		written := writeFeedLines(rec, controller, lines)
+		written := writeFeedLines(rec, controller, req.budget, lines)
 		// The lines held their bytes in the budget until they were written (or failed to be).
 		req.budget.give(size)
 		if !written {
@@ -443,11 +448,26 @@ func (s *server) feedReaderGone(req *stackRequest) {
 	s.stack.end(req, false)
 }
 
-func writeFeedLines(rec *responseRecorder, controller *http.ResponseController, lines [][]byte) bool {
-	for _, line := range lines {
-		if _, err := rec.Write(line); err != nil {
-			return false
+// writeFeedLines writes a batch of records. A debug copy is claimed only as its turn comes, so until then the budget
+// can still take it back (its `omitted` line goes instead); its bytes come back once written, or at once when an
+// earlier write failed.
+func writeFeedLines(rec *responseRecorder, controller *http.ResponseController, budget *stackBudget, lines []feedItem) bool {
+	written := true
+	for _, item := range lines {
+		line, held := item.line, int64(0)
+		if item.spare != nil {
+			if full, size := budget.claimSpare(item.spare); full != nil {
+				line, held = full, size
+			}
 		}
+		if written {
+			_, err := rec.Write(line)
+			written = err == nil
+		}
+		budget.give(held)
+	}
+	if !written {
+		return false
 	}
 	err := controller.Flush()
 	return err == nil || errors.Is(err, http.ErrNotSupported)

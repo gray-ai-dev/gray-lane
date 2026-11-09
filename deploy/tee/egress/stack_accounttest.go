@@ -107,6 +107,11 @@ func (s *server) serveAccountTest(rec *responseRecorder, r *http.Request, entry 
 		return
 	}
 	if answer == nil {
+		// Past the KMS lease's end no account test reaches a vendor (stack_lease.go).
+		if s.stack.lease.ended(s.stack.now()) {
+			refuse(errStackCredentialUnknown)
+			return
+		}
 		if s.stack.testsRunning.Add(1) > stackTestsMax {
 			s.stack.testsRunning.Add(-1)
 			refuse(errStackTestsBusy)

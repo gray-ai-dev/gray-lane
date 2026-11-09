@@ -14,9 +14,17 @@
  * parses them strictly and checks each member's form, never their bytes. Events are only facts when the
  * log replayed to the quote's RTMR3: the caller checks that first (`replayEventLog`).
  *
+ * Phase 2 (docs/design/relay-no-always-on-host.md §3.5, 13.11 P2d): a VM with no relay host takes its image from the
+ * sealed boot box, whose relay-signed designation `gray-relay-image` v2 carries instead of a token service's nonce:
+ * `{image, image_sig, issued_ms, previous, relay_id, seq}`, `image_sig` the relay key's Ed25519 signature over
+ * `gray-relay-designation/v1\n` ‖ JCS({image, issued_ms, previous, relay_id, seq}) (`sealed`, with a
+ * `RelayDesignationClaim`). A phase-2 VM with no boot box to open measures `{image: null, relay_id, seq: 0}` and runs
+ * Gray's idle program in the relay's slot: `empty_slot`, which serves nothing and which no party routes to; only the
+ * relay's own tool delivers to it (P4).
+ *
  * Pure code (`@gray/attest`'s Ed25519 on WebCrypto), so it runs in Node and workerd.
  */
-import { ed25519Verify, lowerHexBytes } from "@gray/attest";
+import { ed25519Verify, jcsBytes, lowerHexBytes } from "@gray/attest";
 import { isObject, parseStrict, type Json } from "@gray/json";
 import { DSTACK_RUNTIME_EVENT_TYPE, type DstackEvent } from "./dstack.ts";
 
@@ -28,6 +36,8 @@ export const PRELAUNCH_SEALED_EVENT = "gray-prelaunch-sealed";
 export const PRELAUNCH_SEALED_PAYLOAD = "gray-prelaunch-sealed-v1";
 /** S51: the first line of what the relay signs for the image it chose. */
 export const RELAY_IMAGE_SIGNATURE_DOMAIN = "gray-relay-image/v1";
+/** P2d: the first line of what the relay signs for a phase-2 designation (`@gray/relay-connector/vault` DESIGNATION_DOMAIN). */
+export const RELAY_DESIGNATION_SIGNATURE_DOMAIN = "gray-relay-designation/v1";
 
 /** The relay id form (app-compose.mjs `RELAY_ID`, `@gray/control` `LANE_RELAY_ID_PATTERN`). */
 export const STACK_RELAY_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -71,9 +81,29 @@ export interface RelayImageClaim {
   readonly nonce: string;
 }
 
+/** P2d: the relay-signed designation a phase-2 boot measured (`gray-relay-image` v2). */
+export interface RelayDesignationClaim {
+  readonly relayId: string;
+  readonly image: string;
+  /** 128 lower hex: Ed25519 over `relayDesignationMessage(claim)`. */
+  readonly imageSig: string;
+  readonly issuedMs: number;
+  /** The image before this one, or null for the relay's first. */
+  readonly previous: string | null;
+  /** Grows with every designation (at least 1). */
+  readonly seq: number;
+}
+
+/** Whether a sealed boot's image claim is a phase-2 designation (v2) rather than a token service's answer (v1). */
+export function isRelayDesignationClaim(claim: RelayImageClaim | RelayDesignationClaim): claim is RelayDesignationClaim {
+  return "seq" in claim;
+}
+
 export type StackBootFacts =
   | { readonly phase: "pre_launch"; readonly identity: StackIdentity }
-  | { readonly phase: "sealed"; readonly identity: StackIdentity; readonly image: RelayImageClaim };
+  | { readonly phase: "sealed"; readonly identity: StackIdentity; readonly image: RelayImageClaim | RelayDesignationClaim }
+  /** P2d: a phase-2 boot with no boot box to open: the relay's slot runs Gray's idle program, nothing is served. */
+  | { readonly phase: "empty_slot"; readonly identity: StackIdentity };
 
 export type StackBootProblemCode =
   /** No `system-ready`, or runtime events after it that are not exactly one of the two shapes. */
@@ -94,6 +124,16 @@ export type StackBootResult =
 /** S51: the bytes the relay signs: `gray-relay-image/v1\n<nonce>\n<image>`, UTF-8, no trailing newline. */
 export function relayImageMessage(nonce: string, image: string): Uint8Array {
   return new TextEncoder().encode(`${RELAY_IMAGE_SIGNATURE_DOMAIN}\n${nonce}\n${image}`);
+}
+
+/** P2d: the bytes the relay signs for a designation: `gray-relay-designation/v1\n` ‖ JCS of its five members, no trailing newline. */
+export function relayDesignationMessage(claim: Omit<RelayDesignationClaim, "imageSig">): Uint8Array {
+  const domain = new TextEncoder().encode(`${RELAY_DESIGNATION_SIGNATURE_DOMAIN}\n`);
+  const body = jcsBytes({ image: claim.image, issued_ms: BigInt(claim.issuedMs), previous: claim.previous, relay_id: claim.relayId, seq: BigInt(claim.seq) });
+  const out = new Uint8Array(domain.length + body.length);
+  out.set(domain);
+  out.set(body, domain.length);
+  return out;
 }
 
 /** Whether `image` is an S51 relay image reference. */
@@ -177,6 +217,41 @@ export function parseRelayImagePayload(event: DstackEvent): RelayImageClaim | nu
   return { relayId: relayId as string, image, imageSig: imageSig as string, nonce: nonce as string };
 }
 
+function payloadJson(event: DstackEvent): Readonly<Record<string, Json>> | null {
+  const bytes = lowerHexBytes(event.event_payload);
+  if (bytes === null) return null;
+  try {
+    const value = parseStrict(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+    return isObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeInteger(value: Json | undefined, min: number): number | null {
+  return typeof value === "bigint" && value >= BigInt(min) && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+}
+
+/**
+ * P2d's image payload: a designation (`RelayDesignationClaim`), `"empty_slot"` for `{image: null, relay_id, seq: 0}`,
+ * or null. `relayId` is the empty slot's relay, checked by the caller against the identity.
+ */
+export function parseRelayDesignationPayload(event: DstackEvent): RelayDesignationClaim | { readonly emptySlot: true; readonly relayId: string } | null {
+  const value = payloadJson(event);
+  if (value === null) return null;
+  const keys = Object.keys(value).sort().join(",");
+  const relayId = value.relay_id;
+  if (typeof relayId !== "string" || !STACK_RELAY_ID_PATTERN.test(relayId)) return null;
+  if (keys === "image,relay_id,seq") return value.image === null && value.seq === 0n ? { emptySlot: true, relayId } : null;
+  if (keys !== "image,image_sig,issued_ms,previous,relay_id,seq") return null;
+  const { image, image_sig: imageSig, previous } = value;
+  const seq = safeInteger(value.seq, 1);
+  const issuedMs = safeInteger(value.issued_ms, 0);
+  if (!isStackRelayImage(image) || !(previous === null || isStackRelayImage(previous))) return null;
+  if (typeof imageSig !== "string" || !/^[0-9a-f]{128}$/.test(imageSig) || seq === null || issuedMs === null) return null;
+  return { relayId, image, imageSig, issuedMs, previous, seq };
+}
+
 /**
  * The stack facts of a replayed event log (S52), without the signature check. The runtime events after the
  * one `system-ready` must be none, `[identity]` or `[identity, image, sealed]`; events of other IMRs or
@@ -198,25 +273,32 @@ export function stackBootFacts(events: readonly DstackEvent[]): StackBootResult 
   const identity = parseStackIdentityPayload(after[0] as DstackEvent);
   if (identity === null) return fail("stack_identity_invalid", `the ${STACK_IDENTITY_EVENT} payload is not {public_key, relay_id, token_url} (or, before stack release B, with tls_domain) in their forms`);
   if (after.length === 1) return { ok: true, facts: { phase: "pre_launch", identity } };
-  const image = parseRelayImagePayload(after[1] as DstackEvent);
-  if (image === null) return fail("relay_image_invalid", `the ${RELAY_IMAGE_EVENT} payload is not {image, image_sig, nonce, relay_id} in their forms`);
+  const image = parseRelayImagePayload(after[1] as DstackEvent) ?? parseRelayDesignationPayload(after[1] as DstackEvent);
+  if (image === null) {
+    return fail("relay_image_invalid", `the ${RELAY_IMAGE_EVENT} payload is not {image, image_sig, nonce, relay_id}, v2's {image, image_sig, issued_ms, previous, relay_id, seq} or the empty slot's {image: null, relay_id, seq: 0} in their forms`);
+  }
   if (image.relayId !== identity.relayId) return fail("relay_image_relay_mismatch", `the ${RELAY_IMAGE_EVENT} event names another relay than ${STACK_IDENTITY_EVENT}`);
   const seal = lowerHexBytes((after[2] as DstackEvent).event_payload);
   if (seal === null || new TextDecoder().decode(seal) !== PRELAUNCH_SEALED_PAYLOAD) {
     return fail("stack_events_invalid", `the ${PRELAUNCH_SEALED_EVENT} payload is not ${PRELAUNCH_SEALED_PAYLOAD}`);
   }
+  if ("emptySlot" in image) return { ok: true, facts: { phase: "empty_slot", identity } };
   return { ok: true, facts: { phase: "sealed", identity, image } };
 }
 
-/** Whether `claim.imageSig` is the identity's key's signature over `relayImageMessage(claim.nonce, claim.image)`. */
-export async function relayImageSignatureValid(identity: StackIdentity, claim: RelayImageClaim): Promise<boolean> {
+/**
+ * Whether `claim.imageSig` is the identity's key's signature over `relayImageMessage(claim.nonce, claim.image)` (v1), or
+ * over `relayDesignationMessage(claim)` (v2).
+ */
+export async function relayImageSignatureValid(identity: StackIdentity, claim: RelayImageClaim | RelayDesignationClaim): Promise<boolean> {
   const key = lowerHexBytes(identity.publicKey);
   const signature = lowerHexBytes(claim.imageSig);
   if (key === null || signature === null) return false;
-  return ed25519Verify(key, relayImageMessage(claim.nonce, claim.image), signature);
+  const message = isRelayDesignationClaim(claim) ? relayDesignationMessage(claim) : relayImageMessage(claim.nonce, claim.image);
+  return ed25519Verify(key, message, signature);
 }
 
-/** `stackBootFacts`, and for a sealed boot the relay's signature on its image. */
+/** `stackBootFacts`, and for a sealed boot the relay's signature on its image (v1) or designation (v2). */
 export async function verifyStackBoot(events: readonly DstackEvent[]): Promise<StackBootResult> {
   const result = stackBootFacts(events);
   if (!result.ok || result.facts === null || result.facts.phase !== "sealed") return result;

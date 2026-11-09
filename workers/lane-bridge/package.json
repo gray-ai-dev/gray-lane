@@ -19,6 +19,7 @@
     "@gray/json": "0.0.0",
     "@gray/lane-verify": "0.0.0",
     "@gray/lane-wire": "0.0.0",
+    "@gray/relay-connector": "0.0.0",
     "@gray/request-index": "0.0.0",
     "@gray/snapshot": "0.0.0",
     "@phala/dcap-qvl": "0.7.0"

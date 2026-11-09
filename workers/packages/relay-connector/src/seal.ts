@@ -9,6 +9,7 @@ import {
   type CredentialRevoke,
   type CredentialUpdate,
 } from "./bundle.ts";
+import { BootBoxError, bootBoxDeliveryValue, parseBootBoxDelivery, type BootBoxDelivery } from "./boot-box.ts";
 import { bytesToHex } from "./bytes.ts";
 import { sealedCredentialValue } from "./envelope.ts";
 import { RelayConnectorError } from "./errors.ts";
@@ -61,21 +62,52 @@ async function sealPayload(
   const nowSecs = options.nowSecs ?? nowSeconds();
   if (isExpiredAt(binding.binding.keyset, nowSecs)) throw new RelayConnectorError("keyset_expired");
   if (relaySigningKey instanceof Uint8Array && relaySigningKey.length !== 32) throw new RelayConnectorError("invalid_bundle", "relaySigningKey");
-
   // Re-parse the typed payload through the wire rules, so the sealing side cannot sign a shape the
   // TEE will refuse (or a credential whose format class is wrong for its vendor).
   const validated = parseCredentialPayload(payloadValue(payload));
   if (payloadKindIsBundle(validated)) assertBundleSealable(validated, nowSecs);
+  return sealSignedValue(report, relaySigningKey, payloadValue(validated), { ...options, nowSecs });
+}
+
+/** The envelope around one signed payload value: the report's checks, the relay's signature, HPKE to the intake key. */
+async function sealSignedValue(report: Json, relaySigningKey: Ed25519KeyMaterial, value: Json, options: SealCredentialOptions): Promise<JsonObject> {
+  if (options.quoteVerified !== true) throw new RelayConnectorError("quote_not_verified");
+  const binding = verifyReportBinding(report, options.nonce);
+  if (!binding.ok || binding.binding === null) throw new RelayConnectorError("report_binding_invalid");
+  const nowSecs = options.nowSecs ?? nowSeconds();
+  if (isExpiredAt(binding.binding.keyset, nowSecs)) throw new RelayConnectorError("keyset_expired");
+  if (relaySigningKey instanceof Uint8Array && relaySigningKey.length !== 32) throw new RelayConnectorError("invalid_bundle", "relaySigningKey");
 
   const entry = requireIntakeKey(binding.binding.keyset, options.keyId);
   const recipient = intakePublicKey(entry);
   if (recipient === null) throw new RelayConnectorError("no_intake_key");
   const keysetDigest = binding.binding.keyset_digest;
-  const preimage = jcsBytes(payloadValue(validated));
+  const preimage = jcsBytes(value);
   const signature = await signEd25519(relaySigningKey, preimage, "invalid_bundle");
-  const plaintext = jcsBytes({ payload: payloadValue(validated), signature: bytesToHex(signature) });
+  const plaintext = jcsBytes({ payload: value, signature: bytesToHex(signature) });
   const sealed = await hpkeSeal(recipient, plaintext, intakeInfo(entry.key_id, keysetDigest), intakeAad(keysetDigest));
   return sealedCredentialValue(entry.key_id, keysetDigest, sealed.enc, sealed.ciphertext);
+}
+
+/**
+ * Seal one boot box delivery (P4b, `boot-box.ts` `BootBoxDelivery`) to a phase-2 VM's intake key: the same envelope,
+ * report checks and relay signature as a credential bundle. The box goes through `parseBootBoxDelivery` first, so the
+ * relay's tool cannot sign a shape the lane refuses.
+ */
+export async function sealBootBoxDelivery(
+  report: Json,
+  relaySigningKey: Ed25519KeyMaterial,
+  delivery: BootBoxDelivery,
+  options: SealCredentialOptions,
+): Promise<JsonObject> {
+  let value: Json;
+  try {
+    value = bootBoxDeliveryValue(parseBootBoxDelivery(bootBoxDeliveryValue(delivery)));
+  } catch (error) {
+    if (error instanceof BootBoxError) throw new RelayConnectorError("invalid_plaintext", "payload.boot_box");
+    throw error;
+  }
+  return sealSignedValue(report, relaySigningKey, value, options);
 }
 
 function payloadKindIsBundle(payload: CredentialPayload): payload is CredentialBundle {

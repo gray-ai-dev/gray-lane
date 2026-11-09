@@ -34,6 +34,28 @@
 #      with the seal event (every later quote of this boot carries it, and the token service refuses such
 #      quotes, S11), and delete the key and the rest of the work directory.
 #
+# Phase 2 (docs/design/relay-no-always-on-host.md §3.5, 13.11 P2d). An app on an on-chain KMS names it in its measured
+# compose (the lane's LANE_KMS_URL literal, app-compose.mjs --kms-url); only such an app takes this path, and every other
+# app runs steps 4-9 above exactly as before. After steps 1-3 (the identity is measured as before; Gray's images are
+# pulled), there is no token service: the registry login and the relay-signed image designation are in the sealed boot
+# box on the data disk, with a copy at Gray. Steps 4-9 become `gray_prelaunch_stack_phase2`:
+#   P1. the relay's data-disk directory /var/lib/gray-persist/relay, the lane's (10001:10001, 0700);
+#   P2. the boot box helper, Gray's measured code from the lane image the compose pins by digest (/srv/lane/boot-box.mjs,
+#       deploy/tee/boot-box), run once per attempt with the guest agent's socket, that directory and a fresh 0700 tmpfs
+#       output directory: it reads the disk's record and Gray's copy, obtains Gray's share for a quote of this boot,
+#       derives K_boot from the measured relay id and key, opens the newest record never below the highest this disk
+#       has seen, checks the designation, and answers the login and the designation, or the empty slot with its reason.
+#       It needs the bridge, so it runs on Docker's default bridge network (not --network none, which #349 assumed
+#       before the copy and the share were bridge calls): the code is Gray's measured code, and nothing of the relay's
+#       is in it but ciphertext until the share arrives sealed (HPKE) to a key of this run. Its input (the bridge URL,
+#       the bridge key's seed, the identity) goes in on stdin, never in argv or env. While Gray's copy (with no disk
+#       record) or its share is unavailable it exits 75 and runs again with the token wait's backoff, as S51a waits;
+#   P3. the designation checked again here with the guest's OpenSSL (S49's command) against the measured relay key,
+#       then the image pulled by digest with the boot box's login, a VOLUME refused, the slot tagged, the login deleted;
+#       or, for the empty slot, the lane image's static gray-idle imported alone as the slot (no relay code runs);
+#   P4. `gray-relay-image` v2: {image, image_sig, issued_ms, previous, relay_id, seq} (the designation and its
+#       signature; no nonce), or {image: null, relay_id, seq: 0} for the empty slot; then the seal, as in step 9.
+#
 # Fail-closed: the work is one function, gray_prelaunch_stack, called as the last command of this file.
 # Every command in it is checked explicitly (`|| { gray_prelaunch_stack_fail …; return 1; }`), so it does
 # not depend on errexit, which bash ignores inside a function called from a condition. Any failure removes
@@ -119,6 +141,169 @@ gray_prelaunch_stack_extend() {
   local payload
   payload="$(od -An -v -tx1 < "$2" | tr -d ' \n')" && [[ -n "$payload" ]] \
     && dstack-util extend --event "$1" --payload "$payload" >/dev/null 2>&1
+}
+
+# Phase 2, the empty slot (P3): the lane image's static gray-idle, alone in an image of its own, as the relay's slot.
+# `docker create` makes a container of the lane image that never starts, `docker cp` streams that one file as a tar,
+# `docker import` makes it an image whose entrypoint is that file (the relay service sets no command, S50), and the
+# result is checked: one layer, that entrypoint, no command, no VOLUME. Every byte comes from the lane image the
+# compose pins by digest. Reads lane_image and slot from the caller.
+gray_prelaunch_stack_empty_slot() {
+  local container
+  container="$(docker create --pull never --network none -- "$lane_image" 2>/dev/null)" \
+    && [[ "$container" =~ ^[0-9a-f]{64}$ ]] \
+    || { gray_prelaunch_stack_fail "preparing the empty slot"; return 1; }
+  docker cp "$container:/usr/local/bin/gray-idle" - 2>/dev/null \
+      | docker import --change 'ENTRYPOINT ["/gray-idle"]' - "$slot" >/dev/null 2>&1 \
+    || { gray_prelaunch_stack_fail "importing the empty slot"; return 1; }
+  # -v: the lane image declares VOLUME /certs, so the container has an anonymous volume, removed with it.
+  docker rm -v -- "$container" >/dev/null 2>&1 \
+    || { gray_prelaunch_stack_fail "removing the empty slot's source container"; return 1; }
+  docker image inspect -- "$slot" 2>/dev/null \
+      | jq -e 'length == 1 and .[0].Config.Entrypoint == ["/gray-idle"] and .[0].Config.Cmd == null
+          and ((.[0].Config.Volumes // {}) | type == "object" and length == 0) and (.[0].RootFS.Layers | length == 1)' >/dev/null 2>&1 \
+    || { gray_prelaunch_stack_fail "the empty slot is not gray-idle alone"; return 1; }
+  gray_prelaunch_stack_status "empty slot in the relay's slot"
+}
+
+# Phase 2 (P1-P4 in the header). Reads root, work, persist, dstack_sock, slot, seal_payload, image_pattern,
+# ed25519_spki_prefix, relay_id, relay_key, lane_image and bridge_url from gray_prelaunch_stack.
+gray_prelaunch_stack_phase2() {
+  local relay_dir="$persist/relay" box="$work/box"
+  # P1. The lane's directory on the data disk (P2e binds it into the lane): the boot box and the vault records.
+  mkdir -p -- "$relay_dir" >/dev/null 2>&1 \
+    && chown 10001:10001 "$relay_dir" >/dev/null 2>&1 \
+    && chmod 0700 "$relay_dir" >/dev/null 2>&1 \
+    && [[ "$(stat -c '%u:%g:%a' "$relay_dir" 2>/dev/null)" == "10001:10001:700" ]] \
+    || { gray_prelaunch_stack_fail "the relay's data-disk directory"; return 1; }
+  [[ "$lane_image" =~ ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] \
+    && [[ "$bridge_url" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]] \
+    && [[ "${LANE_BRIDGE_KEY_SEED:-}" =~ ^[0-9a-f]{64}$ ]] \
+    || { gray_prelaunch_stack_fail "the boot box helper's inputs"; return 1; }
+
+  # P2. The helper, run again while Gray's copy or share is unavailable (exit 75), waiting 1 s, then doubling up to
+  # 32 s, at most the token wait (840 s, S51a's budget) in all; any other failure stops the boot.
+  local token_wait="${GRAY_PRELAUNCH_TOKEN_WAIT_SECONDS:-840}"
+  [[ "$token_wait" =~ ^[0-9]{1,5}$ ]] || { gray_prelaunch_stack_fail "the token wait is not whole seconds"; return 1; }
+  local started=$SECONDS delay=1 call
+  while :; do
+    rm -rf -- "$box" >/dev/null 2>&1 \
+      && mkdir -m 0700 -- "$box" >/dev/null 2>&1 \
+      && chown 10001:10001 "$box" >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "the boot box helper's directory"; return 1; }
+    call=0
+    # The values are checked above to forms that need no JSON escaping; printf is a builtin, so the seed reaches the
+    # helper's stdin and no process's arguments.
+    printf '{"bridge_url":"%s","key_seed":"%s","relay_id":"%s","relay_key":"%s"}' \
+        "$bridge_url" "$LANE_BRIDGE_KEY_SEED" "$relay_id" "$relay_key" \
+      | docker run --rm -i --pull never --network bridge --user 10001:10001 --read-only --cap-drop ALL \
+          --security-opt no-new-privileges --tmpfs /tmp --entrypoint node \
+          -v "$dstack_sock:/var/run/dstack.sock" -v "$relay_dir:/persist" -v "$box:/out" \
+          "$lane_image" /srv/lane/boot-box.mjs --socket /var/run/dstack.sock --persist /persist --out /out \
+          >/dev/null 2>&1 \
+      || call=$?
+    [[ "$call" -eq 0 ]] && break
+    [[ "$call" -eq 75 ]] || { gray_prelaunch_stack_fail "the boot box helper"; return 1; }
+    if (( SECONDS - started + delay > token_wait )); then
+      gray_prelaunch_stack_fail "Gray's boot box copy or share did not answer in time"
+      return 1
+    fi
+    gray_prelaunch_stack_status "boot box copy or share unavailable, retrying"
+    sleep "$delay" >/dev/null 2>&1 || { gray_prelaunch_stack_fail "waiting for Gray's boot box copy or share"; return 1; }
+    delay=$(( delay >= 16 ? 32 : delay * 2 ))
+  done
+
+  local entries reason
+  entries="$(ls -A -- "$box" 2>/dev/null | tr '\n' ' ')" \
+    || { gray_prelaunch_stack_fail "the boot box helper's answer"; return 1; }
+  if [[ "$entries" == "empty " ]]; then
+    # The reason is one of the helper's closed codes (EMPTY_SLOT_REASONS), the one value of its answer printed.
+    reason="$(cat -- "$box/empty" 2>/dev/null)" \
+      || { gray_prelaunch_stack_fail "the boot box helper's answer"; return 1; }
+    case "$reason" in
+      no_boot_box|boot_box_missing|boot_box_rolled_back|boot_box_unopened|boot_box_invalid|designation_refused|share_refused) ;;
+      *)
+        gray_prelaunch_stack_fail "the boot box helper's answer"
+        return 1
+        ;;
+    esac
+    gray_prelaunch_stack_status "no boot box to run ($reason): the empty slot"
+    gray_prelaunch_stack_empty_slot || return 1
+    jq -ncSj --arg relay_id "$relay_id" '{image: null, relay_id: $relay_id, seq: 0}' > "$work/image.payload" 2>/dev/null \
+      || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+  elif [[ "$entries" == "designation.json designation.sig login.json " ]]; then
+    gray_prelaunch_stack_status "boot box opened"
+    # P3. The designation: the JCS the relay signed (jq -cS writes the same bytes for this closed shape of checked
+    # forms), naming this relay, an image of S51's form, a seq of at least 1; its registry is the login's.
+    local designation="$box/designation.json" image image_sig registry
+    image="$(jq -er --arg relay_id "$relay_id" --arg pattern "$image_pattern" '
+        select(type == "object" and (keys == ["image", "issued_ms", "previous", "relay_id", "seq"]) and .relay_id == $relay_id
+          and (.seq | type == "number" and . >= 1 and . == floor and . <= 9007199254740991)
+          and (.issued_ms | type == "number" and . >= 0 and . == floor and . <= 9007199254740991)
+          and (.previous == null or (.previous | type == "string" and length <= 512 and test($pattern))))
+        | .image | select(type == "string" and length <= 512 and test($pattern))' "$designation" 2>/dev/null)" \
+      && [[ "$(jq -cSj . "$designation" 2>/dev/null)" == "$(cat -- "$designation" 2>/dev/null)" ]] \
+      && image_sig="$(cat -- "$box/designation.sig" 2>/dev/null)" \
+      && [[ "$image_sig" =~ ^[0-9a-f]{128}$ ]] \
+      && registry="${image%%/*}" \
+      && [[ -n "$registry" && "$registry" != "$image" ]] \
+      || { gray_prelaunch_stack_fail "the designation in the boot box"; return 1; }
+    # S49's check: the relay's Ed25519 signature over `gray-relay-designation/v1\n` ‖ the designation, with the key
+    # the identity event measured. Gray, which holds the copy, cannot name another image.
+    { gray_prelaunch_stack_hex_bytes "$ed25519_spki_prefix" && gray_prelaunch_stack_hex_bytes "$relay_key"; } > "$work/relay-key.der" 2>/dev/null \
+      && gray_prelaunch_stack_hex_bytes "$image_sig" > "$work/designation.sig.bin" 2>/dev/null \
+      && [[ "$(wc -c < "$work/relay-key.der")" -eq 44 && "$(wc -c < "$work/designation.sig.bin")" -eq 64 ]] \
+      && { printf 'gray-relay-designation/v1\n' && cat -- "$designation"; } > "$work/designation.message" 2>/dev/null \
+      && openssl pkeyutl -verify -pubin -keyform DER -inkey "$work/relay-key.der" -rawin -in "$work/designation.message" \
+        -sigfile "$work/designation.sig.bin" >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "the designation signature"; return 1; }
+    gray_prelaunch_stack_status "designation signature verified"
+    # The login, for the designated image's registry only; the password reaches `docker login` on stdin only.
+    local login="$box/login.json" username relay_config="$work/docker"
+    jq -e --arg registry "$registry" \
+        '(keys == ["password", "registry", "username"]) and .registry == $registry
+          and (.username | type == "string" and length > 0) and (.password | type == "string" and length > 0)' \
+        "$login" >/dev/null 2>&1 \
+      && username="$(jq -r .username "$login" 2>/dev/null)" \
+      && mkdir -m 0700 -- "$relay_config" >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "the registry login"; return 1; }
+    jq -j .password "$login" 2>/dev/null \
+        | DOCKER_CONFIG="$relay_config" docker login --username "$username" --password-stdin "$registry" >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "the registry login"; return 1; }
+    gray_prelaunch_stack_status "registry login done"
+    DOCKER_CONFIG="$relay_config" docker pull --quiet "$image" >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "pulling the relay image"; return 1; }
+    gray_prelaunch_stack_status "relay image pulled"
+    docker image inspect -- "$image" 2>/dev/null \
+        | jq -e 'length == 1 and ((.[0].Config.Volumes // {}) | type == "object" and length == 0)' >/dev/null 2>&1 \
+      || { gray_prelaunch_stack_fail "the relay image declares a volume"; return 1; }
+    gray_prelaunch_stack_status "relay image declares no volume"
+    local pulled_id slot_id
+    docker tag "$image" "$slot" >/dev/null 2>&1 \
+      && pulled_id="$(docker image inspect --format '{{.Id}}' -- "$image" 2>/dev/null)" \
+      && slot_id="$(docker image inspect --format '{{.Id}}' -- "$slot" 2>/dev/null)" \
+      && [[ "$pulled_id" =~ ^sha256:[0-9a-f]{64}$ && "$slot_id" == "$pulled_id" ]] \
+      || { gray_prelaunch_stack_fail "tagging the relay image into its slot"; return 1; }
+    gray_prelaunch_stack_status "relay image in its slot"
+    rm -rf -- "$relay_config" "$login" >/dev/null 2>&1 && [[ ! -e "$relay_config" && ! -e "$login" ]] \
+      || { gray_prelaunch_stack_fail "deleting the registry credential"; return 1; }
+    gray_prelaunch_stack_status "registry credential deleted"
+    # P4. v2: the designation's members and its signature, as the relay signed them (jq keeps its integers).
+    jq -cSj --arg image_sig "$image_sig" '. + {image_sig: $image_sig}' "$designation" > "$work/image.payload" 2>/dev/null \
+      || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+  else
+    gray_prelaunch_stack_fail "the boot box helper's answer"
+    return 1
+  fi
+
+  gray_prelaunch_stack_extend gray-relay-image "$work/image.payload" \
+    || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+  gray_prelaunch_stack_status "relay image measured"
+  dstack-util extend --event gray-prelaunch-sealed --payload "$seal_payload" >/dev/null 2>&1 \
+    || { gray_prelaunch_stack_fail "sealing pre-launch"; return 1; }
+  rm -rf -- "$work" >/dev/null 2>&1 && [[ ! -e "$work" ]] \
+    || { gray_prelaunch_stack_fail "deleting the work directory"; return 1; }
+  gray_prelaunch_stack_status "sealed"
 }
 
 gray_prelaunch_stack() {
@@ -231,11 +416,19 @@ gray_prelaunch_stack() {
   # anonymous (a public image); a partial set is refused. Each image must be pinned by digest. The compose's
   # JSON carries interpolated environment values, so it goes straight into jq and only the names are kept.
   # The password reaches `docker login` on stdin only (printf is a builtin).
-  local gray_config="$work/gray-docker" gray_images image
-  gray_images="$(docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null \
-      | jq -er '[.services | to_entries[] | select(.key != "relay") | .value.image] | unique
-          | select(length > 0 and all(type == "string" and test("^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$")))
-          | .[]' 2>/dev/null)" \
+  # Phase 2 reads three more values of the same JSON: the lane's image, its bridge URL and its LANE_KMS_URL literal
+  # (none secret); the seed it carries never leaves jq.
+  local gray_config="$work/gray-docker" gray_images image compose_facts lane_image bridge_url kms_url
+  compose_facts="$(docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null \
+      | jq -ec '{images: ([.services | to_entries[] | select(.key != "relay") | .value.image] | unique),
+            lane_image: (.services.lane.image // ""), bridge_url: (.services.lane.environment.LANE_BRIDGE_URL // ""),
+            kms_url: (.services.lane.environment.LANE_KMS_URL // "")}
+          | select((.images | length > 0 and all(type == "string" and test("^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$")))
+            and (.lane_image | type == "string") and (.bridge_url | type == "string") and (.kms_url | type == "string"))' 2>/dev/null)" \
+    && gray_images="$(jq -er '.images[]' <<<"$compose_facts" 2>/dev/null)" \
+    && lane_image="$(jq -r .lane_image <<<"$compose_facts" 2>/dev/null)" \
+    && bridge_url="$(jq -r .bridge_url <<<"$compose_facts" 2>/dev/null)" \
+    && kms_url="$(jq -r .kms_url <<<"$compose_facts" 2>/dev/null)" \
     && mkdir -m 0700 -- "$gray_config" >/dev/null 2>&1 \
     || { gray_prelaunch_stack_fail "reading Gray's images from the compose"; return 1; }
   if [[ -n "${DSTACK_DOCKER_REGISTRY:-}" && -n "${DSTACK_DOCKER_USERNAME:-}" && -n "${DSTACK_DOCKER_PASSWORD:-}" ]]; then
@@ -254,6 +447,12 @@ gray_prelaunch_stack() {
   rm -rf -- "$gray_config" >/dev/null 2>&1 && [[ ! -e "$gray_config" ]] \
     || { gray_prelaunch_stack_fail "deleting the Gray registry login"; return 1; }
   gray_prelaunch_stack_status "Gray images pulled"
+
+  # Phase 2 (the header's P1-P4): an app whose measured compose names its on-chain KMS has no token service.
+  if [[ -n "$kms_url" ]]; then
+    gray_prelaunch_stack_phase2 || return 1
+    return 0
+  fi
 
   # 4. The one-time key (its SPKI goes into every attempt's report_data below).
   (umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$work/pull.key") >/dev/null 2>&1 \

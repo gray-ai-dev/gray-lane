@@ -509,6 +509,15 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 	}
 
 	resp, err := client.Do(outReq)
+	if err == nil && ctx.Err() != nil {
+		// A head read after egress canceled the call (the entry left, or the silence bound fired) is the cancel's,
+		// not the peer's answer: net/http's transport still returns a response its read loop got after the cancel, and
+		// the cancel's TLS close_notify can bring one (the Go test VM's handler returns on it, and its server answers
+		// 200). TestPeerSilenceBound forwarded such a 200 in 43 of 640 loaded runs on the build box (2026-11-09). The
+		// call failed with the cancel.
+		_ = resp.Body.Close()
+		resp, err = nil, ctx.Err()
+	}
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -545,6 +554,7 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 		return
 	}
 	buffer := make([]byte, forwardBufferBytes)
+	var written int64
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
@@ -557,16 +567,24 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 				entry.Error = errClientWrite
 				return
 			}
+			written += int64(n)
 		}
-		if errors.Is(readErr, io.EOF) {
-			// The peer's answer ended, but an entry that left first never read its end: net/http's transport returns
-			// a body's last chunk as io.EOF even when it comes after the request was canceled. The cancel's TLS
-			// close_notify can end the peer's answer before egress has closed the connection, so the end arrives in
-			// that window (gate 5f46d5249, 2026-11-09: TestPeerClientCancelClosesTheUpstream logged a whole answer).
-			// The entry's own context says whether it left first.
-			if r.Context().Err() != nil {
-				entry.Error = errClientWrite
-			}
+		// An answer that declared its length is whole once that many bytes are written, as forward's
+		// (declaredLengthWritten): the entry has all of it and may close at once (a client without keep-alive does),
+		// and net/http then ends the entry's context, before or after the peer's end reaches egress. Its context says
+		// nothing more here: read at the peer's end below, it logged whole answers client_write (TestPeerPinMatch,
+		// TestPeerLinkAttestMode and TestPeerAttestModeAllowsOnlyTheTwoGets in five main runs of 2026-11-09).
+		if declaredLengthWritten(resp, written) {
+			return
+		}
+		// The peer's answer ended, unless egress had canceled the call first (the entry left, or the silence bound
+		// fired): net/http's transport returns a body's last chunk as io.EOF even when it comes after the request was
+		// canceled, and the cancel's TLS close_notify can end the peer's answer before egress has closed the
+		// connection, so the end arrives in that window (gate 5f46d5249, 2026-11-09: TestPeerClientCancelClosesTheUpstream
+		// logged a whole answer; TestPeerSilenceBound ended a cut one cleanly). This answer declared no length (a short
+		// declared one ends in io.ErrUnexpectedEOF), so the entry reads its end only once the handler returns: an end
+		// read after the cancel is a cut answer, as any other read error below.
+		if errors.Is(readErr, io.EOF) && ctx.Err() == nil {
 			return
 		}
 		if readErr != nil {

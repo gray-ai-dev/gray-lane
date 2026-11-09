@@ -22,6 +22,7 @@ import { remoteShardLocator } from "./remote/account.ts";
 import { remoteSinks } from "./remote/sinks.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { remoteModelCheckTickets } from "./remote/tickets.ts";
+import { gatedUpstreamAuth } from "./kms-lease.ts";
 import type { LaneDeps, LaneGatewayDeps, LanePeers, StackTransport } from "./types.ts";
 import type { LaneProcessState } from "./state.ts";
 
@@ -267,7 +268,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
   // The seam's per-request view of the same boot state: the stores and clients the hooks call.
   const lane: LaneDeps = {
     state: state.state,
-    credentials: state.state.credentials,
+    // P2c-2: with a KMS lease, an account's auth headers leave the store only while the lease serves (`kms-lease.ts`).
+    credentials: gatedUpstreamAuth(state.state.credentials, state.state.kmsLease),
     schedulers: state.state.scheduler,
     policies: state.state.policySource,
     timing: state.state.timing,
@@ -405,6 +407,11 @@ export interface LaneEnv extends GatewayEnv {
    * relay_in address (10.231.10.3:3000). Absent in the default layout.
    */
   readonly RELAY?: Fetcher;
+  /**
+   * P2e (docs/design/relay-no-always-on-host.md §3.1): the supervisor's vault disk, a unix socket on the lane container's
+   * own tmpfs (deploy/tee/bin/vault-disk.mjs). Rendered only for a relay stack VM with a KMS lease; absent otherwise.
+   */
+  readonly LANE_VAULT_DISK?: Fetcher;
 }
 
 /** The egress binding the lane needs, or a boot error naming the missing one. */

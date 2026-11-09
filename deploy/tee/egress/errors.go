@@ -39,6 +39,9 @@ const (
 	errStackRequestsFull      = "stack_requests_full"
 	errStackFeedBusy          = "stack_feed_busy"
 	errStackAccountsStale     = "stack_accounts_stale"
+	// P2e-2 (persist first, stack_persist.go): an acknowledgement of a token family egress no longer holds as pending
+	// and has not installed (a newer one replaced it, or a push dropped it).
+	errStackOpsAckStale = "stack_ops_ack_stale"
 	// Account health (S35-S44): a call refused for its account's cooling (S40), a cooling push below the highest
 	// accepted (S40), and an account test while four run (S44). stack_cooling_full is log-only (S38).
 	// stack_identity_mismatch (S32a's first form: a client-identity value other than the registered one) is retired
@@ -125,7 +128,7 @@ func refusalStatus(code string) int {
 		return http.StatusTooManyRequests
 	case errStackRewriteRefused, errStackRouteRefused, errStackHeaderRefused, errStackIdentityMismatch:
 		return http.StatusUnprocessableEntity
-	case errStackRequestExists, errStackFeedBusy, errStackAccountsStale, errStackCoolingStale, errPeerPinsStale:
+	case errStackRequestExists, errStackFeedBusy, errStackAccountsStale, errStackCoolingStale, errPeerPinsStale, errStackOpsAckStale:
 		return http.StatusConflict
 	case errStackRequestsFull, errEgressLimit, errStackTestsBusy:
 		return http.StatusServiceUnavailable

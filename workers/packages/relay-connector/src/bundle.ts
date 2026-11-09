@@ -54,6 +54,17 @@ export interface CredentialBundle {
   readonly expires_at: bigint;
   /** May be empty: a signed full replacement with no accounts revokes the relay's whole pool. */
   readonly accounts: readonly Account[];
+  /**
+   * The relay's choice for its VM's vault (docs/design/relay-no-always-on-host.md H13), for a VM that keeps one (an app
+   * on an on-chain KMS): `persist: false` keeps the accounts in memory only, with no disk record and no copy at Gray, so
+   * every boot starts with none. Absent is `persist: true`. A VM without a vault (phase 1) keeps memory only either way.
+   * The choice holds until the next bundle; an update or a revoke keeps it.
+   */
+  readonly vault?: BundleVaultOptions;
+}
+
+export interface BundleVaultOptions {
+  readonly persist: boolean;
 }
 
 export interface CredentialUpdate {
@@ -91,7 +102,8 @@ const versionSchema = z.bigint().min(1n).max(U64_MAX);
 
 const credentialTypeSchema = z.enum(CREDENTIAL_TYPES);
 
-const credentialSchema = z
+/** A sealed credential's closed shape, as a bundle, an update and a vault record (vault-state.ts) carry it. */
+export const credentialSchema = z
   .object({
     type: credentialTypeSchema,
     value: z.string().min(1).max(MAX_CREDENTIAL_LENGTH),
@@ -106,7 +118,8 @@ const credentialSchema = z
   .refine((credential) => (credential.type === "password") === (credential.username !== undefined), { message: "a password, and only a password, has a username" })
   .refine((credential) => credential.totp_secret === undefined || credential.type === "password", { message: "only a password has a TOTP secret" });
 
-const accountSchema = z
+/** One account's closed shape, as a bundle and a vault record (vault-state.ts) carry it. */
+export const accountSchema = z
   .object({
     account_id: idSchema,
     vendor: z.enum(VENDORS),
@@ -115,6 +128,9 @@ const accountSchema = z
   })
   .strict();
 
+/** H13: the bundle's `vault` member, closed: `{"persist": true|false}`. */
+const bundleVaultSchema = z.object({ persist: z.boolean() }).strict();
+
 const bundleSchema = z
   .object({
     relay_id: idSchema,
@@ -122,6 +138,7 @@ const bundleSchema = z
     issued_at: u64Schema,
     expires_at: u64Schema,
     accounts: z.array(accountSchema).max(MAX_ACCOUNTS_PER_BUNDLE),
+    vault: bundleVaultSchema.optional(),
   })
   .strict();
 
@@ -245,6 +262,7 @@ export function payloadValue(payload: CredentialPayload): JsonObject {
       issued_at: payload.issued_at,
       expires_at: payload.expires_at,
       accounts: payload.accounts.map(accountValue),
+      ...(payload.vault === undefined ? {} : { vault: { persist: payload.vault.persist } }),
     };
   }
   return {

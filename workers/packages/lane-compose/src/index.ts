@@ -1,6 +1,6 @@
 /**
  * @gray/lane-compose: the supply app-compose policy (docs/confidential-lane-supply-implementation.md §3,
- * S7, S50, S54). Gray's release gate and gray-relay's pull-token service run the same rules on the same bytes:
+ * S7, S50, S54). Gray's release gate and gray-assistant's pull-token service run the same rules on the same bytes:
  * the app-compose JSON a relay-stack lane measures must contain nothing that could read the relay's
  * image. The rules are a closed allowlist: every member, key and value not named here is refused.
  *
@@ -123,6 +123,16 @@ export interface SupplyFacts {
   readonly allowedEnvs: readonly string[] | null;
   readonly kmsEnabled: boolean | null;
   readonly services: readonly SupplyServiceFacts[];
+  /**
+   * lane's `LANE_KMS_URL` literal (P2c-2): the on-chain KMS an app of phase 2 keeps its lease with; null when lane names
+   * none (phase 1) or the compose cannot be read. A fact, not a check: `checkSupplyAppCompose` checks it.
+   */
+  readonly laneKmsUrl: string | null;
+  /**
+   * P6: whether lane's volumes bind the relay's vault directory read-write at its own path (P2e, the layout's
+   * `laneVaultVolumes` line). A fact, as `laneKmsUrl`; the policy requires it exactly when lane names its KMS.
+   */
+  readonly laneVaultBind: boolean;
 }
 
 const COMPOSE_TOP_KEYS = Object.freeze(["name", "services", "networks", "volumes"]);
@@ -456,10 +466,15 @@ function checkPorts(service: YamlMap, path: string, expected: readonly string[],
   if (!sameStrings(ports, expected)) problems.add("ports_mismatch", `${path}.ports`);
 }
 
-/** S2–S5: every fixed setting of the service equals the layout's (`STACK_LAYOUT.fixed`). */
-function checkFixed(name: string, service: YamlMap, path: string, problems: Problems): void {
+/**
+ * S2–S5: every fixed setting of the service equals the layout's (`STACK_LAYOUT.fixed`). P2e: lane's mounts are
+ * `laneVaultVolumes` instead when lane names the KMS it keeps a lease with (`leased`), so the vault's bind comes with the
+ * lease and never without it.
+ */
+function checkFixed(name: string, service: YamlMap, path: string, leased: boolean, problems: Problems): void {
   const fixed = STACK_LAYOUT.fixed[name as keyof typeof STACK_LAYOUT.fixed] as Readonly<Record<string, unknown>>;
-  for (const [key, expected] of Object.entries(fixed)) {
+  for (const [key, fixedValue] of Object.entries(fixed)) {
+    const expected = name === "lane" && leased && key === "volumes" ? STACK_LAYOUT.laneVaultVolumes : fixedValue;
     if (!sameValue(service.get(key), expected)) problems.add(FIXED_CODES[key] ?? "service_key_not_allowed", `${path}.${key}`);
   }
 }
@@ -492,7 +507,8 @@ function hostPath(source: string): boolean {
 type BindAccess = "rw" | "ro" | "other";
 
 /**
- * One bind mount. Allowed: the guest-agent socket on lane (read-write: connecting writes to it). Nothing else, no
+ * One bind mount. Allowed: the guest-agent socket on lane (read-write: connecting writes to it), and (P2e) the relay's
+ * vault directory on lane, read-write at its own path, for an app with a KMS lease. Nothing else, no
  * subpath and no other target (relay-outbound-only §3.9 removed S2a's ACME account directory: gray-acme is
  * self-signed in this layout); the Docker socket gets its own code. (The exact mount lists of `STACK_LAYOUT.fixed`
  * are checked as well; these codes say what a mount would expose.)
@@ -503,7 +519,9 @@ function checkBind(serviceName: string, source: string, target: string, access: 
     return;
   }
   const guestAgent = serviceName === "lane" && access === "rw" && source === STACK_LAYOUT.dstackSocket && target === STACK_LAYOUT.dstackSocket;
-  if (!guestAgent) problems.add("bind_mount_forbidden", path);
+  // P2e: the relay's vault directory, read-write on lane at its own path (checkFixed ties it to LANE_KMS_URL).
+  const vault = serviceName === "lane" && access === "rw" && source === STACK_LAYOUT.vaultPath && target === STACK_LAYOUT.vaultPath;
+  if (!guestAgent && !vault) problems.add("bind_mount_forbidden", path);
 }
 
 /** A short-form bind's access: `source:target` and `:rw` are read-write, `:ro` read-only, any other option is refused. */
@@ -586,7 +604,9 @@ function checkService(name: string, service: YamlMap, expect: SupplyExpectation,
   if (name !== "relay") checkImage(service, path, (image) => Array.isArray(expect.grayImages) && expect.grayImages.includes(image), problems);
   checkHardening(service, path, problems);
   checkPorts(service, path, STACK_LAYOUT.ports[name as keyof typeof STACK_LAYOUT.ports], problems);
-  checkFixed(name, service, path, problems);
+  // P2e: whether lane names the KMS it keeps a lease with, read without a problem of its own (environmentOf reports those).
+  const rawEnvironment = service.get("environment");
+  checkFixed(name, service, path, isYamlMap(rawEnvironment) && rawEnvironment.has(STACK_LAYOUT.kmsUrlName), problems);
   checkServiceVolumes(name, service, path, declared, problems);
   const environment = environmentOf(service, path, problems);
   if (environment !== undefined) checkEnvironment(name, environment, path, expect, problems);
@@ -666,7 +686,7 @@ export function checkSupplyAppCompose(appComposeJson: string, expect: SupplyExpe
   return problems.list;
 }
 
-/** A parsed view of the app-compose for logs and the panel; never throws, never carries env values. */
+/** A parsed view of the app-compose for logs and the panel; never throws, never carries env values (lane's KMS URL is a public literal). */
 export function supplyComposeFacts(appComposeJson: string): SupplyFacts {
   const facts: SupplyFacts = {
     appComposeSha256: sha256Hex(appComposeJson),
@@ -676,6 +696,8 @@ export function supplyComposeFacts(appComposeJson: string): SupplyFacts {
     allowedEnvs: null,
     kmsEnabled: null,
     services: [],
+    laneKmsUrl: null,
+    laneVaultBind: false,
   };
   let doc: Json;
   try {
@@ -691,6 +713,9 @@ export function supplyComposeFacts(appComposeJson: string): SupplyFacts {
   const composeText = get(doc, "docker_compose_file");
   const parsed = typeof composeText === "string" ? parseComposeText(composeText) : undefined;
   const services: SupplyServiceFacts[] = [];
+  let laneKmsUrl: string | null = null;
+  let laneVaultBind = false;
+  const vaultLine = `${STACK_LAYOUT.vaultPath}:${STACK_LAYOUT.vaultPath}`;
   if (parsed?.ok === true) {
     const map = parsed.value.get("services");
     if (isYamlMap(map)) {
@@ -698,6 +723,13 @@ export function supplyComposeFacts(appComposeJson: string): SupplyFacts {
         const image = isYamlMap(service) && typeof service.get("image") === "string" ? (service.get("image") as string) : null;
         const user = isYamlMap(service) ? (scalarText(service.get("user")) ?? null) : null;
         services.push({ name: keyText(key), image, user });
+        const environment = isYamlMap(service) ? service.get("environment") : undefined;
+        if (keyText(key) === "lane" && isYamlMap(environment)) {
+          const url = environment.get(STACK_LAYOUT.kmsUrlName);
+          laneKmsUrl = typeof url === "string" ? url : null;
+        }
+        const volumes = isYamlMap(service) ? service.get("volumes") : undefined;
+        if (keyText(key) === "lane" && Array.isArray(volumes)) laneVaultBind = volumes.some((volume) => volume === vaultLine);
       }
     }
   }
@@ -709,5 +741,7 @@ export function supplyComposeFacts(appComposeJson: string): SupplyFacts {
     allowedEnvs: isArray(envs) && envs.every((name) => typeof name === "string") ? (envs as string[]) : null,
     kmsEnabled: typeof kms === "boolean" ? kms : null,
     services,
+    laneKmsUrl,
+    laneVaultBind,
   };
 }

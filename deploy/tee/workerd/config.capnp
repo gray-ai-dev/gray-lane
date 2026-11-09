@@ -59,7 +59,7 @@ const config :Workerd.Config = (
       )
     ),__STACK_SERVICES__
 __PEERLINK_SERVICES__
-
+__VAULT_DISK_SERVICES__
     # Nothing is reachable through this service: `allow` defaults to ["public"], and the empty list
     # permits no address family at all (workerd.capnp, `Network.allow`).
     ( name = "no-network",
@@ -110,8 +110,8 @@ __PEERLINK_SERVICES__
           ( name = "LANE_POLICY_OVERHEAD_MS", text = "__LANE_POLICY_OVERHEAD_MS__" ),
           ( name = "LANE_SCHEDULER_PICK_MS", text = "__LANE_SCHEDULER_PICK_MS__" ),__PEER_BINDINGS__
 __PEERLINK_BINDINGS__
-
-          # Provenance from the build (§4.1 of the ACI spec; a deployment fills the image digest).
+__KMS_LEASE_BINDINGS__
+__VAULT_DISK_BINDINGS__          # Provenance from the build (§4.1 of the ACI spec; a deployment fills the image digest).
           ( name = "SOURCE_REPO_URL", text = "__SOURCE_REPO_URL__" ),
           ( name = "SOURCE_REPO_COMMIT", text = "__SOURCE_REPO_COMMIT__" ),
           ( name = "SOURCE_IMAGE_DIGEST", text = "__SOURCE_IMAGE_DIGEST__" )
@@ -140,5 +140,5 @@ __PEERLINK_BINDINGS__
       ),
       service = "lane"
     )__STACK_SOCKETS__
-  ]
+__KMS_LEASE_SOCKETS__  ]
 );

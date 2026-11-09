@@ -6,14 +6,17 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run -c vitest.config.ts",
-    "test:workerd": "vitest run -c vitest.workerd.config.ts"
+    "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "test:anvil": "vitest run -c vitest.anvil.config.ts"
   },
   "dependencies": {
     "@gray/attest": "0.0.0",
     "@gray/control": "0.0.0",
     "@gray/json": "0.0.0",
+    "@gray/relay-app-auth": "0.0.0",
     "@noble/curves": "1.9.1",
     "@noble/hashes": "1.8.0",
-    "@phala/dstack-sdk": "0.5.8"
+    "@phala/dstack-sdk": "0.5.8",
+    "viem": "2.57.4"
   }
 }

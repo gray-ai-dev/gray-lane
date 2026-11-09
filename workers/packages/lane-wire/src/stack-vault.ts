@@ -112,3 +112,81 @@ export function stackVaultCopyOf(dto: StackVaultGetAnswerDto): StackVaultCopy {
 export function stackVaultPutResultOf(dto: StackVaultPutAnswerDto): StackVaultPutResult {
   return { stored: dto.stored, version: Number(dto.version) };
 }
+
+// ---------------------------------------------------------------------------------------------
+// stack.vault.share_nonce and stack.vault.share: Gray's share (decision H5)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `stack.vault.share_nonce` and `stack.vault.share` (docs/design/relay-no-always-on-host.md §3.1, H5 and 13.11): Gray's
+ * 32-byte share of the relay's record keys (`S_gray`, `@gray/relay-connector/vault-share`), released only to a VM whose
+ * TDX quote Gray verified, sealed to an X25519 key the VM made for the request.
+ *
+ * Freshness is a nonce Gray issued: `share_nonce` answers one for (relay, app), `issued_ms` (8 bytes, big-endian) ‖ 16
+ * random bytes ‖ an HMAC-SHA256 tag over the relay, the app and the first 24 bytes under Gray's share secret, as lower hex
+ * (STACK_VAULT_SHARE_NONCE_PATTERN). Gray stores nothing: it checks the tag and that the nonce is at most
+ * STACK_VAULT_SHARE_NONCE_TTL_MS old. The quote's report data binds the nonce, so a quote is at most that old when Gray
+ * answers it; a VM-chosen time could not show that. A nonce is not single-use: an answer sealed again within the window
+ * goes to the same quote-bound key, which only that VM holds.
+ *
+ * `share` carries the quote (hex), the event log as the guest agent's `GetQuote` answers it (JSON text), the X25519
+ * public key and the nonce. The bridge verifies the quote and replays the log; the console checks the nonce, the relay
+ * and its app, and the compose hash on the relay's contract, and answers `sealed`: `enc ‖ ciphertext`, 80 bytes as lower
+ * hex. Any check that fails is `vault_share_refused` (403), which the VM does not retry with the same quote.
+ */
+
+/** A Gray-issued share nonce: 56 bytes as lower hex (8 bytes of `issued_ms`, 16 random, a 32-byte tag). */
+export const STACK_VAULT_SHARE_NONCE_PATTERN = /^[0-9a-f]{112}$/;
+/** How long a share nonce is accepted after Gray issued it: a quote takes about a second; 5 minutes is slack for retries. */
+export const STACK_VAULT_SHARE_NONCE_TTL_MS = 5 * 60_000;
+/** The longest quote, in hex characters: 32 KiB of quote (a TDX v4 quote with its PCK chain is about 5 KiB). */
+export const STACK_VAULT_SHARE_QUOTE_MAX_CHARS = 64 * 1024;
+/** The longest event log, in characters (dstack's log of a stack boot is tens of KiB). */
+export const STACK_VAULT_SHARE_EVENT_LOG_MAX_CHARS = 256 * 1024;
+/** `stack.vault.share`'s request body bound: the quote, the event log as a JSON string (escapes at most double it), the rest. */
+export const STACK_VAULT_SHARE_MAX_BYTES = STACK_VAULT_SHARE_QUOTE_MAX_CHARS + 2 * STACK_VAULT_SHARE_EVENT_LOG_MAX_CHARS + 4 * 1024;
+/** The sealed share on the wire: 80 bytes as lower hex (`@gray/relay-connector/vault-share` VAULT_SHARE_SEALED_BYTES). */
+export const STACK_VAULT_SHARE_SEALED_PATTERN = /^[0-9a-f]{160}$/;
+
+const shareNonce = z.string().regex(STACK_VAULT_SHARE_NONCE_PATTERN);
+
+export const stackVaultShareNonceRequestSchema = z.object({ relay_id: id, app_id: appId }).strict();
+export type StackVaultShareNonceRequestDto = z.infer<typeof stackVaultShareNonceRequestSchema>;
+
+export const stackVaultShareNonceAnswerSchema = z.object({ nonce: shareNonce }).strict();
+export type StackVaultShareNonceAnswerDto = z.infer<typeof stackVaultShareNonceAnswerSchema>;
+
+export const stackVaultShareRequestSchema = z
+  .object({
+    relay_id: id,
+    app_id: appId,
+    quote: z.string().min(2).max(STACK_VAULT_SHARE_QUOTE_MAX_CHARS).regex(/^(?:[0-9a-f]{2})+$/),
+    event_log: z.string().min(2).max(STACK_VAULT_SHARE_EVENT_LOG_MAX_CHARS),
+    ephemeral_public_key: z.string().regex(/^[0-9a-f]{64}$/),
+    nonce: shareNonce,
+  })
+  .strict();
+export type StackVaultShareRequestDto = z.infer<typeof stackVaultShareRequestSchema>;
+
+export const stackVaultShareAnswerSchema = z.object({ sealed: z.string().regex(STACK_VAULT_SHARE_SEALED_PATTERN) }).strict();
+export type StackVaultShareAnswerDto = z.infer<typeof stackVaultShareAnswerSchema>;
+
+/** The wire request of a share nonce. */
+export function stackVaultShareNonceRequestDtoOf(relayId: string, appId: string): StackVaultShareNonceRequestDto {
+  return checked(stackVaultShareNonceRequestSchema, { relay_id: relayId, app_id: appId });
+}
+
+/** The wire request of a share: the quote as hex, the event log as the guest agent answered it. */
+export function stackVaultShareRequestDtoOf(relayId: string, appId: string, quote: string, eventLog: string, ephemeralPublicKey: string, nonce: string): StackVaultShareRequestDto {
+  return checked(stackVaultShareRequestSchema, { relay_id: relayId, app_id: appId, quote, event_log: eventLog, ephemeral_public_key: ephemeralPublicKey, nonce });
+}
+
+/** The console's nonce as the wire answer. */
+export function stackVaultShareNonceAnswerDtoOf(nonce: string): StackVaultShareNonceAnswerDto {
+  return checked(stackVaultShareNonceAnswerSchema, { nonce });
+}
+
+/** The console's sealed share as the wire answer. */
+export function stackVaultShareAnswerDtoOf(sealed: string): StackVaultShareAnswerDto {
+  return checked(stackVaultShareAnswerSchema, { sealed });
+}

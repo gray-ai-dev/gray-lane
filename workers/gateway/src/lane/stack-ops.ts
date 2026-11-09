@@ -1,15 +1,17 @@
 import { parsePlain, toJsonString, type Json } from "@gray/json";
-import { stackOwnCallSettings, type StackConfigDocument, type StackOwnCallSettings } from "@gray/lane-wire";
+import { STACK_LOGIN_CODES, stackOwnCallSettings, type StackConfigDocument, type StackOwnCallSettings } from "@gray/lane-wire";
 import {
   authHeaders,
   chatgptAccountId,
   egressValue,
   type Credential,
+  type RelayVaultLogin,
   type RefreshedRequest,
   type RefreshedToken,
   type StackSealedAccount,
 } from "@gray/relay-connector";
 import { z } from "zod";
+import { LEASE_UNTIL_HEADER } from "./kms-lease.ts";
 import { BridgeCallError } from "./remote/client.ts";
 import type { StackExclusion } from "./stack-document.ts";
 
@@ -35,12 +37,28 @@ import type { StackExclusion } from "./stack-document.ts";
  *    (`POST /v1/aci/relay-credentials/refreshed`, `@gray/relay-connector` refreshed.ts) and writes each to the relay's
  *    account source. A token stays held until gray-relay acknowledges its `seq` or a newer sealed version replaces it.
  *
+ * **Persist first (P2e-2, docs/design/relay-no-always-on-host.md H12, I9).** With a vault (`persist`), the push says
+ * `"persist_first": true`, and egress holds every new token family pending (egress stack_persist.go): it keeps using the
+ * token it had until the lane acknowledges the family (`POST /v1/stack/ops/tokens/ack` with its seq). The lane writes the
+ * family to the vault first (`LaneVault.persistToken`) and acknowledges only once it is on the disk; a family it could
+ * not write is not acknowledged, and egress offers it again at the next round. An ack that was lost is sent again when
+ * egress offers a family already written, without a second write. The sign-in pacing egress reports (`logins`) goes into
+ * the vault too, and back into the push (`login.pacing`) for egress to take after a restart.
+ *
+ * **Hold (P7, docs/design/relay-no-always-on-host.md 13.4).** During a rollout two instances hold the relay's accounts;
+ * only the serving one refreshes and signs in. While this VM is not serving (draining, or its role unknown: `hold`), the
+ * push says `"hold": true` and egress runs no refresh and no in-VM sign-in (stack_ops.go, stack_login.go), keeping the
+ * tokens it holds for the requests this VM still serves; the push carries the accounts as before. The change is pushed
+ * at once (the role's listener forces a round), and `hold: false` (absent) lets egress's schedule run again.
+ *
  * No line it logs names a credential, a token or a header value: closed codes, account ids, counts.
  */
 
 /** Egress's own-call control routes (unix socket). */
 export const STACK_OPS_ACCOUNTS_URL = "http://egress/v1/stack/ops/accounts";
 export const STACK_OPS_TOKENS_URL = "http://egress/v1/stack/ops/tokens";
+/** P2e-2: the lane wrote a pending family to the vault (egress stack_persist.go). */
+export const STACK_OPS_TOKENS_ACK_URL = "http://egress/v1/stack/ops/tokens/ack";
 /** How often the account set is sent even when unchanged: egress holds it in memory only. */
 export const LANE_STACK_OPS_RESEND_MS = 60_000;
 
@@ -71,10 +89,46 @@ export interface StackOpsOptions {
   readonly settings?: (metadata: StackConfigDocument | null) => StackOwnCallSettings;
   /** A token was taken: rebuild the document and push egress's table now. */
   readonly onRefreshed?: () => Promise<void>;
+  /**
+   * P2c-2, review 11-09: the KMS lease's end the set is pushed with (`LEASE_UNTIL_HEADER`), egress's own bound on its own
+   * calls; a changed end is a new push. Absent without a lease: no header.
+   */
+  readonly leaseUntil?: () => number;
+  /**
+   * P2e-2: the VM's vault, for persist first. Absent (phase 1): no `persist_first` in the push, and egress installs every
+   * family at once, as before.
+   */
+  readonly persist?: StackOpsPersist;
+  /** P7: whether this VM is not its relay's serving instance now (with `persist` only): egress refreshes and signs in nothing. */
+  readonly hold?: () => boolean;
   readonly log?: (line: Record<string, unknown>) => void;
 }
 
+/** What persist first needs of the vault (`LaneVault`). */
+export interface StackOpsPersist {
+  persistToken(apply: () => boolean): Promise<"persisted" | "refused" | "failed">;
+  /** A token taken without persist first (an egress that installed it at once) is written after the fact. */
+  changed(reason: "token"): Promise<boolean>;
+  pacingFor(accountId: string, username: string): RelayVaultLogin | null;
+  notePacing(logins: readonly RelayVaultLogin[]): Promise<boolean>;
+}
+
 const u64Text = z.string().regex(/^(0|[1-9][0-9]{0,19})$/);
+const msTime = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+/** egress stack_persist.go `opsLoginPacing`. */
+const pacingSchema = z
+  .object({
+    account_id: z.string().regex(/^[\x21-\x7e]{1,128}$/),
+    username: z.string().min(1).max(254),
+    failures: z.number().int().min(0).max(1_000_000),
+    last: z
+      .object({ outcome: z.enum(["ok", "failed"]), code: z.enum(STACK_LOGIN_CODES).nullable(), at_ms: msTime })
+      .strict()
+      .refine((l) => (l.outcome === "ok") === (l.code === null))
+      .nullable(),
+    last_ok_ms: msTime.nullable(),
+  })
+  .strict();
 const tokensSchema = z
   .object({
     tokens: z.array(
@@ -87,9 +141,13 @@ const tokensSchema = z
             .object({ type: z.literal("oauth_access_token"), value: z.string().min(1).max(16_384), expires_at: z.number().int().positive().optional() })
             .strict(),
           refresh_token: z.string().min(1).max(16_384).nullable(),
+          // P2e-2: a family egress holds pending until the lane acknowledges it.
+          pending: z.literal(true).optional(),
         })
         .strict(),
     ),
+    // P2e-2: the sign-in pacing, with persist first only.
+    logins: z.array(pacingSchema).optional(),
   })
   .strict();
 
@@ -114,32 +172,82 @@ export function opsCredentialFields(vendor: string, credential: Credential): Rec
   return fields;
 }
 
+/** egress's pacing as the vault keeps it (bigints, `@gray/relay-connector` RelayVaultLogin). */
+function pacingOf(p: z.infer<typeof pacingSchema>): RelayVaultLogin {
+  return {
+    account_id: p.account_id,
+    username: p.username,
+    failures: BigInt(p.failures),
+    last: p.last === null ? null : { outcome: p.last.outcome, code: p.last.code, at_ms: BigInt(p.last.at_ms) },
+    last_ok_ms: p.last_ok_ms === null ? null : BigInt(p.last_ok_ms),
+  };
+}
+
+/** The push's `login.pacing` (egress stack_persist.go `wireLoginPacing`), or nothing. */
+function pacingMember(pacing: RelayVaultLogin | null): Record<string, Json> {
+  if (pacing === null) return {};
+  return {
+    pacing: {
+      failures: pacing.failures,
+      last: pacing.last === null ? null : { outcome: pacing.last.outcome, code: pacing.last.code, at_ms: pacing.last.at_ms },
+      last_ok_ms: pacing.last_ok_ms,
+    },
+  };
+}
+
 export class StackOpsService {
   readonly #options: StackOpsOptions;
   readonly #log: (line: Record<string, unknown>) => void;
   #polledAt: number | null = null;
   #running = false;
-  /** The account set egress last took, and when. */
+  /** A forced round was asked for while one ran: that round runs once more when it ends. */
+  #again = false;
+  /** The account set egress last took (with its lease end, when there is one), and when. */
   #sent: { readonly text: string; readonly at: number } | null = null;
   /** The highest token `seq` taken from egress, per account (a restarted egress numbers from 1 again: see #take). */
   #taken = new Map<string, { readonly seq: number; readonly value: string }>();
   /** Tokens held for gray-relay's write-back, by account. */
   #writeBack = new Map<string, RefreshedToken>();
+  /** P2e-2: the pending family written to the vault, per account, whose ack egress has not taken yet. */
+  #written = new Map<string, { readonly seq: number; readonly value: string }>();
+  /**
+   * Whether each account egress was last pushed is a password account (its sign-in in the push), by account id. Kept
+   * across pushes that leave the account out (a KMS lease that does not serve, an expired bundle: the credential store
+   * then lists nothing), so a token egress hands over meanwhile is still known as a sign-in's and never written back.
+   */
+  #pushedLogin = new Map<string, boolean>();
 
   constructor(options: StackOpsOptions) {
     this.#options = options;
     this.#log = options.log ?? ((line) => console.log(JSON.stringify(line)));
   }
 
-  /** One round (see above). */
-  async round(view: StackOpsView): Promise<void> {
+  /**
+   * One round (see above). `force` (P2c-2: the KMS lease changed) runs it whatever the interval, and once more after a
+   * round already running, so a lease that stopped serving empties egress's set at once rather than at the next poll.
+   * `view` is read when the round starts, so pass a function for a round that may run later.
+   */
+  async round(view: StackOpsView | (() => StackOpsView), force = false): Promise<void> {
+    const viewNow = (): StackOpsView => (typeof view === "function" ? view() : view);
+    if (this.#running) {
+      if (force) this.#again = true;
+      return;
+    }
     const now = this.#options.now();
-    if (this.#running || (this.#polledAt !== null && now - this.#polledAt < this.#options.pollMs) || view.metadata === null) return;
+    if ((!force && this.#polledAt !== null && now - this.#polledAt < this.#options.pollMs) || viewNow().metadata === null) return;
     this.#running = true;
-    this.#polledAt = now;
     try {
-      await this.#push(view, now);
-      await this.#readTokens();
+      let again = true;
+      while (again) {
+        this.#again = false;
+        const at = this.#options.now();
+        this.#polledAt = at;
+        const current = viewNow();
+        if (current.metadata === null) break;
+        await this.#push(current, at, force);
+        await this.#readTokens();
+        again = this.#again;
+      }
     } finally {
       this.#running = false;
     }
@@ -166,6 +274,7 @@ export class StackOpsService {
       // the account is an access-token account (ChatGPT or Claude), refreshed by egress alone (its token exists only in
       // the VM).
       const login = held.login;
+      this.#pushedLogin.set(account.id, login !== undefined);
       const every: Record<string, bigint> = {};
       if (settings.everySeconds.limits !== undefined) every.limits = BigInt(settings.everySeconds.limits);
       if (settings.everySeconds.models !== undefined) every.models = BigInt(settings.everySeconds.models);
@@ -182,17 +291,29 @@ export class StackOpsService {
         models: [...account.models],
         ...(login === undefined
           ? {}
-          : { login: { username: login.username, password: login.password, ...(login.totp_secret === undefined ? {} : { totp_secret: login.totp_secret }) } }),
+          : {
+              login: {
+                username: login.username,
+                password: login.password,
+                ...(login.totp_secret === undefined ? {} : { totp_secret: login.totp_secret }),
+                ...pacingMember(options.persist?.pacingFor(account.id, login.username) ?? null),
+              },
+            }),
       });
     }
-    return toJsonString({ accounts });
+    if (options.persist === undefined) return toJsonString({ accounts });
+    return toJsonString(options.hold?.() === true ? { accounts, persist_first: true, hold: true } : { accounts, persist_first: true });
   }
 
-  async #push(view: StackOpsView, now: number): Promise<void> {
-    const text = this.accountsBody(view, now);
+  async #push(view: StackOpsView, now: number, force = false): Promise<void> {
+    const body = this.accountsBody(view, now);
+    const until = this.#options.leaseUntil?.();
+    // The lease's end is part of what egress holds: a changed end (a renewal, a refusal) is pushed even with the same set.
+    const text = until === undefined ? body : `${body}\n${until}`;
     const sent = this.#sent;
-    if (sent !== null && sent.text === text && now - sent.at < LANE_STACK_OPS_RESEND_MS) return;
-    const status = await this.#egress(STACK_OPS_ACCOUNTS_URL, { method: "PUT", headers: { "content-type": "application/json" }, body: text });
+    if (!force && sent !== null && sent.text === text && now - sent.at < LANE_STACK_OPS_RESEND_MS) return;
+    const headers: Record<string, string> = { "content-type": "application/json", ...(until === undefined ? {} : { [LEASE_UNTIL_HEADER]: String(until) }) };
+    const status = await this.#egress(STACK_OPS_ACCOUNTS_URL, { method: "PUT", headers, body });
     if (status === null) return;
     if (status.status === 204) this.#sent = { text, at: now };
     else this.#log({ level: "warn", event: "lane_stack_ops_push_failed", relay_id: this.#options.relayId, code: "status", status: status.status });
@@ -211,7 +332,22 @@ export class StackOpsService {
       return;
     }
     let taken = 0;
-    for (const token of parsed.tokens) if (this.#take(token)) taken += 1;
+    let installed = 0;
+    for (const token of parsed.tokens) {
+      if (token.pending === true) {
+        if (await this.#takePending(token)) taken += 1;
+      } else if (this.#take(token)) {
+        taken += 1;
+        installed += 1;
+      }
+    }
+    const persist = this.#options.persist;
+    // A family egress installed at once (no persist first yet: its first push did not reach it) is written now.
+    if (persist !== undefined && installed > 0) await persist.changed("token");
+    if (persist !== undefined && parsed.logins !== undefined) {
+      const written = await persist.notePacing(parsed.logins.map(pacingOf));
+      if (!written) this.#log({ level: "warn", event: "lane_stack_ops_pacing_unpersisted", relay_id: this.#options.relayId });
+    }
     if (taken > 0) {
       this.#log({ level: "info", event: "lane_stack_ops_tokens_taken", relay_id: this.#options.relayId, accounts: taken });
       await this.#options.onRefreshed?.();
@@ -223,23 +359,78 @@ export class StackOpsService {
     const held = this.#taken.get(token.account_id);
     // A restarted egress numbers from 1 again; its token is still new when its value differs.
     if (held !== undefined && held.seq >= token.seq && held.value === token.credential.value) return false;
-    const credential: Credential = {
+    const credential = this.#credentialOf(token);
+    if (!this.#options.credentials.applyRefreshed(this.#options.relayId, token.account_id, BigInt(token.based_on_version), credential)) {
+      this.#log({ level: "warn", event: "lane_stack_ops_token_refused", relay_id: this.#options.relayId, account_id: token.account_id });
+      return false;
+    }
+    this.#recordTaken(token, credential);
+    return true;
+  }
+
+  #credentialOf(token: z.infer<typeof tokensSchema>["tokens"][number]): Credential {
+    return {
       type: "oauth_access_token",
       value: token.credential.value,
       ...(token.credential.expires_at === undefined ? {} : { expires_at: BigInt(token.credential.expires_at) }),
       ...(token.refresh_token === null ? {} : { refresh_token: token.refresh_token }),
     };
-    if (!this.#options.credentials.applyRefreshed(this.#options.relayId, token.account_id, BigInt(token.based_on_version), credential)) {
-      this.#log({ level: "warn", event: "lane_stack_ops_token_refused", relay_id: this.#options.relayId, account_id: token.account_id });
-      return false;
-    }
+  }
+
+  /** A taken token: its seq for the next round, and the write-back gray-relay asks for. */
+  #recordTaken(token: z.infer<typeof tokensSchema>["tokens"][number], credential: Credential): void {
+    const held = this.#taken.get(token.account_id);
     const seq = Math.max(token.seq, (held?.seq ?? 0) + 1);
     this.#taken.set(token.account_id, { seq, value: token.credential.value });
     // A password account's tokens stay in the VM: nothing is written back to the relay's source, which holds the
-    // password (docs/design/relay-in-cvm-login.md §1).
-    const login = this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now()).some((a) => a.account_id === token.account_id && a.login !== undefined);
-    if (!login) this.#writeBack.set(token.account_id, { account_id: token.account_id, seq, credential });
+    // password (docs/design/relay-in-cvm-login.md §1). Known from what egress was pushed, not from the store as served
+    // now, which lists nothing while the KMS lease does not serve.
+    if (!this.#isLogin(token.account_id)) this.#writeBack.set(token.account_id, { account_id: token.account_id, seq, credential });
+  }
+
+  /** Whether `accountId` is a password account: as egress was last pushed it, or as the store serves it now. */
+  #isLogin(accountId: string): boolean {
+    if (this.#pushedLogin.get(accountId) === true) return true;
+    return this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now()).some((a) => a.account_id === accountId && a.login !== undefined);
+  }
+
+  /**
+   * P2e-2, persist first: a family egress holds pending. Written to the vault, then acknowledged; one written before
+   * whose ack was lost is acknowledged again without a second write. A family the store refuses (a newer sealed version
+   * replaced its account) is left to egress, whose next push from the lane drops it.
+   */
+  async #takePending(token: z.infer<typeof tokensSchema>["tokens"][number]): Promise<boolean> {
+    const persist = this.#options.persist;
+    const relayId = this.#options.relayId;
+    if (persist === undefined) return false;
+    const done = this.#written.get(token.account_id);
+    if (done !== undefined && done.seq === token.seq && done.value === token.credential.value) {
+      await this.#ack(token.account_id, token.seq);
+      return false;
+    }
+    const credential = this.#credentialOf(token);
+    const outcome = await persist.persistToken(() => this.#options.credentials.applyRefreshed(relayId, token.account_id, BigInt(token.based_on_version), credential));
+    if (outcome !== "persisted") {
+      this.#log({ level: "warn", event: outcome === "refused" ? "lane_stack_ops_token_refused" : "lane_stack_ops_token_unpersisted", relay_id: relayId, account_id: token.account_id });
+      return false;
+    }
+    this.#written.set(token.account_id, { seq: token.seq, value: token.credential.value });
+    this.#recordTaken(token, credential);
+    await this.#ack(token.account_id, token.seq);
     return true;
+  }
+
+  /** `POST /v1/stack/ops/tokens/ack`: egress installs the family. A lost one is sent again at the next round. */
+  async #ack(accountId: string, seq: number): Promise<void> {
+    const answer = await this.#egress(STACK_OPS_TOKENS_ACK_URL, { method: "POST", headers: { "content-type": "application/json" }, body: toJsonString({ account_id: accountId, seq: BigInt(seq) }) });
+    if (answer === null) return;
+    if (answer.status === 204) {
+      this.#written.delete(accountId);
+      return;
+    }
+    this.#log({ level: "warn", event: "lane_stack_ops_ack_failed", relay_id: this.#options.relayId, account_id: accountId, status: answer.status });
+    // 409: egress holds another family now (a newer one, or a push dropped it); the next round offers what it holds.
+    if (answer.status === 409) this.#written.delete(accountId);
   }
 
   /**
@@ -248,11 +439,14 @@ export class StackOpsService {
    */
   writeBackTokens(request: RefreshedRequest): readonly RefreshedToken[] {
     if (request.relayId !== this.#options.relayId) return [];
-    const current = new Map(this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now()).map((a) => [a.account_id, a.credential.value]));
+    const served = this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now());
+    const current = new Map(served.map((a) => [a.account_id, a.credential.value]));
     const out: RefreshedToken[] = [];
     for (const [accountId, token] of this.#writeBack) {
       const acked = request.acked.get(accountId);
-      if ((acked !== undefined && acked >= token.seq) || current.get(accountId) !== token.credential.value) {
+      // A password account's token never leaves the VM, however it came to be held (checked again at the exit).
+      const login = this.#pushedLogin.get(accountId) === true || served.some((a) => a.account_id === accountId && a.login !== undefined);
+      if (login || (acked !== undefined && acked >= token.seq) || current.get(accountId) !== token.credential.value) {
         this.#writeBack.delete(accountId);
         continue;
       }

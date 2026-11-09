@@ -34,6 +34,8 @@ type stack struct {
 	sessionKey []byte
 	// testsRunning counts the account tests in flight (S44: at most stackTestsMax).
 	testsRunning atomic.Int32
+	// lease is the KMS lease's end the lane last pushed (stack_lease.go): past it, no account of the relay is used.
+	lease leaseBound
 
 	mu       sync.Mutex
 	accounts map[string]stackAccount // by credential_sha256
@@ -148,12 +150,19 @@ func (attempt *stackAttempt) endOf(reason string, streamFailed bool) feedEnd {
 // gone from memory, so a long stream costs only what the reader has not read yet, and that is held in the
 // budget (bytes) until the reader has written it. After `done`, or once the reader left, appends are dropped.
 type stackFeed struct {
-	lines  [][]byte
-	bytes  int64         // the queued lines' share of the budget
+	lines  []feedItem
+	bytes  int64         // the queued lines' share of the budget (a debug copy's own bytes are its stackSpare's)
 	wake   chan struct{} // closed and replaced on every append
 	opened bool
 	gone   bool
 	closed bool
+}
+
+// feedItem is one queued record: its line, and for a debug copy (recordForwarded) the copy itself, which the reader
+// writes in place of the line unless the budget took it back by then.
+type feedItem struct {
+	line  []byte
+	spare *stackSpare
 }
 
 // setAccounts replaces the whole table (S15: on every config version) unless (version, push) is below the
@@ -177,9 +186,17 @@ func (st *stack) setAccounts(version, push uint64, accounts map[string]stackAcco
 	return true
 }
 
+// account is the row a call's credential names; none once the KMS lease's end has passed (stack_lease.go), which also
+// empties the table: every vendor call of the relay's, a registered rid's included, asks this first.
 func (st *stack) account(credential string) (stackAccount, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.lease.ended(st.now()) {
+		if len(st.accounts) > 0 {
+			st.accounts = map[string]stackAccount{}
+		}
+		return stackAccount{}, false
+	}
 	account, ok := st.accounts[credential]
 	return account, ok
 }
@@ -338,17 +355,27 @@ func (req *stackRequest) record(records ...any) bool {
 // (docs/design/relay-debug-sharing.md): the lane in the relay's VM keeps it, with the rest of the request's records, as
 // the request's debug record, which leaves the VM only for a request its customer authorized, sealed to the relay's
 // gray-relay. Only for a registration that asked for it, right after the call's `attempt` record and before its
-// vendor call, so before its `response`. Best effort: when the budget cannot hold the body, the record says only that
-// it was left out and how long the body was (a forced line of a few bytes); the call is never refused for it.
+// vendor call, so before its `response`. Best effort: the copy holds only budget nothing else needs (stackSpare), and
+// when it does not fit, or a holder takes its bytes back before the entry read it, the record says only that it was
+// left out and how long the body was (a forced line of a few bytes); no call is refused or cut for it.
 func (req *stackRequest) recordForwarded(n int, body []byte) {
 	if !req.forwarded {
 		return
 	}
 	req.mu.Lock()
 	defer req.mu.Unlock()
-	if !req.putLocked(false, feedForwarded{T: "forwarded", N: n, B64: base64.StdEncoding.EncodeToString(body), Bytes: len(body)}) {
-		req.putLocked(true, feedForwarded{T: "forwarded", N: n, Bytes: len(body), Omitted: true})
+	if req.feed.closed || req.feed.gone {
+		return
 	}
+	full, errFull := json.Marshal(feedForwarded{T: "forwarded", N: n, B64: base64.StdEncoding.EncodeToString(body), Bytes: len(body)})
+	omitted, errOmitted := json.Marshal(feedForwarded{T: "forwarded", N: n, Bytes: len(body), Omitted: true})
+	if errFull != nil || errOmitted != nil {
+		return // a struct of strings and numbers
+	}
+	omitted = append(omitted, '\n')
+	size := int64(cap(omitted))
+	req.budget.force(size)
+	req.queueLocked([]feedItem{{line: omitted, spare: req.budget.takeSpare(append(full, '\n'))}}, size)
 }
 
 // refused numbers a counted call and queues its refusal. It always reaches the entry: when the budget cannot
@@ -376,7 +403,7 @@ func (req *stackRequest) putLocked(forced bool, records ...any) bool {
 	if req.feed.closed || req.feed.gone || len(records) == 0 {
 		return true
 	}
-	lines := make([][]byte, 0, len(records))
+	items := make([]feedItem, 0, len(records))
 	var size int64
 	for _, record := range records {
 		line, err := json.Marshal(record)
@@ -385,7 +412,7 @@ func (req *stackRequest) putLocked(forced bool, records ...any) bool {
 			continue
 		}
 		line = append(line, '\n')
-		lines = append(lines, line)
+		items = append(items, feedItem{line: line})
 		size += int64(cap(line))
 	}
 	if forced {
@@ -393,15 +420,25 @@ func (req *stackRequest) putLocked(forced bool, records ...any) bool {
 	} else if !req.budget.take(size) {
 		return false
 	}
-	req.feed.lines = append(req.feed.lines, lines...)
-	req.feed.bytes += size
-	close(req.feed.wake)
-	req.feed.wake = make(chan struct{})
+	req.queueLocked(items, size)
 	return true
 }
 
-// dropLinesLocked forgets the queued lines and gives their bytes back.
+// queueLocked appends items whose lines' size is already in the budget, and wakes the reader.
+func (req *stackRequest) queueLocked(items []feedItem, size int64) {
+	req.feed.lines = append(req.feed.lines, items...)
+	req.feed.bytes += size
+	close(req.feed.wake)
+	req.feed.wake = make(chan struct{})
+}
+
+// dropLinesLocked forgets the queued lines and gives their bytes back, the debug copies' too.
 func (req *stackRequest) dropLinesLocked() {
+	for _, item := range req.feed.lines {
+		if item.spare != nil {
+			req.budget.releaseSpare(item.spare)
+		}
+	}
 	req.budget.give(req.feed.bytes)
 	req.feed.lines, req.feed.bytes = nil, 0
 }
@@ -423,8 +460,8 @@ func (req *stackRequest) openFeed() string {
 
 // nextLines blocks until the feed has records or ends, then takes every record queued. last is true when the
 // lines end with `done`. The lines' bytes stay in the budget until the reader gives them back after writing
-// them (size). A reader that leaves (ctx) makes the feed drop every later record.
-func (req *stackRequest) nextLines(ctx context.Context) (lines [][]byte, size int64, last bool, err error) {
+// them (size; a debug copy's, writeFeedLines). A reader that leaves (ctx) makes the feed drop every later record.
+func (req *stackRequest) nextLines(ctx context.Context) (lines []feedItem, size int64, last bool, err error) {
 	for {
 		req.mu.Lock()
 		if len(req.feed.lines) > 0 || req.feed.closed {

@@ -22,10 +22,12 @@
     "@gray/errors": "0.0.0",
     "@gray/holds": "0.0.0",
     "@gray/json": "0.0.0",
+    "@gray/lane-compose": "0.0.0",
     "@gray/lane-wire": "0.0.0",
     "@gray/ledger-keys": "0.0.0",
     "@gray/modeltrace": "0.0.0",
     "@gray/protocol": "0.0.0",
+    "@gray/relay-app-auth": "0.0.0",
     "@gray/relay-connector": "0.0.0",
     "@gray/routing": "0.0.0",
     "@gray/snapshot": "0.0.0",
@@ -37,6 +39,7 @@
     "ipaddr.js": "2.5.0",
     "jose": "6.2.12",
     "pg": "8.23.1",
+    "viem": "2.57.4",
     "zod": "4.6.6"
   },
   "devDependencies": {

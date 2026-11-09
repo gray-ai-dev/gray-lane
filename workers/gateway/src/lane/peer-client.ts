@@ -841,15 +841,20 @@ async function refusalCode(answer: Response): Promise<string> {
 }
 
 /**
- * Whether a VM's `/healthz?relay=` answer says it holds the relay's sealed credentials: `relay.sealed_version` a
- * string for that relay. Null for an answer that does not say (a body that is not that shape): unknown, not unsealed.
+ * Whether a VM's `/healthz?relay=` answer says it can serve the relay: it holds the relay's sealed credentials
+ * (`relay.sealed_version` a string) and its relay container fetched a configuration (`relay.config_version` a string),
+ * without which a request finds `config_unready`. A VM of a release before `config_version` says only the first. Null
+ * for an answer that does not say (a body that is not that shape): unknown, not unsealed.
  */
 async function sealedOf(answer: Response, relayId: string): Promise<boolean | null> {
   try {
     const relay = get(parseStrict(await answer.text()), "relay");
     if (!isObject(relay) || get(relay, "relay_id") !== relayId) return null;
     const version = get(relay, "sealed_version");
-    return typeof version === "string" ? true : version === null ? false : null;
+    if (version === null) return false;
+    if (typeof version !== "string") return null;
+    const config = get(relay, "config_version");
+    return config === undefined || typeof config === "string";
   } catch {
     return null;
   }

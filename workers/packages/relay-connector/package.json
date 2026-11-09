@@ -7,7 +7,10 @@
     ".": "./src/index.ts",
     "./lease": "./src/lease.ts",
     "./egress": "./src/egress.ts",
-    "./vault": "./src/vault.ts"
+    "./vault": "./src/vault.ts",
+    "./boot-box": "./src/boot-box.ts",
+    "./vault-share": "./src/vault-share.ts",
+    "./vault-state": "./src/vault-state.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

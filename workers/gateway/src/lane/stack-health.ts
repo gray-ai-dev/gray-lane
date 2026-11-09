@@ -37,6 +37,8 @@ import {
   type StackReport,
   type StackReportAccount,
   type StackReportCooling,
+  type StackReportKmsLease,
+  type StackReportVault,
   type StackReportLogin,
   type StackReportRefresh,
   type StackRelayChangeCounters,
@@ -141,6 +143,13 @@ export interface StackHealthOptions {
   /** `LANE_STACK_REPORT_MIN_MS` and `LANE_STACK_REPORT_HEARTBEAT_MS` (S42). */
   readonly reportMinMs: number;
   readonly reportHeartbeatMs: number;
+  /**
+   * P2c-2: the VM's KMS lease at a time, for the report's `kms_lease` (docs/design/relay-no-always-on-host.md H9); absent
+   * for a VM without one, whose report has no such member. `credentials` then already reads through the lease's gate.
+   */
+  readonly kmsLease?: (nowMs: number) => StackReportKmsLease;
+  /** P2e: the vault's versions for the report's `vault` (docs/design/relay-no-always-on-host.md 13.4); absent without a vault. */
+  readonly vault?: () => StackReportVault;
   /** One JSON line per event; never a credential, a header value or a document. */
   readonly log?: (line: Record<string, unknown>) => void;
 }
@@ -776,6 +785,8 @@ export class StackHealthService {
         .slice(0, STACK_REPORT_APPENDS_MAX),
       relay_image: options.relayImage,
       ...(this.#violation === null ? {} : { violation: this.#violation }),
+      ...(options.kmsLease === undefined ? {} : { kms_lease: options.kmsLease(now) }),
+      ...(options.vault === undefined ? {} : { vault: options.vault() }),
     };
   }
 

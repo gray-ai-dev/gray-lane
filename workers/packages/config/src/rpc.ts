@@ -107,7 +107,7 @@ export const RPC_SURFACES = {
   setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog"] },
   publicSetup: { callee: "console", target: "PublicSetup", kind: "entrypoint", callers: ["gateway"], calls: ["fetch", "keyStatus"] },
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
-  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut"] },
+  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut", "vaultShareNonce", "vaultShare", "stackInstance"] },
   laneStackSignals: { callee: "console", target: "LaneStackSignals", kind: "entrypoint", callers: ["lane-watch"], calls: ["releaseList"] },
   identity: { callee: "identity", target: "IdentityService", kind: "entrypoint", callers: ["console"], calls: ["challenge", "verify"] },
   content: { callee: "content", target: "ContentService", kind: "entrypoint", callers: ["console"], calls: ["open", "ensureWorkspace"] },
@@ -136,6 +136,13 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // release before `vaultGet` or `vaultPut` throws, the bridge answers unavailable, and the VM tries again.
   "laneStackConfig.vaultGet": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before vaultGet answers that it has no such method: unavailable, and the VM reads again",
   "laneStackConfig.vaultPut": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before vaultPut answers that it has no such method: unavailable, and the VM writes again",
+  // Gray's share of a relay's record keys (docs/design/relay-no-always-on-host.md H5): a gray-console of a release before
+  // `vaultShareNonce` or `vaultShare` throws, the bridge answers unavailable, and the VM asks again.
+  "laneStackConfig.vaultShareNonce": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before vaultShareNonce answers that it has no such method: unavailable, and the VM asks again",
+  "laneStackConfig.vaultShare": "lane-bridge/test/stack-vault-share.test.ts > a console of a release before vaultShare answers that it has no such method: unavailable, and the VM asks again",
+  // A relay VM's role in a rollout (docs/design/relay-no-always-on-host.md 13.4, P7): a gray-console of a release before
+  // `stackInstance` throws, the bridge answers unavailable, and the VM's role stays unknown (it writes nothing).
+  "laneStackConfig.stackInstance": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before stackInstance answers that it has no such method: unavailable, and the VM writes nothing",
 };
 
 /** Each call taken off a list since the previous release's lists, as `<surface>.<call>`: why no release that runs calls it. */

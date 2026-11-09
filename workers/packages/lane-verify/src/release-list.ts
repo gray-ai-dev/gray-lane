@@ -43,6 +43,13 @@
  * SHA-256(`sha256sum.txt`), which lists the SHA-256 of `metadata.json`, which says `is_dev`.
  * `osImageProvenance` checks that chain; an entry without the texts stays readable and reports
  * `provenance_missing` (what a reader does then is its own policy).
+ *
+ * P6 (docs/design/relay-no-always-on-host.md 13.11): a release may also carry `app_compose`, the exact
+ * Phala-normalized app-compose text dstack measures, so anyone can hash it to `compose_hash` and run
+ * `@gray/lane-compose`'s policy on it (the relay's `releases check` and `deliver`, phase 2). Like S11a's
+ * and S11b's members it sits inside the entry, so a reader that predates it ignores it, and the schema
+ * stays `/1`. A text that does not hash (SHA-256 of its UTF-8 bytes) to its entry's `compose_hash` is a
+ * malformed list: the signer never writes one.
  */
 import { bytesToLowerHex, ed25519PublicKey, ed25519Sign, ed25519Verify, jcsBytes, jcsText, lowerHexBytes, sha256BareHex, utf8Bytes } from "@gray/attest";
 import { get, isObject, parseSerde, parseStrict, type Json } from "@gray/json";
@@ -81,6 +88,8 @@ export interface ReleaseEntry {
   readonly published_at: string | null;
   /** S11a: present on a relay-stack release, null on every other. */
   readonly stack: ReleaseStack | null;
+  /** P6: the measured app-compose text, whose SHA-256 is `compose_hash`; null when the list does not publish it. */
+  readonly app_compose: string | null;
 }
 
 export interface OsImageEntry {
@@ -177,8 +186,12 @@ function parseReleases(value: Json | undefined, problems: ReleaseListProblem[]):
       problems.push({ path, message: "a release names a git_tag, a git_commit, or both" });
     }
     const stack = optionalStack(entry, path, problems);
+    const appCompose = optionalString(entry, "app_compose", path, problems);
+    if (appCompose !== null && sha256BareHex(utf8Bytes(appCompose)) !== composeHash) {
+      problems.push({ path: `${path}.app_compose`, message: "its SHA-256 is not compose_hash" });
+    }
     seen.add(composeHash);
-    out.push({ compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack });
+    out.push({ compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack, app_compose: appCompose });
   }
   return out;
 }

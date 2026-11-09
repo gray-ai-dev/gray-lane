@@ -7,7 +7,8 @@
  * - **Ops** (`ops.ts`): `account.admit|count|settle|release`, `endpoint.acquire|release|note|reserveRetry`,
  *   `snapshot.current`, `scheduler.forward`, `records.index|events|points|service_events`, `stack.config`,
  *   `stack.proxy_checks`, `stack.rules`, `stack.report`, `stack.tests`, `stack.debug_shares`, `stack.vault.get|put` (Gray's
- *   ciphertext copy of a VM's sealed records, stack-vault.ts), `release.lists`, `attest.collateral`, with
+ *   ciphertext copy of a VM's sealed records, stack-vault.ts), `stack.vault.share_nonce|share` (Gray's share of the
+ *   record keys, H5), `stack.instance` (a VM's serving or draining role in a rollout, stack-instance.ts), `release.lists`, `attest.collateral`, with
  *   `lane.acme_failed` and `ticket.use` (a model-check ticket's one-time id, ticket.ts), with their paths, methods and target addresses; a relay stack's account-health words are the closed lists of
  *   `stack-health.ts` (S34); the two background reads a lane VM verifies a peer with are `background.ts`'s.
  * - **The peer hop** (`peer.ts`): the entry's signed envelope to a relay's stack VM, the stack VM's `head`/`data`/`end`
@@ -50,6 +51,7 @@ export * from "./stack-report.ts";
 export * from "./stack-tests.ts";
 export * from "./stack-debug.ts";
 export * from "./stack-vault.ts";
+export * from "./stack-instance.ts";
 export * from "./stack-trace.ts";
 export * from "./background.ts";
 export * from "./lane-acme.ts";

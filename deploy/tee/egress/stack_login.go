@@ -49,10 +49,11 @@ const (
 	loginRouteName   = "/v1/relay/login"
 
 	// The bounds on egress's own resources, wide of any sign-in. One call holds at most its body twice (as read and
-	// as filled) and, on the token endpoint, the answer: 16 calls at once hold at most about 48 MiB beside the relay
-	// calls' own budget (-stack-max-bytes). A sign-in step's body is a few KiB and a token answer a few KiB, so the
-	// caps are over a hundred times what one needs; one account signs in one call at a time, so 16 calls at once is
-	// 16 accounts signing in together, and a 17th waits for one of them (503 login_busy, retry).
+	// as filled: the filled query and body together are at most loginBodyMax, loginFill.left) and, on the token
+	// endpoint, the answer: 16 calls at once hold at most about 48 MiB beside the relay calls' own budget
+	// (-stack-max-bytes). A sign-in step's body is a few KiB and a token answer a few KiB, so the caps are over a
+	// hundred times what one needs; one account signs in one call at a time, so 16 calls at once is 16 accounts
+	// signing in together, and a 17th waits for one of them (503 login_busy, retry).
 	loginInFlightMax    = 16
 	loginBodyMax        = 1 << 20
 	loginTokenAnswerMax = 1 << 20
@@ -115,6 +116,8 @@ const (
 	errLoginBodyTooLarge       = "login_body_too_large"
 	errLoginPlaceholderRefused = "login_placeholder_refused"
 	errLoginBusy               = "login_busy"
+	// errLoginHeld (P7): this VM is not its relay's serving instance during a rollout; the serving one signs in.
+	errLoginHeld = "login_held"
 )
 
 // The closed outcome codes of a token exchange, as the container's view and Gray's report carry them.
@@ -145,7 +148,7 @@ func loginRefusalStatus(code string) (int, bool) {
 		return http.StatusUnprocessableEntity, true
 	case errLoginBodyTooLarge:
 		return http.StatusRequestEntityTooLarge, true
-	case errLoginBusy:
+	case errLoginBusy, errLoginHeld:
 		return http.StatusServiceUnavailable, true
 	}
 	return 0, false
@@ -162,6 +165,8 @@ type opsLogin struct {
 	failures int
 	last     *loginOutcome
 	lastOK   time.Time
+	// pushedPacing is the pacing a push carried (stack_persist.go), taken in `put` only when egress held none.
+	pushedPacing *loginPacing
 }
 
 type loginOutcome struct {
@@ -174,6 +179,9 @@ type wireOpsLogin struct {
 	Username   *string `json:"username"`
 	Password   *string `json:"password"`
 	TOTPSecret *string `json:"totp_secret"`
+	// Pacing (P2e-2, stack_persist.go): the sign-in's failures and times as the VM's vault kept them, which egress takes
+	// only when it holds none of its own for the account (after a restart).
+	Pacing *wireLoginPacing `json:"pacing"`
 }
 
 // parseLogin checks the push's login member: the sealed e-mail (printable ASCII, one `@`), the password (UTF-8 without
@@ -207,6 +215,13 @@ func parseLogin(w *wireOpsLogin) (*opsLogin, bool) {
 			return nil, false
 		}
 		login.totp, login.totpText = secret, *w.TOTPSecret
+	}
+	if w.Pacing != nil {
+		pacing, ok := parseLoginPacing(w.Pacing)
+		if !ok {
+			return nil, false
+		}
+		login.pushedPacing = pacing
 	}
 	return login, true
 }
@@ -254,6 +269,11 @@ func (l *opsLogin) carry(held *opsLogin) {
 // loginNeeded: egress holds no access token for the account, the one it holds ends within loginTokenLead, or the
 // vendor refused its last refresh. Only the views read it: a sign-in may run at any time.
 func (o *stackOps) loginNeeded(account *opsAccount, now time.Time) bool {
+	// Persist first: a sign-in's family the lane has not written yet is a good token (no new sign-in for it); its
+	// expiry decides, as an installed one's would.
+	if p := account.pending; p != nil && p.access != "" {
+		return p.expiresAt != 0 && !now.Before(time.Unix(p.expiresAt, 0).Add(-loginTokenLead))
+	}
 	if account.fields["access_token"] == "" {
 		return true
 	}
@@ -346,45 +366,81 @@ type loginFill struct {
 	totp               []byte
 	at                 time.Time
 	code               string
+	// left is what the texts egress fills for the call (its query, then its body) may still take, together at most
+	// loginBodyMax. Each fill stops, login_body_too_large, as soon as its text would pass it, while the text is
+	// expanded and while it is encoded: a body that repeats a placeholder never makes egress build more than that.
+	left int
 }
 
-func (f *loginFill) text(s string) (string, bool) {
+// text fills s's placeholders; the result is at most limit bytes, or the code is login_body_too_large.
+func (f *loginFill) text(s string, limit int) (string, string) {
 	if !strings.Contains(s, placeholderMark) {
-		return s, true
+		return s, ""
 	}
 	var b strings.Builder
+	write := func(piece string) bool {
+		if b.Len()+len(piece) > limit {
+			return false
+		}
+		b.WriteString(piece)
+		return true
+	}
 	for {
 		i := strings.Index(s, placeholderMark)
 		if i < 0 {
-			b.WriteString(s)
-			return b.String(), true
+			if !write(s) {
+				return "", errLoginBodyTooLarge
+			}
+			return b.String(), ""
 		}
-		b.WriteString(s[:i])
+		if !write(s[:i]) {
+			return "", errLoginBodyTooLarge
+		}
 		s = s[i:]
+		var value string
 		switch {
 		case strings.HasPrefix(s, placeholderUsername):
-			b.WriteString(f.username)
-			s = s[len(placeholderUsername):]
+			value, s = f.username, s[len(placeholderUsername):]
 		case strings.HasPrefix(s, placeholderPassword):
-			b.WriteString(f.password)
-			s = s[len(placeholderPassword):]
+			value, s = f.password, s[len(placeholderPassword):]
 		case strings.HasPrefix(s, placeholderTOTP) && f.totp != nil:
 			if f.code == "" {
 				f.code = totpCode(f.totp, f.at, 6)
 			}
-			b.WriteString(f.code)
-			s = s[len(placeholderTOTP):]
+			value, s = f.code, s[len(placeholderTOTP):]
 		default:
-			return "", false
+			return "", errLoginPlaceholderRefused
+		}
+		if !write(value) {
+			return "", errLoginBodyTooLarge
 		}
 	}
 }
 
-// fillJSON re-writes a JSON body token by token, member order and number spellings as written, its string values'
-// placeholders filled. A body that is not strict JSON, or a placeholder in a member name, is refused.
+// jsonHasPlaceholder reports whether a strict JSON body holds the placeholder mark in a string, as decoded: a JSON
+// encoder may spell any of its characters as an escape.
+func jsonHasPlaceholder(body []byte) bool {
+	dec := jsontext.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return false
+		}
+		if tok.Kind() == '"' && strings.Contains(tok.String(), placeholderMark) {
+			return true
+		}
+	}
+}
+
+// fillJSON fills a JSON body's placeholders. A body that is not strict JSON is refused: egress could not tell where a
+// placeholder is. One without a placeholder passes as it came; one with any is re-written token by token, member order
+// and number spellings as written, its string values' placeholders filled, and a placeholder in a member name refused.
 func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 	if checkStrictJSON(body) != nil {
 		return nil, errLoginBodyRefused
+	}
+	if !jsonHasPlaceholder(body) {
+		return body, ""
 	}
 	dec := jsontext.NewDecoder(bytes.NewReader(body))
 	var out bytes.Buffer
@@ -401,54 +457,79 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 			if enc.WriteToken(tok) != nil {
 				return nil, errLoginBodyRefused
 			}
-			continue
-		}
-		text := tok.String()
-		kind, length := dec.StackIndex(dec.StackDepth())
-		if kind == '{' && length%2 == 1 {
-			if strings.Contains(text, placeholderMark) {
-				return nil, errLoginPlaceholderRefused
-			}
 		} else {
-			filled, ok := fill.text(text)
-			if !ok {
-				return nil, errLoginPlaceholderRefused
+			text := tok.String()
+			kind, length := dec.StackIndex(dec.StackDepth())
+			if kind == '{' && length%2 == 1 {
+				if strings.Contains(text, placeholderMark) {
+					return nil, errLoginPlaceholderRefused
+				}
+			} else {
+				filled, code := fill.text(text, fill.left-int(enc.OutputOffset()))
+				if code != "" {
+					return nil, code
+				}
+				text = filled
 			}
-			text = filled
+			if enc.WriteToken(jsontext.String(text)) != nil {
+				return nil, errLoginBodyRefused
+			}
 		}
-		if enc.WriteToken(jsontext.String(text)) != nil {
-			return nil, errLoginBodyRefused
+		// The encoded text, escapes included, counts: the output never grows past the bound by more than one token.
+		if int(enc.OutputOffset()) > fill.left {
+			return nil, errLoginBodyTooLarge
 		}
 	}
-	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), ""
+	filled := bytes.TrimSuffix(out.Bytes(), []byte("\n"))
+	fill.left -= len(filled)
+	return filled, ""
 }
 
-// fillForm re-writes an application/x-www-form-urlencoded text (a body or a query) pair by pair, in order: a pair whose
-// value holds no placeholder keeps its bytes. refused is the code for a text that does not decode.
-func fillForm(raw string, fill *loginFill, refused string) (string, string) {
-	if !strings.Contains(raw, "{{") && !strings.Contains(raw, "%7B%7B") && !strings.Contains(raw, "%7b%7b") {
-		return raw, ""
-	}
-	parts := strings.Split(raw, "&")
-	for i, part := range parts {
+// fillForm fills an application/x-www-form-urlencoded text's placeholders (a body or a query), found in each pair as
+// decoded: a form encoder percent-encodes the braces. A pair whose value holds none keeps its bytes, and a text with
+// none comes back as it came (changed false). refused is the code for a text that does not decode: egress could not
+// tell where a placeholder is.
+func fillForm(raw string, fill *loginFill, refused string) (string, bool, string) {
+	var out strings.Builder
+	changed := false
+	copied, start := 0, 0 // raw[:copied] is in out; the pair being read starts at start
+	for part := range strings.SplitSeq(raw, "&") {
+		pairStart := start
+		start += len(part) + 1
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, errKey := url.QueryUnescape(rawKey)
 		value, errValue := url.QueryUnescape(rawValue)
 		if errKey != nil || errValue != nil {
-			return "", refused
+			return "", false, refused
 		}
 		if strings.Contains(key, placeholderMark) {
-			return "", errLoginPlaceholderRefused
+			return "", false, errLoginPlaceholderRefused
 		}
-		filled, ok := fill.text(value)
-		if !ok {
-			return "", errLoginPlaceholderRefused
+		if !strings.Contains(value, placeholderMark) {
+			continue
 		}
-		if filled != value {
-			parts[i] = rawKey + "=" + url.QueryEscape(filled)
+		// What the text is with this pair left out: out, the raw bytes before the pair, and those after it.
+		rest := out.Len() + (pairStart - copied) + len(raw) - (pairStart + len(part))
+		filled, code := fill.text(value, fill.left-rest)
+		if code != "" {
+			return "", false, code
 		}
+		escaped := url.QueryEscape(filled)
+		if rest+len(rawKey)+1+len(escaped) > fill.left {
+			return "", false, errLoginBodyTooLarge
+		}
+		out.WriteString(raw[copied:pairStart])
+		out.WriteString(rawKey)
+		out.WriteByte('=')
+		out.WriteString(escaped)
+		copied, changed = pairStart+len(part), true
 	}
-	return strings.Join(parts, "&"), ""
+	if !changed {
+		return raw, false, ""
+	}
+	out.WriteString(raw[copied:])
+	fill.left -= out.Len()
+	return out.String(), true, ""
 }
 
 // loginGrayHeaders are egress's own (framing, hop-by-hop, the encoding it asks for): the container's value is left out.
@@ -509,6 +590,10 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		writeLoginRefusal(rec, code, header)
 	}
 	o.mu.Lock()
+	// Past the KMS lease's end no sign-in call is made, and the set goes (stack_lease.go).
+	if o.leaseEnded(o.now()) {
+		o.dropForLeaseLocked()
+	}
 	account := o.accounts[accountID]
 	var login opsLogin
 	var vendor string
@@ -516,9 +601,14 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	if account != nil && account.login != nil {
 		login, vendor, spec = *account.login, account.vendor, account.spec
 	}
+	held := o.hold
 	o.mu.Unlock()
 	if vendor == "" {
 		refuse(errLoginAccountUnknown, "")
+		return
+	}
+	if held {
+		refuse(errLoginHeld, "")
 		return
 	}
 	rule, known := loginHosts[vendor][host]
@@ -556,23 +646,28 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		}
 		body = read
 	}
-	fill := &loginFill{username: login.username, password: login.password, totp: login.totp, at: o.now()}
-	query, code := fillForm(r.URL.RawQuery, fill, errLoginPathRefused)
-	if code == "" && bytes.Contains(body, []byte(placeholderMark)) {
+	fill := &loginFill{username: login.username, password: login.password, totp: login.totp, at: o.now(), left: loginBodyMax}
+	query, _, code := fillForm(r.URL.RawQuery, fill, errLoginPathRefused)
+	if code == "" && len(body) > 0 {
 		media := ""
 		if parsed, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil {
 			media = strings.ToLower(parsed)
 		}
+		// A placeholder is found in the body as its type decodes it.
 		switch media {
 		case "application/json":
 			body, code = fillJSON(body, fill)
 		case "application/x-www-form-urlencoded":
-			var text string
-			text, code = fillForm(string(body), fill, errLoginBodyRefused)
-			body = []byte(text)
+			if text, changed, formCode := fillForm(string(body), fill, errLoginBodyRefused); formCode != "" {
+				code = formCode
+			} else if changed {
+				body = []byte(text)
+			}
 		default:
 			// Egress fills a placeholder only where it can find one: in a JSON string or a form value.
-			code = errLoginPlaceholderRefused
+			if bytes.Contains(body, []byte(placeholderMark)) {
+				code = errLoginPlaceholderRefused
+			}
 		}
 	}
 	if code != "" {
@@ -735,27 +830,43 @@ func (o *stackOps) recordLogin(accountID, username string, token *loginToken, ou
 }
 
 // installLoginTokenLocked makes a sign-in's tokens the account's: an own-call token (stack_ops.go), which the lane
-// reads at `GET /v1/stack/ops/tokens` and serves through /credentials, refreshed by egress from now on.
+// reads at `GET /v1/stack/ops/tokens` and serves through /credentials, refreshed by egress from now on. Persist first
+// (stack_persist.go): the family is pending until the lane acknowledges it; the sign-in's pacing counts it at once.
 func (o *stackOps) installLoginTokenLocked(account *opsAccount, token *loginToken, now time.Time) {
 	o.tokenSeq++
-	account.token = &opsToken{seq: o.tokenSeq, basedOn: account.credentialVersion, access: token.access, refresh: token.refresh, expiresAt: token.expiresAt}
-	account.fields["access_token"] = token.access
-	if token.accountID != "" {
-		account.fields["chatgpt_account_id"] = token.accountID
-	}
-	if token.refresh != "" {
-		account.fields["refresh_token"] = token.refresh
-	} else {
-		delete(account.fields, "refresh_token")
-	}
-	account.expiresAt = token.expiresAt
-	delete(account.results, opRefresh)
-	delete(account.next, opRefresh)
-	account.failures = 0
+	family := &opsToken{seq: o.tokenSeq, basedOn: account.credentialVersion, access: token.access, refresh: token.refresh, expiresAt: token.expiresAt,
+		login: true, accountID: token.accountID}
+	// A refresh in flight read the refresh token this family replaces: its outcome is dropped (run).
+	account.generation = family.seq
 	l := account.login
 	l.failures = 0
 	l.last = &loginOutcome{outcome: "ok", at: now}
 	l.lastOK = now
+	if o.persistFirst {
+		account.pending = family
+		delete(account.next, opRefresh)
+		return
+	}
+	o.installLoginFamilyLocked(account, family, now)
+}
+
+// installLoginFamilyLocked puts a sign-in's family in use: its access token, ChatGPT account id and refresh token (none
+// when the answer had none), its expiry, and a refresh schedule of its own.
+func (o *stackOps) installLoginFamilyLocked(account *opsAccount, family *opsToken, now time.Time) {
+	account.token = family
+	account.fields["access_token"] = family.access
+	if family.accountID != "" {
+		account.fields["chatgpt_account_id"] = family.accountID
+	}
+	if family.refresh != "" {
+		account.fields["refresh_token"] = family.refresh
+	} else {
+		delete(account.fields, "refresh_token")
+	}
+	account.expiresAt = family.expiresAt
+	delete(account.results, opRefresh)
+	delete(account.next, opRefresh)
+	account.failures = 0
 	o.scheduleLocked(account, now)
 }
 

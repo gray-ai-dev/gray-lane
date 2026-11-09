@@ -126,7 +126,7 @@ echo "build.sh: workerd $workerd_version ($workerd_package)"
 
 # 2. Stage the build context: every byte the image carries, and nothing else.
 rm -rf "$build"
-mkdir -p "$context" "$build/wrangler" "$context/egress" "$context/acme" "$context/isolation-check" "$context/peerlink" "$context/worker"
+mkdir -p "$context" "$build/wrangler" "$context/egress" "$context/acme" "$context/isolation-check" "$context/peerlink" "$context/idle" "$context/worker"
 
 workerd_basename="${workerd_package##*/}"
 curl -fsSL --retry 3 -o "$build/workerd.tgz" \
@@ -165,9 +165,10 @@ cp "$build/wrangler/entry.js" "$context/worker/entry.js"
 cp "$build/wrangler"/*.wasm "$context/worker/"
 # workerd treats every named export of the entry module as an entrypoint, and the lane bundle also
 # exports its route constants for the tests. A small wrapper makes the workerd entrypoints exactly the
-# default one and `relayConfig` (S28: the relay-stack layout's config listener binds it; the default
-# layout binds no socket to it); the bundle keeps its named exports for Node tests.
-printf 'import entry, { relayConfig } from "./entry.js";\nexport default entry;\nexport { relayConfig };\n' > "$context/worker/worker.mjs"
+# default one, `relayConfig` (S28: the relay-stack layout's config listener binds it; the default
+# layout binds no socket to it) and `kmsLease` (P2c-2: the supervisor's KMS lease socket binds it, only in an app
+# whose measured compose names the KMS); the bundle keeps its named exports for Node tests.
+printf 'import entry, { kmsLease, relayConfig } from "./entry.js";\nexport default entry;\nexport { kmsLease, relayConfig };\n' > "$context/worker/worker.mjs"
 
 # 4. What the image carries besides the bundle: the config template, the entrypoint and the three Go
 #    programs' sources. Tests and notes are not part of the measured image; go.mod/go.sum are, so
@@ -177,8 +178,16 @@ tar -C "$here/acme" --exclude='*_test.go' --exclude='README.md' -cf - . | tar -C
 tar -C "$here/isolation-check" --exclude='*_test.go' --exclude='dockertest' --exclude='check.sh' -cf - . | tar -C "$context/isolation-check" -xf -
 # gray-peerlink's sources, for the Dockerfile's peerlink stage (both layouts run it, relay-outbound-only §3.8).
 tar -C "$here/peerlink" --exclude='*_test.go' --exclude='README.md' --exclude='check.sh' --exclude='testdata' -cf - . | tar -C "$context/peerlink" -xf -
+# P2d: gray-idle's source (the empty slot's program) and pre-launch's boot box helper, bundled by esbuild from the
+# workspace's lockfile (deploy/tee/boot-box/bundle.mjs: one ES module, no source map, no absolute path).
+tar -C "$here/idle" --exclude='*_test.go' --exclude='check.sh' -cf - . | tar -C "$context/idle" -xf -
+node "$here/boot-box/bundle.mjs" "$workers" "$context/boot-box.mjs"
 cp "$here/workerd/config.capnp" "$context/config.capnp"
 cp "$here/bin/entrypoint.mjs" "$context/entrypoint.mjs"
+# P2c-2: the KMS lease the entrypoint imports (./kms-lease.mjs, beside it in /srv/lane).
+cp "$here/bin/kms-lease.mjs" "$context/kms-lease.mjs"
+# P2e: the vault disk the entrypoint imports (./vault-disk.mjs).
+cp "$here/bin/vault-disk.mjs" "$context/vault-disk.mjs"
 
 # 5. Provenance, from the worktree the bundle was made of (§4.1 `source_provenance`). The image digest is
 #    not known until after the build, so it stays empty here and is a deployment-time value (README).
@@ -293,4 +302,5 @@ echo "  bundle   $(node -e 'const {createHash}=require("node:crypto");const {rea
 echo "  config   $(node -e 'const {createHash}=require("node:crypto");const {readFileSync}=require("node:fs");process.stdout.write("sha256:"+createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"))' "$context/config.capnp")"
 echo "  egress   $(node -e 'const {createHash}=require("node:crypto");const {readdirSync,readFileSync}=require("node:fs");const {join}=require("node:path");const d=process.argv[1];const h=createHash("sha256");for(const f of readdirSync(d).sort()){if(f.endsWith(".go")||f==="go.mod")h.update(f).update(readFileSync(join(d,f)));}process.stdout.write("sha256:"+h.digest("hex"))' "$context/egress")"
 echo "  acme     $(node -e 'const {createHash}=require("node:crypto");const {readdirSync,readFileSync}=require("node:fs");const {join}=require("node:path");const d=process.argv[1];const h=createHash("sha256");for(const f of readdirSync(d).sort()){if(f.endsWith(".go")||f==="go.mod"||f==="go.sum")h.update(f).update(readFileSync(join(d,f)));}process.stdout.write("sha256:"+h.digest("hex"))' "$context/acme")"
+echo "  boot-box $(node -e 'const {createHash}=require("node:crypto");const {readFileSync}=require("node:fs");process.stdout.write("sha256:"+createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"))' "$context/boot-box.mjs")"
 echo "  isolation $(node -e 'const {createHash}=require("node:crypto");const {readdirSync,readFileSync}=require("node:fs");const {join}=require("node:path");const d=process.argv[1];const h=createHash("sha256");for(const f of readdirSync(d).sort()){if(f.endsWith(".go")||f==="go.mod")h.update(f).update(readFileSync(join(d,f)));}process.stdout.write("sha256:"+h.digest("hex"))' "$context/isolation-check")"

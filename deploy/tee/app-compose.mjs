@@ -528,6 +528,23 @@ export const STACK_INTERPOLATIONS = Object.freeze({
 });
 /** relay-outbound-only §3.2: the stack lane's default entry list (--peer-entries), lower-case DNS names, comma-separated. */
 export const PEER_ENTRIES_ENV = "LANE_PEER_ENTRIES";
+/**
+ * P2c-2 (docs/design/relay-no-always-on-host.md H9): the KMS a stack lane re-checks its app key with every 10 minutes
+ * (--kms-url), rendered only for an app on an on-chain KMS, where the relay's contract decides whether the KMS gives
+ * the app its keys. Absent, the VM keeps no lease (a phase-1 app on Phala's own KMS), and its compose is byte for byte
+ * the one before. A lane literal, so it is measured: Gray's unmeasured environment cannot turn the lease off or point it
+ * elsewhere (the entrypoint pins the KMS's certificate to the measured key provider whatever the URL names).
+ */
+export const KMS_URL_ENV = "LANE_KMS_URL";
+/**
+ * P2e (docs/design/relay-no-always-on-host.md §3.1, 13.11): the relay's vault on the data disk, bound read-write into
+ * lane at the same path for an app with a KMS lease (--kms-url) and for no other. Pre-launch binds the data disk's
+ * gray-persist at /var/lib/gray-persist (S9.1) and creates this directory owned by lane's uid, mode 0700; the lane's
+ * supervisor serves it to the Worker (deploy/tee/bin/vault-disk.mjs). @gray/lane-compose `STACK_LAYOUT.vaultBind`.
+ */
+export const VAULT_BIND_PATH = "/var/lib/gray-persist/relay";
+export const VAULT_BIND = `${VAULT_BIND_PATH}:${VAULT_BIND_PATH}`;
+const DSTACK_SOCKET_BIND = "/var/run/dstack.sock:/var/run/dstack.sock";
 
 /** What each layout's gate and output use; `default` is exactly the generator before layouts. */
 const LAYOUT_SPECS = Object.freeze({
@@ -544,6 +561,7 @@ const LAYOUT_SPECS = Object.freeze({
     allowedEnvs: ALLOWED_ENVS,
     identityNames: "TLS_DOMAIN, LANE_BRIDGE_URL, KEYSET_NOT_AFTER, LANE_RELEASE_PUBLIC_KEY, LANE_RELEASE_FRESHNESS_PUBLIC_KEY",
     certsBind: undefined,
+    vaultBind: undefined,
     bindRule: "only lane's guest-agent socket /var/run/dstack.sock may be bind-mounted (D94)",
   }),
   stack: Object.freeze({
@@ -560,7 +578,9 @@ const LAYOUT_SPECS = Object.freeze({
     allowedEnvs: STACK_ALLOWED_ENVS,
     identityNames: "LANE_BRIDGE_URL, KEYSET_NOT_AFTER, LANE_RELEASE_PUBLIC_KEY, LANE_RELEASE_FRESHNESS_PUBLIC_KEY, LANE_PEER_ENTRIES (--peer-entries)",
     certsBind: undefined,
-    bindRule: "only lane's guest-agent socket /var/run/dstack.sock may be bind-mounted (D94; relay-outbound-only §3.9 removed S2a's ACME account directory)",
+    vaultBind: VAULT_BIND_PATH,
+    bindRule:
+      "only lane's guest-agent socket /var/run/dstack.sock may be bind-mounted (D94; relay-outbound-only §3.9 removed S2a's ACME account directory), and for an app with LANE_KMS_URL lane's vault directory /var/lib/gray-persist/relay at its own path, read-write (P2e)",
   }),
 });
 
@@ -883,7 +903,9 @@ function checkVolumesAndPorts(services, data, spec, problems) {
         // S2a, D133: the stack's ACME account directory, read-write on lane only, at /certs only.
         const certs = spec.certsBind !== undefined && source === spec.certsBind && mount.target === CERTS_MOUNT
           && name === "lane" && !mount.readOnly;
-        if (!guestAgent && !certs) {
+        // P2e: the relay's vault directory, read-write on lane only, at its own path (checkStackFixed ties it to LANE_KMS_URL).
+        const vault = spec.vaultBind !== undefined && source === spec.vaultBind && mount.target === spec.vaultBind && name === "lane" && !mount.readOnly;
+        if (!guestAgent && !certs && !vault) {
           problems.push(`${label}: ${name} bind-mounts '${source}' at '${mount.target}'${mount.readOnly ? " read-only" : ""}; ${spec.bindRule}`);
         }
       } else if (source !== "" && !declared.has(source)) {
@@ -1240,12 +1262,25 @@ function sameValue(actual, expected) {
   return actual !== undefined && canonicalJson(plainValue(actual)) === canonicalJson(expected);
 }
 
+/**
+ * P2e: lane's mounts in the stack layout: STACK_FIXED's, and for an app with a KMS lease the vault's bind after the guest
+ * agent's socket (where --kms-url adds its line).
+ */
+export function stackLaneVolumes(leased) {
+  const volumes = [...STACK_FIXED.lane.volumes];
+  if (leased) volumes.splice(volumes.indexOf(DSTACK_SOCKET_BIND) + 1, 0, VAULT_BIND);
+  return volumes;
+}
+
 /** S2-S5, §9 B: every stack-only setting is exactly the layout's value (STACK_FIXED). */
 function checkStackFixed(services, label, problems) {
   for (const [name, fixed] of Object.entries(STACK_FIXED)) {
     const service = services.get(name);
     if (!isMap(service)) continue;
-    for (const [key, expected] of Object.entries(fixed)) {
+    // P2e: lane's mounts gain the vault's bind exactly when lane names the KMS it keeps a lease with (LANE_KMS_URL).
+    const leased = name === "lane" && environmentOf(service).has(KMS_URL_ENV);
+    for (const [key, fixedValue] of Object.entries(fixed)) {
+      const expected = leased && key === "volumes" ? stackLaneVolumes(true) : fixedValue;
       const actual = service.get(key);
       if (actual === undefined) {
         problems.push(`${label}: ${name} must set ${key}: ${canonicalJson(expected)} (S2-S5)`);
@@ -1479,6 +1514,7 @@ export function checkCompose(composeText, options = {}) {
   if (spec.name === "stack") {
     checkStackLaneEnvironment(parsed.services, label, problems);
     checkStackPeerlink(parsed.services, label, problems);
+    checkStackKmsUrl(parsed.services, label, problems);
     checkStackImages(parsed.services, images, options, label, problems);
     checkStackEnvironmentForm(parsed.services, label, problems);
     checkStackFixed(parsed.services, label, problems);
@@ -1497,7 +1533,7 @@ export function checkCompose(composeText, options = {}) {
     // layout has no relay network, so none of them belongs there.
     for (const [name, service] of parsed.services) {
       if (!isMap(service)) continue;
-      for (const key of [...Object.keys(STACK_LANE_ENVIRONMENT), STACK_LANE_POLL, PEER_ENTRIES_ENV]) {
+      for (const key of [...Object.keys(STACK_LANE_ENVIRONMENT), STACK_LANE_POLL, PEER_ENTRIES_ENV, KMS_URL_ENV]) {
         if (environmentOf(service).has(key)) problems.push(`${label}: ${name} sets ${key}, which only the relay-stack layout's lane sets (S28)`);
       }
     }
@@ -1529,6 +1565,72 @@ function setEnvLines(composeText, key, value, flag, expected) {
     throw new Error(`compose.yaml has ${matches.length} ${key} lines; expected exactly ${expected} to set from ${flag}`);
   }
   return composeText.replace(pattern, (_match, prefix, suffix) => `${prefix}${JSON.stringify(value)}${suffix}`);
+}
+
+/**
+ * A `key: "value"` line after the one line that sets `anchor`, with the same indentation; refused when `key` is set
+ * already or `anchor` is not exactly one line.
+ */
+function addEnvLineAfter(composeText, anchor, key, value, flag) {
+  if (new RegExp(`^[ \\t]+${key}[ \\t]*:`, "m").test(composeText)) throw new Error(`compose.yaml sets ${key} already; ${flag} adds it`);
+  const pattern = new RegExp(`^([ \\t]+)${anchor}[ \\t]*:[^\\n]*$`, "gm");
+  const matches = composeText.match(pattern) ?? [];
+  if (matches.length !== 1) throw new Error(`compose.yaml has ${matches.length} ${anchor} lines; ${flag} adds its line under exactly one`);
+  return composeText.replace(pattern, (line, indent) => `${line}\n${indent}${key}: ${JSON.stringify(value)}`);
+}
+
+/**
+ * A `- item` list line after the one line that is `- anchor`, with the same indentation; refused when `item` is listed
+ * already or `anchor` is not exactly one line.
+ */
+function addListLineAfter(composeText, anchor, item, flag) {
+  const quote = (text) => text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  if (new RegExp(`^[ \\t]+- ${quote(item)}[ \\t]*$`, "m").test(composeText)) throw new Error(`compose.yaml lists ${item} already; ${flag} adds it`);
+  const pattern = new RegExp(`^([ \\t]+)- ${quote(anchor)}[ \\t]*$`, "gm");
+  const matches = composeText.match(pattern) ?? [];
+  if (matches.length !== 1) throw new Error(`compose.yaml has ${matches.length} '- ${anchor}' lines; ${flag} adds its line under exactly one`);
+  return composeText.replace(pattern, (line, indent) => `${line}\n${indent}- ${item}`);
+}
+
+/**
+ * `--kms-url` and the gate's LANE_KMS_URL: https://<host>[:port][/path] without credentials, query or fragment (the form
+ * kms-lease.mjs dials), never a reserved .invalid host. Returns the problem, or null.
+ */
+function kmsUrlProblem(text) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return "is not a URL";
+  }
+  if (url.protocol !== "https:" || url.hostname === "" || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return "is not https://<host>[:port][/path] without credentials, query or fragment";
+  }
+  if (url.hostname.endsWith(".invalid")) return "names a reserved .invalid host";
+  return null;
+}
+
+function validateKmsUrl(text, flag) {
+  const problem = kmsUrlProblem(text);
+  if (problem !== null) throw new Error(`${flag} '${text}' ${problem} (the KMS of the app's measured key provider)`);
+  return text;
+}
+
+/**
+ * P2c-2: LANE_KMS_URL only on the stack lane, and only in its form (kmsUrlProblem). Absent is a VM without a lease.
+ */
+function checkStackKmsUrl(services, label, problems) {
+  for (const [name, service] of services) {
+    if (!isMap(service)) continue;
+    const value = environmentOf(service).get(KMS_URL_ENV);
+    if (value === undefined) continue;
+    if (name !== "lane") {
+      problems.push(`${label}: ${name} sets ${KMS_URL_ENV}; only the lane keeps the KMS lease (P2c-2)`);
+      continue;
+    }
+    const problem = typeof value === "string" ? kmsUrlProblem(value) : "is not a string";
+    if (problem !== null) problems.push(`${label}: lane.${KMS_URL_ENV} ${problem}; it is the KMS of the app's measured key provider (--kms-url, P2c-2)`);
+  }
 }
 
 /** `--tls-domain`: a real lowercase DNS hostname; `.invalid` can never be issued a certificate. */
@@ -1841,6 +1943,14 @@ function applyComposeFlags(composeText, options) {
     if (layoutSpec(options).name !== "stack") throw new Error("--peer-entries is a stack compose value: only a relay stack VM dials entries (relay-outbound-only §3.2)");
     measured = setEnvLines(measured, PEER_ENTRIES_ENV, validatePeerEntries(options.peerEntries), "--peer-entries", 1);
   }
+  if (options.kmsUrl !== undefined) {
+    if (layoutSpec(options).name !== "stack") throw new Error("--kms-url is a stack compose value: only a relay stack VM keeps a KMS lease (P2c-2)");
+    // A new line under lane's LANE_PEER_ENTRIES, with its indentation: the committed compose has none, so an app
+    // without a lease measures exactly what it did before.
+    measured = addEnvLineAfter(measured, PEER_ENTRIES_ENV, KMS_URL_ENV, validateKmsUrl(options.kmsUrl, "--kms-url"), "--kms-url");
+    // P2e: and the vault's bind, a new line under lane's guest-agent socket (the one service that mounts it).
+    measured = addListLineAfter(measured, DSTACK_SOCKET_BIND, VAULT_BIND, "--kms-url");
+  }
   if (options.lanePeers !== undefined) {
     if (layoutSpec(options).name === "stack") throw new Error("--lane-peers is not a stack compose value: a relay stack VM is never an entry (routing PR 9)");
     if (options.lanePeers !== "true" && options.lanePeers !== "false") throw new Error(`--lane-peers '${options.lanePeers}' is not true or false`);
@@ -2088,13 +2198,14 @@ const USAGE = `usage: app-compose.mjs [--check] [--out <file>] [--compose <file>
   [--scheduler-pick-ms <ms>] [--release-public-key <64 hex>] [--release-freshness-public-key <64 hex>]
   [--lane-peers true|false (default layout only)] [--gateway-enabled true|false (default layout only; default true)]
   [--peer-entries <name>[,<name>...] (stack layout only: the entries the VM dials first)]
+  [--kms-url <https url> (stack layout only: an app on an on-chain KMS, whose lane keeps the KMS lease)]
   [--image <name@sha256:<64 hex>>] [--pre-launch <file>] [--allow-placeholders]
   (the stack layout names no relay: the relay's identity is the app's encrypted env, S54)`;
 
 const VALUE_OPTIONS = new Set([
   "--out", "--compose", "--image", "--target", "--kms-ca-pubkey", "--deploy-env", "--tls-domain", "--bridge-url",
   "--keyset-not-after", "--scheduler-pick-ms", "--layout", "--pre-launch", "--release-public-key",
-  "--release-freshness-public-key", "--lane-peers", "--gateway-enabled", "--peer-entries",
+  "--release-freshness-public-key", "--lane-peers", "--gateway-enabled", "--peer-entries", "--kms-url",
 ]);
 const BOOLEAN_OPTIONS = new Set(["--check", "--allow-placeholders", "--help"]);
 
@@ -2154,6 +2265,7 @@ export function main(argv = process.argv.slice(2), log = console.log) {
     lanePeers: values["--lane-peers"],
     gatewayEnabled: values["--gateway-enabled"],
     peerEntries: values["--peer-entries"],
+    kmsUrl: values["--kms-url"],
     preLaunchScript,
   });
 

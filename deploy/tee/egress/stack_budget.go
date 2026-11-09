@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"errors"
 	"io"
 	"net"
@@ -22,15 +23,48 @@ import (
 //   - a feed: every record line queued for the entry, until the entry's GET has written it or the feed is
 //     dropped.
 //
+// A debug copy of a forwarded body (stackRequest.recordForwarded) is held at a lower rank (stackSpare): only in
+// bytes no other holder needs, and a take that does not fit takes them back first, oldest first, so an optional
+// copy never makes a call fail that would have gone through without it.
+//
 // What stays outside it (copies inside one function call, kernel socket buffers, the runtime) is in README
 // "Memory budget", with what bounds each.
 type stackBudget struct {
 	max  atomic.Int64 // read on every accept and call; set once by newStack (a test may lower it)
 	used atomic.Int64
+
+	// spares are the debug copies held, oldest first, and spareBytes their bytes (within used). spareMu guards
+	// them and every copy's state; it is taken after a request's mu, never before.
+	spareMu    sync.Mutex
+	spares     list.List
+	spareBytes int64
 }
 
-// take holds n more bytes if they fit; false leaves the budget as it was.
+// take holds n more bytes if they fit, taking back debug copies when only their bytes are in the way; false leaves
+// the budget as it was (and every copy held).
 func (b *stackBudget) take(n int64) bool {
+	if b.tryTake(n) {
+		return true
+	}
+	b.spareMu.Lock()
+	defer b.spareMu.Unlock()
+	if b.used.Load()-b.spareBytes+n > b.max.Load() {
+		return false
+	}
+	for {
+		if b.tryTake(n) {
+			return true
+		}
+		oldest := b.spares.Front()
+		if oldest == nil {
+			return false
+		}
+		b.dropSpareLocked(oldest.Value.(*stackSpare))
+	}
+}
+
+// tryTake holds n more bytes if they fit as the budget stands.
+func (b *stackBudget) tryTake(n int64) bool {
 	for {
 		used := b.used.Load()
 		if used+n > b.max.Load() {
@@ -40,6 +74,59 @@ func (b *stackBudget) take(n int64) bool {
 			return true
 		}
 	}
+}
+
+// stackSpare is one debug copy's feed line in the budget: held until the feed's reader claims it to write it, the
+// feed drops it, or a take needs its bytes.
+type stackSpare struct {
+	line []byte
+	size int64
+	elem *list.Element // in the budget's spares while held; nil after
+}
+
+// takeSpare holds line as a debug copy if it fits without taking anything back; nil when it does not.
+func (b *stackBudget) takeSpare(line []byte) *stackSpare {
+	size := int64(cap(line))
+	b.spareMu.Lock()
+	defer b.spareMu.Unlock()
+	if !b.tryTake(size) {
+		return nil
+	}
+	spare := &stackSpare{line: line, size: size}
+	spare.elem = b.spares.PushBack(spare)
+	b.spareBytes += size
+	return spare
+}
+
+// claimSpare hands a held copy's line to the feed's reader, whose bytes it then gives back once written; nil when
+// the budget took the copy back.
+func (b *stackBudget) claimSpare(spare *stackSpare) ([]byte, int64) {
+	b.spareMu.Lock()
+	defer b.spareMu.Unlock()
+	if spare.elem == nil {
+		return nil, 0
+	}
+	line, size := spare.line, spare.size
+	b.spares.Remove(spare.elem)
+	b.spareBytes -= size
+	spare.elem, spare.line = nil, nil
+	return line, size
+}
+
+// releaseSpare gives back a copy nobody will write (a dropped feed); nothing when it is no longer held.
+func (b *stackBudget) releaseSpare(spare *stackSpare) {
+	b.spareMu.Lock()
+	defer b.spareMu.Unlock()
+	if spare.elem != nil {
+		b.dropSpareLocked(spare)
+	}
+}
+
+func (b *stackBudget) dropSpareLocked(spare *stackSpare) {
+	b.spares.Remove(spare.elem)
+	b.spareBytes -= spare.size
+	spare.elem, spare.line = nil, nil
+	b.give(spare.size)
 }
 
 // force holds n bytes whether or not they fit: only for the few small records that must reach the entry
