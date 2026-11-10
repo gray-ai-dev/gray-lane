@@ -304,7 +304,8 @@ export class PeerRegistry implements LanePeerRegistry {
           peer.status = "pinned";
           peer.code = null;
         }
-        if (peer.usable(now)) sessions.push(peer);
+        // A boot in the empty slot is pinned for the relay's own tunnel only (PeerPin.emptySlot): never a request's.
+        if (peer.usable(now) && peer.pin?.emptySlot !== true) sessions.push(peer);
       }
       const born = (peer: Peer): number => channel.bornOf?.(relayId, peer.target.keyset!) ?? 0;
       sessions.sort((a, b) => {
@@ -326,7 +327,7 @@ export class PeerRegistry implements LanePeerRegistry {
   bootOf(relay: string, keyset: string): { readonly appId: string | null; readonly instanceId: string | null; readonly relayImage: string | null; readonly usable: boolean; readonly sealed: boolean | null } | null {
     const peer = this.#peers.get(peerKey(relay, channelOrigin(keyset)));
     if (peer === undefined || !peer.channel) return null;
-    return { appId: peer.pin?.appId ?? null, instanceId: peer.pin?.instanceId ?? null, relayImage: peer.pin?.relayImage ?? null, usable: peer.usable(this.#deps.clock()), sealed: peer.sealed };
+    return { appId: peer.pin?.appId ?? null, instanceId: peer.pin?.instanceId ?? null, relayImage: peer.pin === null || peer.pin.relayImage === "" ? null : peer.pin.relayImage, usable: peer.usable(this.#deps.clock()), sealed: peer.sealed };
   }
 
   /** Whether `relayId` has a usable channel peer now (the warm's wait, section 8.1 row 1). */
@@ -334,7 +335,7 @@ export class PeerRegistry implements LanePeerRegistry {
     const now = this.#deps.clock();
     const channel = this.#channel;
     if (channel === null) return false;
-    for (const peer of this.#peers.values()) if (peer.channel && peer.target.relayId === relayId && peer.usable(now) && channel.hasPinnedSession(relayId, peer.target.keyset!)) return true;
+    for (const peer of this.#peers.values()) if (peer.channel && peer.target.relayId === relayId && peer.usable(now) && peer.pin?.emptySlot !== true && channel.hasPinnedSession(relayId, peer.target.keyset!)) return true;
     return false;
   }
 
@@ -623,6 +624,9 @@ export class PeerRegistry implements LanePeerRegistry {
         nowSecs: BigInt(Math.floor(clock() / 1000)),
         expectedRelayId: peer.target.relayId,
         expectedRelayPublicKey: peer.target.relayKey,
+        // P2d/P4b: a phase-2 boot in the empty slot waits for the relay's first delivery, which reaches it only through
+        // this entry's tunnel; it is pinned for that alone (PeerPin.emptySlot) and checked against the relay key below.
+        allowEmptySlot: true,
         quoteVerifier: quote.verifier,
       }),
     );
@@ -632,7 +636,8 @@ export class PeerRegistry implements LanePeerRegistry {
     }
     const v = verified.verification;
     const facts = v?.stackBoot?.ok === true ? v.stackBoot.facts : null;
-    if (!verified.ok || v === null || v.keysetDigest === null || v.keyset === null || v.composeHash === null || v.osImageHash === null || facts === null || facts.phase !== "sealed" || verified.listCurrentUntil === null) {
+    const phaseOk = facts !== null && (facts.phase === "sealed" || facts.phase === "empty_slot");
+    if (!verified.ok || v === null || v.keysetDigest === null || v.keyset === null || v.composeHash === null || v.osImageHash === null || facts === null || !phaseOk || verified.listCurrentUntil === null) {
       if (quote.unavailable()) {
         this.#down(peer, "peer_collateral_unavailable", clock());
         return;
@@ -643,6 +648,12 @@ export class PeerRegistry implements LanePeerRegistry {
       // Of a channel peer, only when the report binds the keyset the sessions claimed; anything else is a real refusal.
       const listOnly = onlyListMiss(verified.checks) && (!peer.channel || v?.keysetDigest === `sha256:${peer.target.keyset!}`);
       this.#refuse(peer, `attestation_refused:${failed?.id ?? "unknown"}`, listOnly ? LIST_REREAD_MS : undefined);
+      return;
+    }
+    // The empty slot's identity is held to the relay's key here: @gray/lane-verify checks only its relay id there (it has
+    // no relay image whose signature would carry the key).
+    if (facts.phase === "empty_slot" && facts.identity.publicKey !== peer.target.relayKey) {
+      this.#refuse(peer, "attestation_refused:relay_key_pin");
       return;
     }
     if (peer.channel && v.keysetDigest !== `sha256:${peer.target.keyset!}`) {
@@ -660,7 +671,8 @@ export class PeerRegistry implements LanePeerRegistry {
       notAfterMs,
       composeHash: v.composeHash,
       osImageHash: v.osImageHash,
-      relayImage: facts.image.image,
+      relayImage: facts.phase === "sealed" ? facts.image.image : "",
+      ...(facts.phase === "empty_slot" ? { emptySlot: true } : {}),
       appId: peerAppIdOf(v.appId),
       instanceId: peerAppIdOf(v.instanceId),
       report,
@@ -686,7 +698,7 @@ export class PeerRegistry implements LanePeerRegistry {
     peer.status = "pinned";
     peer.code = null;
     peer.backoffMs = 0;
-    this.#deps.log({ level: "info", event: "lane_peer_pinned", relay: peer.target.relayId, origin: peer.target.origin, keyset_digest: v.keysetDigest, not_after_ms: notAfterMs });
+    this.#deps.log({ level: "info", event: "lane_peer_pinned", relay: peer.target.relayId, origin: peer.target.origin, keyset_digest: v.keysetDigest, not_after_ms: notAfterMs, ...(facts.phase === "empty_slot" ? { empty_slot: true } : {}) });
   }
 
   /**

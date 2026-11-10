@@ -51,6 +51,12 @@ export interface PeerPin {
   readonly composeHash: string;
   readonly osImageHash: string;
   readonly relayImage: string;
+  /**
+   * A phase-2 boot in the empty slot (docs/design/relay-no-always-on-host.md §3.3, 13.11 P2d): no boot box was delivered,
+   * so it runs no relay image (`relayImage` is "") and serves nothing. It is pinned so that the relay's own tool reaches
+   * it through `GET /v1/peer/tunnel/<relay>` to attest it and deliver (P4b), and no request is ever routed to it.
+   */
+  readonly emptySlot?: boolean;
   /** The boot's dstack app id (its `app-id` event, 40 lower-case hex), null when the report names none. */
   readonly appId?: string | null;
   /**

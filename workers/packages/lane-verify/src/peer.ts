@@ -50,6 +50,13 @@ export interface VerifyPeerAttestationOptions {
   readonly expectedRelayId?: string;
   /** A stack peer: the relay's signing key the lane record names (the identity's `public_key`, 64 hex). */
   readonly expectedRelayPublicKey?: string;
+  /**
+   * A stack peer (docs/design/relay-no-always-on-host.md 13.11 P2d, P4b): accept a phase-2 boot in the empty slot, as
+   * `verifyAttestation`'s option of the same name does. Its relay id and relay key are still held to the expected ones.
+   * An entry sets it so that the relay's own tool reaches the boot through the entry's tunnel to deliver, and routes no
+   * request to it (it serves nothing).
+   */
+  readonly allowEmptySlot?: boolean;
   readonly quoteVerifier: QuoteVerifier;
 }
 
@@ -103,6 +110,7 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
     host: options.host,
     nowSecs: options.nowSecs,
     ...(options.expectedRelayId === undefined ? {} : { expectedRelayId: options.expectedRelayId }),
+    ...(options.layout === "stack" && options.allowEmptySlot === true ? { allowEmptySlot: true } : {}),
     quoteVerifier: options.quoteVerifier,
   });
   checks.push(...verification.checks);
@@ -113,6 +121,7 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
     checks.push(fail("layout", "not checked: the measured compose hash is not a release of this list"));
   } else if (options.layout === "stack") {
     if (release.stack === null) checks.push(fail("layout", `release ${release.compose_hash} is not a stack release (no stack member)`));
+    else if (facts !== null && facts.phase === "empty_slot" && options.allowEmptySlot === true) checks.push(pass("layout", `stack release ${release.compose_hash}, empty slot of relay ${facts.identity.relayId}`));
     else if (facts === null || facts.phase !== "sealed") checks.push(fail("layout", "the boot measured no sealed relay identity"));
     else checks.push(pass("layout", `stack release ${release.compose_hash}, sealed boot of relay ${facts.identity.relayId}`));
   } else if (release.stack !== null) {
