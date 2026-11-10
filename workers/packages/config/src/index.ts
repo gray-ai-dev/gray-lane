@@ -3526,6 +3526,43 @@ export const SETTINGS: readonly SettingSpec[] = [
       "minutes a page at a time.",
   },
   {
+    name: "LANE_STACK_FAILING_WINDOW_MINUTES",
+    key: "laneStackFailingWindowMinutes",
+    workers: ["console"],
+    type: "int",
+    default: "5",
+    min: 2,
+    max: 60,
+    source:
+      "A sustained few minutes [estimate]: five passes of the console's minute cron, so one bad minute does not alert; at least two " +
+      "whole minutes of lane_stack_attempts, and at most the hour an account's `failing` state reads (S46, lane-stack/state.ts).",
+    doc:
+      "The minutes over which the console counts a relay's calls (lane_stack_attempts, its container's own failures included) for the " +
+      "relay_failing alert, which opens while the share failed holds and resolves when it no longer does.",
+  },
+  {
+    name: "LANE_STACK_FAILING_MIN_CALLS",
+    key: "laneStackFailingMinCalls",
+    workers: ["console"],
+    type: "int",
+    default: "20",
+    min: 1,
+    max: 100000,
+    source: "The floor of an account's `failing` state (S46, lane-stack/state.ts FAILING_MIN_ATTEMPTS: 20), below which a share is too few to judge.",
+    doc: "The fewest calls in LANE_STACK_FAILING_WINDOW_MINUTES for which the relay_failing alert judges the share failed.",
+  },
+  {
+    name: "LANE_STACK_FAILING_PERCENT",
+    key: "laneStackFailingPercent",
+    workers: ["console"],
+    type: "int",
+    default: "50",
+    min: 1,
+    max: 100,
+    source: "The share of an account's `failing` state (S46, lane-stack/state.ts: at least half of the attempts failures).",
+    doc: "The percent of a relay's calls in LANE_STACK_FAILING_WINDOW_MINUTES that failed (the customer's own 4xx left out) at which relay_failing opens.",
+  },
+  {
     name: "LANE_STACK_PROXY_CHECK_EXPIRY_MS",
     key: "laneStackProxyCheckExpiryMs",
     workers: ["console"],
@@ -3909,6 +3946,21 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc:
       "The lowest gray-relay kit version (agent status agent_version) whose relay's signed rollouts and rollbacks run without downtime (a " +
       "second VM, then the first drains and goes). Empty: none do; every rollout restarts the VM with the new image, as before.",
+  },
+  {
+    name: "LANE_STACK_PHASE2_MIN_KIT",
+    key: "laneStackPhase2MinKit",
+    workers: ["console"],
+    type: "text",
+    default: "1.3.1",
+    textCheck: (v) => (/^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/.test(v) ? null : "is not a kit version (major.minor.patch, such as 1.3.1)"),
+    source:
+      "Measured 2026-11-10 moving two test relays to phase 2: kit 1.3.0 delivers the boot box but cannot send the restart request that " +
+      "finishes a phase-2 delivery (it fails its own schema check), so the VM never runs the relay's image; kit 1.3.1 is the first that " +
+      "finishes it. A phase-2 relay has no daemon reporting its kit, so the version is the one its pairing (agent_version) names.",
+    doc:
+      "The lowest gray-assistant kit version with which a relay pairs in phase 2 (the pairing's agent_version; refused with " +
+      "lane_stack_pairing_kit_outdated) and Deploys a phase-2 VM (refused with lane_stack_provision_phase2_kit_outdated).",
   },
   {
     name: "LANE_STACK_RELEASE_MOVES",
@@ -5317,6 +5369,10 @@ export interface ConsoleConfig {
   readonly internalCallTimeoutMs: number;
   /** LANE_STACK_USAGE_KEEP_DAYS: the days of lane_stack_usage the console keeps and reads. */
   readonly laneStackUsageKeepDays: number;
+  /** LANE_STACK_FAILING_WINDOW_MINUTES, _MIN_CALLS, _PERCENT: the relay_failing alert's rule. */
+  readonly laneStackFailingWindowMinutes: number;
+  readonly laneStackFailingMinCalls: number;
+  readonly laneStackFailingPercent: number;
   /** LANE_STACK_VM_PAYER: who pays for a relay VM unless the operator's quota decision names the payer. */
   readonly laneStackVmPayer: "gray" | "relay";
   /** LANE_STACK_AUTO_VM_QUOTA: whether a relay's first VM quota is approved at once (owner, 2026-11-02). */
@@ -5337,6 +5393,8 @@ export interface ConsoleConfig {
   readonly laneStackOutboundMinKit: string;
   /** LANE_STACK_ROLLOUT_MIN_KIT: the lowest gray-relay kit whose rollouts run without downtime; empty: none. */
   readonly laneStackRolloutMinKit: string;
+  /** LANE_STACK_PHASE2_MIN_KIT: the lowest gray-assistant kit that pairs and Deploys in phase 2. */
+  readonly laneStackPhase2MinKit: string;
   /** LANE_STACK_RELEASE_MOVES: whether the console moves running VMs to the relay's newest accepted release. */
   readonly laneStackReleaseMoves: LaneStackReleaseMoveMode;
   /** LANE_STACK_RELEASE_MOVE_RETRY_MS: how long after a failed move to a release the console tries it again. */

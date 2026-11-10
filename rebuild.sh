@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuilds the gray-lane image of 2026.11.10-245977e8e860 from this tree with the release build script, deploy/tee/build.sh, unchanged,
+# Rebuilds the gray-lane image of 2026.11.10-47b69420b3c0 from this tree with the release build script, deploy/tee/build.sh, unchanged,
 # and prints the OCI manifest digest: the digest the release list names (`stack.gray_image`) and the measured compose
 # runs. A different digest means the tree is not what the image was built from, or your build environment differs
 # (README.md, "Rebuild").
@@ -18,8 +18,8 @@
 # included, to your git.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-commit=245977e8e860e657eb6234889bf7103fdaaf1be6
-epoch=1794302790
+commit=47b69420b3c047a45275a2e02010269d312d567a
+epoch=1794309850
 for tool in node npm docker curl tar git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "rebuild.sh: $tool is required" >&2; exit 2; }
 done

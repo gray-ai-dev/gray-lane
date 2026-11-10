@@ -154,9 +154,18 @@ func check(ctx context.Context, cfg config, sys system) []result {
 	add(itemRoute6, noDefaultRoute(sys, syscall.AF_INET6))
 	// lane and egress only have to have started (service_started); their listeners may come later.
 	add(itemAllowedOpen, waitOpen(ctx, sys, cfg.allow, cfg.wait))
-	add(itemDNS, noneResolves(ctx, sys))
-	add(itemPublic4, sys.dial(ctx, publicIPv4, probeTimeout) != outcomeOpen)
-	add(itemPublic6, sys.dial(ctx, publicIPv6, probeTimeout) != outcomeOpen)
+	// The three are independent and each passes by waiting out its timeout (a dropped SYN, a lookup with no answer):
+	// run together, reported in their order. On a VM boot they ran one after the other, up to 2 s + 2 s beside the
+	// lookups' 5 s, on the critical path of every boot (2026-11-10: the check took 8 s of a 100-s restart).
+	var dnsOK, public4OK, public6OK bool
+	var wg sync.WaitGroup
+	wg.Go(func() { dnsOK = noneResolves(ctx, sys) })
+	wg.Go(func() { public4OK = sys.dial(ctx, publicIPv4, probeTimeout) != outcomeOpen })
+	wg.Go(func() { public6OK = sys.dial(ctx, publicIPv6, probeTimeout) != outcomeOpen })
+	wg.Wait()
+	add(itemDNS, dnsOK)
+	add(itemPublic4, public4OK)
+	add(itemPublic6, public6OK)
 
 	addresses, settled := settledAddresses(ctx, sys)
 	add(itemHost4, settled && hostsClosed(ctx, sys, bridgeHosts4(addresses, cfg.allow)))

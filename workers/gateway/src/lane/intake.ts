@@ -215,9 +215,11 @@ export async function answerRefreshed(
 ): Promise<{ readonly ok: true; readonly answer: Record<string, unknown>; readonly tokens: number } | { readonly ok: false; readonly refusal: IntakeRefusal }> {
   const read = await readRefreshedRequest(
     value,
+    // `signingKeyOf`, not `get`: the asker is a stack VM's relay, which is tracked by its stack record and is never a
+    // registry entry (`get` does not name it), as for the credentials it seals to this boot.
     (relayId) => {
-      const relay = state.registry.get(relayId);
-      return relay === undefined ? null : hexBytes(relay.signingPublicKey, 32);
+      const key = state.registry.signingKeyOf(relayId);
+      return key === undefined ? null : hexBytes(key, 32);
     },
     Math.floor(nowMs / 1000),
   );
