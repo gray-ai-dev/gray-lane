@@ -30,9 +30,10 @@ import { laneRelaysOf, stackRelayOf } from "./remote/snapshot.ts";
 import type { StackRelayConfigProvider } from "./stack-config.ts";
 import { gatedStackConfig, gatedStackCredentials, KmsLeaseGate } from "./kms-lease.ts";
 import { StackConfigClient } from "./remote/stack.ts";
-import { LaneVault, vaultCopy, vaultDiskClient, vaultKeys } from "./vault.ts";
+import { LaneVault, VAULT_PREV_DISK_URL, vaultDiskClient, vaultKeys } from "./vault.ts";
 import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
-import { bootCopy, bootDiskClient, LaneBootBox } from "./boot-intake.ts";
+import { bootDiskClient, LaneBootBox } from "./boot-intake.ts";
+import { LanePairCopy, pairDiskClient } from "./pair-copy.ts";
 import { laneStackService, type LaneStackOptions, type StackConfigService } from "./stack-service.ts";
 import type { StoredPeerAttempt } from "./peer-model.ts";
 import type { LanePolicyRecord, LanePolicySource, LaneReceiptStore, LaneRelay, LaneRelayRegistry, LaneScheduler, LaneState, LaneTiming, StoredReceipt } from "./types.ts";
@@ -497,23 +498,34 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     const relayId = options.stack.relayId;
     const bridge = new StackConfigClient(bridgeOptions);
     const keys = vaultKeys({ guest: vaultSettings.guest, guestUrl: vaultSettings.guestUrl, timeoutMs: vaultSettings.guestTimeoutMs, bridge, relayId, appId: vaultSettings.appId });
-    const vaultFor = (image: string, store: RelayCredentialStore, role?: LaneInstanceRole): LaneVault =>
+    // P7-4: Gray's copy is one pair (boot box, vault, previous image's vault) under one compare-and-swap; each writer
+    // uploads through its slot, and every upload carries the pair the disk holds.
+    const pair = new LanePairCopy({ relayId, appId: vaultSettings.appId, bridge, disk: pairDiskClient(vaultSettings.disk) });
+    const vaultFor = (image: string, store: RelayCredentialStore, role?: LaneInstanceRole, previousImage?: string | null): LaneVault =>
       new LaneVault({
         relayId,
         relayKey: vaultSettings.relayKey,
         image,
+        ...(previousImage === undefined || previousImage === null ? {} : { previousImage }),
         appId: vaultSettings.appId,
         store,
         disk: vaultDiskClient(vaultSettings.disk),
         keys,
-        copy: vaultCopy(bridge, relayId, vaultSettings.appId),
+        copy: pair.member("vault"),
+        previousCopy: pair.member("vault_prev"),
+        previousDisk: vaultDiskClient(vaultSettings.disk, VAULT_PREV_DISK_URL),
+        // P7 (13.4): a draining instance's last upload, marked final.
+        final: (base) => pair.final(base),
         now,
         // P7 (13.4): only the serving instance writes; a merge's accounts reach the document at once.
         ...(role === undefined ? {} : { writer: role, onRestored: () => restored() }),
       });
     if (stackImage !== null) {
-      const role = new LaneInstanceRole({ relayId, source: bridge, now, pollMs: options.stack.pollMs, ttlMs: LANE_ROLE_TTL_MS });
-      const served = vaultFor(stackImage, credentials, role);
+      // P7 (13.4, the final mark): named serving during a rollout's drain, this instance waits for the retiring one's final
+      // mark at Gray (LANE_FINAL_MARK_WAIT_MS at most) before it writes or egress refreshes.
+      const finalMark = async (retiring: string): Promise<boolean> => (await pair.read()).finalFrom === retiring;
+      const role = new LaneInstanceRole({ relayId, source: bridge, now, pollMs: options.stack.pollMs, ttlMs: LANE_ROLE_TTL_MS, keyId: options.laneKeyId, finalMark });
+      const served = vaultFor(stackImage, credentials, role, options.stack.relayPrevious ?? null);
       // Becoming serving (a rollout's new instance at its shift, an instance a rollback serves again): Gray's newest copy
       // is read, and merged when another instance wrote it, before this one writes.
       role.onChange((now) => (now === "serving" ? served.becameServing() : undefined));
@@ -527,10 +539,11 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
       runningImage: stackImage,
       disk: bootDiskClient(vaultSettings.disk),
       keys,
-      copy: bootCopy(bridge, relayId, vaultSettings.appId),
+      copy: pair.member("boot"),
       now,
+      // The vault that follows the designation: the running one, or in the empty slot one made for an image.
       ...(stackImage !== null
-        ? {}
+        ? { vault }
         : { stagedVault: (image: string) => vaultFor(image, new RelayCredentialStore({ intakeKey, keys: relayKeys, keysetDigest: keyset.digest, leaseGated: true })) }),
     });
   }

@@ -9,8 +9,8 @@
  * streaming JSON library the gateway already reads tier C request bodies with). This module adds
  * what `parseStrictBytes` checks beyond JSON's grammar:
  *
- * - no byte order mark: the tokenizer skips one before the first token, `parseStrictBytes` decodes
- *   with `ignoreBOM` and JSON.parse refuses the U+FEFF;
+ * - no byte order mark anywhere: the tokenizer skips one until its first string, number or literal
+ *   (`refuseByteOrderMark`), `parseStrictBytes` decodes with `ignoreBOM` and JSON.parse refuses the U+FEFF;
  * - at most SERDE_MAX_DEPTH nested containers;
  * - no two equal keys in one object, compared after unescaping;
  * - every key and string well formed (no lone surrogate escape);
@@ -371,6 +371,29 @@ export function exactStrings(tokenizer: Tokenizer): void {
   (tokenizer as unknown as { bufferedString: StringBuilder }).bufferedString = new ScanStrings(() => true);
 }
 
+/**
+ * The tokenizer state START (`TokenizerStates.START`, tokenizer.js of @streamparser/json 0.0.26). A new
+ * tokenizer is in BOM_OR_START, where it skips a byte order mark, and it stays there across `{`, `[`,
+ * `}`, `]`, `:`, `,` and whitespace, which set no state: only the first string, number or literal moves
+ * it on. So `{` EF BB BF `"a":1}`, `[` EF BB BF `1]` and `{}` EF BB BF read as if the mark were not there,
+ * and every offset after it falls 3 bytes short (the skipped bytes are not counted, a leading mark's
+ * neither), while `parseStrictBytes` refuses them: U+FEFF is not JSON whitespace (RFC 8259 section 2),
+ * and serde_json reads no byte order mark anywhere. Found by the "mutated answers" property in CI,
+ * 2026-11-09.
+ */
+const TOKENIZER_START = 0;
+
+/**
+ * Makes a new @streamparser/json 0.0.26 tokenizer refuse a byte order mark wherever it is, as
+ * `parseStrictBytes` and serde_json do: it starts at START (`TOKENIZER_START`), where 0xEF is an
+ * unexpected byte like any other. Every tokenizer Gray reads a request or an answer with goes through
+ * this before its first `write`: a skipped mark would put every offset after it 3 bytes short, and the
+ * gateway splices bodies by those offsets.
+ */
+export function refuseByteOrderMark(tokenizer: Tokenizer): void {
+  (tokenizer as unknown as { state: number }).state = TOKENIZER_START;
+}
+
 /** A tokenizer that keeps a number's source text (the documented `parseNumber` override). */
 class SourceTokenizer extends Tokenizer {
   protected override parseNumber(numberStr: string): number {
@@ -391,8 +414,6 @@ interface Container {
 /** What the end of the last chunk was in the middle of. */
 export type ScanPartial = { readonly kind: "key" | "string" | "number" | "literal"; readonly offset: number } | null;
 
-const WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
-
 /**
  * One answer's strict scan. `write` each chunk as it arrives, then `end`; both throw a JsonError
  * when the text is not one `parseStrictBytes` accepts, from the chunk where that shows (a duplicate
@@ -406,8 +427,6 @@ export class StrictJsonScan {
   private readonly listener: ScanListener;
   private readonly stack: Container[] = [];
   private prev: TokenType | null = null;
-  /** A non-whitespace byte has been seen (the byte order mark check is done). */
-  private started = false;
   private failure: unknown = null;
   private numberStart = -1;
   /** Bytes written so far. */
@@ -432,6 +451,8 @@ export class StrictJsonScan {
     this.listener = new GuardedListener(listener);
     // No buffer of the tokenizer's own (its builder is replaced below); numbers keep the default builder.
     this.tokenizer = new SourceTokenizer({ stringBufferSize: 0, emitPartialTokens: true });
+    // No byte order mark skipped, at the start or after the first brackets.
+    refuseByteOrderMark(this.tokenizer);
     // A key is always whole (the duplicate check compares keys); a value the listener keeps whole spills past `spillBytes`.
     this.strings = new ScanStrings(() => (this.keyNext() ? "key" : this.listener.wholeString() ? "whole" : "prefix"), options.spillBytes ?? Number.POSITIVE_INFINITY);
     (this.tokenizer as unknown as { bufferedString: StringBuilder }).bufferedString = this.strings;
@@ -492,14 +513,6 @@ export class StrictJsonScan {
   write(chunk: Uint8Array): void {
     if (chunk.length === 0) return;
     if (this.failure !== null) throw this.failure instanceof ListenerFailure ? this.failure.cause : new JsonError("the scan already failed");
-    if (!this.started) {
-      for (const byte of chunk) {
-        if (WHITESPACE.has(byte)) continue;
-        if (byte === 0xef) throw new JsonError("a byte order mark is not JSON");
-        this.started = true;
-        break;
-      }
-    }
     this.partial = null;
     this.written += chunk.length;
     try {

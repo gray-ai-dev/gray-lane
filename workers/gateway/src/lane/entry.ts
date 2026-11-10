@@ -150,6 +150,8 @@ export interface LaneGatewayEnv extends LaneEnv {
   readonly LANE_STACK_RELAY_IMAGE?: unknown;
   /** P2d: `1` in a phase-2 boot's empty slot (`gray-relay-image` v2 with `image: null`), instead of LANE_STACK_RELAY_IMAGE. */
   readonly LANE_STACK_EMPTY_SLOT?: unknown;
+  /** P7: the image the boot's measured designation replaced (`gray-relay-image` v2 `previous`); phase 2 only. */
+  readonly LANE_STACK_RELAY_PREVIOUS?: unknown;
   /**
    * The boot's measured relay key (`gray-stack-identity`'s `public_key`, 64 hex), which the entrypoint read from the
    * guest agent; stack layout only. What gray-relay's debug fetch is checked against (docs/design/relay-debug-sharing.md).
@@ -345,6 +347,8 @@ export function laneTiming(
  * that a phase-2 boot in the empty slot (docs/design/relay-no-always-on-host.md §3.3, 13.11 P2d: no boot box opened,
  * `gray-relay-image` v2 with `image: null`) sets `LANE_STACK_EMPTY_SLOT` to `1` instead: then `relayImage` is null, the
  * relay's slot runs Gray's idle program, and no entry routes to this boot (@gray/lane-verify's `empty_slot` phase).
+ * P7: `LANE_STACK_RELAY_PREVIOUS` is the image the designation replaced (phase 2, beside a relay image only), for which
+ * the vault seals each version too (docs/design/relay-no-always-on-host.md 13.4: the previous image's record).
  */
 export function laneStackSettings(
   env: Readonly<Record<string, unknown>>,
@@ -353,6 +357,8 @@ export function laneStackSettings(
   readonly relayId: string;
   /** Null in the empty slot (P2d). */
   readonly relayImage: string | null;
+  /** P7: the image the designation replaced; null when it names none (and in phase 1). */
+  readonly relayPrevious: string | null;
   readonly pollMs: number;
   readonly attemptsMax: number;
   readonly rotationGraceMs: number;
@@ -363,6 +369,9 @@ export function laneStackSettings(
   const relayId = textBinding(env, "LANE_STACK_RELAY_ID", problems);
   const relayImage = textBinding(env, "LANE_STACK_RELAY_IMAGE", problems);
   const emptySlot = textBinding(env, "LANE_STACK_EMPTY_SLOT", problems);
+  const relayPrevious = textBinding(env, "LANE_STACK_RELAY_PREVIOUS", problems);
+  if (relayPrevious !== undefined && relayImage === undefined) problems.push("LANE_STACK_RELAY_PREVIOUS is set without LANE_STACK_RELAY_IMAGE: only a designation names the image it replaced (P7)");
+  if (relayPrevious !== undefined && (!isReceiptRelayImage(relayPrevious) || relayPrevious === relayImage)) problems.push("LANE_STACK_RELAY_PREVIOUS is <registry>/<repository>@sha256:<64 hex>, not the relay image (P7)");
   if (relayId !== undefined && !STACK_RELAY_ID_PATTERN.test(relayId)) problems.push("LANE_STACK_RELAY_ID is 1-128 characters of A-Z a-z 0-9 . _ : -");
   if (relayId === undefined && relayImage !== undefined) problems.push("LANE_STACK_RELAY_IMAGE is set outside the relay-stack layout");
   if (relayId === undefined && emptySlot !== undefined) problems.push("LANE_STACK_EMPTY_SLOT is set outside the relay-stack layout");
@@ -375,6 +384,7 @@ export function laneStackSettings(
   return {
     relayId,
     relayImage: relayImage ?? null,
+    relayPrevious: relayPrevious ?? null,
     pollMs: cfg.laneStackPollMs,
     attemptsMax: cfg.retryMaxAttempts,
     rotationGraceMs: cfg.streamTotalSeconds * 1000,
@@ -1083,30 +1093,37 @@ async function credentials(request: Request, env: LaneGatewayEnv, cfg: GatewayCo
 /**
  * P4b: a credential message in the empty slot. Only after a boot box this boot took (`LaneBootBox.stagedVault`): the
  * message goes into the vault for the designated image, through a store of its own that nothing here serves (no
- * document, no egress table). A RAM-only bundle (H13) is refused: this VM restarts before anything could use it.
+ * document, no egress table). A RAM-only bundle (H13) is refused: this VM restarts before anything could use it. It
+ * runs on the boot box's queue: one that waited while another box was taken or the lease refused is refused
+ * (`designation_changed`), so it never writes a vault for an image the disk no longer designates.
  */
 async function emptySlotCredentials(request: Request, cfg: GatewayConfig, state: LaneProcessState): Promise<Response> {
-  const staged = state.bootBox?.stagedVault() ?? null;
-  if (staged === null) {
+  const boot = state.bootBox;
+  if (boot === null || boot.stagedVault() === null) {
     return aciJson(409, { error: { code: "relay_empty_slot", message: "this VM runs the empty slot: deliver the boot box first" } }, state.keysetDigest);
   }
+  const generation = boot.generation;
   const lease = state.kmsLease;
   if (lease !== null && !lease.serving(Date.now())) return aciJson(503, { error: { code: "vault_unavailable", message: "this VM's KMS lease does not serve; send it again once it does" } }, state.keysetDigest);
   const body = await readIntakeBody(request, cfg, state);
   if (!body.ok) return body.response;
-  const applied = await vaultDelivery(staged, body.value, Date.now());
+  const taken = await boot.deliverStaged(generation, async (staged) => ({ applied: await vaultDelivery(staged, body.value, Date.now()), image: staged.image, persists: staged.persists() }));
+  if (taken === null) {
+    return aciJson(409, { error: { code: "designation_changed", message: "this VM took another boot box, or its KMS lease refused, while the delivery waited: send it again" } }, state.keysetDigest);
+  }
+  const { applied, image, persists } = taken;
   if (!applied.ok) return aciJson(applied.refusal.status, { error: { code: applied.refusal.code, message: applied.refusal.detail } }, state.keysetDigest);
-  if (!staged.persists()) {
+  if (!persists) {
     return aciJson(409, { error: { code: "vault_ram_only_empty_slot", message: "a RAM-only delivery is not kept, and this VM restarts onto the designated image: deliver the accounts after the restart" } }, state.keysetDigest);
   }
-  return aciJson(200, { relay_id: applied.relayId, version: applied.version, kind: applied.kind, accounts: BigInt(applied.accounts), image: staged.image, staged: true }, state.keysetDigest);
+  return aciJson(200, { relay_id: applied.relayId, version: applied.version, kind: applied.kind, accounts: BigInt(applied.accounts), image, staged: true }, state.keysetDigest);
 }
 
 /**
  * `POST /v1/aci/relay-boot-box` (P4b, `boot-intake.ts`): one sealed boot box delivery. Opened by the credential store
  * (this boot's intake key and the relay's registered key), checked and written by the boot box intake; a box for another
- * image than the one this boot runs re-wraps the running vault under that image's key. The answer is the receipt the
- * relay's tool prints, with `vault` saying what became of the vault (`none` in the empty slot and without accounts).
+ * image than the vault's commits with the vault re-wrapped under that image's key, as one pair. The answer is the
+ * receipt the relay's tool prints, with `vault` saying what became of the vault (`rewrapped`, `unchanged`, `none`).
  */
 async function bootBoxIntake(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, ctx: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") return methodNotAllowed(state.keysetDigest, "POST");
@@ -1128,14 +1145,8 @@ async function bootBoxIntake(request: Request, env: LaneGatewayEnv, cfg: Gateway
   }
   const taken = await boot.deliver(opened.delivery);
   if (!taken.ok) return aciJson(taken.status, { error: { code: taken.code, message: taken.detail } }, state.keysetDigest);
-  const receipt = taken.receipt;
-  // The running vault follows the designation, so the restarted boot opens it; it keeps serving meanwhile.
-  // A role that moved to draining since the check above re-wraps nothing: the receipt says `failed` (the tool's closed
-  // list), so the tool requests no restart.
-  const rewrapped = state.vault === null ? "none" : await state.vault.rewrap(receipt.image);
-  const vault = rewrapped === "not_serving" ? "failed" : rewrapped;
   ctx.waitUntil(boot.tick(lease?.serving(Date.now()) ?? false).catch(() => undefined));
-  return aciJson(200, { ...receipt, vault }, state.keysetDigest);
+  return aciJson(200, { ...taken.receipt }, state.keysetDigest);
 }
 
 /** P2e: a sealed message through the vault, answered as the intake answers the store's (`applyCredentialMessage`). */
@@ -1191,7 +1202,8 @@ function stackOpsOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayCo
       onRefreshed: () => stack.refresh(),
       ...(state.vault === null ? {} : { persist: state.vault }),
       // P7 (13.4): only the serving instance refreshes and signs in; egress holds while this VM is not it.
-      ...(state.instanceRole === null ? {} : { hold: () => !(state.instanceRole?.serving ?? true) }),
+      // P7 (13.4, the final mark): and while a serving instance has not yet merged Gray's newest copy (`syncing`).
+      ...(state.instanceRole === null ? {} : { hold: () => !(state.instanceRole?.serving ?? true) || state.vault?.syncing === true }),
     });
     stackOpsServices.set(state, ops);
     // A change of role reaches egress at once, not at the next poll.
@@ -1208,7 +1220,11 @@ function stackOpsRound(state: LaneProcessState, env: LaneGatewayEnv, cfg: Gatewa
     const held = stack.healthView();
     return { metadata: held.metadata, excluded: held.excluded };
   };
-  return ops.round(view, force).catch((thrown: unknown) => {
+  const round = ops.round(view, force).then(async () => {
+    // P7 (13.4, the final mark): a draining instance's last upload, once egress is idle under the hold.
+    if (state.vault !== null && state.instanceRole?.retiring === true) await state.vault.finalMark(ops.idle());
+  });
+  return round.catch((thrown: unknown) => {
     console.error(JSON.stringify({ level: "error", event: "lane_stack_ops_round_failed", code: thrown instanceof Error ? thrown.name : "error" }));
   });
 }
@@ -1423,8 +1439,12 @@ export const kmsLease = {
     const now = Date.now();
     const was = gate.serving(now);
     // P2e, §3.6: a refusal drops the vault's key and the accounts it opened at once; the disk records stay, and the
-    // lease serving again opens the vault again (vaultTick below, then on every push).
-    if (push.refused_reason !== null) state.vault?.drop();
+    // lease serving again opens the vault again (vaultTick below, then on every push). P4b: the empty slot's staged vault
+    // goes the same way, and a staged delivery that began before the refusal fails.
+    if (push.refused_reason !== null) {
+      state.vault?.drop();
+      state.bootBox?.drop();
+    }
     if (gate.update(push, now)) {
       const serving = gate.serving(now);
       // The lease's state only: no key, no account, no credential (the reason is the KMS's, cut by the supervisor).

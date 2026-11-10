@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { BridgeWireError, fromZod } from "./error.ts";
+import { LANE_BRIDGE_KEY_ID_PATTERN } from "./signing.ts";
 import { STACK_WIRE_ID_PATTERN } from "./stack-rules.ts";
 
 /**
@@ -29,7 +30,11 @@ export type StackInstanceRole = (typeof STACK_INSTANCE_ROLES)[number];
 export const stackInstanceRequestSchema = z.object({ relay_id: z.string().regex(STACK_WIRE_ID_PATTERN) }).strict();
 export type StackInstanceRequestDto = z.infer<typeof stackInstanceRequestSchema>;
 
-export const stackInstanceAnswerSchema = z.object({ role: z.enum(STACK_INSTANCE_ROLES) }).strict();
+/**
+ * P7 (13.4, the final mark): `retiring` names the instance a rollout retires, to every key: the serving one waits for its
+ * final mark at Gray, and the retiring one (its own key) puts it.
+ */
+export const stackInstanceAnswerSchema = z.object({ role: z.enum(STACK_INSTANCE_ROLES), retiring: z.string().regex(LANE_BRIDGE_KEY_ID_PATTERN).optional() }).strict();
 export type StackInstanceAnswerDto = z.infer<typeof stackInstanceAnswerSchema>;
 
 function checked<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -44,7 +49,7 @@ export function stackInstanceRequestDtoOf(relayId: string): StackInstanceRequest
 }
 
 /** The console's role as the wire answer. */
-export function stackInstanceAnswerDtoOf(role: StackInstanceRole): StackInstanceAnswerDto {
+export function stackInstanceAnswerDtoOf(role: StackInstanceRole, retiring: string | null = null): StackInstanceAnswerDto {
   if (!STACK_INSTANCE_ROLES.includes(role)) throw new BridgeWireError("invalid_document", "role", `role: ${String(role)} is not a role`);
-  return checked(stackInstanceAnswerSchema, { role });
+  return checked(stackInstanceAnswerSchema, { role, ...(retiring === null ? {} : { retiring }) });
 }

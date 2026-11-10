@@ -145,7 +145,7 @@ export {
   imageFamily,
 } from "./images.ts";
 export { type CanonicalResponse, type ToolCall, parseProviderError, parseResponse } from "./response.ts";
-export { KEPT_STRING_UNITS, SCAN_KEY_ENTRY_BYTES, STRING_BUFFER_BYTES, type ScanListener, type ScanPartial, type ScanString, StrictJsonScan, exactStrings } from "./answer-scan.ts";
+export { KEPT_STRING_UNITS, SCAN_KEY_ENTRY_BYTES, STRING_BUFFER_BYTES, type ScanListener, type ScanPartial, type ScanString, StrictJsonScan, exactStrings, refuseByteOrderMark } from "./answer-scan.ts";
 export { AnswerProjection, type KeepRule, PROJECTION_NODE_BYTES, type PathKey, type ProjectionObserver, keepRule, keptString } from "./answer-projection.ts";
 export { jsonHeapBytes, stringHeapBytes } from "./heap.ts";
 export {

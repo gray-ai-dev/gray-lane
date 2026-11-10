@@ -1,3 +1,4 @@
+import semver from "semver";
 import { DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_BYTES, LANE_PROTOCOLS, LANE_STACK_VENDORS, OPENAI_COMPATIBLE_VENDORS, POSITIONS, POSITIONS_BY_PROTOCOL, type Position } from "@gray/lane";
 import { EGRESS_TYPES, isValidEgressHost } from "@gray/relay-connector/egress";
 import { z } from "zod";
@@ -508,10 +509,18 @@ export type StackRestartReason = (typeof STACK_RESTART_REASONS)[number];
 /** A restart request id: `r` and 32 lower-case hex digits, fresh per request. */
 export const STACK_RESTART_REQUEST_ID_PATTERN = /^r[0-9a-f]{32}$/;
 
+/** P7: a gray-assistant kit version as a restart request carries it: strict semver (node-semver), as its own text, no newline. */
+const restartKitSchema = z.string().min(5).max(80).refine((v) => !/\s/.test(v) && semver.valid(v) === v, { message: "a kit version is strict semver" });
+
 /**
  * S53: the relay asks Gray to restart its stack app so the next boot takes the image its token service now names.
  * `image` is what the relay rolled out (null for a plain restart); Gray never acts on it, since the VM gets its image
  * from the token service at boot. The relay signs it with its lane record's Ed25519 key, as its issue reports.
+ *
+ * P7 (docs/design/relay-no-always-on-host.md 13.4): a phase-2 relay's tool adds its own version (`kit`), which the
+ * console's rollout gate reads for a relay with no gray-relay daemon to report it, and the boot box version the VM's
+ * receipt named (`boot_version`), which the provisioner waits for in Gray's copy before it starts a second instance.
+ * Both optional; the signature covers them when present.
  */
 export const stackRestartRequestSchema = z
   .object({
@@ -521,6 +530,8 @@ export const stackRestartRequestSchema = z
     app_id: z.string().regex(STACK_APP_ID_PATTERN),
     reason: z.enum(STACK_RESTART_REASONS),
     image: z.string().max(512).regex(STACK_RELAY_IMAGE_PATTERN).nullable(),
+    kit: restartKitSchema.optional(),
+    boot_version: u64.optional(),
   })
   .strict()
   .refine((r) => r.reason === "restart" || r.image !== null, { message: "a rollout or rollback names its image", path: ["image"] });
@@ -533,9 +544,15 @@ export type StackRestartRequestReport = z.infer<typeof stackRestartRequestReport
 /** The first line of the signed restart request. */
 export const STACK_RESTART_REQUEST_DOMAIN = "gray-relay-stack-restart/v1";
 
-/** The bytes the relay signs: the domain and each member on its own line, in this order; a null image is empty. */
+/**
+ * The bytes the relay signs: the domain and each member on its own line, in this order; a null image is empty. P7's
+ * `kit` and `boot_version` add two lines (an absent one empty) only when either is present, so a request without them
+ * signs exactly the bytes it did before, and one message has one reading (seven lines or nine).
+ */
 export function stackRestartRequestMessage(r: StackRestartRequest): Uint8Array {
-  return new TextEncoder().encode([STACK_RESTART_REQUEST_DOMAIN, r.relay_id, r.request_id, String(r.issued_ms), r.app_id, r.reason, r.image ?? ""].join("\n"));
+  const lines = [STACK_RESTART_REQUEST_DOMAIN, r.relay_id, r.request_id, String(r.issued_ms), r.app_id, r.reason, r.image ?? ""];
+  if (r.kit !== undefined || r.boot_version !== undefined) lines.push(r.kit ?? "", r.boot_version === undefined ? "" : String(r.boot_version));
+  return new TextEncoder().encode(lines.join("\n"));
 }
 
 /** Where a restart request stands: recorded and waiting, or settled by the provisioner or Gray's operator. */

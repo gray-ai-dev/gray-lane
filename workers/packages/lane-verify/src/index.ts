@@ -159,6 +159,7 @@ export {
   type ReleaseStack,
 } from "./release-list.ts";
 export {
+  MAX_RELEASE_LIST_BYTES,
   RELEASE_LIST_DEFAULT_HORIZON_SECONDS,
   RELEASE_LIST_DEFAULT_KEY_ID,
   RELEASE_LIST_DEFAULT_MAX_AGE_SECONDS,

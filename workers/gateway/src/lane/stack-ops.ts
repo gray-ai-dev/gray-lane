@@ -42,7 +42,10 @@ import type { StackExclusion } from "./stack-document.ts";
  * token it had until the lane acknowledges the family (`POST /v1/stack/ops/tokens/ack` with its seq). The lane writes the
  * family to the vault first (`LaneVault.persistToken`) and acknowledges only once it is on the disk; a family it could
  * not write is not acknowledged, and egress offers it again at the next round. An ack that was lost is sent again when
- * egress offers a family already written, without a second write. The sign-in pacing egress reports (`logins`) goes into
+ * egress offers a family already written, without a second write. An account's installed token and pending family are
+ * read as one state: while a family is pending, the installed token beside it (the one it replaces) is never taken, so
+ * a lost ack cannot put the older family back into the store and onto the disk over the one the vendor issued last
+ * (review 11-09b vm #1). The sign-in pacing egress reports (`logins`) goes into
  * the vault too, and back into the push (`login.pacing`) for egress to take after a restart.
  *
  * **Hold (P7, docs/design/relay-no-always-on-host.md 13.4).** During a rollout two instances hold the relay's accounts;
@@ -148,8 +151,12 @@ const tokensSchema = z
     ),
     // P2e-2: the sign-in pacing, with persist first only.
     logins: z.array(pacingSchema).optional(),
+    // P7 (13.4, the final mark): the refreshes, own calls and sign-ins egress runs now, with persist first only.
+    in_flight: z.number().int().min(0).max(1_000_000).optional(),
   })
   .strict();
+/** One entry of egress's tokens answer: an account's installed token, or (`pending`) the family it holds for the lane. */
+type OpsToken = z.infer<typeof tokensSchema>["tokens"][number];
 
 /** The reasons an account is left out of egress's set: the VM does not hold the credential the panel names. */
 const NOT_HELD = new Set(["not_sealed", "vendor_mismatch", "credential_waiting", "invalid_credential", "proxy_unknown", "proxy_mismatch", "proxy_waiting"]);
@@ -208,14 +215,21 @@ export class StackOpsService {
   #taken = new Map<string, { readonly seq: number; readonly value: string }>();
   /** Tokens held for gray-relay's write-back, by account. */
   #writeBack = new Map<string, RefreshedToken>();
-  /** P2e-2: the pending family written to the vault, per account, whose ack egress has not taken yet. */
-  #written = new Map<string, { readonly seq: number; readonly value: string }>();
+  /**
+   * P2e-2: the pending family written to the vault, per account, whose ack egress has not taken yet, and the access token
+   * egress listed as installed beside it when it was written (the family it replaces), if any.
+   */
+  #written = new Map<string, { readonly seq: number; readonly value: string; readonly replaces: string | null }>();
   /**
    * Whether each account egress was last pushed is a password account (its sign-in in the push), by account id. Kept
    * across pushes that leave the account out (a KMS lease that does not serve, an expired bundle: the credential store
    * then lists nothing), so a token egress hands over meanwhile is still known as a sign-in's and never written back.
    */
   #pushedLogin = new Map<string, boolean>();
+  /** P7: whether the account set egress last took carried `hold`. */
+  #sentHold = false;
+  /** P7: egress held, ran nothing and held no family pending, as of the last read. */
+  #idle = false;
 
   constructor(options: StackOpsOptions) {
     this.#options = options;
@@ -315,8 +329,10 @@ export class StackOpsService {
     const headers: Record<string, string> = { "content-type": "application/json", ...(until === undefined ? {} : { [LEASE_UNTIL_HEADER]: String(until) }) };
     const status = await this.#egress(STACK_OPS_ACCOUNTS_URL, { method: "PUT", headers, body });
     if (status === null) return;
-    if (status.status === 204) this.#sent = { text, at: now };
-    else this.#log({ level: "warn", event: "lane_stack_ops_push_failed", relay_id: this.#options.relayId, code: "status", status: status.status });
+    if (status.status === 204) {
+      this.#sent = { text, at: now };
+      this.#sentHold = this.#options.persist !== undefined && this.#options.hold?.() === true;
+    } else this.#log({ level: "warn", event: "lane_stack_ops_push_failed", relay_id: this.#options.relayId, code: "status", status: status.status });
   }
 
   async #readTokens(): Promise<void> {
@@ -331,12 +347,27 @@ export class StackOpsService {
       this.#log({ level: "warn", event: "lane_stack_ops_tokens_failed", relay_id: this.#options.relayId, code: "invalid_document" });
       return;
     }
+    // P7: idle under the hold: egress took the hold, runs nothing, and lists no family pending (one it listed before is
+    // written and acknowledged by now: egress lists a family until its ack).
+    this.#idle = this.#sentHold && parsed.in_flight === 0 && !parsed.tokens.some((token) => token.pending === true);
+    // One account's installed token and pending family are one state (review 11-09b vm #1). egress lists the token it
+    // uses beside the family it holds pending; the family is the newer of the two (made from that token's refresh token,
+    // or by a sign-in after it), and once the vault holds it, it is the account's until egress confirms or drops it.
+    const accounts = new Map<string, { installed?: OpsToken; pending?: OpsToken }>();
+    for (const token of parsed.tokens) {
+      const entry = accounts.get(token.account_id) ?? {};
+      if (token.pending === true) entry.pending = token;
+      else entry.installed = token;
+      accounts.set(token.account_id, entry);
+    }
     let taken = 0;
     let installed = 0;
-    for (const token of parsed.tokens) {
-      if (token.pending === true) {
-        if (await this.#takePending(token)) taken += 1;
-      } else if (this.#take(token)) {
+    for (const entry of accounts.values()) {
+      if (entry.pending !== undefined) {
+        // The installed token is not taken while a family waits: it is the one the family replaces, and taking it would
+        // put it back over a family already written (an ack that was lost), and then on the disk.
+        if (await this.#takePending(entry.pending, entry.installed ?? null)) taken += 1;
+      } else if (entry.installed !== undefined && this.#take(entry.installed)) {
         taken += 1;
         installed += 1;
       }
@@ -354,8 +385,28 @@ export class StackOpsService {
     }
   }
 
-  /** One token from egress: taken when it is not the one already held. */
-  #take(token: z.infer<typeof tokensSchema>["tokens"][number]): boolean {
+  /**
+   * P7 (docs/design/relay-no-always-on-host.md 13.4, the final mark): whether egress is idle under the hold as of the last
+   * round: it took the hold (no refresh or sign-in starts), runs none, and holds no family pending (each it held is
+   * written and acknowledged). What a draining instance waits for before its final mark.
+   */
+  idle(): boolean {
+    return this.#idle && this.#options.hold?.() === true;
+  }
+
+  /**
+   * One token from egress: taken when it is not the one already held. A family the vault holds and egress has not
+   * confirmed yet (`#written`) stays the account's: an installed token other than it is not taken over it; the family
+   * itself listed as installed is egress's confirmation (an ack whose answer was lost).
+   */
+  #take(token: OpsToken): boolean {
+    const written = this.#written.get(token.account_id);
+    if (written !== undefined) {
+      // The family it replaced never goes back over it; any other token means egress no longer holds it pending (it
+      // installed it, or a push or a restart dropped it), and is judged as before.
+      if (written.replaces !== null && written.replaces === token.credential.value) return false;
+      this.#written.delete(token.account_id);
+    }
     const held = this.#taken.get(token.account_id);
     // A restarted egress numbers from 1 again; its token is still new when its value differs.
     if (held !== undefined && held.seq >= token.seq && held.value === token.credential.value) return false;
@@ -395,11 +446,12 @@ export class StackOpsService {
   }
 
   /**
-   * P2e-2, persist first: a family egress holds pending. Written to the vault, then acknowledged; one written before
-   * whose ack was lost is acknowledged again without a second write. A family the store refuses (a newer sealed version
-   * replaced its account) is left to egress, whose next push from the lane drops it.
+   * P2e-2, persist first: a family egress holds pending (`installed`: the token egress lists beside it, which it
+   * replaces). Written to the vault, then acknowledged; one written before whose ack was lost is acknowledged again
+   * without a second write, and stays the store's meanwhile. A family the store refuses (a newer sealed version replaced
+   * its account) is left to egress, whose next push from the lane drops it.
    */
-  async #takePending(token: z.infer<typeof tokensSchema>["tokens"][number]): Promise<boolean> {
+  async #takePending(token: OpsToken, installed: OpsToken | null): Promise<boolean> {
     const persist = this.#options.persist;
     const relayId = this.#options.relayId;
     if (persist === undefined) return false;
@@ -414,7 +466,7 @@ export class StackOpsService {
       this.#log({ level: "warn", event: outcome === "refused" ? "lane_stack_ops_token_refused" : "lane_stack_ops_token_unpersisted", relay_id: relayId, account_id: token.account_id });
       return false;
     }
-    this.#written.set(token.account_id, { seq: token.seq, value: token.credential.value });
+    this.#written.set(token.account_id, { seq: token.seq, value: token.credential.value, replaces: installed?.credential.value ?? null });
     this.#recordTaken(token, credential);
     await this.#ack(token.account_id, token.seq);
     return true;

@@ -22,7 +22,7 @@ import { Tokenizer, TokenType } from "@streamparser/json";
 import { type Json, type JsonObject, cloneJson, get, isObject, setMember, toJsonString } from "@gray/json";
 import type { Protocol } from "./types.ts";
 import { type ClientBody, geminiKey, geminiObjectMut } from "./request.ts";
-import { exactStrings } from "./answer-scan.ts";
+import { exactStrings, refuseByteOrderMark } from "./answer-scan.ts";
 
 /** One top-level member of an object body, by byte offsets into the body. */
 export interface MemberSpan {
@@ -105,9 +105,12 @@ export function locateMembers(bytes: Uint8Array, heldMax: number = Number.MAX_SA
     colon = -1;
   };
   // Every string read whole and exactly (`exactStrings`): the library's own builder drops a U+FEFF at the start of a
-  // string, which would read a key `"\uFEFFinput"` as `"input"`, and a listener's values likewise.
+  // string, which would read a key `"\uFEFFinput"` as `"input"`, and a listener's values likewise. A byte order mark
+  // is refused wherever it is (`refuseByteOrderMark`): one skipped before the first key would put every offset after
+  // it 3 bytes short, and a tier B body is located without being parsed whole.
   const tokenizer = new Tokenizer({ stringBufferSize: 0 });
   exactStrings(tokenizer);
+  refuseByteOrderMark(tokenizer);
   tokenizer.onToken = ({ token, value, offset }) => {
     listen?.(token, value, offset);
     switch (token) {

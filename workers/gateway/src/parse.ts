@@ -19,6 +19,7 @@ import {
   memberHeldBytes,
   parseClientBody,
   parseRequest,
+  refuseByteOrderMark,
   takeModels,
 } from "@gray/protocol";
 import { Tokenizer, TokenType } from "@streamparser/json";
@@ -435,12 +436,15 @@ export class TokenTooLong extends Error {
  * parse a long number again at every chunk. Its strings are read by @gray/protocol's `exactStrings`
  * builder: the library's own drops a U+FEFF at the start of a decoded piece, and a member key
  * `"\uFEFFmodel"` read as `"model"` would let the layout splice the route's model into the wrong
- * member while the upstream reads the other.
+ * member while the upstream reads the other. It refuses a byte order mark wherever it is
+ * (`refuseByteOrderMark`): the library skips one before the first key, `{` EF BB BF `"model":...` among
+ * them, and every offset after it would be 3 bytes short.
  */
 class LayoutTokenizer extends Tokenizer {
   constructor() {
     super({ stringBufferSize: 0, emitPartialTokens: true });
     exactStrings(this);
+    refuseByteOrderMark(this);
   }
 
   protected override parseNumber(): number {

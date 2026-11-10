@@ -38,6 +38,8 @@ const EX_TEMPFAIL = 75;
 const GUEST_TIMEOUT_MS = 30_000;
 const BRIDGE_TIMEOUT_MS = 30_000;
 const NAMES = new Set(['boot.v1', 'boot.v1.seen']);
+// P7-4: the vault of Gray's pair, staged under the box record's hash before the box (vault-disk.mjs promotes it).
+const STAGED = /^vault\.v1\.boot-[0-9a-f]{64}$/;
 
 function say(line) {
   stdout.write(`gray-boot-box: ${line}\n`);
@@ -174,7 +176,7 @@ async function main() {
     },
     readFile: async name => readSmall(paths.persist, name),
     writeFile: async (name, text) => {
-      if (!NAMES.has(name)) throw new Error('not a boot box file');
+      if (!NAMES.has(name) && !STAGED.test(name)) throw new Error('not a boot box file');
       writeDurable(paths.persist, name, text);
     },
   });

@@ -477,6 +477,13 @@ export const RELEASE_LIST_DEFAULT_KEY_ID = "gray-release-1";
  * bounds how long a leaked freshness key can keep a replaced list alive.
  */
 export const RELEASE_LIST_MAX_HORIZON_SECONDS = 31n * 86_400n;
+
+/**
+ * The largest release list a client reads, in bytes (gray-assistant's daemon and its node source refuse a larger one
+ * whole). sign-release-list.mjs and release.mjs publish refuse to sign or upload a larger list: since entries carry
+ * their whole app_compose, the releases kept from --previous add up (review 2026-11-09b chain #4).
+ */
+export const MAX_RELEASE_LIST_BYTES = 4 * 1024 * 1024;
 /** D136: the horizon `sign-release-list.mjs` writes unless `--expires-in-days` says otherwise. */
 export const RELEASE_LIST_DEFAULT_HORIZON_SECONDS = 30n * 86_400n;
 

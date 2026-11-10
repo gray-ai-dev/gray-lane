@@ -281,7 +281,14 @@ func (o *stackOps) scheduleLocked(account *opsAccount, now time.Time) {
 // refreshes is an account egress refreshes: `refresh: "gray"`, an operation in the table and a refresh token, and no
 // hold (P7: only the relay's serving instance refreshes).
 func (o *stackOps) refreshes(account *opsAccount) bool {
-	return !o.hold && account.refreshMode == "gray" && o.table.op(account.vendor, account.credentialType, opRefresh) != nil && account.fields["refresh_token"] != ""
+	return !o.hold && o.refreshable(account)
+}
+
+// refreshable is an account egress refreshes when it does not hold: what decides whether a refresh's result is kept. A
+// refresh already at the vendor when the hold arrives keeps its result (P7 case 0: the vendor has rotated the refresh
+// token by then, so a dropped family would leave no instance able to refresh the account); the hold stops new ones.
+func (o *stackOps) refreshable(account *opsAccount) bool {
+	return account.refreshMode == "gray" && o.table.op(account.vendor, account.credentialType, opRefresh) != nil && account.fields["refresh_token"] != ""
 }
 
 // refreshAt is the next refresh: before expiry by the table's lead less up to a tenth of it; with no expiry known,
@@ -361,7 +368,7 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	switch op {
 	case opRefresh:
 		switch {
-		case !o.refreshes(account):
+		case !o.refreshable(account):
 			delete(account.next, opRefresh)
 		case refreshed != nil && account.credentialVersion == version && o.persistFirst:
 			// Persist first: the family waits for the lane's ack, and no refresh runs until it is installed (the vendor
@@ -398,6 +405,10 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 			account.failures++
 			backoff := stackOpsBackoffFirst << min(account.failures-1, 4)
 			account.next[opRefresh] = now.Add(min(backoff, stackOpsBackoffMax))
+		}
+		if o.hold {
+			// Held: the result is kept above, and nothing more is scheduled.
+			delete(account.next, opRefresh)
 		}
 	default:
 		every := account.every[op]
@@ -916,6 +927,9 @@ func (o *stackOps) tokens() map[string]any {
 	out := map[string]any{"tokens": answers}
 	if o.persistFirst {
 		out["logins"] = o.loginPacingLocked()
+		// P7 (docs/design/relay-no-always-on-host.md 13.4, the final mark): the operations and sign-in calls running now,
+		// so a draining lane knows when nothing it must still write is at a vendor (with `hold`, none starts).
+		out["in_flight"] = o.running + int(o.loginSlots.n.Load())
 	}
 	return out
 }

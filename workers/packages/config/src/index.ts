@@ -3625,6 +3625,19 @@ export const SETTINGS: readonly SettingSpec[] = [
       "counts, and a phase-2 pairing's terms and guardian part name it (RELAY_PHASE2_RELAYS).",
   },
   {
+    name: "RELAY_RELEASE_CHECK_MS",
+    key: "relayReleaseCheckMs",
+    workers: ["console"],
+    type: "int",
+    default: "600000",
+    min: 60000,
+    max: 86400000,
+    source:
+      "docs/design/relay-no-always-on-host.md 3.2 and 13.11 P5b-2: a release is told within its 7-day window (proposed, day 5, effective); " +
+      "reading each undecided release every 10 minutes keeps a notice within minutes of its event at two eth_call batches per relay a read [estimate].",
+    doc: "How often the console's minute cron reads an undecided phase-2 release's state from RELAY_SHARE_RPC_URLS for its notices (lane_stack_relay_releases).",
+  },
+  {
     name: "RELAY_PHASE2_RELAYS",
     key: "relayPhase2Relays",
     workers: ["console"],
@@ -3653,6 +3666,21 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc:
       "Gray's release proposer address (0x and 40 hex digits). A phase-2 pairing's terms name it, and the console recomputes the relay's " +
       "contract address with it. Changing it changes the address of every contract not yet deployed: relays paired before then pair again.",
+  },
+  {
+    name: "RELAY_CHAIN_PROPOSER_RECOVERY",
+    key: "relayChainProposerRecovery",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: optionalAddressProblem,
+    source:
+      "docs/design/relay-no-always-on-host.md 13.8 (2026-11-10): Gray's second offline key, the only one that replaces the proposer " +
+      "or itself on a relay's contract, so a lost or leaked proposer needs no new app. Part of the contract's CREATE2 address (C12).",
+    doc:
+      "Gray's proposer recovery address (0x and 40 hex digits), another key than RELAY_CHAIN_PROPOSER. A phase-2 pairing's terms name it " +
+      "and the console recomputes the relay's contract address with it; no relay pairs in phase 2 while it is unset. Changing it changes " +
+      "the address of every contract not yet deployed, as RELAY_CHAIN_PROPOSER does.",
   },
   {
     name: "RELAY_CHAIN_DSTACK_KMS",
@@ -5347,10 +5375,14 @@ export interface ConsoleConfig {
   /** RELAY_SHARE_RPC_URLS: "" when unset, else one or two comma-separated http(s) URLs. */
   readonly relayShareRpcUrls: string;
   readonly relayShareChainId: number;
+  /** RELAY_RELEASE_CHECK_MS: how often an undecided phase-2 release's state is read for its notices. */
+  readonly relayReleaseCheckMs: number;
   /** RELAY_PHASE2_RELAYS: "", "*" or relay ids (relayOnPhase2 reads it). */
   readonly relayPhase2Relays: string;
   /** RELAY_CHAIN_PROPOSER: Gray's release proposer address; "" when unset (no phase-2 pairing). */
   readonly relayChainProposer: string;
+  /** RELAY_CHAIN_PROPOSER_RECOVERY: Gray's proposer recovery address; "" when unset (no phase-2 pairing). */
+  readonly relayChainProposerRecovery: string;
   readonly relayChainDstackKms: string;
   /** RELAY_CHAIN_KMS_IDS: the Phala KMS ids on the relays' chain, comma-separated. */
   readonly relayChainKmsIds: string;

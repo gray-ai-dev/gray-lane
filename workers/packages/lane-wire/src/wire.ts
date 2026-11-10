@@ -79,6 +79,28 @@ export const BRIDGE_RESPONSE_MAX_BYTES = SNAPSHOT_RESPONSE_MAX_BYTES;
  */
 export const LANE_BRIDGE_CALL_MS = 20_000;
 
+/** P7 (stack-instance.ts): how long a role answer stands on the VM without a newer one: a few of the lane's polls, and of the 15 s lease pushes. */
+export const LANE_ROLE_TTL_MS = 20_000;
+/** egress's cap on one vendor call (deploy/tee/egress stack_ops.go `stackOpsCallCap`, stack_login.go `loginCallCap`). */
+export const EGRESS_CALL_CAP_MS = 60_000;
+/** The lane vault's first wait after a failed upload, doubling after each (workers/gateway/src/lane/vault.ts). */
+export const VAULT_RETRY_FIRST_MS = 5_000;
+/**
+ * P7 (docs/design/relay-no-always-on-host.md 13.4, the final mark): the most the retiring instance needs for its final
+ * mark when every call is answered at once (100 s). It learns it is draining within a role answer's life, a call at a
+ * vendor when that happened returns within egress's cap, and its final put is one bridge call.
+ */
+export const LANE_FINAL_MARK_FLOOR_MS = LANE_ROLE_TTL_MS + EGRESS_CALL_CAP_MS + LANE_BRIDGE_CALL_MS;
+/** P7: what rounds the final mark's wait up to three minutes; it also covers the lane's polls (5 s each) between the ack and the put. */
+export const LANE_FINAL_MARK_MARGIN_MS = 25_000;
+/**
+ * P7 (13.4, the final mark): how long the serving instance waits for the retiring one's final mark, and the least the
+ * provisioner's `remove_old` waits (PROVISION_FINAL_MARK_WAIT_MS is refused below it), 180 s: the floor (100 s), then two
+ * final puts that time out, each one bridge call, with the vault's backoff after each (5 s, then 10 s), so the third put
+ * starts by 135 s and lands by 155 s; and the margin.
+ */
+export const LANE_FINAL_MARK_WAIT_MS = LANE_FINAL_MARK_FLOOR_MS + 2 * LANE_BRIDGE_CALL_MS + VAULT_RETRY_FIRST_MS * (1 + 2) + LANE_FINAL_MARK_MARGIN_MS;
+
 export const BRIDGE_REQUEST_SCHEMAS = {
   "account.admit": admitInputSchema,
   "account.count": countInputSchema,

@@ -12,7 +12,7 @@ import {
   type RecordHeader,
   type SealedRecord,
 } from "@gray/relay-connector/vault";
-import type { StackVaultCopy, StackVaultKind } from "@gray/lane-wire";
+import type { StackVaultCopy } from "@gray/lane-wire";
 import { BridgeCallError } from "./remote/client.ts";
 
 /**
@@ -25,9 +25,10 @@ import { BridgeCallError } from "./remote/client.ts";
  * In order:
  *
  *   1. the highest record version and designation `seq` this disk has seen (`boot.v1.seen`, JCS {"seq","version"});
- *   2. the disk's record (`boot.v1`) and Gray's copy (`stack.vault.get`, kind `boot`): the newest that opens wins and
- *      never one below the version seen. With a disk record a copy that cannot be read is skipped; without one the boot
- *      cannot tell "nothing delivered yet" from "Gray did not answer", so that is `unavailable` (pre-launch retries);
+ *   2. the disk's record (`boot.v1`) and Gray's copy (`stack.vault.get`: P7-4, the boot box of Gray's one pair): the
+ *      newest that opens wins and never one below the version seen. With a disk record a copy that cannot be read is
+ *      skipped; without one the boot cannot tell "nothing delivered yet" from "Gray did not answer", so that is
+ *      `unavailable` (pre-launch retries);
  *   3. no record on the disk and none at Gray: the empty slot (`no_boot_box`), without asking for the share;
  *   4. Gray's share (H5, always mixed in phase 2): `stack.vault.share_nonce`, the guest agent's quote of
  *      `vaultShareRequest`'s report data, `stack.vault.share`, opened with the request's key. A 403 is
@@ -36,8 +37,11 @@ import { BridgeCallError } from "./remote/client.ts";
  *      binding, so a VM whose env names another relay key (F8) derives another key and opens nothing (`boot_box_unopened`);
  *   6. the opened plaintext is the boot box (`parseBootBox`) and its designation names this relay, is signed by the
  *      measured relay key and is not below the `seq` this disk has seen (`checkBootBox`); otherwise the empty slot;
- *   7. a copy newer than the disk's record is written to the disk, then the new highest version and `seq`
- *      (each atomically, fsynced, by `writeFile`), and the box is returned.
+ *   7. a copy newer than the disk's record is written to the disk with the vault of the same pair, as the lane's disk
+ *      commits a box and its vault (vault-disk.mjs, #482): the pair's vault record is staged first as
+ *      `vault.v1.boot-<SHA-256 of the box record>`, then the box record (`boot.v1`, the commit point: the supervisor makes
+ *      the staged record the vault when it starts), then the new highest version and `seq` (each atomically, fsynced, by
+ *      `writeFile`); the box is returned. So a restored disk holds a pair Gray had, never a box beside another pair's vault.
  *
  * Nothing here logs: the Node entry prints fixed lines only, and the box (the registry password) leaves this module only
  * as the return value its caller writes to the 0700 tmpfs directory pre-launch reads.
@@ -100,9 +104,12 @@ export class BootBoxFault extends Error {
   }
 }
 
+/** P7-4: the staged vault record's name prefix (vault-disk.mjs `STAGED_VAULT_PREFIX`), then the box record's SHA-256. */
+export const STAGED_VAULT_PREFIX = "vault.v1.boot-";
+
 /** The bridge operations the helper uses (`StackConfigClient`'s). */
 export interface BootBoxBridge {
-  vaultGet(relayId: string, appId: string, kind: StackVaultKind): Promise<StackVaultCopy>;
+  vaultGet(relayId: string, appId: string): Promise<StackVaultCopy>;
   vaultShareNonce(relayId: string, appId: string): Promise<string>;
   vaultShare(relayId: string, appId: string, quote: string, eventLog: string, ephemeralPublicKey: string, nonce: string): Promise<string>;
 }
@@ -166,17 +173,26 @@ function refused(error: unknown): boolean {
   return code !== null && code >= 400 && code < 500;
 }
 
-async function grayCopy(deps: BootBoxDeps, haveDisk: boolean): Promise<SealedRecord | null> {
+/** Gray's pair: its boot box (a candidate, when it parses) and its vault record (staged with the box when it is taken). */
+async function grayCopy(deps: BootBoxDeps, haveDisk: boolean): Promise<{ readonly boot: SealedRecord | null; readonly vault: string | null }> {
   let copy: StackVaultCopy;
   try {
-    copy = await deps.bridge.vaultGet(deps.relayId, deps.appId, "boot");
+    copy = await deps.bridge.vaultGet(deps.relayId, deps.appId);
   } catch (error) {
-    if (haveDisk) return null;
+    if (haveDisk) return { boot: null, vault: null };
     if (refused(error)) throw new BootBoxFault("copy_refused", `stack.vault.get answered ${String(status(error))}`);
     throw new BootBoxUnavailable("copy_unavailable");
   }
   // A copy that does not parse is no candidate; Gray cannot make one that opens.
-  return parsedOrNull(copy.record);
+  return { boot: parsedOrNull(copy.pair?.boot ?? null), vault: copy.pair?.vault ?? null };
+}
+
+/** SHA-256 of a record's text (its UTF-8 bytes), lower hex: the staged vault's name (vault-disk.mjs `recordSha256`). */
+async function textSha256(text: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  let hex = "";
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
+  return hex;
 }
 
 async function grayShare(deps: BootBoxDeps): Promise<Uint8Array | "refused"> {
@@ -215,7 +231,8 @@ export async function openBootBox(deps: BootBoxDeps): Promise<BootBoxOutcome> {
     throw new BootBoxFault("disk", error instanceof Error ? error.message : "read");
   }
   const disk = parsedOrNull(diskText);
-  const copy = await grayCopy(deps, disk !== null);
+  const pair = await grayCopy(deps, disk !== null);
+  const copy = pair.boot;
   if (disk === null && copy === null) return { kind: "empty", reason: seen.version > 0 ? "boot_box_missing" : "no_boot_box" };
 
   const share = await grayShare(deps);
@@ -261,7 +278,12 @@ export async function openBootBox(deps: BootBoxDeps): Promise<BootBoxOutcome> {
   try {
     // The copy was the newest that opened: it becomes the disk's record (its own bytes, re-serialized from the parse).
     const fromCopy = copy !== null && opened.header.version === copy.header.version && (disk === null || copy.header.version > disk.header.version);
-    if (fromCopy) await deps.writeFile(BOOT_BOX_FILE, serializeRecord(copy));
+    if (fromCopy) {
+      const boxText = serializeRecord(copy);
+      // P7-4: the vault of the same pair, staged under the box record's hash before the box (the commit point).
+      if (pair.vault !== null) await deps.writeFile(`${STAGED_VAULT_PREFIX}${await textSha256(boxText)}`, pair.vault);
+      await deps.writeFile(BOOT_BOX_FILE, boxText);
+    }
     if (next.version !== seen.version || next.seq !== seen.seq) await deps.writeFile(BOOT_BOX_SEEN_FILE, seenText(next));
   } catch (error) {
     throw new BootBoxFault("disk", error instanceof Error ? error.message : "write");

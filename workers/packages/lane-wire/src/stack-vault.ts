@@ -1,27 +1,30 @@
 import { z } from "zod";
 import { BridgeWireError, fromZod } from "./error.ts";
 import { uintSchema } from "./ints.ts";
+import { LANE_BRIDGE_KEY_ID_PATTERN } from "./signing.ts";
 import { STACK_WIRE_ID_PATTERN } from "./stack-rules.ts";
 
 /**
  * `stack.vault.get` and `stack.vault.put` (docs/design/relay-no-always-on-host.md §3.1 and 13.4, decision H6): Gray's
- * ciphertext copy of a relay stack VM's sealed records, the boot box (`boot`) and the vault (`vault`), kept so that a
- * node move, a lost disk or a second instance of the same app recovers without the relay. The record is
- * `@gray/relay-connector/vault`'s `serializeRecord` text: its header in clear, its body sealed under keys only the TEE
- * derives; Gray stores it and cannot open it.
+ * ciphertext copy of a relay stack VM's sealed records, kept so that a node move, a lost disk or a second instance of
+ * the same app recovers without the relay. A record is `@gray/relay-connector/vault`'s `serializeRecord` text: its header
+ * in clear, its body sealed under keys only the TEE derives; Gray stores it and cannot open it.
  *
- * One record per (relay, app, kind) at Gray, the latest only. `get` answers it with its version (version 0 and no record
- * when Gray holds none). `put` carries the version the VM built its record on (`base_version`): Gray takes the record
- * only when its own current version is that one (compare-and-swap), and answers `stored: true` with the record's
- * version; otherwise `stored: false` with Gray's current version, and the VM reads the newest, applies its change again
- * and retries (13.4, "Two instances, one vault"). The bridge answers a key only for its own relay
- * (LANE_BRIDGE_STACK_RELAYS), as the other `stack.*` ops; the console refuses an app that is not the relay's, a record
- * whose header names another relay, app or kind, and one whose version is not above `base_version`
- * (`vault_record_refused`).
+ * **One pair per (relay, app)** (P7-4, 13.4): the boot box (`boot`), the vault (`vault`) and the vault sealed for the
+ * previous image (`vault_prev`), stored and replaced together, as the VM's disk commits a boot box and the vault it needs
+ * as one pair (vault-disk.mjs, #482). `get` answers the pair with its version (version 0 and no pair when Gray holds
+ * none). `put` carries the whole pair and the pair version the VM built it on (`base_version`): Gray stores it only when
+ * its own current version is that one (compare-and-swap, one condition for the three records), as version
+ * `base_version + 1`, and answers `stored: true` with it; otherwise `stored: false` with Gray's current version, and the
+ * VM reads the newest pair and decides again (13.4, "Two instances, one vault"). A restore therefore only ever reads a
+ * pair one VM had committed on its disk, never one half of an update. The bridge answers a key only for its own relay
+ * (LANE_BRIDGE_STACK_RELAYS), as the other `stack.*` ops; the console refuses an app that is not the relay's and a pair
+ * whose records do not fit it (a header naming another relay, app or format, a boot box with an image or a vault
+ * without one, or a record whose version is below the one Gray's pair holds), as `vault_record_refused`.
  */
 
-/** The two record kinds (`@gray/relay-connector/vault` `RecordKind`). */
-export const STACK_VAULT_KINDS = ["boot", "vault"] as const;
+/** The records of a pair (`@gray/relay-connector/vault` `RecordKind`, and P7's `vault_prev`, a vault-format record). */
+export const STACK_VAULT_KINDS = ["boot", "vault", "vault_prev"] as const;
 export type StackVaultKind = (typeof STACK_VAULT_KINDS)[number];
 
 /** A dstack app id: 40 lower hex, no `0x` (the relay's contract address on an on-chain KMS). */
@@ -34,39 +37,49 @@ export const STACK_VAULT_APP_ID_PATTERN = /^[0-9a-f]{40}$/;
 export const STACK_VAULT_RECORD_MAX_CHARS = 1024 * 1024;
 
 /**
- * `stack.vault.put`'s request body bound (`bridgeRequestMaxBytes`): the record as a JSON string, where a quote or a
- * backslash is written as two bytes, so at most twice its characters, and the rest of the document.
+ * `stack.vault.put`'s request body bound (`bridgeRequestMaxBytes`): three records as JSON strings, where a quote or a
+ * backslash is written as two bytes, so at most twice their characters each, and the rest of the document.
  */
-export const STACK_VAULT_PUT_MAX_BYTES = 2 * STACK_VAULT_RECORD_MAX_CHARS + 4 * 1024;
+export const STACK_VAULT_PUT_MAX_BYTES = 3 * 2 * STACK_VAULT_RECORD_MAX_CHARS + 8 * 1024;
 
 const id = z.string().regex(STACK_WIRE_ID_PATTERN);
 const appId = z.string().regex(STACK_VAULT_APP_ID_PATTERN);
-const kind = z.enum(STACK_VAULT_KINDS);
 const record = z.string().min(1).max(STACK_VAULT_RECORD_MAX_CHARS).regex(/^[ -~]+$/);
 
-export const stackVaultGetRequestSchema = z.object({ relay_id: id, app_id: appId, kind }).strict();
+/** A pair: each record, or null for one the VM's disk does not hold. */
+export const stackVaultPairSchema = z.object({ boot: record.nullable(), vault: record.nullable(), vault_prev: record.nullable() }).strict();
+export type StackVaultPair = z.infer<typeof stackVaultPairSchema>;
+
+export const stackVaultGetRequestSchema = z.object({ relay_id: id, app_id: appId }).strict();
 export type StackVaultGetRequestDto = z.infer<typeof stackVaultGetRequestSchema>;
 
-/** Version 0 with no record when Gray holds none; a record's version is at least 1. */
+/** Version 0 with no pair when Gray holds none; a stored pair's version is at least 1. */
+/**
+ * P7 (13.4, the final mark): `final_from` is the bridge key of the draining instance whose final put Gray's pair carries
+ * (absent when none): the retiring instance's last version, uploaded once nothing of its own is left to write.
+ */
 export const stackVaultGetAnswerSchema = z
-  .object({ version: uintSchema, record: record.nullable() })
+  .object({ version: uintSchema, pair: stackVaultPairSchema.nullable(), final_from: z.string().regex(LANE_BRIDGE_KEY_ID_PATTERN).optional() })
   .strict()
-  .refine((a) => (a.version === 0n) === (a.record === null), { message: "version 0 is no record, and a record has a version", path: ["version"] });
+  .refine((a) => (a.version === 0n) === (a.pair === null), { message: "version 0 is no pair, and a pair has a version", path: ["version"] });
 export type StackVaultGetAnswerDto = z.infer<typeof stackVaultGetAnswerSchema>;
 
-export const stackVaultPutRequestSchema = z.object({ relay_id: id, app_id: appId, kind, base_version: uintSchema, record }).strict();
+/** P7: `final: true` is a draining instance's final mark; the bridge names the calling key as its `final_from`. */
+export const stackVaultPutRequestSchema = z.object({ relay_id: id, app_id: appId, base_version: uintSchema, pair: stackVaultPairSchema, final: z.literal(true).optional() }).strict();
 export type StackVaultPutRequestDto = z.infer<typeof stackVaultPutRequestSchema>;
 
 export const stackVaultPutAnswerSchema = z.object({ stored: z.boolean(), version: uintSchema }).strict();
 export type StackVaultPutAnswerDto = z.infer<typeof stackVaultPutAnswerSchema>;
 
-/** Gray's copy as the console answers it and the VM reads it: JS numbers. */
+/** Gray's pair as the console answers it and the VM reads it: JS numbers. */
 export interface StackVaultCopy {
   readonly version: number;
-  readonly record: string | null;
+  readonly pair: StackVaultPair | null;
+  /** P7: the draining key whose final mark Gray's pair carries; none when absent or null. */
+  readonly finalFrom?: string | null;
 }
 
-/** A put's outcome as the console answers it and the VM reads it. */
+/** A put's outcome as the console answers it and the VM reads it: whether it was stored, and Gray's pair version now. */
 export interface StackVaultPutResult {
   readonly stored: boolean;
   readonly version: number;
@@ -84,18 +97,18 @@ function wireUint(value: number, field: string): bigint {
 }
 
 /** The wire request of a get. */
-export function stackVaultGetRequestDtoOf(relayId: string, appId: string, kind: StackVaultKind): StackVaultGetRequestDto {
-  return checked(stackVaultGetRequestSchema, { relay_id: relayId, app_id: appId, kind });
+export function stackVaultGetRequestDtoOf(relayId: string, appId: string): StackVaultGetRequestDto {
+  return checked(stackVaultGetRequestSchema, { relay_id: relayId, app_id: appId });
 }
 
-/** The wire request of a put: the record built on `baseVersion` (0: Gray held none). */
-export function stackVaultPutRequestDtoOf(relayId: string, appId: string, kind: StackVaultKind, baseVersion: number, record: string): StackVaultPutRequestDto {
-  return checked(stackVaultPutRequestSchema, { relay_id: relayId, app_id: appId, kind, base_version: wireUint(baseVersion, "base_version"), record });
+/** The wire request of a put: the whole pair, built on Gray's pair version `baseVersion` (0: Gray held none). */
+export function stackVaultPutRequestDtoOf(relayId: string, appId: string, baseVersion: number, pair: StackVaultPair, final = false): StackVaultPutRequestDto {
+  return checked(stackVaultPutRequestSchema, { relay_id: relayId, app_id: appId, base_version: wireUint(baseVersion, "base_version"), pair, ...(final ? { final: true } : {}) });
 }
 
-/** The console's copy as the get's wire answer. */
+/** The console's pair as the get's wire answer. */
 export function stackVaultGetAnswerDtoOf(copy: StackVaultCopy): StackVaultGetAnswerDto {
-  return checked(stackVaultGetAnswerSchema, { version: wireUint(copy.version, "version"), record: copy.record });
+  return checked(stackVaultGetAnswerSchema, { version: wireUint(copy.version, "version"), pair: copy.pair, ...((copy.finalFrom ?? null) === null ? {} : { final_from: copy.finalFrom }) });
 }
 
 /** The console's put outcome as the wire answer. */
@@ -105,7 +118,7 @@ export function stackVaultPutAnswerDtoOf(result: StackVaultPutResult): StackVaul
 
 /** The get's wire answer with JS numbers (the schema bounds the version to a safe integer). */
 export function stackVaultCopyOf(dto: StackVaultGetAnswerDto): StackVaultCopy {
-  return { version: Number(dto.version), record: dto.record };
+  return { version: Number(dto.version), pair: dto.pair, finalFrom: dto.final_from ?? null };
 }
 
 /** The put's wire answer with JS numbers. */

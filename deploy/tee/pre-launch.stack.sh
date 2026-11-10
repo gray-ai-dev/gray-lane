@@ -52,7 +52,9 @@
 #       record) or its share is unavailable it exits 75 and runs again with the token wait's backoff, as S51a waits;
 #   P3. the designation checked again here with the guest's OpenSSL (S49's command) against the measured relay key,
 #       then the image pulled by digest with the boot box's login, a VOLUME refused, the slot tagged, the login deleted;
-#       or, for the empty slot, the lane image's static gray-idle imported alone as the slot (no relay code runs);
+#       or, for the empty slot, the lane image's static gray-idle imported alone as the slot (no relay code runs). An
+#       image the boot cannot run (the login refused, the digest not pulled, each after three tries, or a VOLUME) is the
+#       relay's to repair through the running lane, so it is the empty slot too, with the boot box and vault kept;
 #   P4. `gray-relay-image` v2: {image, image_sig, issued_ms, previous, relay_id, seq} (the designation and its
 #       signature; no nonce), or {image: null, relay_id, seq: 0} for the empty slot; then the seal, as in step 9.
 #
@@ -267,30 +269,73 @@ gray_prelaunch_stack_phase2() {
       && username="$(jq -r .username "$login" 2>/dev/null)" \
       && mkdir -m 0700 -- "$relay_config" >/dev/null 2>&1 \
       || { gray_prelaunch_stack_fail "the registry login"; return 1; }
-    jq -j .password "$login" 2>/dev/null \
-        | DOCKER_CONFIG="$relay_config" docker login --username "$username" --password-stdin "$registry" >/dev/null 2>&1 \
-      || { gray_prelaunch_stack_fail "the registry login"; return 1; }
-    gray_prelaunch_stack_status "registry login done"
-    DOCKER_CONFIG="$relay_config" docker pull --quiet "$image" >/dev/null 2>&1 \
-      || { gray_prelaunch_stack_fail "pulling the relay image"; return 1; }
-    gray_prelaunch_stack_status "relay image pulled"
-    docker image inspect -- "$image" 2>/dev/null \
-        | jq -e 'length == 1 and ((.[0].Config.Volumes // {}) | type == "object" and length == 0)' >/dev/null 2>&1 \
-      || { gray_prelaunch_stack_fail "the relay image declares a volume"; return 1; }
-    gray_prelaunch_stack_status "relay image declares no volume"
-    local pulled_id slot_id
-    docker tag "$image" "$slot" >/dev/null 2>&1 \
-      && pulled_id="$(docker image inspect --format '{{.Id}}' -- "$image" 2>/dev/null)" \
-      && slot_id="$(docker image inspect --format '{{.Id}}' -- "$slot" 2>/dev/null)" \
-      && [[ "$pulled_id" =~ ^sha256:[0-9a-f]{64}$ && "$slot_id" == "$pulled_id" ]] \
-      || { gray_prelaunch_stack_fail "tagging the relay image into its slot"; return 1; }
-    gray_prelaunch_stack_status "relay image in its slot"
-    rm -rf -- "$relay_config" "$login" >/dev/null 2>&1 && [[ ! -e "$relay_config" && ! -e "$login" ]] \
-      || { gray_prelaunch_stack_fail "deleting the registry credential"; return 1; }
-    gray_prelaunch_stack_status "registry credential deleted"
-    # P4. v2: the designation's members and its signature, as the relay signed them (jq keeps its integers).
-    jq -cSj --arg image_sig "$image_sig" '. + {image_sig: $image_sig}' "$designation" > "$work/image.payload" 2>/dev/null \
-      || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+    # A relay image this boot cannot run (the registry refuses the login, the digest cannot be pulled, its config
+    # declares a VOLUME) is the relay's to repair, and only a running lane takes the repair (`registry set`, a rollback,
+    # a new deliver all attest it first). So it is not a failed boot: the slot is the empty one, which the lane
+    # attests as `empty_slot` and which takes a boot box; the vault on the data disk stays as it is. Login and pull are
+    # tried three times (2 s, then 4 s apart) before that, so a registry that blinks does not empty the slot.
+    local attempt unusable="registry_login_failed"
+    for attempt in 1 2 3; do
+      if jq -j .password "$login" 2>/dev/null \
+          | DOCKER_CONFIG="$relay_config" docker login --username "$username" --password-stdin "$registry" >/dev/null 2>&1; then
+        unusable=""
+        break
+      fi
+      (( attempt < 3 )) || break
+      gray_prelaunch_stack_status "relay registry login refused, retrying"
+      sleep $(( attempt * 2 )) >/dev/null 2>&1 || { gray_prelaunch_stack_fail "waiting for the relay registry"; return 1; }
+    done
+    if [[ -z "$unusable" ]]; then
+      gray_prelaunch_stack_status "registry login done"
+      unusable="image_pull_failed"
+      for attempt in 1 2 3; do
+        if DOCKER_CONFIG="$relay_config" docker pull --quiet "$image" >/dev/null 2>&1; then
+          unusable=""
+          break
+        fi
+        (( attempt < 3 )) || break
+        gray_prelaunch_stack_status "relay image pull failed, retrying"
+        sleep $(( attempt * 2 )) >/dev/null 2>&1 || { gray_prelaunch_stack_fail "waiting for the relay registry"; return 1; }
+      done
+    fi
+    if [[ -z "$unusable" ]]; then
+      gray_prelaunch_stack_status "relay image pulled"
+      docker image inspect -- "$image" 2>/dev/null \
+          | jq -e 'length == 1 and ((.[0].Config.Volumes // {}) | type == "object" and length == 0)' >/dev/null 2>&1 \
+        || unusable="image_declares_volume"
+    fi
+    if [[ -n "$unusable" ]]; then
+      # Nothing of the image is kept: the login, its docker config, the image if it was pulled (never tagged as the slot).
+      rm -rf -- "$relay_config" "$login" >/dev/null 2>&1 && [[ ! -e "$relay_config" && ! -e "$login" ]] \
+        || { gray_prelaunch_stack_fail "deleting the registry credential"; return 1; }
+      if docker image inspect -- "$image" >/dev/null 2>&1; then
+        docker image rm --force -- "$image" >/dev/null 2>&1 \
+          || { gray_prelaunch_stack_fail "removing the relay image that cannot run"; return 1; }
+      fi
+      case "$unusable" in
+        registry_login_failed) gray_prelaunch_stack_status "relay image cannot run (registry_login_failed): the empty slot, waiting for a repair" ;;
+        image_pull_failed) gray_prelaunch_stack_status "relay image cannot run (image_pull_failed): the empty slot, waiting for a repair" ;;
+        *) gray_prelaunch_stack_status "relay image cannot run (image_declares_volume): the empty slot, waiting for a repair" ;;
+      esac
+      gray_prelaunch_stack_empty_slot || return 1
+      jq -ncSj --arg relay_id "$relay_id" '{image: null, relay_id: $relay_id, seq: 0}' > "$work/image.payload" 2>/dev/null \
+        || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+    else
+      gray_prelaunch_stack_status "relay image declares no volume"
+      local pulled_id slot_id
+      docker tag "$image" "$slot" >/dev/null 2>&1 \
+        && pulled_id="$(docker image inspect --format '{{.Id}}' -- "$image" 2>/dev/null)" \
+        && slot_id="$(docker image inspect --format '{{.Id}}' -- "$slot" 2>/dev/null)" \
+        && [[ "$pulled_id" =~ ^sha256:[0-9a-f]{64}$ && "$slot_id" == "$pulled_id" ]] \
+        || { gray_prelaunch_stack_fail "tagging the relay image into its slot"; return 1; }
+      gray_prelaunch_stack_status "relay image in its slot"
+      rm -rf -- "$relay_config" "$login" >/dev/null 2>&1 && [[ ! -e "$relay_config" && ! -e "$login" ]] \
+        || { gray_prelaunch_stack_fail "deleting the registry credential"; return 1; }
+      gray_prelaunch_stack_status "registry credential deleted"
+      # P4. v2: the designation's members and its signature, as the relay signed them (jq keeps its integers).
+      jq -cSj --arg image_sig "$image_sig" '. + {image_sig: $image_sig}' "$designation" > "$work/image.payload" 2>/dev/null \
+        || { gray_prelaunch_stack_fail "measuring the relay image"; return 1; }
+    fi
   else
     gray_prelaunch_stack_fail "the boot box helper's answer"
     return 1

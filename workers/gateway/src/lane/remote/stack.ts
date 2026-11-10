@@ -25,7 +25,7 @@ import {
   type StackTestsAnswer,
   type StackTestsRequestDto,
   type StackVaultCopy,
-  type StackVaultKind,
+  type StackVaultPair,
   type StackVaultPutResult,
 } from "@gray/lane-wire";
 import { BridgeClient, type BridgeClientOptions } from "./client.ts";
@@ -101,25 +101,25 @@ export class StackConfigClient extends BridgeClient {
   }
 
   /**
-   * `stack.vault.get` (docs/design/relay-no-always-on-host.md §3.1, 13.4): Gray's ciphertext copy of this app's `kind`
-   * record, version 0 and no record when Gray holds none. The caller opens it (`@gray/relay-connector/vault`
-   * `newestRecord`) beside its disk's; Gray cannot.
+   * `stack.vault.get` (docs/design/relay-no-always-on-host.md §3.1, 13.4, P7-4): Gray's ciphertext pair of this app's
+   * records (boot box, vault, previous image's vault), version 0 and no pair when Gray holds none. The caller opens them
+   * (`@gray/relay-connector/vault` `newestRecord`) beside its disk's; Gray cannot.
    */
-  async vaultGet(relayId: string, appId: string, kind: StackVaultKind): Promise<StackVaultCopy> {
+  async vaultGet(relayId: string, appId: string): Promise<StackVaultCopy> {
     const call = bridgeCall("stack.vault.get", stackTarget(relayId));
-    return stackVaultCopyOf(await this.call("stack.vault.get", call, stackVaultGetRequestDtoOf(relayId, appId, kind)));
+    return stackVaultCopyOf(await this.call("stack.vault.get", call, stackVaultGetRequestDtoOf(relayId, appId)));
   }
 
   /**
-   * `stack.vault.put`: upload `record` (`serializeRecord` text, at most STACK_VAULT_RECORD_MAX_CHARS), built on Gray's
-   * version `baseVersion` (0 when Gray held none). `stored: false` is a lost compare-and-swap, with Gray's current
-   * version: read it, apply the change again and retry (13.4, "Two instances, one vault"). A record Gray will not keep
-   * (another app, a header that does not fit the call, a version not above the base) is the bridge's 422
-   * `vault_record_refused`, thrown as a `BridgeCallError`.
+   * `stack.vault.put`: upload the pair the disk holds (`serializeRecord` texts, each at most STACK_VAULT_RECORD_MAX_CHARS),
+   * built on Gray's pair version `baseVersion` (0 when Gray held none); stored as `baseVersion + 1`. `stored: false` is a
+   * lost compare-and-swap, with Gray's current version: read it and decide again (13.4, "Two instances, one vault"). A
+   * pair Gray will not keep (another app, a record that does not fit its slot, one below Gray's in its slot) is the
+   * bridge's 422 `vault_record_refused`, thrown as a `BridgeCallError`.
    */
-  async vaultPut(relayId: string, appId: string, kind: StackVaultKind, baseVersion: number, record: string): Promise<StackVaultPutResult> {
+  async vaultPut(relayId: string, appId: string, baseVersion: number, pair: StackVaultPair, final = false): Promise<StackVaultPutResult> {
     const call = bridgeCall("stack.vault.put", stackTarget(relayId));
-    return stackVaultPutResultOf(await this.call("stack.vault.put", call, stackVaultPutRequestDtoOf(relayId, appId, kind, baseVersion, record)));
+    return stackVaultPutResultOf(await this.call("stack.vault.put", call, stackVaultPutRequestDtoOf(relayId, appId, baseVersion, pair, final)));
   }
 
   /**
@@ -127,9 +127,10 @@ export class StackConfigClient extends BridgeClient {
    * serving instance or a draining one during a rollout. A bridge or console from before the op is a `BridgeCallError`,
    * which the caller reads as an unknown role.
    */
-  async instance(relayId: string): Promise<{ readonly role: StackInstanceRole }> {
+  async instance(relayId: string): Promise<{ readonly role: StackInstanceRole; readonly retiring: string | null }> {
     const call = bridgeCall("stack.instance", stackTarget(relayId));
-    return { role: (await this.call("stack.instance", call, stackInstanceRequestDtoOf(relayId))).role };
+    const answer = await this.call("stack.instance", call, stackInstanceRequestDtoOf(relayId));
+    return { role: answer.role, retiring: answer.retiring ?? null };
   }
 
   /**

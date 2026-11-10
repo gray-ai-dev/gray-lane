@@ -19,7 +19,7 @@
  * reads it. Only ids `wanted` accepts are reported (the gateway asks for handles), so what the scan
  * keeps stays small whatever the body holds.
  */
-import { type Protocol, exactStrings } from "@gray/protocol";
+import { type Protocol, exactStrings, refuseByteOrderMark } from "@gray/protocol";
 import { Tokenizer, TokenType } from "@streamparser/json";
 import type { Role, Step } from "./ids.ts";
 
@@ -129,11 +129,15 @@ interface Frame {
 const GEMINI_CALL = ["functionCall", "function_call"] as const;
 const GEMINI_RESPONSE = ["functionResponse", "function_response"] as const;
 
-/** A tokenizer whose numbers are not parsed (as parse.ts's `LayoutTokenizer`) and whose strings are exact. */
+/**
+ * A tokenizer whose numbers are not parsed (as parse.ts's `LayoutTokenizer`), whose strings are exact, and which
+ * refuses a byte order mark wherever it is (a skipped one would put every site after it 3 bytes short).
+ */
 class SiteTokenizer extends Tokenizer {
   constructor() {
     super({ stringBufferSize: 0, emitPartialTokens: false });
     exactStrings(this);
+    refuseByteOrderMark(this);
   }
 
   protected override parseNumber(): number {

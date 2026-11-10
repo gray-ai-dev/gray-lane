@@ -364,7 +364,7 @@ function stackBoot(info, phase2 = false) {
     if (claim.image !== null && !verifySignature(null, designationMessage(claim), key, Buffer.from(claim.imageSig, "hex"))) {
       fail("the gray-relay-image designation's signature does not verify with the gray-stack-identity key (P2d)");
     }
-    return { relayId: identity.relay_id, image: claim.image, publicKey: identity.public_key, seq: claim.seq };
+    return { relayId: identity.relay_id, image: claim.image, publicKey: identity.public_key, seq: claim.seq, previous: claim.image === null ? null : claim.previous };
   }
   const image = stackPayload(after[1].event_payload, ["image", "image_sig", "nonce", "relay_id"]);
   if (image === null || image.image.length > 512 || !RELAY_IMAGE.test(image.image) || !/^[0-9a-f]{128}$/.test(image.image_sig)
@@ -475,6 +475,11 @@ export function stackFragments(stack) {
     // Worker then starts without a relay image. Rendered only then, so every other boot's config is as before.
     ...(stack.emptySlot === true
       ? ["          # P2d: no relay image this boot (gray-relay-image v2 `image: null`): the relay's slot runs gray-idle.", '          ( name = "LANE_STACK_EMPTY_SLOT", text = "1" ),']
+      : []),
+    // P7: the image the measured designation replaced (gray-relay-image v2 `previous`), when it names one; rendered only
+    // then, so every other boot's config is as before.
+    ...(typeof stack.relayPrevious === "string" && stack.relayPrevious !== stack.relayImage
+      ? ["          # P7: the image the relay's designation replaced; the vault seals each version for it too (rollback).", `          ( name = "LANE_STACK_RELAY_PREVIOUS", text = "${stack.relayPrevious}" ),`]
       : []),
     "          # docs/design/relay-debug-sharing.md: the relay key the boot measured (gray-stack-identity), which gray-relay's",
     "          # debug fetch is checked against: never a key Gray's snapshot serves.",
@@ -1043,6 +1048,8 @@ export async function main({
     stack.relayImage = boot.image;
     stack.relayKey = boot.publicKey;
     stack.emptySlot = boot.image === null;
+    // P7: the image the designation replaced, so the vault also seals for it (a rollback opens it); phase 2 only.
+    stack.relayPrevious = boot.previous ?? null;
   }
   // P2c-2: the re-check's inputs are the guest agent's own (vm_config and the measured key provider's CA, from the same
   // v1 Info answer as the app id): a lease app that cannot read them does not serve.

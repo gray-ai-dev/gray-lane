@@ -714,6 +714,8 @@ export interface LaneStackOptions {
   readonly relayId: string;
   /** S52/S55: the boot's measured relay image (LANE_STACK_RELAY_IMAGE); null in the empty slot (P2d, LANE_STACK_EMPTY_SLOT). */
   readonly relayImage: string | null;
+  /** P7: the image the boot's designation replaced (LANE_STACK_RELAY_PREVIOUS); absent or null when none. */
+  readonly relayPrevious?: string | null;
   readonly pollMs: number;
   readonly attemptsMax: number;
   readonly rotationGraceMs: number;
