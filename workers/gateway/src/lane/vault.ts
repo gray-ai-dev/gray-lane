@@ -1,3 +1,4 @@
+import type { Background } from "./background.ts";
 import { parsePlain, toJsonString, type Json } from "@gray/json";
 import { VAULT_RETRY_FIRST_MS, type StackVaultPutResult } from "@gray/lane-wire";
 
@@ -157,6 +158,8 @@ export interface LaneVaultOptions {
   readonly copy: LaneVaultCopy;
   readonly now: () => number;
   readonly log?: (line: Record<string, unknown>) => void;
+  /** Keeps work no caller waits for (an upload behind a write) with the request that started it (`background.ts`). */
+  readonly background?: Background;
   /** P7: the serving-instance rule. */
   readonly writer?: LaneVaultWriter;
   /** P7: a merge put Gray's accounts into the store: rebuild the document and push egress's set. */
@@ -338,11 +341,13 @@ export class LaneVault {
   #pacing = new Map<string, RelayVaultLogin>();
   /** One change at a time: a version is sealed from the store as it is when its turn comes. */
   #queue: Promise<unknown> = Promise.resolve();
+  readonly #background: Background;
 
   constructor(options: LaneVaultOptions) {
     this.#options = options;
     this.#binding = { relayId: options.relayId, relayKey: options.relayKey, image: options.image };
     this.#log = options.log ?? ((line) => console.log(JSON.stringify(line)));
+    this.#background = options.background ?? ((work) => work);
     if (options.previousImage !== undefined && options.previousImage !== options.image && options.previousDisk !== undefined && options.previousCopy !== undefined) {
       this.#previous = { binding: { ...this.#binding, image: options.previousImage }, key: null };
     }
@@ -734,7 +739,7 @@ export class LaneVault {
     }
     this.#copyOk = pending === null && held.version === this.#version;
     this.#log({ level: "info", event: "lane_vault_copy_read", relay_id: relayId, version: this.#version, copy_version: held.version, outcome: held.version < unread.version ? "behind" : "same" });
-    if (pending !== null) void this.#upload();
+    if (pending !== null) void this.#background(this.#upload());
   }
 
   /** Gray's copy's state when it opens under `key` and this binding; null otherwise. Never throws. */
@@ -1012,7 +1017,8 @@ export class LaneVault {
   #serial<T>(work: () => Promise<T>): Promise<T> {
     const run = this.#queue.then(work, work);
     this.#queue = run.catch(() => undefined);
-    return run;
+    // Kept by the request that queued it, so a step no caller waits for (a conflict's sync) still leaves the queue.
+    return this.#background(run);
   }
 
   /** Seal the store's snapshot as the next version, write it to the disk, then start its upload. Throws VaultWriteError. */
@@ -1097,7 +1103,8 @@ export class LaneVault {
         persist: state.persist,
         ...(landed === null ? {} : { recommitted_from: landed }),
       });
-      void this.#upload();
+      // Behind this write, and kept by the request that made it: an upload workerd dropped would hold the copy's queue.
+      void this.#background(this.#upload());
       await this.#writePrevious(state, next);
       return;
     }
@@ -1141,7 +1148,7 @@ export class LaneVault {
     this.#prevPending = { text, version };
     this.#prevUploadFailures = 0;
     this.#prevNextUploadAt = now();
-    void this.#uploadPrevious();
+    void this.#background(this.#uploadPrevious());
   }
 
   /**

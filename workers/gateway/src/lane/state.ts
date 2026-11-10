@@ -32,6 +32,7 @@ import { gatedStackConfig, gatedStackCredentials, KmsLeaseGate } from "./kms-lea
 import { StackConfigClient } from "./remote/stack.ts";
 import { LaneVault, VAULT_PREV_DISK_URL, vaultDiskClient, vaultKeys } from "./vault.ts";
 import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
+import { keepRequestAlive } from "./background.ts";
 import { bootDiskClient, LaneBootBox } from "./boot-intake.ts";
 import { LanePairCopy, pairDiskClient } from "./pair-copy.ts";
 import { laneStackService, type LaneStackOptions, type StackConfigService } from "./stack-service.ts";
@@ -500,7 +501,9 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     const keys = vaultKeys({ guest: vaultSettings.guest, guestUrl: vaultSettings.guestUrl, timeoutMs: vaultSettings.guestTimeoutMs, bridge, relayId, appId: vaultSettings.appId });
     // P7-4: Gray's copy is one pair (boot box, vault, previous image's vault) under one compare-and-swap; each writer
     // uploads through its slot, and every upload carries the pair the disk holds.
-    const pair = new LanePairCopy({ relayId, appId: vaultSettings.appId, bridge, disk: pairDiskClient(vaultSettings.disk) });
+    // Every queue of these records keeps its steps with the request that queued them (`background.ts`): the records are
+    // this process's, and a step workerd dropped with its request would hold the queue for every later one.
+    const pair = new LanePairCopy({ relayId, appId: vaultSettings.appId, bridge, disk: pairDiskClient(vaultSettings.disk), background: keepRequestAlive });
     const vaultFor = (image: string, store: RelayCredentialStore, role?: LaneInstanceRole, previousImage?: string | null): LaneVault =>
       new LaneVault({
         relayId,
@@ -517,6 +520,7 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
         // P7 (13.4): a draining instance's last upload, marked final.
         final: (base) => pair.final(base),
         now,
+        background: keepRequestAlive,
         // P7 (13.4): only the serving instance writes; a merge's accounts reach the document at once.
         ...(role === undefined ? {} : { writer: role, onRestored: () => restored() }),
       });
@@ -541,6 +545,7 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
       keys,
       copy: pair.member("boot"),
       now,
+      background: keepRequestAlive,
       // The vault that follows the designation: the running one, or in the empty slot one made for an image.
       ...(stackImage !== null
         ? { vault }

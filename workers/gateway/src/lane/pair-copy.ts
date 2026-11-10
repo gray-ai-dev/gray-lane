@@ -1,6 +1,7 @@
 import { parsePlain } from "@gray/json";
 import type { StackVaultCopy, StackVaultKind, StackVaultPair, StackVaultPutResult } from "@gray/lane-wire";
 import { z } from "zod";
+import type { Background } from "./background.ts";
 
 /**
  * Gray's copy of a VM's sealed records as **one pair** (docs/design/relay-no-always-on-host.md 13.4, P7-4): the boot box,
@@ -87,21 +88,33 @@ export class LanePairCopy {
   #reading: Promise<StackVaultCopy> | null = null;
   /** One put at a time: each reads the disk and Gray's version when its turn comes. */
   #queue: Promise<unknown> = Promise.resolve();
+  /** Keeps a put or a shared read with the request that started it (`background.ts`): every later one waits for it. */
+  readonly #background: Background;
 
-  constructor(options: { readonly relayId: string; readonly appId: string; readonly bridge: PairBridge; readonly disk: PairDisk; readonly log?: (line: Record<string, unknown>) => void }) {
+  constructor(options: {
+    readonly relayId: string;
+    readonly appId: string;
+    readonly bridge: PairBridge;
+    readonly disk: PairDisk;
+    readonly log?: (line: Record<string, unknown>) => void;
+    readonly background?: Background;
+  }) {
     this.#relayId = options.relayId;
     this.#appId = options.appId;
     this.#bridge = options.bridge;
     this.#disk = options.disk;
     this.#log = options.log ?? ((line) => console.log(JSON.stringify(line)));
+    this.#background = options.background ?? ((work) => work);
   }
 
   /** Gray's pair now; reads that run together share one. */
   async read(): Promise<StackVaultCopy> {
     if (this.#reading === null) {
-      this.#reading = this.#bridge.vaultGet(this.#relayId, this.#appId).finally(() => {
-        this.#reading = null;
-      });
+      this.#reading = this.#background(
+        this.#bridge.vaultGet(this.#relayId, this.#appId).finally(() => {
+          this.#reading = null;
+        }),
+      );
     }
     const copy = await this.#reading;
     this.#gray = copy;
@@ -128,7 +141,7 @@ export class LanePairCopy {
   #serial<T>(work: () => Promise<T>): Promise<T> {
     const run = this.#queue.then(work, work);
     this.#queue = run.catch(() => undefined);
-    return run;
+    return this.#background(run);
   }
 
   /** `record` null: the final mark, of whatever the disk holds. */

@@ -1,3 +1,4 @@
+import type { Background } from "./background.ts";
 import { parsePlain } from "@gray/json";
 import type { StackVaultPutResult } from "@gray/lane-wire";
 import type { MemberCopy } from "./pair-copy.ts";
@@ -97,6 +98,8 @@ export interface LaneBootBoxOptions {
   readonly stagedVault?: (image: string) => LaneVault;
   readonly now: () => number;
   readonly log?: (line: Record<string, unknown>) => void;
+  /** Keeps a queued step with the request that queued it (`background.ts`). */
+  readonly background?: Background;
 }
 
 /** What the relay's tool prints and acts on. Nothing secret: versions, the designation's public members. */
@@ -166,11 +169,13 @@ export class LaneBootBox {
   #resumeFailures = 0;
   #nextResumeAt = 0;
   #queue: Promise<unknown> = Promise.resolve();
+  readonly #background: Background;
 
   constructor(options: LaneBootBoxOptions) {
     this.#options = options;
     this.#binding = { relayId: options.relayId, relayKey: options.relayKey };
     this.#log = options.log ?? ((line) => console.log(JSON.stringify(line)));
+    this.#background = options.background ?? ((work) => work);
   }
 
   /** The image the last box this boot took designates, or null. */
@@ -233,7 +238,7 @@ export class LaneBootBox {
   #serial<T>(work: () => Promise<T>): Promise<T> {
     const run = this.#queue.then(work);
     this.#queue = run.catch(() => undefined);
-    return run;
+    return this.#background(run);
   }
 
   async #deliver(delivery: BootBoxDelivery): Promise<BootBoxIntake> {

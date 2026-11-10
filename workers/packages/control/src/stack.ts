@@ -509,8 +509,18 @@ export type StackRestartReason = (typeof STACK_RESTART_REASONS)[number];
 /** A restart request id: `r` and 32 lower-case hex digits, fresh per request. */
 export const STACK_RESTART_REQUEST_ID_PATTERN = /^r[0-9a-f]{32}$/;
 
-/** P7: a gray-assistant kit version as a restart request carries it: strict semver (node-semver), as its own text, no newline. */
-const restartKitSchema = z.string().min(5).max(80).refine((v) => !/\s/.test(v) && semver.valid(v) === v, { message: "a kit version is strict semver" });
+/**
+ * P7: a gray-assistant kit version as a restart request carries it: strict semver (node-semver), as its own text, no
+ * newline. Build metadata is part of it: a released kit names its commit there (`1.3.0+2373d8cc36e3`,
+ * deploy/relay/image/bundle.mjs), and the kit gate ignores it (`kitAtLeast`).
+ */
+function kitVersionText(text: string): boolean {
+  if (/\s/.test(text)) return false;
+  const version = semver.parse(text);
+  if (version === null) return false;
+  return (version.build.length === 0 ? version.version : `${version.version}+${version.build.join(".")}`) === text;
+}
+const restartKitSchema = z.string().min(5).max(80).refine(kitVersionText, { message: "a kit version is strict semver" });
 
 /**
  * S53: the relay asks Gray to restart its stack app so the next boot takes the image its token service now names.
