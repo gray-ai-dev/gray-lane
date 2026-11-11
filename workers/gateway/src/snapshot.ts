@@ -153,6 +153,11 @@ export interface RouteRecord {
    */
   readonly lane?: GatewayLaneRelay | null;
   /**
+   * A relay stack's route: until when (Unix ms) it takes traffic, while the relay's VM serves an older release than one
+   * Gray proposed since (@gray/snapshot `GatewayRouteRecord.trafficUntil`, the release traffic window). Absent: no limit.
+   */
+  readonly trafficUntil?: number;
+  /**
    * The supplier credential, sealed: base64 of nonce (12 bytes) || AES-256-GCM ciphertext under the
    * master key, with the endpoint id as associated data, as the server stores credentials
    * (crates/gray-control/src/lib.rs `encrypt`). The gateway opens it with its MASTER_KEY secret. A

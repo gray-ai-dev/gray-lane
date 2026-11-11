@@ -141,6 +141,11 @@ export interface SnapshotRoute {
    * (`withCodingAgentResults`). Absent (a snapshot older than release 4): none.
    */
   readonly codingAgentPasses?: readonly OpencodeThinking[];
+  /**
+   * A relay stack's route: until when (Unix ms) it takes traffic while the relay's VM serves an older release than one
+   * Gray proposed since (@gray/control release-traffic.ts, the release traffic window). Absent: no limit.
+   */
+  readonly trafficUntilMs?: number;
 }
 
 /** One capacity key with its agreed concurrency; `enabled` while a current pass covers its mapping (inference.rs refresh: CapacityState). */
@@ -438,6 +443,11 @@ export interface SnapshotReader {
    * model routes at 1. A reader without it takes every model as checked.
    */
   modelTraceCovers?(model: string): boolean;
+  /**
+   * Each relay stack's traffic limit (@gray/control release-traffic.ts `trafficUntilByRelay` over STACK_TRAFFIC_SQL), by
+   * relay id; a reader without it reads none.
+   */
+  stackTraffic?(): Promise<ReadonlyMap<string, { readonly untilMs: number }>>;
 }
 
 /** modeltrace.rs `PROFILE_ID`: the profile prefix of ModelTrace's records. */
@@ -1037,8 +1047,10 @@ export async function buildSnapshot(
   const covers = reader.modelTraceCovers?.bind(reader) ?? (() => true);
   const weights = published.length > 0 && reader.modelTraceRecords ? standingWeights(await reader.modelTraceRecords(published.map(({ e }) => e.id)), covers) : new Map<string, number>();
 
+  const traffic = published.some(({ e }) => e.config.lane?.mode === "stack") && reader.stackTraffic ? await reader.stackTraffic() : new Map<string, { readonly untilMs: number }>();
   const routes: SnapshotRoute[] = [];
   for (const { e, snapshot } of published) {
+    const trafficUntilMs = e.config.lane?.mode === "stack" ? traffic.get(e.config.lane.relay_id)?.untilMs : undefined;
     const credential = credentials.get(`${e.id}\u0000${e.workspace_id}\u0000${e.credential_generation}`);
     if (credential === undefined) continue;
     const config = e.config;
@@ -1080,6 +1092,7 @@ export async function buildSnapshot(
         supplierRef: supplierRef(e.workspace_id),
         // A lane relay has no verification, so nothing it proved is being checked again.
         ...((recovering) => (recovering === null ? {} : { recovering }))(lane ? null : routeRecovering(e, m.protocol, v!, proofs.get(v!.id), nowMs)),
+        ...(trafficUntilMs === undefined ? {} : { trafficUntilMs }),
       });
     }
   }

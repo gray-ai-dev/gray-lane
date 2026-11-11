@@ -117,6 +117,9 @@ func refusalStatus(code string) int {
 	if status, ok := loginRefusalStatus(code); ok {
 		return status
 	}
+	if status, ok := signInRefusalStatus(code); ok {
+		return status
+	}
 	switch code {
 	case errBodyTooLarge:
 		return http.StatusRequestEntityTooLarge

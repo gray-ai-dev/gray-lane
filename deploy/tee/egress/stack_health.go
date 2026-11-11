@@ -207,10 +207,6 @@ type stackHealthEntry struct {
 	Peak      *stackHealthPeak     `json:"peak"`
 	Cooling   []stackHealthCooling `json:"cooling"`
 	Windows   []stackWindow        `json:"windows"`
-	// Refresh is the account's token refresh (stack_ops.go refreshHealth), null for an account egress's own calls do
-	// not keep up or whose vendor's table has no refresh: the entry reports it to Gray, whose panel says who refreshes
-	// the account and why it cannot.
-	Refresh *opsRefreshHealth `json:"refresh"`
 	// Login is a password account's sign-in inside the VM (stack_login.go loginHealth), absent for every other account.
 	Login *opsLoginHealth `json:"login,omitempty"`
 }
@@ -323,23 +319,17 @@ func (s *server) serveHealth(rec *responseRecorder, r *http.Request, entry *requ
 		return
 	}
 	ids := s.stack.tableIDs()
-	var refresh map[string]*opsRefreshHealth
 	var login map[string]*opsLoginHealth
 	if s.ops != nil {
 		// Taken before the health lock (a leaf): each account egress keeps up is listed, with its refresh and, for a
 		// password account, its sign-in.
-		refresh = s.ops.refreshHealth()
 		login = s.ops.loginHealth()
-		for id := range refresh {
-			ids = append(ids, id)
-		}
 		for id := range login {
 			ids = append(ids, id)
 		}
 	}
 	doc := s.stack.health.snapshot(ids)
 	for i := range doc.Accounts {
-		doc.Accounts[i].Refresh = refresh[doc.Accounts[i].AccountID]
 		doc.Accounts[i].Login = login[doc.Accounts[i].AccountID]
 	}
 	writeControlJSON(rec, doc)

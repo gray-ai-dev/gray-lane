@@ -143,6 +143,8 @@ COPY build.env /etc/lane/build.env
 # capabilities, never sees this ownership. /run/peerlink is the same for peerlink's socket (relay-outbound-only
 # §3.8): peerlink's (10005) with the group 10101 and setgid, so in the stack layout the lane (group 10101) reaches
 # peerlink.sock and nothing else of peerlink's, and the relay, which mounts neither volume, reaches neither socket.
+# The sign-in CA's volumes (docs/design/relay-sign-in-in-vm.md D1) fill the same way: /run/gray-sign-in-key is
+# egress's alone (0700, the CA key), /run/gray-sign-in-ca egress's and readable (0755), mounted read-only in the relay.
 RUN echo "${WORKERD_SHA256}  /usr/local/bin/workerd" | sha256sum -c - \
  && chmod 0755 /usr/local/bin/workerd /usr/local/bin/gray-egress /usr/local/bin/gray-acme \
       /usr/local/bin/gray-isolation-check /usr/local/bin/gray-peerlink /usr/local/bin/gray-idle /srv/lane/entrypoint.mjs \
@@ -153,6 +155,10 @@ RUN echo "${WORKERD_SHA256}  /usr/local/bin/workerd" | sha256sum -c - \
  && chmod 2750 /run/gray \
  && chown 10005:10101 /run/peerlink \
  && chmod 2750 /run/peerlink \
+ && mkdir -p /run/gray-sign-in-key /run/gray-sign-in-ca \
+ && chown 10002:10002 /run/gray-sign-in-key /run/gray-sign-in-ca \
+ && chmod 0700 /run/gray-sign-in-key \
+ && chmod 0755 /run/gray-sign-in-ca \
  && test -s /etc/ssl/certs/ca-certificates.crt \
  && test -s /etc/ssl/cert.pem
 

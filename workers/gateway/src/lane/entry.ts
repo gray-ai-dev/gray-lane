@@ -16,7 +16,7 @@ import "./policy-interpreter.ts";
 import { attestationFor } from "./attestation.ts";
 import { calibrateLaneStep, calibrationLogLine, LaneCalibrationError } from "./calibration.ts";
 import { bridgeFetch, egressBindingOf, laneBridgeKeySeed, laneGatewayDeps, laneIsolate, laneRegion, missingLaneBindings, type LaneEnv, type LaneIsolate } from "./deps.ts";
-import { acceptPolicyBundle, answerRefreshed, applyCredentialMessage, type CredentialIntake, policyRegistryDocument, readJsonBody, readPolicyBundle, refusalBody, INTAKE_MAX_BYTES, RELAY_CREDENTIALS_PATH, RELAY_POLICY_BUNDLE_PATH, RELAY_POLICY_PREFIX, RELAY_REFRESHED_PATH } from "./intake.ts";
+import { acceptPolicyBundle, applyCredentialMessage, type CredentialIntake, policyRegistryDocument, readSignedLoginStart, readJsonBody, readPolicyBundle, refusalBody, INTAKE_MAX_BYTES, RELAY_CREDENTIALS_PATH, RELAY_POLICY_BUNDLE_PATH, RELAY_POLICY_PREFIX } from "./intake.ts";
 import { StackOpsService } from "./stack-ops.ts";
 import { gatedStackCredentials, KMS_LEASE_BINDING, KMS_LEASE_PATH, KMS_LEASE_PUSH_MAX_BYTES, KMS_LEASE_REQUIRED, kmsLeasePushOf } from "./kms-lease.ts";
 import { ACI_API_VERSION, ACI_KEYSET_DIGEST_HEADER, ACI_VERSION_HEADER, aciHeaders, aciJson, RECEIPT_ID_HEADER, withAciHeaders, WORKLOAD_KEYSET_DIGEST_HEADER } from "./receipts.ts";
@@ -30,7 +30,8 @@ import { backendOf, isPeerRequest, peerRoute } from "./peer-routes.ts";
 import { serveReceipt } from "./receipt-route.ts";
 import { DEBUG_REQUESTS_PREFIX, debugCorsOrigin, debugGrantsOf, debugRequestIdOf, serveDebugGrant } from "./debug-route.ts";
 import { answerRelayDebug, stackDebugOf } from "./stack-debug.ts";
-import { RELAY_DEBUG_PATH } from "@gray/relay-connector";
+import { readLoginCallback, readLoginInput, RELAY_DEBUG_PATH, RELAY_LOGIN_KEY_HEADER, RELAY_LOGIN_PATH, RELAY_LOGIN_SESSION_PATTERN } from "@gray/relay-connector";
+import { LaneLoginSessions, MemoryLoginPins, UNKNOWN_SESSION, type LoginAnswer } from "./login-session.ts";
 import { BOOT_BOX_DELIVERY_PATH } from "@gray/relay-connector/boot-box";
 import type { LaneRequestState } from "./deps.ts";
 import { BridgePeerVerifier, peerListKeys, type PeerVerifier } from "./peer.ts";
@@ -58,6 +59,8 @@ import type { LanePeers } from "./types.ts";
  * - `POST|GET /v1/aci/requests/{request_id}/debug` → on an entry, a customer's authorization of one request for
  *   debugging at its relay, owner checked as the receipts are (`debug-route.ts`, docs/design/relay-debug-sharing.md).
  * - `POST /v1/aci/relay-debug` → on a stack VM, gray-relay's fetch of a record a customer authorized (`stack-debug.ts`).
+ * - `POST /v1/aci/relay-login`, `GET|DELETE /v1/aci/relay-login/{session}`, `POST …/{session}/input|callback|cancel` → on a stack
+ *   VM, the login operation of `gray-assistant login <account>` (`login-session.ts`, docs/design/relay-sign-in-in-vm.md).
  * - `POST /v1/aci/relay-credentials`, `POST /v1/aci/relay-policy/bundle` → the intake routes.
  * - `POST /v1/aci/relay-boot-box` → a phase-2 VM's boot box intake (P4b, `boot-intake.ts`).
  * - `GET /v1/aci/relay-policy/{relay_id}` → the accepted bundle's templates (M22).
@@ -951,9 +954,9 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
     return serveDebugGrant(request, { receipts: state.receipts, grants: debugGrantsOf(state), keysetDigest: state.keysetDigest, receiptKeyId: state.receiptKeyId, signer: state.signer, followUpMs: cfg.peerFollowUpMs, clock: state.now }, requestId);
   }
   if (path === RELAY_DEBUG_PATH) return relayDebug(request, env, cfg, state, ctx);
+  if (path === RELAY_LOGIN_PATH || path.startsWith(`${RELAY_LOGIN_PATH}/`)) return relayLogin(request, env, cfg, state, ctx, path.slice(RELAY_LOGIN_PATH.length));
   if (path === RELAY_CREDENTIALS_PATH) return credentials(request, env, cfg, state, ctx);
   if (path === BOOT_BOX_DELIVERY_PATH) return bootBoxIntake(request, env, cfg, state, ctx);
-  if (path === RELAY_REFRESHED_PATH) return refreshed(request, env, cfg, state, ctx);
   if (path === RELAY_POLICY_BUNDLE_PATH) return policyBundle(request, env, cfg, state);
   if (path.startsWith(RELAY_POLICY_PREFIX) && path.length > RELAY_POLICY_PREFIX.length) return policyRegistry(request, state, path.slice(RELAY_POLICY_PREFIX.length));
   // Backend mode (docs/confidential-lane-stack-routing.md section 4.6): a stack VM serves the peer hop of the entries it
@@ -1220,7 +1223,9 @@ function stackOpsRound(state: LaneProcessState, env: LaneGatewayEnv, cfg: Gatewa
     const held = stack.healthView();
     return { metadata: held.metadata, excluded: held.excluded };
   };
-  const round = ops.round(view, force).then(async () => {
+  // Sign-in sessions whose person left are voided on the lane's own traffic too (30 s idle).
+  const sweep = loginSessions.get(state)?.sweep() ?? Promise.resolve();
+  const round = Promise.all([sweep, ops.round(view, force)]).then(async () => {
     // P7 (13.4, the final mark): a draining instance's last upload, once egress is idle under the hold.
     if (state.vault !== null && state.instanceRole?.retiring === true) await state.vault.finalMark(ops.idle());
   });
@@ -1229,17 +1234,85 @@ function stackOpsRound(state: LaneProcessState, env: LaneGatewayEnv, cfg: Gatewa
   });
 }
 
-/** `POST /v1/aci/relay-credentials/refreshed`: gray-relay's signed ask for the tokens egress refreshed. */
-async function refreshed(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, ctx: ExecutionContext): Promise<Response> {
+/**
+ * The login operation's sessions (docs/design/relay-sign-in-in-vm.md §4.2): made on first use for a stack VM with an
+ * image. Pins go to the vault when the VM has one (D7), else they last for the boot.
+ */
+const loginSessions = new WeakMap<LaneProcessState, LaneLoginSessions>();
+
+function loginSessionsOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig): LaneLoginSessions | null {
+  const stack = state.stack;
+  if (stack === null || stack.relayImage === null) return null;
+  let sessions = loginSessions.get(state);
+  if (sessions === undefined) {
+    const credentials = gatedStackCredentials(state.credentials, state.kmsLease);
+    sessions = new LaneLoginSessions({
+      relayId: stack.relayId,
+      egress: env.EGRESS,
+      accounts: () => credentials.stackAccounts(stack.relayId, Date.now()),
+      image: stack.relayImage,
+      pins: state.vault ?? new MemoryLoginPins(),
+      // P7 (13.4): only the serving instance signs in, as egress's hold says.
+      held: () => (state.instanceRole !== null && !(state.instanceRole.serving ?? true)) || state.vault?.syncing === true,
+      now: () => Date.now(),
+      random: (length) => crypto.getRandomValues(new Uint8Array(length)),
+    });
+    loginSessions.set(state, sessions);
+  }
+  return sessions;
+}
+
+/**
+ * `/v1/aci/relay-login…` (`login-session.ts`): the start (signed by the relay key, as `relay-debug`'s ask), then the
+ * session's calls with its key. A VM outside the relay-stack layout, or the empty slot, has no sign-in.
+ */
+async function relayLogin(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, ctx: ExecutionContext, rest: string): Promise<Response> {
+  const answer = (out: LoginAnswer): Response => {
+    // A login call that passed its check (a signed start, a session's key) reads egress's tokens at once: a sign-in's
+    // family waits on the lane's vault write (persist first). An unauthenticated call starts nothing.
+    if (out.status < 300) {
+      const ops = stackOpsOf(state, env, cfg);
+      if (ops !== null) ctx.waitUntil(ops.tokensNow().catch(() => undefined));
+    }
+    return out.status === 204 ? new Response(null, { status: 204, headers: aciHeaders(state.keysetDigest) }) : aciJson(out.status, out.body, state.keysetDigest);
+  };
+  if (rest === "") {
+    if (request.method !== "POST") return methodNotAllowed(state.keysetDigest, "POST");
+    await primeRegistry(state, env, cfg);
+    const sessions = loginSessionsOf(state, env, cfg);
+    if (sessions === null) return aciJson(404, { error: { code: "login_unsupported", message: "this VM runs no relay image: it has nothing to sign in" } }, state.keysetDigest);
+    const body = await readIntakeBody(request, cfg, state);
+    if (!body.ok) return body.response;
+    const read = await readSignedLoginStart(state, body.value, Date.now());
+    if (!read.ok) return aciJson(read.refusal.status, { error: { code: read.refusal.code, message: read.refusal.detail } }, state.keysetDigest);
+    return answer(await sessions.start(read.start));
+  }
+  const match = /^\/([^/]+)(?:\/(input|callback|cancel))?$/.exec(rest);
+  if (match === null || !RELAY_LOGIN_SESSION_PATTERN.test(match[1] as string)) return answer(UNKNOWN_SESSION());
+  const sessions = loginSessionsOf(state, env, cfg);
+  if (sessions === null) return aciJson(404, { error: { code: "login_unsupported", message: "this VM runs no relay image: it has nothing to sign in" } }, state.keysetDigest);
+  const id = match[1] as string;
+  const key = request.headers.get(RELAY_LOGIN_KEY_HEADER) ?? "";
+  if (!/^[0-9a-f]{64}$/.test(key)) return answer(UNKNOWN_SESSION());
+  const action = match[2];
+  if (action === undefined) {
+    if (request.method === "GET") return answer(await sessions.view(id, key));
+    if (request.method === "DELETE") return answer(await sessions.cancel(id, key));
+    return methodNotAllowed(state.keysetDigest, "GET, DELETE");
+  }
   if (request.method !== "POST") return methodNotAllowed(state.keysetDigest, "POST");
-  await primeRegistry(state, env, cfg);
+  // `POST …/cancel` is the DELETE for a client whose transport sends GET and POST only (gray-assistant's pinned fetch).
+  if (action === "cancel") return answer(await sessions.cancel(id, key));
   const body = await readIntakeBody(request, cfg, state);
   if (!body.ok) return body.response;
-  const ops = stackOpsOf(state, env, cfg);
-  const answered = await answerRefreshed(state, body.value, Date.now(), (asked) => ops?.writeBackTokens(asked) ?? []);
-  if (!answered.ok) return aciJson(answered.refusal.status, { error: { code: answered.refusal.code, message: answered.refusal.detail } }, state.keysetDigest);
-  ctx.waitUntil(stackOpsRound(state, env, cfg));
-  return aciJson(200, answered.answer, state.keysetDigest);
+  if (action === "input") {
+    const text = readLoginInput(body.value);
+    if (text === null) return aciJson(400, { error: { code: "invalid_input", message: "the input is one line of printable text, at most 4096 bytes" } }, state.keysetDigest);
+    return answer(await sessions.input(id, key, text));
+  }
+  const callback = readLoginCallback(body.value);
+  if (callback === null) return aciJson(400, { error: { code: "invalid_callback", message: "the callback is {method, path, query} of the browser's request" } }, state.keysetDigest);
+  return answer(await sessions.callback(id, key, callback));
 }
 
 /**

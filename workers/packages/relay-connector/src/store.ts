@@ -126,6 +126,19 @@ export interface RelayVaultSnapshot {
    * does not reset the backoff. The lane's vault holds it beside the store; the store neither reads nor returns it.
    */
   readonly logins?: readonly RelayVaultLogin[];
+  /**
+   * Sign-in inside the VM (docs/design/relay-sign-in-in-vm.md D7): the authorize-URL templates pinned per (image
+   * digest, vendor, flow), kept beside the store as `logins` is; the store neither reads nor returns them.
+   */
+  readonly sign_in_pins?: readonly RelayVaultPin[];
+}
+
+/** One pinned authorize-URL template (`state` and `code_challenge` blanked by egress). */
+export interface RelayVaultPin {
+  readonly image: string;
+  readonly vendor: string;
+  readonly flow: "code" | "callback" | "callback_input";
+  readonly template: string;
 }
 
 /** A password account's sign-in pacing (egress stack_persist.go `opsLoginPacing`), times in ms. */
@@ -146,8 +159,9 @@ export interface RelayVaultAccount {
   /** The sealed version that last set the account's credential or egress. */
   readonly version: bigint;
   /**
-   * A `password` account's first sealed version with its current sign-in e-mail (`StoredAccount.loginSince`), when it is
-   * older than `version`; absent: `version`.
+   * The first sealed version the account is the same one from (`StoredAccount.loginSince`: a `password` account's
+   * e-mail, a `sign_in` account, an access token sealed again unchanged), when it is older than `version`; absent:
+   * `version`.
    */
   readonly login_since?: bigint;
 }
@@ -169,9 +183,12 @@ interface StoredAccount {
   /** The sealed version that last set this account's credential or egress (its bundle, or an update). */
   version: bigint;
   /**
-   * A `password` account's first sealed version with its current sign-in e-mail: a re-seal of the same e-mail (a lease
-   * renewal, a new password) keeps it, another e-mail moves it. egress's sign-in token names the version its sign-in
-   * started from (`based_on`), so a token from before it is another e-mail's (`#standsIn`). `version` for other accounts.
+   * The first sealed version the account is the same one from (`sameSealed`): a `password` account's with its current
+   * sign-in e-mail (a lease renewal or a new password keeps it, another e-mail moves it), a `sign_in` account's as a
+   * `sign_in` account, an access token's with this token and refresh token (the relay's file sealed again unchanged
+   * keeps it, another token moves it). A token made in the VM names the version it started from (`based_on`), so one
+   * from before it is another account's (`#standsIn`), and one from it on survives every re-seal that keeps it
+   * (docs/design/relay-sign-in-in-vm.md D9). `version` for an API key.
    */
   loginSince: bigint;
 }
@@ -192,10 +209,21 @@ function loginOf(credential: Credential): string | null {
   return credential.type === "password" && credential.username !== undefined ? credential.username : null;
 }
 
-/** `next`'s login start when it replaces `previous` at `version`: kept for the same vendor's same e-mail. */
+/**
+ * Whether `next`, sealed over `held`, is the same account to the VM's own tokens (D9): the same sign-in e-mail, still a
+ * `sign_in` account, or the very access token and refresh token sealed before (the relay changed neither, so the family
+ * the VM holds is newer than the file's). Any other access token is the relay's new one, and the file's wins.
+ */
+function sameSealed(held: Credential, next: Credential): boolean {
+  if (held.type !== next.type) return false;
+  if (next.type === "password") return loginOf(next) !== null && loginOf(held) === loginOf(next);
+  if (next.type === "sign_in") return true;
+  return next.type === "oauth_access_token" && held.value === next.value && held.refresh_token === next.refresh_token;
+}
+
+/** `next`'s start when it replaces `previous` at `version`: kept for the same vendor's same account (`sameSealed`). */
 function loginSinceAfter(previous: StoredAccount | undefined, vendor: Vendor, next: Credential, version: bigint): bigint {
-  const login = loginOf(next);
-  if (previous === undefined || login === null || previous.vendor !== vendor || loginOf(previous.credential) !== login) return version;
+  if (previous === undefined || previous.vendor !== vendor || !sameSealed(previous.credential, next)) return version;
   return previous.loginSince;
 }
 
@@ -214,6 +242,11 @@ export interface StackSealedAccount {
   readonly credential: Credential;
   readonly egress?: EgressSpec;
   readonly version: bigint;
+  /**
+   * The first sealed version the account is the same one from (D9), when it is older than `version`; absent: `version`.
+   * The version egress is told: a token it made from this one on is still the account's.
+   */
+  readonly since?: bigint;
   /** A `password` account's sealed sign-in, for egress alone (docs/design/relay-in-cvm-login.md). */
   readonly login?: StackLogin;
 }
@@ -261,8 +294,8 @@ export class RelayCredentialStore implements AccountMembership {
   readonly #relays = new Map<string, RelayState>();
   readonly #accounts = new Map<string, StoredAccount>();
   /**
-   * Tokens egress refreshed inside the VM (docs/relay-changes-v2.md §6, `refresh: "gray"`), by account id: each
-   * stands in for the sealed credential it was refreshed from, until a sealed version past that one arrives.
+   * Tokens egress handed over inside the VM (a sign-in's or a refresh's of the relay's software), by account id: each
+   * stands in for the sealed credential it was made from, until a sealed version past that one arrives.
    */
   readonly #refreshed = new Map<string, RefreshedToken>();
 
@@ -586,6 +619,7 @@ export class RelayCredentialStore implements AccountMembership {
           credential: this.#currentCredential(relayId, account),
           ...(account.egress === undefined ? {} : { egress: account.egress }),
           version: account.version,
+          ...(account.loginSince === account.version ? {} : { since: account.loginSince }),
           ...(account.credential.type !== "password" || account.credential.username === undefined
             ? {}
             : {
@@ -603,8 +637,9 @@ export class RelayCredentialStore implements AccountMembership {
   /**
    * Take a token egress refreshed for one account (`GET /v1/stack/ops/tokens`): it stands in for the sealed
    * credential of version `basedOn` and any older one, so the container's `/credentials` and egress's table follow
-   * it; a sealed version past `basedOn` (the relay's own refresh, or the write-back sealed again) wins. False when
-   * the account is not this relay's, the token is not an access token of it, or a newer sealed version is held.
+   * it; a sealed version past `basedOn` with another token (a new family in the relay's file or source) wins, and one
+   * that seals the same token again, or the same `sign_in` account, keeps it (D9, `sameSealed`). False when the account
+   * is not this relay's, the token is not an access token of it, or a newer sealed token is held.
    *
    * A `password` account's token (its sign-in inside the VM, or egress's refresh of it) exists only in the VM, so no
    * sealed version replaces it: it stands in for as long as the sealed credential is a password for the same e-mail
@@ -629,16 +664,17 @@ export class RelayCredentialStore implements AccountMembership {
 
   /**
    * Whether a refreshed token stands in for `account` as it is now: the same relay and vendor, an access token of the
-   * vendor's class, refreshed from a version the store held; for a `password` account, a sign-in of its current e-mail
-   * (from `loginSince` on), else one of the sealed access token's current version.
+   * vendor's class, made from a version the store held and the account is the same one from (`loginSince`): a
+   * `password` account's current e-mail, the `sign_in` account, the sealed access token as it still is.
    */
   #standsIn(account: StoredAccount, token: RefreshedToken): boolean {
     if (token.relayId !== account.relay_id || token.vendor !== account.vendor || token.credential.type !== "oauth_access_token") return false;
     if (token.basedOn > account.version) return false;
     const login = loginOf(account.credential);
+    if (token.basedOn < account.loginSince) return false;
     if (login !== null) {
-      if (token.username !== login || token.basedOn < account.loginSince) return false;
-    } else if (account.credential.type !== "oauth_access_token" || token.username !== undefined || token.basedOn < account.version) {
+      if (token.username !== login) return false;
+    } else if ((account.credential.type !== "sign_in" && account.credential.type !== "oauth_access_token") || token.username !== undefined) {
       return false;
     }
     try {
@@ -696,7 +732,7 @@ export class RelayCredentialStore implements AccountMembership {
         credential: account.credential,
         ...(account.egress === undefined ? {} : { egress: account.egress }),
         version: account.version,
-        ...(loginOf(account.credential) === null || account.loginSince === account.version ? {} : { login_since: account.loginSince }),
+        ...(account.loginSince === account.version ? {} : { login_since: account.loginSince }),
       }),
     );
     const refreshed: RelayVaultRefreshed[] = [];
@@ -760,7 +796,7 @@ export class RelayCredentialStore implements AccountMembership {
         credential: account.credential,
         ...(account.egress === undefined ? {} : { egress: account.egress }),
         version: account.version,
-        loginSince: login === null || since > account.version ? account.version : since,
+        loginSince: since > account.version ? account.version : since,
       });
       state.accountIds.add(account.account_id);
     }

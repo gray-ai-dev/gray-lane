@@ -148,6 +148,18 @@ const (
 	defaultPeerIdleTimeout = 3 * time.Second
 	minPeerIdleTimeout     = time.Second
 	maxPeerIdleTimeout     = peerServerIdleTimeout - time.Second
+
+	// -login-persist-wait (defaultLoginPersistWait, stack_login.go, 10 s): at least one lane round (5 s), at most two
+	// minutes of a sign-in call held open.
+	minLoginPersistWait = 5 * time.Second
+	maxLoginPersistWait = 2 * time.Minute
+
+	// -login-calls-per-minute: one account's sign-in calls in a minute. RFC 8628 section 3.5's default polling interval
+	// (5 s) is 12 calls a minute; a sign-in's other calls (the code request, the pages and the token exchange) come
+	// beside them, so the default doubles that rounded up to 30. At least 6 (a 10 s poll), at most 600 (10 a second).
+	defaultLoginCallsPerMinute = 30
+	minLoginCallsPerMinute     = 6
+	maxLoginCallsPerMinute     = 600
 )
 
 // config is the complete run-time configuration of the program. Every value is
@@ -181,6 +193,19 @@ type config struct {
 	// peerLink is peerlink's unix socket (docs/design/relay-outbound-only.md §3.2): a pin row naming a relay (a
 	// channel peer) is dialed through its CONNECT. Empty: only today's pins by origin; it needs -peer.
 	peerLink string
+	// signInKeyDir and signInBundle (signin_ca.go, docs/design/relay-sign-in-in-vm.md D1): the egress-only memory volume
+	// the sign-in CA's key and certificate live on, and the file on the relay's read-only memory volume egress writes
+	// the trust bundle to (the system roots and the sign-in CA). Both or neither, both absolute, with -relay-listen.
+	signInKeyDir string
+	signInBundle string
+	// checkFile is the health check's mode (main.go): exit 0 if the file exists and is not empty, 1 otherwise.
+	checkFile string
+	// loginPersistWait bounds how long a sign-in route's token answer waits for the lane to write its family to the
+	// vault (stack_persist.go awaitPersisted); past it the answer is 503 login_persist_pending.
+	loginPersistWait time.Duration
+	// loginCallsPerMinute bounds one account's sign-in calls in a minute: past it 429 login_rate_limited with
+	// Retry-After (stack_login.go loginRate).
+	loginCallsPerMinute int
 	// extraRootCAPath and directDialAddress are set only by the e2e-tagged build (roots_e2e.go);
 	// production keeps them empty and has no flag that could fill them.
 	extraRootCAPath   string
@@ -203,6 +228,8 @@ func defaultConfig() config {
 		peerLinkConnectTimeout: defaultPeerLinkConnectTimeout,
 		peerSilenceTimeout:     defaultPeerSilenceTimeout,
 		peerIdleTimeout:        defaultPeerIdleTimeout,
+		loginPersistWait:       defaultLoginPersistWait,
+		loginCallsPerMinute:    defaultLoginCallsPerMinute,
 	}
 }
 
@@ -236,11 +263,16 @@ func parseConfig(args []string, out io.Writer) (config, error) {
 	fs.Int64Var(&cfg.stackMaxAnswerBytes, "stack-max-answer-bytes", cfg.stackMaxAnswerBytes, "largest non-stream vendor answer held for its digest, in bytes")
 	fs.IntVar(&cfg.stackAppendMaxItems, "stack-append-max-items", cfg.stackAppendMaxItems, "most registered texts one relay-stack request may append")
 	fs.IntVar(&cfg.stackAppendMaxBytes, "stack-append-max-bytes", cfg.stackAppendMaxBytes, "most bytes of registered texts one relay-stack request may append")
+	fs.StringVar(&cfg.signInKeyDir, "sign-in-key-dir", cfg.signInKeyDir, "egress-only directory (a memory volume) holding this boot's sign-in CA key and certificate")
+	fs.StringVar(&cfg.signInBundle, "sign-in-bundle", cfg.signInBundle, "file egress writes the relay's trust bundle to (system roots and the sign-in CA)")
+	fs.StringVar(&cfg.checkFile, "check-file", cfg.checkFile, "health check mode: exit 0 if this file exists and is not empty, then stop")
 	fs.BoolVar(&cfg.peer, "peer", cfg.peer, "serve the peer mode on the unix socket: pinned TLS to attested lane VMs (an entry only; not with -relay-listen)")
 	fs.DurationVar(&cfg.peerLinkConnectTimeout, "peer-link-connect-timeout", cfg.peerLinkConnectTimeout, "timeout for one new channel peer connection: peerlink's CONNECT, the ready byte and TLS together (provisional default)")
 	fs.DurationVar(&cfg.peerSilenceTimeout, "peer-silence-timeout", cfg.peerSilenceTimeout, "longest wait for a byte from a peer, before its head or within its body")
 	fs.DurationVar(&cfg.peerIdleTimeout, "peer-idle-timeout", cfg.peerIdleTimeout, "how long an idle pooled peer connection is kept (below the peer server's 5s)")
 	fs.StringVar(&cfg.peerLink, "peer-link", cfg.peerLink, "peerlink's unix socket: channel peers (pins by relay) are dialed through its CONNECT (needs -peer; empty: pins by origin only)")
+	fs.DurationVar(&cfg.loginPersistWait, "login-persist-wait", cfg.loginPersistWait, "how long a sign-in's token answer waits for the lane to persist its token family before 503 login_persist_pending")
+	fs.IntVar(&cfg.loginCallsPerMinute, "login-calls-per-minute", cfg.loginCallsPerMinute, "one account's sign-in calls in a minute before 429 login_rate_limited")
 	addExtraRootCAFlag(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -258,6 +290,18 @@ func parseConfig(args []string, out io.Writer) (config, error) {
 // silently clamped timeout would make the attested image's behaviour differ
 // from the flags an operator believes they set.
 func (c config) validate() error {
+	if c.checkFile != "" {
+		if !filepath.IsAbs(c.checkFile) {
+			return errors.New("check-file must be absolute")
+		}
+		return nil
+	}
+	if (c.signInKeyDir == "") != (c.signInBundle == "") {
+		return errors.New("sign-in-key-dir and sign-in-bundle go together")
+	}
+	if c.signInKeyDir != "" && (!filepath.IsAbs(c.signInKeyDir) || !filepath.IsAbs(c.signInBundle) || c.relayListen == "") {
+		return errors.New("sign-in-key-dir and sign-in-bundle must be absolute and need -relay-listen")
+	}
 	if c.socketPath == "" {
 		return errors.New("socket path is empty")
 	}
@@ -315,6 +359,12 @@ func (c config) validate() error {
 	}
 	if c.peerSilenceTimeout < minPeerSilenceTimeout || c.peerSilenceTimeout > maxPeerSilenceTimeout {
 		return fmt.Errorf("peer-silence-timeout must be between %s and %s", minPeerSilenceTimeout, maxPeerSilenceTimeout)
+	}
+	if c.loginPersistWait < minLoginPersistWait || c.loginPersistWait > maxLoginPersistWait {
+		return fmt.Errorf("login-persist-wait must be between %s and %s", minLoginPersistWait, maxLoginPersistWait)
+	}
+	if c.loginCallsPerMinute < minLoginCallsPerMinute || c.loginCallsPerMinute > maxLoginCallsPerMinute {
+		return fmt.Errorf("login-calls-per-minute must be between %d and %d", minLoginCallsPerMinute, maxLoginCallsPerMinute)
 	}
 	if c.peerIdleTimeout < minPeerIdleTimeout || c.peerIdleTimeout > maxPeerIdleTimeout {
 		return fmt.Errorf("peer-idle-timeout must be between %s and %s", minPeerIdleTimeout, maxPeerIdleTimeout)

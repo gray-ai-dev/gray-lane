@@ -44,7 +44,12 @@ export type Vendor = (typeof VENDORS)[number];
  * `totp_secret` the optional TOTP secret. It is never an auth header: the account serves with the access token that
  * sign-in ends with.
  */
-export const CREDENTIAL_TYPES = ["api_key", "oauth_access_token", "password"] as const;
+export const CREDENTIAL_TYPES = ["api_key", "oauth_access_token", "password", "sign_in"] as const;
+/**
+ * `sign_in` (docs/design/relay-sign-in-in-vm.md §1): a subscription account with no secret at all, sealed so a person
+ * can sign it in inside the VM with `gray-assistant login <account>`; `value` is empty. Like `password`, it is never an
+ * auth header: the account serves with the tokens that sign-in ends with, which only the VM holds.
+ */
 export type CredentialType = (typeof CREDENTIAL_TYPES)[number];
 
 /** The credential class of one `(vendor, type)` pair; the matrix is closed. */
@@ -52,9 +57,11 @@ export type CredentialClass =
   | "anthropic_api_key"
   | "anthropic_oauth_access_token"
   | "anthropic_password"
+  | "anthropic_sign_in"
   | "openai_api_key"
   | "chatgpt_codex_oauth_access_token"
   | "chatgpt_codex_password"
+  | "chatgpt_codex_sign_in"
   | "openai_compatible_api_key";
 
 /** The longest secret this lane accepts (the largest real JWT is a few kilobytes). */
@@ -62,8 +69,7 @@ export const MAX_CREDENTIAL_LENGTH = 8192;
 
 /**
  * A secret as the sealed bundle carries it. `expires_at` is unix seconds when the issuer knows one. `refresh_token`
- * is an access token's refresh token, sealed only for an account egress refreshes inside the VM (`refresh: "gray"`,
- * docs/relay-changes-v2.md §6); the relay's container is never served it.
+ * is an access token's refresh token; the relay's container is never served it through `/credentials`.
  */
 export interface Credential {
   readonly type: CredentialType;
@@ -130,11 +136,11 @@ const ACCOUNT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 export function credentialClass(vendor: Vendor, type: CredentialType): CredentialClass | null {
   switch (vendor) {
     case "anthropic":
-      return type === "api_key" ? "anthropic_api_key" : type === "oauth_access_token" ? "anthropic_oauth_access_token" : type === "password" ? "anthropic_password" : null;
+      return type === "api_key" ? "anthropic_api_key" : type === "oauth_access_token" ? "anthropic_oauth_access_token" : type === "password" ? "anthropic_password" : type === "sign_in" ? "anthropic_sign_in" : null;
     case "openai":
       return type === "api_key" ? "openai_api_key" : null;
     case "chatgpt_codex":
-      return type === "oauth_access_token" ? "chatgpt_codex_oauth_access_token" : type === "password" ? "chatgpt_codex_password" : null;
+      return type === "oauth_access_token" ? "chatgpt_codex_oauth_access_token" : type === "password" ? "chatgpt_codex_password" : type === "sign_in" ? "chatgpt_codex_sign_in" : null;
     default:
       return isOpenAiCompatibleVendor(vendor) && type === "api_key" ? "openai_compatible_api_key" : null;
   }
@@ -149,6 +155,13 @@ export function assertCredentialFormat(vendor: Vendor, credential: Credential): 
   if (klass === null) throw new RelayConnectorError("invalid_credential", "credential.type");
   if (klass === "chatgpt_codex_password" || klass === "anthropic_password") {
     assertPasswordCredential(credential);
+    return klass;
+  }
+  if (klass === "chatgpt_codex_sign_in" || klass === "anthropic_sign_in") {
+    // No secret: nothing but the type.
+    if (credential.value !== "" || credential.username !== undefined || credential.totp_secret !== undefined || credential.expires_at !== undefined || credential.refresh_token !== undefined) {
+      throw new RelayConnectorError("invalid_credential", "credential.value");
+    }
     return klass;
   }
   if (credential.username !== undefined || credential.totp_secret !== undefined) throw new RelayConnectorError("invalid_credential", "credential.type");

@@ -3675,6 +3675,21 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc: "How often the console's minute cron reads an undecided phase-2 release's state from RELAY_SHARE_RPC_URLS for its notices (lane_stack_relay_releases).",
   },
   {
+    name: "RELAY_RELEASE_TRAFFIC_WINDOW_HOURS",
+    key: "relayReleaseTrafficWindowHours",
+    workers: ["console"],
+    type: "int",
+    default: "72",
+    min: 1,
+    max: 720,
+    source:
+      "The owner's decision of 2026-11-11: a relay still serving an older release gets no traffic 3 days after Gray proposes a newer one; " +
+      "a security fix's window is set shorter per proposal (hours), never past 30 days (720 h).",
+    doc:
+      "The hours after a phase-2 release's proposal past which a relay whose VM still serves an older release gets no traffic " +
+      "(lane_stack_relay_releases.traffic_window_hours, @gray/control release-traffic.ts), unless the operator's proposal sets its own.",
+  },
+  {
     name: "RELAY_PHASE2_RELAYS",
     key: "relayPhase2Relays",
     workers: ["console"],
@@ -5435,6 +5450,8 @@ export interface ConsoleConfig {
   readonly relayShareChainId: number;
   /** RELAY_RELEASE_CHECK_MS: how often an undecided phase-2 release's state is read for its notices. */
   readonly relayReleaseCheckMs: number;
+  /** RELAY_RELEASE_TRAFFIC_WINDOW_HOURS: a proposal's default traffic window. */
+  readonly relayReleaseTrafficWindowHours: number;
   /** RELAY_PHASE2_RELAYS: "", "*" or relay ids (relayOnPhase2 reads it). */
   readonly relayPhase2Relays: string;
   /** RELAY_CHAIN_PROPOSER: Gray's release proposer address; "" when unset (no phase-2 pairing). */

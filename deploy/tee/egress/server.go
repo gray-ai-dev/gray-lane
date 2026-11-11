@@ -75,8 +75,10 @@ type server struct {
 	// peers is the peer mode (peer.go): nil unless -peer is set. roots and dial are the vendor transports'
 	// own, which every peer transport uses too.
 	peers *peerTable
-	roots *x509.CertPool
-	dial  dialFunc
+	// signIn is the sign-in proxy's and sessions' state (signin_session.go); used only with ops.
+	signIn *signInState
+	roots  *x509.CertPool
+	dial   dialFunc
 }
 
 // newServer builds the transports the program uses. Production passes the pool
@@ -109,6 +111,7 @@ func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logg
 		relayProxiedTransport: relayProxied,
 		logger:                logger,
 		afterFunc:             time.AfterFunc,
+		signIn:                newSignInState(),
 		roots:                 roots,
 		dial:                  dial,
 	}

@@ -35,6 +35,7 @@ export * from "./egress.ts";
 export * from "./envelope.ts";
 export * from "./errors.ts";
 export * from "./lease.ts";
+export * from "./login-request.ts";
 export {
   KEYSET_DIGEST,
   MAX_SEALED_PLAINTEXT_BYTES,
@@ -59,7 +60,6 @@ export {
   requireIntakeKey,
   type RelayIntakeKey,
 } from "./intake-key.ts";
-export * from "./refreshed.ts";
 export * from "./seal.ts";
 export * from "./signature.ts";
 export * from "./store.ts";

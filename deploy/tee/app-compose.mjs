@@ -257,6 +257,20 @@ const SERVICE_PORTS = Object.freeze({
 export const EGRESS_VOLUME = "egress-socket";
 export const EGRESS_MOUNT = "/run/gray";
 /**
+ * docs/design/relay-sign-in-in-vm.md D1 (revision 3), stack layout only: egress makes the sign-in CA at its first start
+ * in a boot and keeps the key on SIGN_IN_KEY_VOLUME, which only egress mounts. It writes the relay's trust bundle (the
+ * system roots and the CA) to SIGN_IN_CA_VOLUME, which the relay mounts read-only at RELAY_SIGN_IN_CA_MOUNT. Both are
+ * plain named volumes on the tmpfs docker root (S9): memory only, kept across an egress restart, new each boot. The
+ * relay gains a file, no network path: the isolation check's allow and deny lists are unchanged.
+ */
+export const SIGN_IN_KEY_VOLUME = "egress-sign-in-key";
+export const SIGN_IN_KEY_MOUNT = "/run/gray-sign-in-key";
+export const SIGN_IN_CA_VOLUME = "egress-sign-in-ca";
+export const SIGN_IN_CA_MOUNT = "/run/gray-sign-in-ca";
+export const RELAY_SIGN_IN_CA_MOUNT = "/run/gray";
+export const RELAY_SIGN_IN_CA_FILE = `${RELAY_SIGN_IN_CA_MOUNT}/sign-in-ca.pem`;
+const SIGN_IN_BUNDLE = `${SIGN_IN_CA_MOUNT}/sign-in-ca.pem`;
+/**
  * relay-outbound-only §3.2, §3.8: peerlink's socket volume and its mount, in both layouts. The lane and peerlink mount
  * it (and on an entry egress, which dials channel peers through peerlink's CONNECT); nothing else may, and peerlink
  * mounts nothing else.
@@ -361,15 +375,15 @@ export const STACK_SERVICE_KEYS = Object.freeze({
   ]),
   egress: Object.freeze([
     "image", "restart", "entrypoint", "command", "user", "group_add", "networks", "volumes",
-    "read_only", "tmpfs", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging",
+    "read_only", "tmpfs", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging", "healthcheck",
   ]),
   "isolation-check": Object.freeze([
     "image", "restart", "depends_on", "entrypoint", "command", "user", "networks",
     "read_only", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging",
   ]),
   relay: Object.freeze([
-    "image", "pull_policy", "restart", "depends_on", "user", "environment", "networks", "read_only", "tmpfs", "cap_drop",
-    "security_opt", "ulimits", "mem_limit", "memswap_limit", "pids_limit", "cpus", "oom_score_adj", "logging",
+    "image", "pull_policy", "restart", "depends_on", "user", "environment", "networks", "read_only", "tmpfs", "volumes",
+    "cap_drop", "security_opt", "ulimits", "mem_limit", "memswap_limit", "pids_limit", "cpus", "oom_score_adj", "logging",
   ]),
 });
 
@@ -418,16 +432,19 @@ export const STACK_FIXED = Object.freeze({
     restart: "unless-stopped",
     entrypoint: ["/usr/local/bin/gray-egress"],
     // S17: the budget and Go's soft limit, fixed (compose.stack.yaml names the measurement).
-    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888"],
+    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888",
+      "-sign-in-key-dir", SIGN_IN_KEY_MOUNT, "-sign-in-bundle", SIGN_IN_BUNDLE],
     user: "10002:10002",
     group_add: ["10100"],
     // S3: a fixed front address too, so docker's dynamic allocation (which starts at .2) can never
     // take lane's 10.231.12.2 when egress starts first.
     networks: { front: { ipv4_address: "10.231.12.3" }, relay_out: { ipv4_address: "10.231.11.2" } },
-    volumes: [`${EGRESS_VOLUME}:${EGRESS_MOUNT}`],
+    volumes: [`${EGRESS_VOLUME}:${EGRESS_MOUNT}`, `${SIGN_IN_KEY_VOLUME}:${SIGN_IN_KEY_MOUNT}`, `${SIGN_IN_CA_VOLUME}:${SIGN_IN_CA_MOUNT}`],
     tmpfs: ["/tmp"],
     oom_score_adj: -500,
     logging: GRAY_LOGGING,
+    // D1: healthy once the relay's trust bundle is written (egress writes it before its relay listener serves).
+    healthcheck: { test: ["CMD", "/usr/local/bin/gray-egress", "-check-file", SIGN_IN_BUNDLE], interval: "2s", timeout: "5s", retries: 60 },
   }),
   // relay-outbound-only §3.2, §3.8: peerlink's VM role on front only, its socket shared with lane only.
   peerlink: Object.freeze({
@@ -461,7 +478,7 @@ export const STACK_FIXED = Object.freeze({
     image: RELAY_SLOT_IMAGE,
     pull_policy: "never",
     restart: "unless-stopped",
-    depends_on: { "isolation-check": { condition: "service_completed_successfully" } },
+    depends_on: { "isolation-check": { condition: "service_completed_successfully" }, egress: { condition: "service_healthy" } },
     user: "10003:10003",
     environment: {
       GRAY_RELAY_LISTEN: "0.0.0.0:3000",
@@ -469,7 +486,14 @@ export const STACK_FIXED = Object.freeze({
       GRAY_EGRESS_URL: "http://10.231.11.2:8080",
       TMPDIR: "/tmp",
       GRAY_DATA_DIR: "/data",
+      // D1: every common TLS stack reads the trust bundle (system roots and the sign-in CA) from one of these.
+      SSL_CERT_FILE: RELAY_SIGN_IN_CA_FILE,
+      NODE_EXTRA_CA_CERTS: RELAY_SIGN_IN_CA_FILE,
+      REQUESTS_CA_BUNDLE: RELAY_SIGN_IN_CA_FILE,
+      CURL_CA_BUNDLE: RELAY_SIGN_IN_CA_FILE,
     },
+    // D1: the trust bundle, read-only; the key's volume is egress's alone.
+    volumes: [`${SIGN_IN_CA_VOLUME}:${RELAY_SIGN_IN_CA_MOUNT}:ro`],
     networks: { relay_in: { ipv4_address: "10.231.10.3" }, relay_out: { ipv4_address: "10.231.11.3" } },
     // S5/S21a: sized, and owned by the relay's uid whatever the image holds at those paths.
     tmpfs: ["/tmp:size=256m,uid=10003,gid=10003,mode=1777", "/data:size=512m,uid=10003,gid=10003,mode=0700"],
@@ -512,6 +536,9 @@ export const STACK_VOLUMES = Object.freeze({
   [EGRESS_VOLUME]: {},
   // relay-outbound-only §3.8: peerlink's socket, the same kind (filled from the image's /run/peerlink, 10005:10101 2750).
   [PEERLINK_VOLUME]: {},
+  // D1: the sign-in CA's key (egress only) and the relay's trust bundle (egress writes, the relay reads).
+  [SIGN_IN_KEY_VOLUME]: {},
+  [SIGN_IN_CA_VOLUME]: {},
 });
 
 /** S8/S4: the seed's interpolation. */
@@ -924,10 +951,20 @@ function checkVolumesAndPorts(services, data, spec, problems) {
   const egress = mounts.get("egress");
   if (lane === undefined || egress === undefined) return;
   checkPeerlinkSocket(mounts, spec, problems);
+  if (spec.name === "stack") checkStackSignInVolumes(mounts, label, problems);
+  else {
+    for (const [name, found] of mounts) {
+      if (found.mounts.some((mount) => mount.source === SIGN_IN_KEY_VOLUME || mount.source === SIGN_IN_CA_VOLUME)) {
+        problems.push(`${label}: ${name} mounts a sign-in CA volume; only the relay-stack layout has them (D1)`);
+      }
+    }
+  }
   const socketInLane = lane.mounts.filter((mount) => mount.source === EGRESS_VOLUME && mount.target === EGRESS_MOUNT);
   if (socketInLane.length !== 1) problems.push(`${label}: lane must mount ${EGRESS_VOLUME} at ${EGRESS_MOUNT} (the egress socket)`);
   // relay-outbound-only §3.8: an entry's egress also mounts peerlink's socket volume (checkPeerlinkSocket holds where).
-  const egressOwn = egress.mounts.filter((mount) => mount.source !== PEERLINK_VOLUME);
+  // D1: in the stack layout egress also mounts the sign-in CA's two volumes (checkStackSignInVolumes holds who else may).
+  const signIn = spec.name === "stack" ? [SIGN_IN_KEY_VOLUME, SIGN_IN_CA_VOLUME] : [];
+  const egressOwn = egress.mounts.filter((mount) => mount.source !== PEERLINK_VOLUME && !signIn.includes(mount.source));
   if (egressOwn.length !== 1 || egressOwn[0].source !== EGRESS_VOLUME || egressOwn[0].target !== EGRESS_MOUNT) {
     problems.push(`${label}: egress must mount only ${EGRESS_VOLUME} at ${EGRESS_MOUNT}${spec.name === "default" ? ` (and ${PEERLINK_VOLUME} at ${PEERLINK_MOUNT})` : ""}: no other path may be shared with the lane`);
   }
@@ -942,6 +979,27 @@ function checkVolumesAndPorts(services, data, spec, problems) {
   }
   if (!lane.tmpfs.includes(LANE_RUN)) {
     problems.push(`${label}: lane must mount a tmpfs at ${LANE_RUN} for its rendered config`);
+  }
+}
+
+/**
+ * D1 (relay-sign-in-in-vm.md revision 3): the CA key's volume is mounted by egress alone, read-write at its own path; the
+ * trust bundle's volume by egress (read-write) and the relay (read-only, at RELAY_SIGN_IN_CA_MOUNT) and nothing else.
+ */
+function checkStackSignInVolumes(mounts, label, problems) {
+  for (const [name, found] of mounts) {
+    for (const mount of found.mounts) {
+      if (mount.source === SIGN_IN_KEY_VOLUME && !(name === "egress" && mount.target === SIGN_IN_KEY_MOUNT && !mount.readOnly)) {
+        problems.push(`${label}: ${name} mounts ${SIGN_IN_KEY_VOLUME} at ${mount.target}; only egress may, read-write at ${SIGN_IN_KEY_MOUNT} (the sign-in CA's key, D1)`);
+      }
+      if (mount.source === SIGN_IN_CA_VOLUME) {
+        const egressWrites = name === "egress" && mount.target === SIGN_IN_CA_MOUNT && !mount.readOnly;
+        const relayReads = name === RELAY_SERVICE && mount.target === RELAY_SIGN_IN_CA_MOUNT && mount.readOnly;
+        if (!egressWrites && !relayReads) {
+          problems.push(`${label}: ${name} mounts ${SIGN_IN_CA_VOLUME} at ${mount.target}${mount.readOnly ? " read-only" : ""}; only egress (read-write at ${SIGN_IN_CA_MOUNT}) and the relay (read-only at ${RELAY_SIGN_IN_CA_MOUNT}) may (D1)`);
+        }
+      }
+    }
   }
 }
 

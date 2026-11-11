@@ -1,18 +1,18 @@
-# gray-lane 2026.11.10-47b69420b3c0
+# gray-lane 2026.11.11-39510026d886
 
-The source of Gray's `gray-lane` image built from Gray's commit `47b69420b3c047a45275a2e02010269d312d567a`, published so that a relay, or the
+The source of Gray's `gray-lane` image built from Gray's commit `39510026d886de2d98afd574a7690250b5bd9ded`, published so that a relay, or the
 coding agent a relay uses, can review each release before it accepts it. The image runs in every lane CVM: in the
-entry's default layout and in each relay's stack VM. This tree holds exactly the 621 files its build reads, at
+entry's default layout and in each relay's stack VM. This tree holds exactly the 628 files its build reads, at
 the paths they have in Gray's repository, so the build scripts run unchanged. It also holds the measured compose
 templates and pre-launch scripts that decide what the CVM starts. Tests, documentation and Gray's other services
 are not included. Each release is one commit in this repository. Its parent is the release published before it, so
-`git diff <previous tag> 2026.11.10-47b69420b3c0` shows the code that changed between the two.
+`git diff <previous tag> 2026.11.11-39510026d886` shows the code that changed between the two.
 
 | What runs in the CVM | Where its source is |
 |-|-|
-| the lane Worker on workerd (the inbound program): requests in, policy, receipts | `workers/gateway/src/lane/` and the `workers/packages/` it imports, bundled by `workers/gateway/wrangler.lane.jsonc` |
+| the lane Worker on workerd (the ingress program): requests in, policy, receipts | `workers/gateway/src/lane/` and the `workers/packages/` it imports, bundled by `workers/gateway/wrangler.lane.jsonc` |
 | the entrypoint that starts workerd and gray-acme | `deploy/tee/bin/entrypoint.mjs`, `deploy/tee/workerd/config.capnp` |
-| gray-egress (the outbound program): every vendor request leaves through it | `deploy/tee/egress/` |
+| gray-egress (the egress program): every vendor request leaves through it | `deploy/tee/egress/` |
 | gray-peerlink: the stack VM's link to the entry | `deploy/tee/peerlink/` |
 | gray-acme (the lane's TLS certificate) and gray-isolation-check | `deploy/tee/acme/`, `deploy/tee/isolation-check/` |
 | the compose a CVM runs, and the script dstack runs before it | `deploy/tee/compose.stack.yaml`, `deploy/tee/pre-launch.stack.sh` (stack VM); `deploy/tee/compose.yaml`, `deploy/tee/pre-launch.sh` (entry); rendered by `deploy/tee/app-compose.mjs` |
@@ -41,7 +41,7 @@ The question to answer for each release is whether any code path can keep a rela
 the boot that uses them, or send them, or anything derived from them, anywhere except the vendor they belong to.
 Suggested instructions for a coding agent:
 
-> Review this tree (and `git diff <the tag you accepted last> 2026.11.10-47b69420b3c0`) for any way it could retain or transmit a
+> Review this tree (and `git diff <the tag you accepted last> 2026.11.11-39510026d886`) for any way it could retain or transmit a
 > relay's account keys. Trace: (1) where credentials enter: the sealed account records the lane opens with its
 > per-boot keyset (`workers/gateway/src/lane/state.ts`, `workers/gateway/src/lane/stack-service.ts`,
 > `workers/packages/relay-connector/`, `workers/packages/attest/`) and hands to gray-egress over its unix socket

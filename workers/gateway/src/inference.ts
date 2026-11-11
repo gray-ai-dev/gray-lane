@@ -129,7 +129,7 @@ import { redactedHeaders, redactedQuery } from "./redact.ts";
 import { type ChunkTap, type Primed as PrimedStream, type Uncommitted as StreamUncommitted, primeStream, readAnswer, relayStream, type SettleOutcome, type StreamEnd } from "./relay.ts";
 import { unrouted } from "./resolution.ts";
 import { type AnswerShare, Retained } from "./retained.ts";
-import { capable, dispatchExploratory, nativeRoutes, outputOverhead, pinHolds, priceRoutes, probeLeases, promptOverhead, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, routeProbeLeases, withinBound, type Route } from "./routes.ts";
+import { capable, dispatchExploratory, nativeRoutes, outputOverhead, RELEASE_OUTDATED, releaseOutdated, pinHolds, priceRoutes, probeLeases, promptOverhead, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, routeProbeLeases, withinBound, type Route } from "./routes.ts";
 import {
   ERROR_DETAIL_BYTES,
   FREE_NO_USAGE,
@@ -2614,6 +2614,13 @@ export class InferenceRun {
     this.affinityKey = this.preference.affinityAllowed() && keyed ? affinityKey(key.workspaceId, canonical, parsed.value) : null;
     // S22: a lane routes only what its VM is laid out for (`laneRoutes`), before anything weighs the routes.
     let records = nativeRoutes(snapshot, canonical, protocol, now, !parsed.whole).filter((r) => this.laneRoutes(r));
+    // The release traffic window: a relay stack still on an older release past its window is left out, as a route that
+    // is not available, and the record says why (`routing_skipped` `release_outdated`).
+    records = records.filter((r) => {
+      if (!releaseOutdated(r, now)) return true;
+      this.skippedRoutes.push({ endpointId: r.endpointId, reason: RELEASE_OUTDATED });
+      return false;
+    });
     this.nativeRouteCount = records.length;
     // The preference narrows the native routes before anything else considers them (`retain_admitted`), so a
     // request whose filter excludes every native route is refused here rather than served by a translation.
@@ -2727,7 +2734,7 @@ export class InferenceRun {
         stream: canonical.stream,
         upstreams,
         rule: targets.rule,
-        routes: (upstream) => snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && r.model === canonical.model && r.protocol === upstream),
+        routes: (upstream) => snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === canonical.model && r.protocol === upstream),
         judge: (t, candidates) => {
           const able = candidates.filter((r) => capable(r, t.contract, false));
           if (able.length === 0) return { kind: "skip" };

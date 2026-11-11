@@ -126,15 +126,6 @@ function ownCallSeconds(op: StackOwnCallOp) {
 }
 
 /**
- * Where an account's OAuth token is refreshed (section 6): `source`, the relay's software outside the VM, as before
- * (the default), or `gray`, egress before expiry, whose token gray-relay writes back to the account source. Egress
- * refreshes only accounts whose vendor table has a `refresh` operation and whose sealed credential has a refresh
- * token; on any other account `gray` does nothing.
- */
-export const STACK_REFRESH_MODES = ["source", "gray"] as const;
-export type StackRefreshMode = (typeof STACK_REFRESH_MODES)[number];
-
-/**
  * The relay's own record (`PUT`/`POST` body): every member, null where the relay has not named it yet; `appends_by`
  * `relay` when not named. The dstack app id is Gray's, with the lane origin and the KMS CA key
  * (`stackInstanceInputSchema`): a body that names one is refused.
@@ -203,8 +194,6 @@ export const stackAccountInputSchema = z
      * replaced without it names none.
      */
     identity_profile: z.string().regex(STACK_IDENTITY_PROFILE_PATTERN, STACK_IDENTITY_PROFILE_RULE).nullable().default(null),
-    /** Where the account's OAuth token is refreshed (`STACK_REFRESH_MODES`); an account replaced without it is `source`. */
-    refresh: z.enum(STACK_REFRESH_MODES).default("source"),
   })
   .strict();
 export type StackAccountInput = z.infer<typeof stackAccountInputSchema>;
@@ -224,16 +213,14 @@ export const STACK_ACCOUNTS_PATCH_MAX = 1000;
 
 /**
  * A batch edit of accounts (`PATCH .../accounts` body): for every listed account, the identity profile (null clears
- * it) and the token refresh mode, each only when named; at least one of them.
+ * it).
  */
 export const stackAccountsPatchSchema = z
   .object({
     account_ids: z.array(z.string()).min(1).max(STACK_ACCOUNTS_PATCH_MAX),
-    identity_profile: z.string().regex(STACK_IDENTITY_PROFILE_PATTERN, STACK_IDENTITY_PROFILE_RULE).nullable().optional(),
-    refresh: z.enum(STACK_REFRESH_MODES).optional(),
+    identity_profile: z.string().regex(STACK_IDENTITY_PROFILE_PATTERN, STACK_IDENTITY_PROFILE_RULE).nullable(),
   })
-  .strict()
-  .refine((b) => b.identity_profile !== undefined || b.refresh !== undefined, { message: "A batch edit names identity_profile, refresh or both." });
+  .strict();
 export type StackAccountsPatch = z.infer<typeof stackAccountsPatchSchema>;
 
 /** A proxy (`PUT .../proxies/{id}` body); its user name and password are sealed, never sent here. */

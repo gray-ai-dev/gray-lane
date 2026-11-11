@@ -44,6 +44,17 @@ export function nativeRoutes(snapshot: GatewaySnapshot, request: CanonicalReques
   return snapshot.routes.filter((r) => routeServes(r.expiresAt, nowMs) && r.model === request.model && r.protocol === protocol && capable(r, request, mediaUnknown));
 }
 
+/**
+ * The release traffic window (@gray/control release-traffic.ts): a relay stack's route past `trafficUntil` takes no
+ * traffic, as a route that is not available; the request record names it as passed over for this word.
+ */
+export const RELEASE_OUTDATED = "release_outdated";
+
+/** Whether `route` is out of traffic at `nowMs` because its relay's VM still serves an older release. */
+export function releaseOutdated(route: Pick<RouteRecord, "trafficUntil">, nowMs: number): boolean {
+  return route.trafficUntil !== undefined && nowMs >= route.trafficUntil;
+}
+
 /** The offer service regions a preference names (crates/gray-gateway/src/provider_offers.rs `SERVICE_REGIONS`, `region_matches`). */
 const US = new Set(["US East", "US West"]);
 const EU = new Set(["Germany", "France", "Netherlands"]);

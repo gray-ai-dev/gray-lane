@@ -21,8 +21,9 @@ import type { RelayVaultSnapshot } from "./store.ts";
  * header's version grows with every write (a refreshed token is a write and no sealed version). Integers are `bigint`
  * (the workspace's u64 rule). `persist: false` (H13) is a record with no account: written once when the relay chooses
  * RAM-only after a persisted record, so a reboot does not bring the older accounts back. `logins` (P2e-2, 13.5) is each
- * password account's sign-in pacing, present only when there is any. An account's `login_since` is a `password`
- * account's first sealed version with its current sign-in e-mail, present only when it is older than `version`.
+ * password account's sign-in pacing, present only when there is any. An account's `login_since` is the first sealed
+ * version the account is the same one from (a `password` account's e-mail, a `sign_in` account, an access token sealed
+ * again unchanged: `store.ts` `sameSealed`), present only when it is older than `version`.
  */
 
 export const VAULT_STATE_FORMAT = "gray-relay-vault-state/v1";
@@ -56,6 +57,16 @@ const loginSchema = z
   })
   .strict();
 
+/** D7: a pinned authorize-URL template, per (image digest, vendor, flow). */
+const pinSchema = z
+  .object({
+    image: z.string().min(1).max(512),
+    vendor: z.string().regex(/^[a-z0-9_]{1,64}$/),
+    flow: z.enum(["code", "callback", "callback_input"]),
+    template: z.string().min(1).max(2048),
+  })
+  .strict();
+
 const vaultStateSchema = z
   .object({
     format: z.literal(VAULT_STATE_FORMAT),
@@ -65,6 +76,7 @@ const vaultStateSchema = z
     accounts: z.array(vaultAccountSchema),
     refreshed: z.array(refreshedSchema),
     logins: z.array(loginSchema).optional(),
+    sign_in_pins: z.array(pinSchema).optional(),
   })
   .strict();
 
@@ -81,7 +93,7 @@ export function vaultStatePlaintext(relayId: string, snapshot: RelayVaultSnapsho
       credential: credentialValue(account.credential),
       ...(account.egress === undefined ? {} : { egress: egressValue(account.egress) }),
       version: account.version,
-      // Only for a password account re-sealed with the same e-mail, so other records are the same bytes as before.
+      // Only for an account sealed again as the same one, so other records are the same bytes as before.
       ...(account.login_since === undefined ? {} : { login_since: account.login_since }),
     })),
     refreshed: snapshot.refreshed.map((token) => ({
@@ -102,6 +114,10 @@ export function vaultStatePlaintext(relayId: string, snapshot: RelayVaultSnapsho
             last_ok_ms: login.last_ok_ms,
           })),
         }),
+    // D7: only with pins to keep, so a record without any is the same bytes as before.
+    ...(snapshot.sign_in_pins === undefined || snapshot.sign_in_pins.length === 0
+      ? {}
+      : { sign_in_pins: [...snapshot.sign_in_pins].sort(byPinKey).map((pin) => ({ image: pin.image, vendor: pin.vendor, flow: pin.flow, template: pin.template })) }),
   };
   return jcsBytes(value);
 }
@@ -142,5 +158,17 @@ export function parseVaultState(relayId: string, plaintext: Uint8Array): RelayVa
       ...(token.username === undefined ? {} : { username: token.username }),
     })),
     ...(state.logins === undefined ? {} : { logins: state.logins.map((login) => ({ ...login, last: login.last === null ? null : { ...login.last } })) }),
+    ...(state.sign_in_pins === undefined ? {} : { sign_in_pins: state.sign_in_pins.map((pin) => ({ ...pin })) }),
   };
+}
+
+/** A pin's key, as the vault orders and merges them. */
+export function vaultPinKey(pin: { readonly image: string; readonly vendor: string; readonly flow: string }): string {
+  return `${pin.image}|${pin.vendor}|${pin.flow}`;
+}
+
+function byPinKey(l: { readonly image: string; readonly vendor: string; readonly flow: string }, r: { readonly image: string; readonly vendor: string; readonly flow: string }): number {
+  const a = vaultPinKey(l);
+  const b = vaultPinKey(r);
+  return a < b ? -1 : a > b ? 1 : 0;
 }

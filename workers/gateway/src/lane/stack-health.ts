@@ -12,9 +12,6 @@ import {
   STACK_LOGIN_BY,
   STACK_LOGIN_CODES,
   STACK_LOGIN_STATES,
-  STACK_REFRESH_CODES,
-  STACK_REFRESH_MODES,
-  STACK_REFRESH_PROBLEMS,
   STACK_REPORT_APPENDS_MAX,
   STACK_REPORT_COOLING_MAX,
   STACK_REPORT_MAX_BYTES,
@@ -40,7 +37,6 @@ import {
   type StackReportKmsLease,
   type StackReportVault,
   type StackReportLogin,
-  type StackReportRefresh,
   type StackRelayChangeCounters,
   type StackReportWindow,
   type StackRestoreEntry,
@@ -209,17 +205,6 @@ const egressCoolingSchema = z
   })
   .strict();
 
-const egressRefreshSchema = z
-  .object({
-    mode: z.enum(STACK_REFRESH_MODES),
-    has_refresh_token: z.boolean(),
-    problem: z.enum(STACK_REFRESH_PROBLEMS).nullable(),
-    last: z.object({ outcome: z.enum(["ok", "failed"]), code: z.enum(STACK_REFRESH_CODES).nullable(), at_ms: uintSchema }).strict().nullable(),
-    next_ms: uintSchema.nullable(),
-    failures: uintSchema.max(4_294_967_295n),
-  })
-  .strict();
-
 /** A password account's sign-in (egress stack_login.go `loginHealth`): its times are already whole hours. */
 const egressLoginSchema = z
   .object({
@@ -256,8 +241,6 @@ const egressHealthSchema = z
           peak: z.object({ minute_ms: uintSchema, in_flight: uintSchema.max(4_294_967_295n) }).strict().nullable(),
           cooling: z.array(egressCoolingSchema),
           windows: z.array(egressWindowSchema),
-          // The account's token refresh (egress stack_ops.go `refreshHealth`); null when egress does not refresh its kind.
-          refresh: egressRefreshSchema.nullable().optional(),
           // A password account's sign-in inside the VM (docs/design/relay-in-cvm-login.md §4); absent for the others.
           login: egressLoginSchema.optional(),
         })
@@ -299,31 +282,8 @@ interface EgressHealth {
       readonly clears: readonly (typeof STACK_RULE_CLEARS)[number][];
     }[];
     readonly windows: readonly EgressWindow[];
-    readonly refresh?: EgressRefresh | null;
     readonly login?: StackReportLogin;
   }[];
-}
-
-/** An account's refresh as egress reads it, with JS numbers. */
-interface EgressRefresh {
-  readonly mode: StackReportRefresh["mode"];
-  readonly has_refresh_token: boolean;
-  readonly problem: StackReportRefresh["problem"];
-  readonly last: { readonly outcome: "ok" | "failed"; readonly code: (typeof STACK_REFRESH_CODES)[number] | null; readonly at_ms: number } | null;
-  readonly next_ms: number | null;
-  readonly failures: number;
-}
-
-/** A refresh as the report carries it: the last attempt's minute floored, the next one's ceiled. */
-function reportRefresh(r: EgressRefresh): StackReportRefresh {
-  return {
-    mode: r.mode,
-    has_refresh_token: r.has_refresh_token,
-    problem: r.problem,
-    last: r.last === null ? null : { outcome: r.last.outcome, code: r.last.code, minute_ms: floorMinute(r.last.at_ms) },
-    next_minute_ms: r.next_ms === null ? null : ceilMinute(r.next_ms),
-    failures: r.failures,
-  };
 }
 
 /** S44's answer (egress `stack_accounttest.go` `accountTestAnswer`): always 200. */
@@ -476,9 +436,7 @@ export class StackHealthService {
   #restore: readonly StackRestoreEntry[] | null = null;
   /** Each account's entries and windows as egress last held them settled (its own, restored), as the report has them. */
   #settled = new Map<string, { readonly cooling: readonly StackReportCooling[]; readonly windows: readonly StackReportWindow[] }>();
-  /** Each account's refresh as egress was last read: a round that cannot read egress reports these. */
-  #refresh = new Map<string, StackReportRefresh>();
-  /** Each password account's sign-in as egress was last read, the same way. */
+  /** Each password account's sign-in as egress was last read: a round that cannot read egress reports these. */
   #login = new Map<string, StackReportLogin>();
   /** Egress's `started_ms` as last read. */
   #egressStarted: number | null = null;
@@ -539,7 +497,6 @@ export class StackHealthService {
         health = await this.#readHealth();
         if (health !== null) this.#observe(health);
       }
-      if (health !== null) this.#refresh = new Map(health.accounts.flatMap((a) => (a.refresh ? [[a.account_id, reportRefresh(a.refresh)] as const] : [])));
       if (health !== null) this.#login = new Map(health.accounts.flatMap((a) => (a.login ? [[a.account_id, a.login] as const] : [])));
       if (health !== null && this.#holdsOwn(health)) {
         this.#settled = new Map(health.accounts.map((a) => [a.account_id, { cooling: a.cooling.map(reportCooling), windows: a.windows.map(reportWindow) }]));
@@ -744,8 +701,16 @@ export class StackHealthService {
       const reason = accountReasons.get(account.id) ?? null;
       const held = sealedById.get(account.id);
       const live = egressById.get(account.id);
-      const refresh = this.#refresh.get(account.id);
-      const login = this.#login.get(account.id);
+      // docs/design/relay-sign-in-in-vm.md: an account sealed for sign-in inside the VM says so, and one egress reports
+      // nothing of yet (a `sign_in` account before its first sign-in) needs one.
+      const vmSignIn = held !== undefined && (held.credential.type === "sign_in" || held.credential.type === "password");
+      const reported = this.#login.get(account.id);
+      const login: StackReportLogin | undefined =
+        reported !== undefined
+          ? { ...reported, ...(vmSignIn ? { vm_sign_in: true as const } : {}) }
+          : held?.credential.type === "sign_in"
+            ? { by: "relay", state: "needed", failures: 0, last: null, last_ok_hour_ms: null, vm_sign_in: true }
+            : undefined;
       return {
         account_id: account.id,
         served: reason !== null ? "excluded" : account.status === "paused" ? "paused" : "served",
@@ -754,13 +719,11 @@ export class StackHealthService {
         sealed:
           held === undefined
             ? null
-            : { version: safeNumber(held.version), type: held.credential.type === "password" ? "oauth_access_token" : held.credential.type, expires_at_s: sealedExpiry(held) },
+            : { version: safeNumber(held.version), type: held.credential.type === "password" || held.credential.type === "sign_in" ? "oauth_access_token" : held.credential.type, expires_at_s: sealedExpiry(held) },
         proxy_id: account.proxy_id,
         in_flight_peak: live === undefined || live.peak === null ? null : { minute_ms: floorMinute(live.peak.minute_ms), value: live.peak.in_flight },
         cooling: (own ? (live?.cooling ?? []).map(reportCooling) : carried(account.id)).slice(0, STACK_REPORT_COOLING_MAX),
         windows: (health === null ? (this.#settled.get(account.id)?.windows ?? []) : (live?.windows ?? []).map(reportWindow)).slice(0, STACK_REPORT_WINDOWS_MAX),
-        // Only for an account egress refreshes or could: an API key's object stays as an older entry wrote it.
-        ...(refresh === undefined ? {} : { refresh }),
         ...(login === undefined ? {} : { login }),
       };
     });

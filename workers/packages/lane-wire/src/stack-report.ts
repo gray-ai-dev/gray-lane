@@ -12,9 +12,6 @@ import {
   STACK_LOGIN_BY,
   STACK_LOGIN_CODES,
   STACK_LOGIN_STATES,
-  STACK_REFRESH_CODES,
-  STACK_REFRESH_MODES,
-  STACK_REFRESH_PROBLEMS,
   STACK_RULE_CLEARS,
   STACK_SERVED,
   STACK_VENDOR_CODES,
@@ -28,8 +25,6 @@ import {
   type StackExclusionReasonWord,
   type StackLoginCode,
   type StackLoginState,
-  type StackRefreshCode,
-  type StackRefreshMode,
   type StackVendorCode,
   type StackWindowClaim,
   type StackWindowKey,
@@ -196,28 +191,6 @@ export const stackWindowsSchema = z
   .max(STACK_REPORT_WINDOWS_MAX)
   .refine((ws) => new Set(ws.map((w) => w.key)).size === ws.length, { message: "a window key is listed twice" });
 
-/**
- * Who refreshes a subscription account's token and how it went, from egress's own-call schedule (stack_ops.go): the
- * mode, whether the sealed credential carries a refresh token (in either mode, never the token), `no_refresh_token` when the mode is `gray` and the sealed credential has no refresh token (egress never refreshes
- * it), egress's last attempt (its minute, floored) and the next one (ceiled), and the failed attempts in a row. Null when
- * egress does not keep the account up (an API key, a vendor its table has no refresh for, egress unread); absent from an
- * entry older than it.
- */
-export const stackReportRefreshSchema = z
-  .object({
-    mode: z.enum(STACK_REFRESH_MODES),
-    has_refresh_token: z.boolean(),
-    problem: z.enum(STACK_REFRESH_PROBLEMS).nullable(),
-    last: z
-      .object({ outcome: z.enum(["ok", "failed"]), code: z.enum(STACK_REFRESH_CODES).nullable(), minute_ms: minute })
-      .strict()
-      .refine((l) => (l.outcome === "ok") === (l.code === null), { message: "an ok refresh has no code, a failed one names one", path: ["code"] })
-      .nullable(),
-    next_minute_ms: minute.nullable(),
-    failures: u32,
-  })
-  .strict();
-
 const HOUR_MS = 3_600_000n;
 /** A sign-in's time in the report: a whole hour (the container chooses when it signs in: relay-changes-v2 V8). */
 const hour = uintSchema.refine((v) => v % HOUR_MS === 0n, { message: "a sign-in time in stack.report is a whole hour" });
@@ -238,6 +211,11 @@ export const stackReportLoginSchema = z
       .refine((l) => (l.outcome === "ok") === (l.code === null), { message: "an ok sign-in has no code, a failed one names one", path: ["code"] })
       .nullable(),
     last_ok_hour_ms: hour.nullable(),
+    /**
+     * The account was sealed to be signed in inside the VM (`sign_in`, or a `password` account): the panel asks for
+     * `gray-assistant login` only for these, or for an account whose last token exchange was a sign-in in the VM.
+     */
+    vm_sign_in: z.literal(true).optional(),
   })
   .strict();
 
@@ -251,7 +229,6 @@ const accountSchema = z
     in_flight_peak: z.object({ minute_ms: minute, value: u32 }).strict().nullable(),
     cooling: z.array(coolingSchema).max(STACK_REPORT_COOLING_MAX),
     windows: stackWindowsSchema,
-    refresh: stackReportRefreshSchema.nullable().optional(),
     login: stackReportLoginSchema.nullable().optional(),
   })
   .strict()
@@ -374,16 +351,6 @@ export interface StackReportWindow {
   readonly resets_at_minute_ms: number | null;
   readonly observed_minute_ms: number;
 }
-/** An account's token refresh as the report carries it, with JS numbers. */
-export interface StackReportRefresh {
-  readonly mode: StackRefreshMode;
-  /** Whether the credential in the VM carries a refresh token (never the token): `gray` is offered only with one. */
-  readonly has_refresh_token: boolean;
-  readonly problem: (typeof STACK_REFRESH_PROBLEMS)[number] | null;
-  readonly last: { readonly outcome: "ok" | "failed"; readonly code: StackRefreshCode | null; readonly minute_ms: number } | null;
-  readonly next_minute_ms: number | null;
-  readonly failures: number;
-}
 /** One account of the report, with JS numbers. */
 export interface StackReportAccount {
   readonly account_id: string;
@@ -394,8 +361,6 @@ export interface StackReportAccount {
   readonly in_flight_peak: { readonly minute_ms: number; readonly value: number } | null;
   readonly cooling: readonly StackReportCooling[];
   readonly windows: readonly StackReportWindow[];
-  /** Egress's refresh of the account; absent from an entry older than it. */
-  readonly refresh?: StackReportRefresh | null;
   /** A password account's sign-in inside the VM; absent for every other account and from an entry older than it. */
   readonly login?: StackReportLogin | null;
 }
@@ -406,6 +371,7 @@ export interface StackReportLogin {
   readonly failures: number;
   readonly last: { readonly outcome: "ok" | "failed"; readonly code: StackLoginCode | null; readonly hour_ms: number } | null;
   readonly last_ok_hour_ms: number | null;
+  readonly vm_sign_in?: true;
 }
 /** The report with JS numbers. */
 /**

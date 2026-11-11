@@ -209,7 +209,9 @@ services:
     # chain it reached 595 MiB without a limit (the copies made as answers complete are outside the
     # budget), at most 277 MiB with it. 240 MiB held it at 231 MiB but leaves the collector less room.
     entrypoint: ["/usr/local/bin/gray-egress"]
-    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888"]
+    # D1 (docs/design/relay-sign-in-in-vm.md): egress makes this boot's sign-in CA on its own volume and writes the
+    # relay's trust bundle (system roots and the CA) to the bundle volume before its relay listener serves.
+    command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888", "-sign-in-key-dir", "/run/gray-sign-in-key", "-sign-in-bundle", "/run/gray-sign-in-ca/sign-in-ca.pem"]
     user: "10002:10002"
     group_add:
       - "10100"
@@ -221,8 +223,17 @@ services:
       relay_out:
         ipv4_address: 10.231.11.2
     volumes:
-      # D63: the only shared mount, and it holds only the socket.
+      # D63: the only mount shared with the lane, and it holds only the socket.
       - egress-socket:/run/gray
+      # D1: the sign-in CA's key, egress's alone; the relay's trust bundle, which the relay mounts read-only.
+      - egress-sign-in-key:/run/gray-sign-in-key
+      - egress-sign-in-ca:/run/gray-sign-in-ca
+    # D1: healthy once the trust bundle is written; the relay starts only then.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gray-egress", "-check-file", "/run/gray-sign-in-ca/sign-in-ca.pem"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
     read_only: true
     tmpfs:
       - /tmp
@@ -329,6 +340,9 @@ services:
     depends_on:
       isolation-check:
         condition: service_completed_successfully
+      # D1: the trust bundle exists before the relay's software starts.
+      egress:
+        condition: service_healthy
     user: "10003:10003"
     # S4: literals only. Relay-specific settings come through the config (§8 `settings`).
     environment:
@@ -337,6 +351,11 @@ services:
       GRAY_EGRESS_URL: "http://10.231.11.2:8080"
       TMPDIR: "/tmp"
       GRAY_DATA_DIR: "/data"
+      # D1: the trust bundle (system roots and the sign-in CA), for Go/OpenSSL, Node, Python requests and curl.
+      SSL_CERT_FILE: "/run/gray/sign-in-ca.pem"
+      NODE_EXTRA_CA_CERTS: "/run/gray/sign-in-ca.pem"
+      REQUESTS_CA_BUNDLE: "/run/gray/sign-in-ca.pem"
+      CURL_CA_BUNDLE: "/run/gray/sign-in-ca.pem"
     # S2: only the two internal networks; the entry reaches it at 10.231.10.3:3000.
     networks:
       relay_in:
@@ -351,6 +370,9 @@ services:
     tmpfs:
       - /tmp:size=256m,uid=10003,gid=10003,mode=1777
       - /data:size=512m,uid=10003,gid=10003,mode=0700
+    # D1: the trust bundle, read-only. A file, no network path: the isolation check is unchanged.
+    volumes:
+      - egress-sign-in-ca:/run/gray:ro
     cap_drop:
       - ALL
     security_opt:
@@ -399,3 +421,7 @@ volumes:
   # relay-outbound-only §3.8: peerlink's socket volume, the same kind: filled from the image's /run/peerlink
   # (10005:10101, 2750), so peerlink.sock is in group 10101, which only lane and peerlink have.
   peerlink-socket: {}
+  # D1: plain local volumes too (memory on the tmpfs docker root: kept across an egress restart, new each boot),
+  # filled from the image's /run/gray-sign-in-key (10002, 0700) and /run/gray-sign-in-ca (10002, 0755).
+  egress-sign-in-key: {}
+  egress-sign-in-ca: {}

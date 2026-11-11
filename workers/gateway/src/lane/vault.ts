@@ -10,8 +10,11 @@ import {
   vaultStatePlaintext,
   type ApplyResult,
   type RelayVaultLogin,
+  type RelayVaultPin,
   type RelayVaultSnapshot,
+  vaultPinKey,
 } from "@gray/relay-connector";
+import type { LoginPins } from "./login-session.ts";
 import { keyPath, newestRecord, parseRecord, recordKey, sealRecord, serializeRecord, type RecordBinding, type SealedRecord } from "@gray/relay-connector/vault";
 import { openVaultShare, vaultShareRequest } from "@gray/relay-connector/vault-share";
 import { z } from "zod";
@@ -272,7 +275,18 @@ export function mergeVaultStates(relayId: string, base: RelayVaultSnapshot | nul
     accounts: pick("accounts", base?.accounts ?? [], local.accounts, gray.accounts),
     refreshed: pick("refreshed", base?.refreshed ?? [], local.refreshed, gray.refreshed),
     logins: pick("logins", base?.logins ?? [], local.logins ?? [], gray.logins ?? []),
+    sign_in_pins: mergePins(local.sign_in_pins ?? [], gray.sign_in_pins ?? []),
   };
+}
+
+/**
+ * D7: pins are written once per (image, vendor, flow) and never removed, so a merge is their union; where both hold a
+ * pin for one key (two instances pinned at once), `local`'s stands (the caller passes the side whose change wins).
+ */
+function mergePins(local: readonly RelayVaultPin[], gray: readonly RelayVaultPin[]): RelayVaultPin[] {
+  const out = new Map(gray.map((pin) => [vaultPinKey(pin), pin]));
+  for (const pin of local) out.set(vaultPinKey(pin), pin);
+  return [...out.values()].sort((l, r) => (vaultPinKey(l) < vaultPinKey(r) ? -1 : vaultPinKey(l) > vaultPinKey(r) ? 1 : 0));
 }
 
 function codeOf(error: unknown): string {
@@ -282,7 +296,7 @@ function codeOf(error: unknown): string {
   return error instanceof Error ? error.name : "error";
 }
 
-export class LaneVault {
+export class LaneVault implements LoginPins {
   readonly #options: LaneVaultOptions;
   /** The measured relay and the image whose `K_vault` seals the records; `rewrap` moves it to a designated image. */
   #binding: RecordBinding;
@@ -339,6 +353,10 @@ export class LaneVault {
   #ramOnlyWritten = false;
   /** P2e-2 (13.5): each password account's sign-in pacing, by account id, sealed with every version. */
   #pacing = new Map<string, RelayVaultLogin>();
+  /** D7: the sign-in pins, by `vaultPinKey`, kept beside the store as the pacing is. */
+  #pins = new Map<string, RelayVaultPin>();
+  /** D7: pins being written, sealed with the next write but not served until it is on the disk. */
+  readonly #pendingPins = new Map<string, RelayVaultPin>();
   /** One change at a time: a version is sealed from the store as it is when its turn comes. */
   #queue: Promise<unknown> = Promise.resolve();
   readonly #background: Background;
@@ -649,6 +667,7 @@ export class LaneVault {
     }
     this.#prevCopyVersion = prevCopy?.version ?? null;
     this.#pacing = new Map((snapshot?.logins ?? []).map((login) => [login.account_id, login]));
+    this.#pins = new Map((snapshot?.sign_in_pins ?? []).map((pin) => [vaultPinKey(pin), pin]));
     this.#dropped = false;
     this.#openFailures = 0;
     this.#nextOpenAt = 0;
@@ -657,7 +676,7 @@ export class LaneVault {
     this.#persistedMs = persistedMs;
     this.#copyOk = copy === null ? null : copy.version === this.#version;
     this.#ramOnlyWritten = snapshot !== null && !snapshot.persist;
-    const withPacing = snapshot === null ? null : { ...snapshot, logins: snapshot.logins ?? [] };
+    const withPacing = snapshot === null ? null : { ...snapshot, logins: snapshot.logins ?? [], sign_in_pins: snapshot.sign_in_pins ?? [] };
     this.#copyUnread = null;
     if (copy === null) {
       // Opened from the disk alone (review 11-09b design #7; `source` is "disk" here, or P7's "disk_prev" with the
@@ -750,7 +769,7 @@ export class LaneVault {
       opened = await newestRecord("vault", key, this.#options.appId, this.#binding, [parseRecord(copy.record)], 0);
       if (opened === null) return null;
       const state = parseVaultState(this.#options.relayId, opened.plaintext);
-      return { version: opened.header.version, state: { ...state, logins: state.logins ?? [] } };
+      return { version: opened.header.version, state: { ...state, logins: state.logins ?? [], sign_in_pins: state.sign_in_pins ?? [] } };
     } catch {
       return null;
     } finally {
@@ -880,7 +899,7 @@ export class LaneVault {
     const { relayId, appId, store, now } = this.#options;
     const stored = store.vaultSnapshot(relayId);
     if (stored === null) return null;
-    let state: RelayVaultSnapshot = { ...stored, logins: [...this.#pacing.values()].sort((l, r) => (l.account_id < r.account_id ? -1 : l.account_id > r.account_id ? 1 : 0)) };
+    let state: RelayVaultSnapshot = this.#withSide(stored);
     if (!stored.persist) {
       // H13: RAM-only; the record without accounts that replaced a persisted one follows the image too.
       if (this.#version === null || this.#version === 0) return null;
@@ -906,6 +925,7 @@ export class LaneVault {
     this.#dropped = true;
     this.#epoch += 1;
     this.#pacing.clear();
+    this.#pins.clear();
     this.#agreed = null;
     if (this.#previous !== null) this.#previous.key = null;
     this.#nextOpenAt = 0;
@@ -950,7 +970,7 @@ export class LaneVault {
    * A change the store already holds (a token egress refreshed, an in-VM sign-in's token): a new version on the disk and
    * then at Gray. False when it is not on the disk (closed, or the write failed: the next change writes it).
    */
-  async changed(reason: "refresh" | "sign_in" | "token" | "pacing"): Promise<boolean> {
+  async changed(reason: "sign_in" | "token" | "pacing"): Promise<boolean> {
     if (this.#key === null || !this.#writes()) return false;
     return this.#serial(async () => {
       if (this.#syncWanted) await this.#sync(reason);
@@ -991,6 +1011,49 @@ export class LaneVault {
     });
   }
 
+  /** The store's snapshot with what the vault keeps beside it: the sign-in pacing and the sign-in pins, in key order. */
+  #withSide(stored: RelayVaultSnapshot): RelayVaultSnapshot {
+    return {
+      ...stored,
+      logins: [...this.#pacing.values()].sort(byAccount),
+      sign_in_pins: [...new Map([...this.#pendingPins, ...this.#pins]).values()].sort((l, r) => (vaultPinKey(l) < vaultPinKey(r) ? -1 : vaultPinKey(l) > vaultPinKey(r) ? 1 : 0)),
+    };
+  }
+
+  /** D7 (`LoginPins`): the template pinned for (image, vendor, flow), or null. */
+  get(image: string, vendor: string, flow: RelayVaultPin["flow"]): string | null {
+    return this.#pins.get(vaultPinKey({ image, vendor, flow }))?.template ?? null;
+  }
+
+  /** D7: every pin of one image, for egress's table (`PUT /v1/stack/ops/login-pins`). */
+  forImage(image: string): readonly { readonly vendor: string; readonly flow: RelayVaultPin["flow"]; readonly template: string }[] {
+    return [...this.#pins.values()].filter((pin) => pin.image === image).map((pin) => ({ vendor: pin.vendor, flow: pin.flow, template: pin.template }));
+  }
+
+  /**
+   * D7: pin a template. The pin waits in `#pendingPins` (sealed with the next write, not yet read by `get` or `forImage`)
+   * until the write is on the disk; only then is it the image's and handed to egress. A key already pinned is not
+   * replaced (the caller compares first). A RAM-only relay's vault writes nothing (H13): its pins last for this boot
+   * (`boot_only`, accepted by the owner, design D7). `failed`: the vault is not open, this instance does not write, or
+   * the write failed (the pin is dropped).
+   */
+  async put(image: string, vendor: string, flow: RelayVaultPin["flow"], template: string): Promise<"persisted" | "boot_only" | "failed"> {
+    if (this.#key === null || !this.#writes()) return "failed";
+    const key = vaultPinKey({ image, vendor, flow });
+    if (this.#pins.has(key)) return this.#pins.get(key)?.template === template ? "persisted" : "failed";
+    const pin = { image, vendor, flow, template };
+    if (this.#options.store.vaultSnapshot(this.#options.relayId)?.persist === false) {
+      this.#pins.set(key, pin);
+      return "boot_only";
+    }
+    this.#pendingPins.set(key, pin);
+    const written = await this.changed("sign_in");
+    this.#pendingPins.delete(key);
+    if (!written) return "failed";
+    this.#pins.set(key, pin);
+    return "persisted";
+  }
+
   /** P2e-2: the sign-in pacing the vault holds for an account's current sign-in, for the push back to egress. */
   pacingFor(accountId: string, username: string): RelayVaultLogin | null {
     const pacing = this.#pacing.get(accountId);
@@ -1029,7 +1092,7 @@ export class LaneVault {
     if (!this.#persists()) throw new VaultWriteError("not_serving");
     const stored = given === undefined ? store.vaultSnapshot(relayId) : given;
     if (stored === null) return;
-    const snapshot: RelayVaultSnapshot = { ...stored, logins: [...this.#pacing.values()].sort((l, r) => (l.account_id < r.account_id ? -1 : l.account_id > r.account_id ? 1 : 0)) };
+    const snapshot: RelayVaultSnapshot = this.#withSide(stored);
     let state = snapshot;
     if (!snapshot.persist) {
       // H13: RAM-only. One record without accounts replaces a persisted one; after that nothing is written.
@@ -1215,6 +1278,7 @@ export class LaneVault {
     this.#key = null;
     this.#epoch += 1;
     this.#pacing.clear();
+    this.#pins.clear();
     this.#nextOpenAt = 0;
     this.#options.store.restoreVaultSnapshot(this.#options.relayId, null);
     this.#log({ level: "error", event: "lane_vault_closed", relay_id: this.#options.relayId, version: this.#version, code });
@@ -1384,7 +1448,7 @@ export class LaneVault {
         return;
       }
       const state = parseVaultState(relayId, opened.plaintext);
-      gray = { ...state, logins: state.logins ?? [] };
+      gray = { ...state, logins: state.logins ?? [], sign_in_pins: state.sign_in_pins ?? [] };
     } catch (error) {
       this.#syncWanted = false;
       this.#log({ level: "error", event: "lane_vault_copy_unopened", relay_id: relayId, reason, copy_version: held.version, code: codeOf(error) });
@@ -1394,11 +1458,12 @@ export class LaneVault {
       opened?.plaintext.fill(0);
     }
     const before = store.vaultSnapshot(relayId);
-    const local = before === null ? null : { ...before, logins: [...this.#pacing.values()].sort(byAccount) };
+    const local = before === null ? null : this.#withSide(before);
     // P7 (13.4): the serving instance's change to an account wins; a draining one's final merge lets Gray's win.
     const base = this.#agreed?.state ?? null;
     const merged = local === null ? gray : final ? mergeVaultStates(relayId, base, gray, local) : mergeVaultStates(relayId, base, local, gray);
     const previousPacing = this.#pacing;
+    const previousPins = this.#pins;
     let dropped: readonly string[] | void;
     try {
       dropped = store.restoreVaultSnapshot(relayId, { version: merged.version, persist: merged.persist, accounts: merged.accounts, refreshed: merged.refreshed });
@@ -1409,6 +1474,7 @@ export class LaneVault {
     }
     if (dropped !== undefined && dropped.length > 0) this.#log({ level: "warn", event: "lane_vault_tokens_dropped", relay_id: relayId, accounts: dropped.length, account_ids: [...dropped] });
     this.#pacing = new Map((merged.logins ?? []).map((login) => [login.account_id, login]));
+    this.#pins = new Map((merged.sign_in_pins ?? []).map((pin) => [vaultPinKey(pin), pin]));
     this.#agreed = { version: held.version, state: gray };
     this.#syncWanted = false;
     const grayAlone = sameVaultState(relayId, merged, gray);
@@ -1437,6 +1503,7 @@ export class LaneVault {
         if (this.#key !== null) {
           store.restoreVaultSnapshot(relayId, before);
           this.#pacing = previousPacing;
+          this.#pins = previousPins;
         }
         this.#syncWanted = true;
         this.#syncRounds += 1;

@@ -106,6 +106,8 @@ export function authHeaders(vendor: Vendor, credential: Credential): Readonly<Re
     // A password signs in; it is never sent as an auth header (the account serves with its sign-in's token).
     case "chatgpt_codex_password":
     case "anthropic_password":
+    case "chatgpt_codex_sign_in":
+    case "anthropic_sign_in":
     case null:
       throw new RelayConnectorError("invalid_credential", "credential.type");
   }

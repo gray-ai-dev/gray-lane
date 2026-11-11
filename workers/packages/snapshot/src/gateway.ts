@@ -230,6 +230,8 @@ export interface GatewayRouteRecord {
    * never from this record (design v2 section C.6, D107).
    */
   readonly lane: GatewayLaneRelay | null;
+  /** A relay stack's route: until when (Unix ms) it takes traffic (`SnapshotRoute.trafficUntilMs`). Absent: no limit. */
+  readonly trafficUntil?: number;
 }
 
 /** A workspace row of the gateway's view (`GatewayView.workspaces`). */
@@ -370,6 +372,7 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
     ...(r.codingAgentPasses === undefined || r.codingAgentPasses.length === 0 ? {} : { codingAgent: [...r.codingAgentPasses] }),
     ...(r.behavioralScore === null ? {} : { behavioralScore: r.behavioralScore }),
     lane: laneRelayOf(r.config.lane),
+    ...(r.trafficUntilMs === undefined ? {} : { trafficUntil: r.trafficUntilMs }),
   };
 }
 

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "vendors": {
+    "chatgpt_codex": {
+      "hosts": {
+        "auth.openai.com": null
+      },
+      "token_endpoints": [
+        {"host": "auth.openai.com", "path": "/oauth/token"},
+        {"host": "auth.openai.com", "path": "/api/accounts/oauth/token"}
+      ],
+      "account_id_claim": true,
+      "authorize_hosts": ["auth.openai.com"],
+      "device_code": {
+        "host": "auth.openai.com",
+        "path": "/api/accounts/deviceauth/usercode",
+        "token_path": "/api/accounts/deviceauth/token",
+        "user_code_fields": ["user_code", "usercode"],
+        "verification_uri": "https://auth.openai.com/codex/device",
+        "expires_in_seconds": 900
+      }
+    },
+    "anthropic": {
+      "hosts": {
+        "claude.com": ["/cai/oauth/"],
+        "claude.ai": ["/oauth/", "/login", "/api/auth/"],
+        "platform.claude.com": ["/oauth/", "/v1/oauth/token"]
+      },
+      "token_endpoints": [{"host": "platform.claude.com", "path": "/v1/oauth/token"}],
+      "account_id_claim": false,
+      "authorize_hosts": ["claude.ai", "claude.com"],
+      "device_code": null
+    }
+  }
+}

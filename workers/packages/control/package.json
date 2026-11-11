@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./coding-agent": "./src/coding-agent.ts",
     "./opencode-thinking": "./src/opencode-thinking.ts",
+    "./release-traffic": "./src/release-traffic.ts",
     "./stack-agent": "./src/stack-agent.ts",
     "./stack-pairing": "./src/stack-pairing.ts",
     "./stack-provision": "./src/stack-provision.ts",

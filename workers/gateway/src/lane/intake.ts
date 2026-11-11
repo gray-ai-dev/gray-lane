@@ -1,7 +1,7 @@
 import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { createTemplateRegistry, isLaneProtocol, isPosition, type LaneProtocol, type Position, type RelayTemplate } from "@gray/lane";
 import { canonicalTemplates, policyClaim, type RelayPolicyBundle } from "@gray/relay-policy";
-import { readRefreshedRequest, RELAY_INTAKE_MAX_BODY_BYTES, sealRefreshedAnswer, type RefreshedRequest, type RefreshedToken } from "@gray/relay-connector";
+import { readLoginStart, RELAY_INTAKE_MAX_BODY_BYTES, type RelayLoginStart } from "@gray/relay-connector";
 import { z } from "zod";
 import type { LaneProcessState } from "./state.ts";
 
@@ -25,12 +25,6 @@ import type { LaneProcessState } from "./state.ts";
  */
 
 export const RELAY_CREDENTIALS_PATH = "/v1/aci/relay-credentials";
-/**
- * The write-back of in-VM refresh (docs/relay-changes-v2.md §6): gray-relay asks for the tokens egress refreshed with
- * a request signed by the relay's key, and gets them sealed to the reply key it named (`@gray/relay-connector`
- * refreshed.ts), to write to the relay's account source (`PUT …/credential`).
- */
-export const RELAY_REFRESHED_PATH = "/v1/aci/relay-credentials/refreshed";
 export const RELAY_POLICY_BUNDLE_PATH = "/v1/aci/relay-policy/bundle";
 /** The registry GET, by relay id (`/v1/aci/relay-policy/{relay_id}`, M22). */
 export const RELAY_POLICY_PREFIX = "/v1/aci/relay-policy/";
@@ -203,32 +197,21 @@ export function policyRegistryDocument(state: LaneProcessState, relayId: string)
 }
 
 /**
- * `POST /v1/aci/relay-credentials/refreshed`: the signed request checked against the registry's relay key, then the
- * tokens not yet written back, sealed to the request's reply key. The answer is ciphertext only; nothing of a token
- * is logged or answered in the clear.
+ * `POST /v1/aci/relay-login` (docs/design/relay-sign-in-in-vm.md §1): the start checked against the relay's signing key
+ * (`signingKeyOf`, not `get`: a stack VM's relay is known by its stack record, not as a registry entry). The nonce's replay check is the session store's (`login-session.ts`).
  */
-export async function answerRefreshed(
-  state: LaneProcessState,
-  value: Json,
-  nowMs: number,
-  tokensFor: (request: RefreshedRequest) => readonly RefreshedToken[],
-): Promise<{ readonly ok: true; readonly answer: Record<string, unknown>; readonly tokens: number } | { readonly ok: false; readonly refusal: IntakeRefusal }> {
-  const read = await readRefreshedRequest(
+export async function readSignedLoginStart(state: LaneProcessState, value: Json, nowMs: number): Promise<{ readonly ok: true; readonly start: RelayLoginStart } | { readonly ok: false; readonly refusal: IntakeRefusal }> {
+  const read = await readLoginStart(
     value,
-    // `signingKeyOf`, not `get`: the asker is a stack VM's relay, which is tracked by its stack record and is never a
-    // registry entry (`get` does not name it), as for the credentials it seals to this boot.
     (relayId) => {
       const key = state.registry.signingKeyOf(relayId);
       return key === undefined ? null : hexBytes(key, 32);
     },
     Math.floor(nowMs / 1000),
   );
-  if (!read.ok) {
-    const status = read.code === "unknown_relay" || read.code === "bad_signature" ? 403 : 400;
-    return { ok: false, refusal: { status, code: read.code, detail: "the request was refused" } };
-  }
-  const tokens = tokensFor(read.request);
-  return { ok: true, answer: await sealRefreshedAnswer(read.request, tokens), tokens: tokens.length };
+  if (read.ok) return read;
+  const status = read.code === "unknown_relay" || read.code === "bad_signature" ? 403 : 400;
+  return { ok: false, refusal: { status, code: read.code, detail: "the sign-in start was refused" } };
 }
 
 /** The response body of a refusal: the closed code and a fixed detail, never the input. */

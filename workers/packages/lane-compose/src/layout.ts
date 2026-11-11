@@ -49,6 +49,17 @@ const VAULT_PATH = "/var/lib/gray-persist/relay";
 const KMS_URL_NAME = "LANE_KMS_URL";
 const EGRESS_VOLUME = "egress-socket";
 const EGRESS_MOUNT = "/run/gray";
+/**
+ * D1 (docs/design/relay-sign-in-in-vm.md revision 3): the sign-in CA's key volume (egress only) and the relay's trust
+ * bundle volume (egress writes, the relay reads at RELAY_SIGN_IN_CA_MOUNT); app-compose.mjs `SIGN_IN_*`.
+ */
+const SIGN_IN_KEY_VOLUME = "egress-sign-in-key";
+const SIGN_IN_KEY_MOUNT = "/run/gray-sign-in-key";
+const SIGN_IN_CA_VOLUME = "egress-sign-in-ca";
+const SIGN_IN_CA_MOUNT = "/run/gray-sign-in-ca";
+const SIGN_IN_BUNDLE = `${SIGN_IN_CA_MOUNT}/sign-in-ca.pem`;
+const RELAY_SIGN_IN_CA_MOUNT = "/run/gray";
+const RELAY_SIGN_IN_CA_FILE = `${RELAY_SIGN_IN_CA_MOUNT}/sign-in-ca.pem`;
 /** S5: every Gray service. */
 const GRAY_OOM_SCORE_ADJ = -500;
 const GRAY_LOGGING = { driver: "local", options: { "max-size": "10m", "max-file": "2" } };
@@ -72,6 +83,11 @@ const RELAY_ENVIRONMENT = {
   GRAY_EGRESS_URL: `http://${EGRESS_ADDRESS}:${EGRESS_RELAY_PORT}`,
   TMPDIR: "/tmp",
   GRAY_DATA_DIR: "/data",
+  // D1: the trust bundle (system roots and the sign-in CA) for Go/OpenSSL, Node, Python requests and curl.
+  SSL_CERT_FILE: RELAY_SIGN_IN_CA_FILE,
+  NODE_EXTRA_CA_CERTS: RELAY_SIGN_IN_CA_FILE,
+  REQUESTS_CA_BUNDLE: RELAY_SIGN_IN_CA_FILE,
+  CURL_CA_BUNDLE: RELAY_SIGN_IN_CA_FILE,
 };
 
 export const STACK_LAYOUT = deepFreeze({
@@ -145,11 +161,11 @@ export const STACK_LAYOUT = deepFreeze({
     },
   },
   /** D63/S2b: the top-level volumes, exactly: the egress socket's plain volume. */
-  volumes: { [EGRESS_VOLUME]: {}, [PEERLINK_VOLUME]: {} },
+  volumes: { [EGRESS_VOLUME]: {}, [PEERLINK_VOLUME]: {}, [SIGN_IN_KEY_VOLUME]: {}, [SIGN_IN_CA_VOLUME]: {} },
 
   /**
    * S2–S5: the keys each service may carry (app-compose.mjs `STACK_SERVICE_KEYS`). The relay has no
-   * entrypoint/command override, no volume and no port.
+   * entrypoint/command override and no port; its one volume is the read-only trust bundle (D1).
    */
   serviceKeys: {
     lane: [
@@ -162,15 +178,15 @@ export const STACK_LAYOUT = deepFreeze({
     ],
     egress: [
       "image", "restart", "entrypoint", "command", "user", "group_add", "networks", "volumes",
-      "read_only", "tmpfs", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging",
+      "read_only", "tmpfs", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging", "healthcheck",
     ],
     "isolation-check": [
       "image", "restart", "depends_on", "entrypoint", "command", "user", "networks",
       "read_only", "cap_drop", "security_opt", "ulimits", "oom_score_adj", "logging",
     ],
     relay: [
-      "image", "pull_policy", "restart", "depends_on", "user", "environment", "networks", "read_only", "tmpfs", "cap_drop",
-      "security_opt", "ulimits", "mem_limit", "memswap_limit", "pids_limit", "cpus", "oom_score_adj", "logging",
+      "image", "pull_policy", "restart", "depends_on", "user", "environment", "networks", "read_only", "tmpfs", "volumes",
+      "cap_drop", "security_opt", "ulimits", "mem_limit", "memswap_limit", "pids_limit", "cpus", "oom_score_adj", "logging",
     ],
   },
   /** The published ports, per service: none (relay-outbound-only O1, §3.8). */
@@ -196,14 +212,17 @@ export const STACK_LAYOUT = deepFreeze({
       entrypoint: ["/usr/local/bin/gray-egress"],
       // S17: the budget (192 MiB) and Go's soft limit (288 MiB), fixed; deploy/tee/compose.stack.yaml names
       // the measurement they come from.
-      command: ["-socket", `${EGRESS_MOUNT}/egress.sock`, "-max-body-bytes", "4194304", "-relay-listen", `${EGRESS_ADDRESS}:${EGRESS_RELAY_PORT}`, "-stack-max-bytes", "201326592", "-memory-limit", "301989888"],
+      command: ["-socket", `${EGRESS_MOUNT}/egress.sock`, "-max-body-bytes", "4194304", "-relay-listen", `${EGRESS_ADDRESS}:${EGRESS_RELAY_PORT}`, "-stack-max-bytes", "201326592", "-memory-limit", "301989888",
+        "-sign-in-key-dir", SIGN_IN_KEY_MOUNT, "-sign-in-bundle", SIGN_IN_BUNDLE],
       user: "10002:10002",
       group_add: [SOCKET_GROUP],
       networks: { front: { ipv4_address: EGRESS_FRONT_ADDRESS }, relay_out: { ipv4_address: EGRESS_ADDRESS } },
-      volumes: [`${EGRESS_VOLUME}:${EGRESS_MOUNT}`],
+      volumes: [`${EGRESS_VOLUME}:${EGRESS_MOUNT}`, `${SIGN_IN_KEY_VOLUME}:${SIGN_IN_KEY_MOUNT}`, `${SIGN_IN_CA_VOLUME}:${SIGN_IN_CA_MOUNT}`],
       tmpfs: ["/tmp"],
       oom_score_adj: GRAY_OOM_SCORE_ADJ,
       logging: GRAY_LOGGING,
+      // D1: healthy once the relay's trust bundle is written.
+      healthcheck: { test: ["CMD", "/usr/local/bin/gray-egress", "-check-file", SIGN_IN_BUNDLE], interval: "2s", timeout: "5s", retries: 60 },
     },
     peerlink: {
       restart: "unless-stopped",
@@ -238,12 +257,14 @@ export const STACK_LAYOUT = deepFreeze({
       image: RELAY_SLOT,
       pull_policy: "never",
       restart: "unless-stopped",
-      depends_on: { "isolation-check": { condition: "service_completed_successfully" } },
+      depends_on: { "isolation-check": { condition: "service_completed_successfully" }, egress: { condition: "service_healthy" } },
       user: "10003:10003",
       environment: RELAY_ENVIRONMENT,
       networks: { relay_in: { ipv4_address: RELAY_IN_ADDRESS }, relay_out: { ipv4_address: RELAY_OUT_ADDRESS } },
       // S5/S21a: sized, and owned by the relay's uid whatever the image holds at those paths.
       tmpfs: ["/tmp:size=256m,uid=10003,gid=10003,mode=1777", "/data:size=512m,uid=10003,gid=10003,mode=0700"],
+      // D1: the trust bundle, read-only; a file, no network path (the isolation check is unchanged).
+      volumes: [`${SIGN_IN_CA_VOLUME}:${RELAY_SIGN_IN_CA_MOUNT}:ro`],
       mem_limit: "1536m",
       memswap_limit: "1536m",
       pids_limit: 512,

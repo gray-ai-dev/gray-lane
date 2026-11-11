@@ -136,7 +136,6 @@ export const STACK_ACCOUNT_STATES = [
   "at_limit",
   "cooling",
   "proxy_failing",
-  "refresh_failing",
   "credential_expiring",
   "failing",
   "serving",
@@ -289,8 +288,6 @@ export const STACK_ACCOUNT_STATE_REASONS = [
   "credential_unknown",
   "container_fault",
   "proxy_failing",
-  "no_refresh_token",
-  "refresh_failed",
   "credential_expiring",
   "credential_expired",
   "failing",
@@ -299,32 +296,16 @@ export const STACK_ACCOUNT_STATE_REASONS = [
 export type StackAccountStateReason = (typeof STACK_ACCOUNT_STATE_REASONS)[number];
 
 /**
- * Who refreshes a subscription account's token (`lane_stack_accounts.refresh`): `source`, the relay's software or
- * gray-relay outside the VM; `gray`, egress inside it (deploy/tee/egress/stack_ops.go).
- */
-export const STACK_REFRESH_MODES = ["source", "gray"] as const;
-export type StackRefreshMode = (typeof STACK_REFRESH_MODES)[number];
-/**
- * Why egress's refresh of a `gray` account is not in use: the sealed credential carries no refresh token
- * (`no_refresh_token`), or (P2e-2, persist first) a new token family waits for the lane to write it to the VM's vault and
- * the previous token is still in use (`not_persisted`).
- */
-export const STACK_REFRESH_PROBLEMS = ["no_refresh_token", "not_persisted"] as const;
-/**
- * Why egress's last refresh failed (egress `refreshCode`): the vendor refused it (400/401/403: sign in again) or answered
- * another error, the proxy or the direct connection failed, it timed out, the answer was not a token, the template
- * lacked an input, or another fault of egress's own.
- */
-export const STACK_REFRESH_CODES = ["vendor_rejected", "vendor_error", "proxy_failed", "connect_failed", "timeout", "invalid_answer", "input_missing", "egress_error"] as const;
-export type StackRefreshCode = (typeof STACK_REFRESH_CODES)[number];
-
-/**
  * A password account's sign-in inside the VM (egress stack_login.go, docs/design/relay-in-cvm-login.md §4): who signs
  * in (`relay`: the relay's software, through egress), and its state: `signed_in` (egress holds a token good for 5 more
  * minutes whose last refresh was not refused) or `needed`.
  */
 export const STACK_LOGIN_BY = ["relay"] as const;
-export const STACK_LOGIN_STATES = ["signed_in", "needed"] as const;
+/**
+ * `requested` (docs/design/relay-sign-in-in-vm.md §3.2): a person opened a sign-in with `gray-assistant login` and the
+ * relay's software signs the account in now.
+ */
+export const STACK_LOGIN_STATES = ["signed_in", "needed", "requested"] as const;
 export type StackLoginState = (typeof STACK_LOGIN_STATES)[number];
 /**
  * Why a token exchange gave egress no token: the vendor refused it, its answer held no usable token, or the call met a
@@ -388,5 +369,5 @@ export const STACK_IDENTITY_STATIC_CHATGPT = ["user-agent", "accept", "originato
 export const STACK_IDENTITY_GENERATED_CHATGPT = ["x-client-request-id", "session_id", "session-id", "conversation_id", "thread-id"] as const;
 
 /** The kinds of the "needs re-login" list (S45), in the order the panel lists them. */
-export const STACK_CREDENTIAL_ISSUE_KINDS = ["login_failed", "login_stuck", "credential_expiring", "not_sealed", "credential_waiting", "lease_expiring", "agent_silent"] as const;
+export const STACK_CREDENTIAL_ISSUE_KINDS = ["credential_expiring", "not_sealed", "credential_waiting", "lease_expiring", "agent_silent"] as const;
 export type StackCredentialIssueKind = (typeof STACK_CREDENTIAL_ISSUE_KINDS)[number];

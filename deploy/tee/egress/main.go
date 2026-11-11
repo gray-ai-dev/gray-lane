@@ -32,6 +32,9 @@ func main() {
 }
 
 func run(cfg config, stdout, stderr io.Writer) error {
+	if cfg.checkFile != "" {
+		return checkFileMode(cfg.checkFile)
+	}
 	applyMemoryLimit(cfg.memoryLimit)
 	logger := log.New(stderr, "", 0)
 	roots, rootCount, err := rootPool(cfg)
@@ -61,6 +64,21 @@ func run(cfg config, stdout, stderr io.Writer) error {
 		relayListener = srv.stack.holdConnections(relayListener)
 		// Own calls (docs/relay-changes-v2.md §6): the schedule runs from start, with or without traffic.
 		srv.ops = newStackOps(srv, stackOpsTable, srv.stack.now)
+		srv.ops.persistWait = cfg.loginPersistWait
+		srv.ops.loginRate.perMinute = cfg.loginCallsPerMinute
+		// D1: the sign-in CA, made at the first start of the boot and kept on egress's own memory volume, and the
+		// relay's trust bundle, written before the relay listener serves (compose starts the relay after egress is
+		// healthy, which the bundle's presence is).
+		if cfg.signInKeyDir != "" {
+			ca, err := loadOrMakeSignInCA(cfg.signInKeyDir, signInDomains(signInRows), time.Now())
+			if err != nil {
+				return fmt.Errorf("sign-in CA: %w", err)
+			}
+			if err := writeSignInBundle(cfg.signInBundle, signInSystemRoots, ca); err != nil {
+				return fmt.Errorf("sign-in bundle: %w", err)
+			}
+			srv.signIn.ca = ca
+		}
 	}
 
 	listener, err := listenUnix(cfg.socketPath)
@@ -206,4 +224,13 @@ func removeStaleSocket(path string) error {
 		return fmt.Errorf("socket path exists and is not a socket")
 	}
 	return os.Remove(path)
+}
+
+// checkFileMode is the compose health check (-check-file): the file exists and is not empty.
+func checkFileMode(path string) error {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return errors.New("not ready")
+	}
+	return nil
 }

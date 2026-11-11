@@ -14,8 +14,6 @@ import {
   STACK_IDENTITY_STATIC_ANTHROPIC,
   STACK_IDENTITY_STATIC_CHATGPT,
   STACK_IDENTITY_STATIC_OPENAI,
-  STACK_REFRESH_MODES,
-  type StackRefreshMode,
 } from "./stack-health.ts";
 
 /**
@@ -33,8 +31,8 @@ import {
  * `settings_json` is the relay's own settings object as JSON text, byte for byte as the console stored it (S30).
  * `appends_by` (relay standard v1.7 §2) is the panel's switch for who inserts the relay's appends: `relay` (the
  * default) or `gray`, the entry. The console always sends it; a document without it reads as `relay`.
- * An account's `refresh` and the relay's `own_calls` are egress's account upkeep (docs/relay-changes-v2.md section 6,
- * `stackOwnCallSettings`): absent when they say nothing (`source`, the vendor's default cadence).
+ * The relay's `own_calls` is egress's account upkeep (docs/relay-changes-v2.md section 6, `stackOwnCallSettings`): absent
+ * when it says nothing (the vendor's default cadence).
  *
  * The integer rule is the bridge's (ints.ts): integers are bigints on the wire; the console answers with JS numbers
  * and the converters below are where the two meet.
@@ -124,9 +122,6 @@ export function stackIdentityProblem(vendor: StackVendorName, identity: StackIde
   return null;
 }
 
-// Where an account's OAuth token is refreshed (`@gray/control` STACK_REFRESH_MODES; absent is `source`): stack-health.ts's
-// STACK_REFRESH_MODES, which the report's refresh names too.
-
 /**
  * One upstream account (section 8): vendors as section 8 names them, `@gray/control` STACK_VENDORS. `credential_type`
  * (the sealed credential's type the relay declares) and `identity` (S32a) are later members: absent when the relay set
@@ -146,7 +141,6 @@ const accountSchema = z
     credential_version: uintSchema,
     credential_type: z.enum(STACK_CREDENTIAL_TYPES).optional(),
     identity: stackIdentitySchema.optional(),
-    refresh: z.enum(STACK_REFRESH_MODES).optional(),
   })
   .strict()
   .superRefine((a, ctx) => {
@@ -271,8 +265,6 @@ export interface StackConfigAccount {
   readonly credential_type?: (typeof STACK_CREDENTIAL_TYPES)[number];
   /** The account's client identity (S32a); absent when the relay registered none. */
   readonly identity?: StackIdentity;
-  /** Where the account's OAuth token is refreshed (section 6); absent: `source`. */
-  readonly refresh?: StackRefreshMode;
 }
 export interface StackConfigProxy {
   readonly id: string;
@@ -315,23 +307,20 @@ export interface StackConfigDocument {
 
 /**
  * The relay's account upkeep as egress gets it (docs/relay-changes-v2.md section 6; the gateway's stack-ops.ts sends it
- * to egress's `PUT /v1/stack/ops/accounts`): per account the refresh mode, per relay the cadence of `limits` and
+ * to egress's `PUT /v1/stack/ops/accounts`): per relay the cadence of `limits` and
  * `models` in seconds (0 turns one off; absent takes the vendor's default; egress clamps to the vendor's bounds).
  */
 export interface StackOwnCallSettings {
-  readonly refresh: ReadonlyMap<string, StackRefreshMode>;
   readonly everySeconds: { readonly limits?: number; readonly models?: number };
 }
 
 /** The upkeep settings of a configuration (`null`: none yet): an absent member is the default. */
 export function stackOwnCallSettings(metadata: StackConfigDocument | null): StackOwnCallSettings {
-  const refresh = new Map<string, StackRefreshMode>();
-  for (const account of metadata?.accounts ?? []) refresh.set(account.id, account.refresh === "gray" ? "gray" : "source");
   const every = metadata?.own_calls?.every_seconds;
   const seconds = (value: unknown): number | undefined => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined);
   const limits = seconds(every?.limits);
   const models = seconds(every?.models);
-  return { refresh, everySeconds: { ...(limits === undefined ? {} : { limits }), ...(models === undefined ? {} : { models }) } };
+  return { everySeconds: { ...(limits === undefined ? {} : { limits }), ...(models === undefined ? {} : { models }) } };
 }
 export interface StackConfigAnswer {
   readonly relay_id: string;

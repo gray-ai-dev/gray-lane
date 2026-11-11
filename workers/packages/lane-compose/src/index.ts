@@ -22,6 +22,8 @@ import { STACK_LAYOUT } from "./layout.ts";
 import { isYamlMap, parseComposeText, type YamlMap, type YamlValue } from "./yaml.ts";
 
 export { STACK_LAYOUT, type StackLayout } from "./layout.ts";
+// The strict compose reader, for relay-kit's `upgrade`, which reads the kit's own compose.yaml.
+export { isYamlMap, parseComposeText, type YamlMap } from "./yaml.ts";
 
 export interface SupplyExpectation {
   /** Digests the relay accepts for Gray's services (from the signed release list's `stack.gray_image`). */
@@ -88,6 +90,7 @@ const PROBLEM_TEXT = {
   limit_mismatch: "a resource limit or OOM priority is not the layout's",
   restart_mismatch: "the restart policy is not the layout's",
   depends_on_mismatch: "the dependencies are not the layout's",
+  healthcheck_mismatch: "the health check is not the layout's (egress: the relay's trust bundle is written, D1)",
   command_mismatch: "the entrypoint or command is not the layout's",
   listen_address_mismatch: "lane's client listener is not its front address (S3)",
   lane_environment_mismatch: "a fixed lane literal (relay config listener, relay address) is not the layout's",
@@ -151,6 +154,7 @@ const FIXED_CODES: Readonly<Record<string, ProblemCode>> = Object.freeze({
   networks: "networks_mismatch",
   restart: "restart_mismatch",
   depends_on: "depends_on_mismatch",
+  healthcheck: "healthcheck_mismatch",
   entrypoint: "command_mismatch",
   command: "command_mismatch",
   volumes: "volumes_mismatch",

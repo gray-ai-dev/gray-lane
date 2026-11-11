@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base32"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/json/jsontext"
@@ -19,6 +18,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -26,9 +26,8 @@ import (
 
 // A relay's sign-in inside the VM (docs/design/relay-in-cvm-login.md). A `password` account (ChatGPT or Claude) reaches
 // egress in the own-call push (stack_ops.go) with its sealed e-mail, password and optional TOTP secret. The relay's own
-// software signs it in, by its own logic, through one route of the relay listener:
-//
-//	GET|POST /v1/relay/login/{account_id}/{host}/<path>?<query>
+// software signs it in, by its own logic, through the sign-in proxy (signin_proxy.go): each request inside a CONNECT
+// tunnel to a vendor's sign-in host is one sign-in call (loginCall).
 //
 // How it signs in is the relay's: egress keeps only the customer's line. A call that names a customer request
 // (X-Gray-Request) is refused, so no sign-in call is bound to one or writes into its feed; the call goes only to the
@@ -45,9 +44,6 @@ import (
 // /credentials and egress refreshes. No line egress logs carries a value from a sign-in call.
 
 const (
-	relayLoginPrefix = "/v1/relay/login/"
-	loginRouteName   = "/v1/relay/login"
-
 	// The bounds on egress's own resources, wide of any sign-in. One call holds at most its body twice (as read and
 	// as filled: the filled query and body together are at most loginBodyMax, loginFill.left) and, on the token
 	// endpoint, the answer: 16 calls at once hold at most about 48 MiB beside the relay calls' own budget
@@ -60,6 +56,11 @@ const (
 	loginCallCap        = 60 * time.Second
 	// loginTokenLead: a token that ends within this is no longer good: the account's state says it needs a sign-in.
 	loginTokenLead = 5 * time.Minute
+	// defaultLoginPersistWait (-login-persist-wait): how long a token answer waits for the lane to write its family to
+	// the vault. The lane reads egress's tokens every LANE_STACK_POLL_MS (5 s, workers/gateway/src/lane/entry.ts
+	// `pollMs`) and writes one vault version (fsynced) per round: 10 s is two rounds, inside the 20 s a reference relay
+	// program waits for a token answer (new-api service/codex_oauth.go defaultHTTPTimeout).
+	defaultLoginPersistWait = 10 * time.Second
 
 	// The sealed values' bounds (the lane's checks are the same: @gray/relay-connector credential.ts).
 	loginUsernameMax = 254
@@ -78,7 +79,9 @@ type loginHostRule struct {
 	prefixes []string
 }
 
-// loginHosts are each vendor's sign-in hosts, as its official client signs in, reviewed as code:
+// loginHosts are each vendor's sign-in hosts and loginTokenEndpoints where its sign-in ends (an answer there with a token
+// makes it the account's), both read from the vendor sign-in rows (vendor-sign-in-v1.json, signin_rows.go), reviewed as
+// data:
 //
 //   - chatgpt_codex: auth.openai.com, the issuer of the Codex CLI's sign-in and token exchange (openai/codex
 //     codex-rs/login/src/server.rs DEFAULT_ISSUER; relay-kit login/codex-oauth.ts). It serves sign-in only, so every
@@ -89,19 +92,37 @@ type loginHostRule struct {
 //     https://claude.ai. claude.ai and platform.claude.com also serve stored content (conversations, projects, files,
 //     the Console), so only their sign-in paths are open: the OAuth paths the client names, and on claude.ai the
 //     sign-in pages by their names (`/login`, `/api/auth/`), which the client does not list.
-var loginHosts = map[string]map[string]loginHostRule{
-	"chatgpt_codex": {"auth.openai.com": {}},
-	"anthropic": {
-		"claude.com":          {prefixes: []string{"/cai/oauth/"}},
-		"claude.ai":           {prefixes: []string{"/oauth/", "/login", "/api/auth/"}},
-		"platform.claude.com": {prefixes: []string{"/oauth/", "/v1/oauth/token"}},
-	},
+var loginHosts, loginTokenEndpoints = loginTables(signInRows)
+
+// loginTokenRule is a vendor's token endpoints, where its sign-in ends (an answer there with a token makes it the
+// account's), and what a token answer must carry beyond RFC 6749's fields.
+type loginTokenRule struct {
+	endpoints []loginTokenEndpoint
+	// accountIDClaim: the access token must carry the ChatGPT account id claim, which serving names (stack_relay.go
+	// codexClaimAccountID); an answer without it is unreadable.
+	accountIDClaim bool
 }
 
-// loginTokenEndpoints are where each vendor's sign-in ends: an answer there with a token makes it the account's.
-var loginTokenEndpoints = map[string]struct{ host, path string }{
-	"chatgpt_codex": {"auth.openai.com", "/oauth/token"},
-	"anthropic":     {"platform.claude.com", "/v1/oauth/token"},
+type loginTokenEndpoint struct{ host, path string }
+
+// loginGrantTypes are the grant types a token-endpoint call may name: the ones CLIProxyAPI, sub2api and new-api send to
+// these endpoints (read 2026-11-11). Any other (the Codex CLI's token exchange for an API key, whose answer is not a
+// token family) is refused before the vendor, so its answer is never installed as one.
+var loginGrantTypes = map[string]bool{"authorization_code": true, "refresh_token": true}
+
+// tokenEndpoint is whether a call is to one of the vendor's token endpoints, in any spelling the server may read as it
+// (case, repeated or trailing slashes, dot segments).
+func (rule loginTokenRule) tokenEndpoint(method, host, decodedPath string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	clean := path.Clean(strings.ToLower(decodedPath))
+	for _, endpoint := range rule.endpoints {
+		if host == endpoint.host && clean == endpoint.path {
+			return true
+		}
+	}
+	return false
 }
 
 // The sign-in channel's refusals: closed codes, never a value from the call.
@@ -116,8 +137,23 @@ const (
 	errLoginBodyTooLarge       = "login_body_too_large"
 	errLoginPlaceholderRefused = "login_placeholder_refused"
 	errLoginBusy               = "login_busy"
-	// errLoginHeld (P7): this VM is not its relay's serving instance during a rollout; the serving one signs in.
+	// errLoginRateLimited: the account made -login-calls-per-minute sign-in calls this minute; 429 with Retry-After,
+	// never a vendor's word.
+	errLoginRateLimited = "login_rate_limited"
+	// errLoginHeld (P7): this VM is not its relay's serving instance during a rollout, or has not yet read the vault's
+	// newest version (the lane's hold); the serving one signs in.
 	errLoginHeld = "login_held"
+	// errLoginRefreshStale: a token-endpoint call presents a refresh token that is not the account's current one (the
+	// vault's, or the pending family's): another call rotated it, and using it again could revoke the account's family.
+	errLoginRefreshStale = "login_refresh_stale"
+	// errLoginPersistPending: the vendor answered a token, but the lane has not written it to the vault within
+	// loginPersistWait; the family stays pending and is persisted on a later poll. The answer is withheld.
+	errLoginPersistPending = "login_persist_pending"
+	// errLoginGrantRefused: a token-endpoint call names no grant type, or one outside loginGrantTypes.
+	errLoginGrantRefused = "login_grant_refused"
+	// errLoginAnswerUnreadable: the vendor answered 2xx but egress cannot read a token family from the answer (RFC 6749's
+	// fields, and the vendor's required claim); the answer, which may hold a token, is not handed out.
+	errLoginAnswerUnreadable = "login_answer_unreadable"
 )
 
 // The closed outcome codes of a token exchange, as the container's view and Gray's report carry them.
@@ -144,12 +180,18 @@ func loginRefusalStatus(code string) (int, bool) {
 		return http.StatusForbidden, true
 	case errLoginHostRefused, errLoginMethodRefused, errLoginPathRefused:
 		return http.StatusBadRequest, true
-	case errLoginHeaderRefused, errLoginBodyRefused, errLoginPlaceholderRefused:
+	case errLoginHeaderRefused, errLoginBodyRefused, errLoginPlaceholderRefused, errLoginGrantRefused:
 		return http.StatusUnprocessableEntity, true
 	case errLoginBodyTooLarge:
 		return http.StatusRequestEntityTooLarge, true
-	case errLoginBusy, errLoginHeld:
+	case errLoginRefreshStale:
+		return http.StatusConflict, true
+	case errLoginAnswerUnreadable:
+		return http.StatusBadGateway, true
+	case errLoginBusy, errLoginHeld, errLoginPersistPending:
 		return http.StatusServiceUnavailable, true
+	case errLoginRateLimited:
+		return http.StatusTooManyRequests, true
 	}
 	return 0, false
 }
@@ -267,8 +309,11 @@ func (l *opsLogin) carry(held *opsLogin) {
 }
 
 // loginNeeded: egress holds no access token for the account, the one it holds ends within loginTokenLead, or the
-// vendor refused its last refresh. Only the views read it: a sign-in may run at any time.
+// vendor refused its refresh token (recordLogin). Only the views read it: a sign-in may run at any time.
 func (o *stackOps) loginNeeded(account *opsAccount, now time.Time) bool {
+	if account.rejected {
+		return true
+	}
 	// Persist first: a sign-in's family the lane has not written yet is a good token (no new sign-in for it); its
 	// expiry decides, as an installed one's would.
 	if p := account.pending; p != nil && p.access != "" {
@@ -278,9 +323,6 @@ func (o *stackOps) loginNeeded(account *opsAccount, now time.Time) bool {
 		return true
 	}
 	if account.expiresAt != 0 && !now.Before(time.Unix(account.expiresAt, 0).Add(-loginTokenLead)) {
-		return true
-	}
-	if last := account.results[opRefresh]; last != nil && last.Outcome != "ok" && refreshCode(last) == refreshCodeVendorRejected {
 		return true
 	}
 	return false
@@ -399,6 +441,9 @@ func (f *loginFill) text(s string, limit int) (string, string) {
 		s = s[i:]
 		var value string
 		switch {
+		case f.username == "" && f.password == "":
+			// No sealed sign-in (a proxied call of an account without one): nothing to fill.
+			return "", errLoginPlaceholderRefused
 		case strings.HasPrefix(s, placeholderUsername):
 			value, s = f.username, s[len(placeholderUsername):]
 		case strings.HasPrefix(s, placeholderPassword):
@@ -556,33 +601,6 @@ func loginHeader(in http.Header) (http.Header, string) {
 	return out, ""
 }
 
-// serveLogin is the sign-in route (above). Its log line names the route and a closed code only.
-func (s *server) serveLogin(rec *responseRecorder, r *http.Request, entry *requestLog) {
-	entry.Route = loginRouteName
-	refuse := func(code, header string) {
-		entry.Error = code
-		writeLoginRefusal(rec, code, header)
-	}
-	// No sign-in call belongs to a customer request: one that names one is refused before anything else.
-	if len(r.Header.Values(stackRequestHeader)) > 0 {
-		refuse(errLoginRequestBound, "")
-		return
-	}
-	rest := strings.TrimPrefix(rawPathOf(r), relayLoginPrefix)
-	accountID, hostPath, found := strings.Cut(rest, "/")
-	host, vendorPath, _ := strings.Cut(hostPath, "/")
-	vendorPath = "/" + vendorPath
-	if !found || !validStackID(accountID) || !validRawPath(vendorPath) {
-		refuse(errLoginPathRefused, "")
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		refuse(errLoginMethodRefused, "")
-		return
-	}
-	s.ops.loginCall(rec, r, accountID, host, vendorPath, entry)
-}
-
 // loginCall is one sign-in call: the account and its hosts, the fill, the call through the account's proxy, the answer.
 func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, host, vendorPath string, entry *requestLog) {
 	refuse := func(code, header string) {
@@ -598,8 +616,14 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	var login opsLogin
 	var vendor string
 	var spec *egressSpec
-	if account != nil && account.login != nil {
-		login, vendor, spec = *account.login, account.vendor, account.spec
+	// A call through the sign-in proxy (signin_proxy.go) may be any subscription account's, a password account's
+	// included.
+	call := signInCallOf(r)
+	if account != nil && (account.login != nil || (call != nil && subscriptionAccount(account))) {
+		vendor, spec = account.vendor, account.spec
+		if account.login != nil {
+			login = *account.login
+		}
 	}
 	held := o.hold
 	o.mu.Unlock()
@@ -609,6 +633,11 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	}
 	if held {
 		refuse(errLoginHeld, "")
+		return
+	}
+	if wait := o.loginRate.take(accountID, o.now()); wait > 0 {
+		rec.Header().Set("Retry-After", strconv.Itoa(wait))
+		refuse(errLoginRateLimited, "")
 		return
 	}
 	rule, known := loginHosts[vendor][host]
@@ -625,6 +654,18 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	if named != "" {
 		refuse(errLoginHeaderRefused, named)
 		return
+	}
+	tokenRule := loginTokenEndpoints[vendor]
+	tokenCall := tokenRule.tokenEndpoint(r.Method, host, decodedPath)
+	if tokenCall {
+		// One token call per account at a time, egress's own refresh included (tokenCalls). A call waits for its account's
+		// slot before it takes one of the sign-in calls' (loginSlots): one account's retries never hold the others' off.
+		release, taken := o.tokenCalls.take(r.Context(), accountID, o.persistWait)
+		if !taken {
+			refuse(errLoginBusy, "")
+			return
+		}
+		defer release()
 	}
 	if !o.loginSlots.take() {
 		refuse(errLoginBusy, "")
@@ -670,34 +711,62 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 			}
 		}
 	}
+	if code == "" {
+		// The session rules and the boundary rewriting of a proxied call (signin_session.go).
+		query, body, code = call.outbound(r.Method, host, decodedPath, r.Header.Get("Content-Type"), query, body)
+	}
 	if code != "" {
 		refuse(code, "")
 		return
 	}
 
 	target := &url.URL{Scheme: "https", Host: host, Opaque: vendorPath, RawQuery: query}
-	ctx, cancel := context.WithTimeout(r.Context(), loginCallCap)
-	defer cancel()
-	plan := requestPlan{route: route{name: loginRouteName, host: host}, target: target, spec: spec}
-	endpoint := loginTokenEndpoints[vendor]
-	// The token endpoint in any spelling the server may read as it (case, repeated or trailing slashes, dot segments).
-	if r.Method != http.MethodPost || host != endpoint.host || path.Clean(strings.ToLower(decodedPath)) != endpoint.path {
+	plan := requestPlan{route: route{name: routeSignInProxyCall, host: host}, target: target, spec: spec}
+	if !tokenCall {
 		// Every other call: the vendor's answer streams back as it came, cookies and redirects included.
-		entry.Error = o.srv.forward(ctx, o.srv.relayClient, rec, r.Method, plan, header, body, nil)
+		ctx, cancel := context.WithTimeout(r.Context(), loginCallCap)
+		defer cancel()
+		entry.Error = o.srv.forward(ctx, o.srv.relayClient, rec, r.Method, plan, header, body, call.observer(r.Method, host, decodedPath))
 		return
 	}
-	// The token exchange: the answer is read whole (at most loginTokenAnswerMax), a token in it becomes the account's,
-	// and the answer passes back as it came.
+	// The token exchange, holding the account's slot: a grant type a token family comes from, and only the account's
+	// current refresh token (a second use of a rotated one fails, and may revoke the family).
+	grants, presented, code := readTokenCall(query, body)
+	if code == "" && (len(grants) == 0 || !allGrantsKnown(grants)) {
+		code = errLoginGrantRefused
+	}
+	var basis string
+	if code == "" {
+		code, basis = o.tokenCallRefusal(accountID, presented)
+	}
+	if code != "" {
+		refuse(code, "")
+		return
+	}
+	// A caller that went away while it waited sends nothing; once sent, the call runs to its end whatever the caller
+	// does (the vendor rotates the family when it answers, and the family must reach the vault).
+	if r.Context().Err() != nil {
+		entry.Error = errClientWrite
+		return
+	}
+	// The answer is read whole (at most loginTokenAnswerMax), a token in it becomes the account's, and the answer
+	// passes back as it came, once the family is in the vault (persist first; at once in phase 1).
 	capture := &captureWriter{header: http.Header{}, limit: loginTokenAnswerMax}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), loginCallCap)
+	defer cancel()
 	forwardCode := o.srv.forward(ctx, o.srv.relayClient, &responseRecorder{ResponseWriter: capture}, r.Method, plan, header, body, nil)
 	outcome := ""
 	var token *loginToken
+	// rejected: the vendor refused a refresh token (a 4xx answer to a refresh_token grant, such as invalid_grant): the
+	// account needs a sign-in now, not once its access token nears its end. A 5xx or a failed connection is not a refusal.
+	rejected := false
 	switch {
 	case forwardCode == "" && capture.status >= 200 && capture.status <= 299:
-		token, outcome = readLoginToken(vendor, capture.body.Bytes(), o.now())
+		token, outcome = readLoginToken(capture.body.Bytes(), tokenRule.accountIDClaim, o.now())
 	case forwardCode == "":
 		outcome = loginCodeVendorRejected
-	case ctx.Err() != nil && r.Context().Err() == nil:
+		rejected = capture.status >= 400 && capture.status <= 499 && inList(grants, "refresh_token")
+	case ctx.Err() != nil:
 		outcome = loginCodeTimeout
 	case forwardCode == errClientWrite:
 		outcome = loginCodeInvalidAnswer
@@ -708,7 +777,22 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	default:
 		outcome = loginCodeEgressError
 	}
-	o.recordLogin(accountID, login.username, token, outcome)
+	seq := o.recordLogin(accountID, login.username, basis, token, outcome, rejected)
+	if forwardCode == "" && capture.status >= 200 && capture.status <= 299 && token == nil {
+		// A 2xx answer egress cannot read may still hold a token: never handed out unpersisted, never the vendor's words.
+		call.exchanged(false, outcome)
+		refuse(errLoginAnswerUnreadable, "")
+		return
+	}
+	// Persist first: no token leaves before the lane has written its family to the vault and acknowledged it, nor one
+	// egress did not keep (a push removed the account or changed its sign-in while the call ran).
+	if token != nil && (seq == 0 || !o.awaitPersisted(r.Context(), accountID, seq)) {
+		call.persistFailed()
+		refuse(errLoginPersistPending, "")
+		return
+	}
+	// A session's code exchange counts once its family is in the vault (or the vendor refused it).
+	call.exchanged(token != nil, outcome)
 	entry.Error = forwardCode
 	if forwardCode != "" && (capture.status == 0 || forwardCode == errClientWrite || forwardCode == errResponseRead) {
 		// No whole answer: egress's own refusal, never a part of the vendor's.
@@ -732,6 +816,46 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	_, _ = rec.Write(capture.body.Bytes())
 }
 
+// loginRate counts each account's sign-in calls in a fixed one-minute window (-login-calls-per-minute).
+type loginRate struct {
+	perMinute int
+	mu        sync.Mutex
+	windows   map[string]*loginWindow
+}
+
+type loginWindow struct {
+	start time.Time
+	calls int
+}
+
+// take counts one call of the account at now: 0 when it may go, else the whole seconds until its window ends (at
+// least 1), for Retry-After.
+func (l *loginRate) take(accountID string, now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.windows == nil {
+		l.windows = map[string]*loginWindow{}
+	}
+	w := l.windows[accountID]
+	if w == nil || !now.Before(w.start.Add(time.Minute)) {
+		// A new window: ended ones of other accounts go with it, so the map holds only accounts that called this minute.
+		for id, other := range l.windows {
+			if !now.Before(other.start.Add(time.Minute)) {
+				delete(l.windows, id)
+			}
+		}
+		l.windows[accountID] = &loginWindow{start: now, calls: 1}
+		return 0
+	}
+	if w.calls < l.perMinute {
+		w.calls++
+		return 0
+	}
+	left := w.start.Add(time.Minute).Sub(now)
+	seconds := int((left + time.Second - 1) / time.Second)
+	return max(seconds, 1)
+}
+
 // loginSlots bounds the sign-in calls in flight (loginInFlightMax).
 type loginSlots struct{ n atomic.Int32 }
 
@@ -745,16 +869,19 @@ func (s *loginSlots) take() bool {
 
 func (s *loginSlots) give() { s.n.Add(-1) }
 
-// loginToken is a token exchange's result: the tokens and, for ChatGPT, the account id its calls name.
+// loginToken is a token exchange's result: the tokens and the ChatGPT account id its access token names, if any.
 type loginToken struct {
 	access, refresh string
 	accountID       string
 	expiresAt       int64
 }
 
-// readLoginToken reads a token exchange's answer: an access token (for ChatGPT a JWT carrying the account id), an
-// optional refresh token and expiry. An answer with no usable token is `invalid_answer`.
-func readLoginToken(vendor string, answer []byte, now time.Time) (*loginToken, string) {
+// readLoginToken reads a token exchange's answer by RFC 6749 §5.1's fields, the same for every vendor: an access
+// token, an optional refresh token, expires_in, and OpenID Connect's id_token (only checked: egress keeps none). An
+// answer with no usable token is `invalid_answer`; a member whose value is null is absent. The one claim serving
+// needs, a ChatGPT token's account id (the `chatgpt_account_id` field the vendor-ops table reads), is taken from the
+// access token, and required where the vendor's row says so (accountIDClaim).
+func readLoginToken(answer []byte, accountIDClaim bool, now time.Time) (*loginToken, string) {
 	value, ok := answerValue(answer)
 	members, isObject := value.(map[string]any)
 	if !ok || !isObject {
@@ -765,21 +892,28 @@ func readLoginToken(vendor string, answer []byte, now time.Time) (*loginToken, s
 		return nil, loginCodeInvalidAnswer
 	}
 	token := &loginToken{access: access}
-	if refresh, present := members["refresh_token"]; present {
-		text, isText := refresh.(string)
-		if !isText || !validCredentialValue(text) {
+	for _, name := range []string{"refresh_token", "id_token"} {
+		member := members[name]
+		if member == nil {
+			continue
+		}
+		text, isText := member.(string)
+		if !isText || text == "" {
 			return nil, loginCodeInvalidAnswer
 		}
-		token.refresh = text
-	}
-	if vendor == "chatgpt_codex" {
-		auth, _ := jwtClaims(access)["https://api.openai.com/auth"].(map[string]any)
-		token.accountID, _ = auth["chatgpt_account_id"].(string)
-		if !validCredentialValue(token.accountID) {
-			return nil, loginCodeInvalidAnswer
+		if name == "refresh_token" {
+			if !validCredentialValue(text) {
+				return nil, loginCodeInvalidAnswer
+			}
+			token.refresh = text
 		}
 	}
-	if expires, present := members["expires_in"]; present {
+	var claimed bool
+	token.accountID, claimed = codexClaimAccountID("Bearer " + access)
+	if accountIDClaim && !claimed {
+		return nil, loginCodeInvalidAnswer
+	}
+	if expires := members["expires_in"]; expires != nil {
 		number, isNumber := expires.(json.Number)
 		seconds, err := number.Int64()
 		if !isNumber || err != nil || seconds <= 0 || seconds > 366*86400 {
@@ -793,61 +927,59 @@ func readLoginToken(vendor string, answer []byte, now time.Time) (*loginToken, s
 	return token, ""
 }
 
-// jwtClaims is a JWT's payload as JSON, unverified: the answer came over egress's own TLS from the issuer.
-func jwtClaims(token string) map[string]any {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return nil
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil
-	}
-	var claims map[string]any
-	if json.Unmarshal(payload, &claims) != nil {
-		return nil
-	}
-	return claims
-}
-
 // recordLogin keeps a token exchange's outcome and installs its token, unless a push removed the account or changed its
-// identity while the call ran.
-func (o *stackOps) recordLogin(accountID, username string, token *loginToken, outcome string) {
+// identity while the call ran, or sealed a refresh token other than the one the account held as the call went out
+// (`basis`): a family refreshed from the old refresh token must not cover the maintainer's new token, so only the
+// pacing counts it (a re-seal of the same tokens, or a password account's lease renewal, changes nothing). A
+// refusal of a refresh token (`rejected`) marks the account as needing a sign-in until a token replaces it. It answers
+// the token's family's seq (0: no token, or not kept).
+func (o *stackOps) recordLogin(accountID, username, basis string, token *loginToken, outcome string, rejected bool) uint64 {
 	now := o.now()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	account := o.accounts[accountID]
-	if account == nil || account.login == nil || account.login.username != username {
-		return
+	// A proxied account without a sealed sign-in has username "" (signin_proxy.go).
+	if account == nil || (account.login == nil) != (username == "") || (account.login != nil && account.login.username != username) {
+		return 0
 	}
-	l := account.login
 	if token == nil {
-		l.failures++
-		l.last = &loginOutcome{outcome: "failed", code: outcome, at: now}
-		return
+		if l := account.login; l != nil {
+			l.failures++
+			l.last = &loginOutcome{outcome: "failed", code: outcome, at: now}
+		}
+		if rejected && currentRefresh(account) == basis {
+			account.rejected = true
+		}
+		return 0
 	}
-	o.installLoginTokenLocked(account, token, now)
+	if currentRefresh(account) != basis {
+		if l := account.login; l != nil {
+			l.failures, l.last, l.lastOK = 0, &loginOutcome{outcome: "ok", at: now}, now
+		}
+		return 0
+	}
+	return o.installLoginTokenLocked(account, token, now)
 }
 
 // installLoginTokenLocked makes a sign-in's tokens the account's: an own-call token (stack_ops.go), which the lane
 // reads at `GET /v1/stack/ops/tokens` and serves through /credentials, refreshed by egress from now on. Persist first
 // (stack_persist.go): the family is pending until the lane acknowledges it; the sign-in's pacing counts it at once.
-func (o *stackOps) installLoginTokenLocked(account *opsAccount, token *loginToken, now time.Time) {
+func (o *stackOps) installLoginTokenLocked(account *opsAccount, token *loginToken, now time.Time) uint64 {
 	o.tokenSeq++
 	family := &opsToken{seq: o.tokenSeq, basedOn: account.credentialVersion, access: token.access, refresh: token.refresh, expiresAt: token.expiresAt,
 		login: true, accountID: token.accountID}
-	// A refresh in flight read the refresh token this family replaces: its outcome is dropped (run).
-	account.generation = family.seq
-	l := account.login
-	l.failures = 0
-	l.last = &loginOutcome{outcome: "ok", at: now}
-	l.lastOK = now
+	account.rejected = false
+	if l := account.login; l != nil {
+		l.failures = 0
+		l.last = &loginOutcome{outcome: "ok", at: now}
+		l.lastOK = now
+	}
 	if o.persistFirst {
 		account.pending = family
-		delete(account.next, opRefresh)
-		return
+		return family.seq
 	}
 	o.installLoginFamilyLocked(account, family, now)
+	return family.seq
 }
 
 // installLoginFamilyLocked puts a sign-in's family in use: its access token, ChatGPT account id and refresh token (none
@@ -864,9 +996,6 @@ func (o *stackOps) installLoginFamilyLocked(account *opsAccount, family *opsToke
 		delete(account.fields, "refresh_token")
 	}
 	account.expiresAt = family.expiresAt
-	delete(account.results, opRefresh)
-	delete(account.next, opRefresh)
-	account.failures = 0
 	o.scheduleLocked(account, now)
 }
 
@@ -877,11 +1006,19 @@ func (o *stackOps) installLoginFamilyLocked(account *opsAccount, family *opsToke
 // than with the placeholders. The view is the container's alone (the relay listener), as its config document is.
 type opsLoginView struct {
 	State      string           `json:"state"`
-	Username   string           `json:"username"`
-	Password   string           `json:"password"`
+	Username   string           `json:"username,omitempty"`
+	Password   string           `json:"password,omitempty"`
 	TOTPSecret *string          `json:"totp_secret"`
 	Failures   int              `json:"failures"`
 	Last       *opsLoginLastRun `json:"last"`
+	// ProxyURL, Session and Token (signin_session.go): the account's sign-in proxy URL, the open sign-in session, and
+	// the token family egress holds.
+	ProxyURL *string            `json:"proxy_url,omitempty"`
+	Session  *loginSessionState `json:"session"`
+	Token    *loginTokenState   `json:"token,omitempty"`
+	// PendingPersist (persist first, stack_persist.go): a new token family waits for the lane to write it; the token in
+	// use is the old one.
+	PendingPersist bool `json:"pending_persist,omitempty"`
 }
 
 type opsLoginLastRun struct {
@@ -891,6 +1028,14 @@ type opsLoginLastRun struct {
 }
 
 func (o *stackOps) loginViewLocked(account *opsAccount, now time.Time) *opsLoginView {
+	view := o.signInViewLocked(account, o.passwordLoginViewLocked(account, now), now)
+	if view != nil && account.pending != nil {
+		view.PendingPersist = true
+	}
+	return view
+}
+
+func (o *stackOps) passwordLoginViewLocked(account *opsAccount, now time.Time) *opsLoginView {
 	l := account.login
 	if l == nil {
 		return nil
@@ -941,6 +1086,10 @@ func (o *stackOps) loginHealth() map[string]*opsLoginHealth {
 	for id, account := range o.accounts {
 		l := account.login
 		if l == nil {
+			// A subscription account the relay signs in through the proxy (signin_session.go signInHealthLocked).
+			if view := o.signInHealthLocked(account, now); view != nil {
+				out[id] = view
+			}
 			continue
 		}
 		view := &opsLoginHealth{By: "relay", State: o.loginState(account, now), Failures: l.failures}

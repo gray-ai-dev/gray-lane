@@ -106,7 +106,8 @@ const credentialTypeSchema = z.enum(CREDENTIAL_TYPES);
 export const credentialSchema = z
   .object({
     type: credentialTypeSchema,
-    value: z.string().min(1).max(MAX_CREDENTIAL_LENGTH),
+    // Empty for a `sign_in` credential only (it carries no secret).
+    value: z.string().max(MAX_CREDENTIAL_LENGTH),
     expires_at: u64Schema.optional(),
     refresh_token: z.string().min(1).max(MAX_CREDENTIAL_LENGTH).regex(/^[\x21-\x7e]+$/).optional(),
     // A `password` credential's sign-in e-mail and TOTP secret (credential.ts checks their form).
@@ -114,6 +115,7 @@ export const credentialSchema = z
     totp_secret: z.string().min(1).max(MAX_CREDENTIAL_LENGTH).optional(),
   })
   .strict()
+  .refine((credential) => (credential.type === "sign_in") === (credential.value === ""), { message: "a sign_in credential, and only one, has no value" })
   .refine((credential) => credential.refresh_token === undefined || credential.type === "oauth_access_token", { message: "only an access token has a refresh token" })
   .refine((credential) => (credential.type === "password") === (credential.username !== undefined), { message: "a password, and only a password, has a username" })
   .refine((credential) => credential.totp_secret === undefined || credential.type === "password", { message: "only a password has a TOTP secret" });

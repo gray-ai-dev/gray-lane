@@ -59,8 +59,8 @@ import type { StackRelayAppend, StackRelayCap, StackRelayConfig, StackRelayRoute
  * one: its container reads `appends` and inserts them under `appends_by: relay` (docs/relay-changes-v2.md §8's
  * removal waits for v2's release).
  *
- * **Refreshed credentials** (§6, own calls): a token egress refreshed for a `refresh: "gray"` account stands in
- * for the sealed credential it was refreshed from (`RelayCredentialStore.applyRefreshed`, taken by
+ * **Refreshed credentials** (§6, own calls): a token egress hands over (a sign-in's or a refresh's the relay's software
+ * made inside the VM) stands in for the sealed credential it was made from (`RelayCredentialStore.applyRefreshed`, taken by
  * `stack-ops.ts`), so it is what `sealed` holds here: `credentialsDigest` moves with it, and so does
  * `credentials_version`, while the routing version stays. A credential's `refresh_token` is never served and is
  * in neither digest.
@@ -292,7 +292,7 @@ export function buildStackDocument(input: StackDocumentInput): StackDocument {
       if (sealed.egress === undefined || !proxyMatches(proxy, sealed.egress)) return "proxy_mismatch";
       if (sealed.version < BigInt(proxy.credential_version)) return "proxy_waiting";
       return null;
-    })() ?? (sealed?.credential.type === "password" ? "login_waiting" : null);
+    })() ?? (sealed?.credential.type === "password" || sealed?.credential.type === "sign_in" ? "login_waiting" : null);
     if (reason !== null || sealed === undefined) {
       excluded.push({ kind: "account", id: account.id, reason: reason ?? "not_sealed" });
       continue;

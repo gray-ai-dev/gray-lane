@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/subtle"
+	"net/url"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,9 +30,8 @@ import (
 //   - `POST /v1/stack/ops/tokens/ack` `{"account_id": <id>, "seq": <n>}` installs the pending family whose seq it names:
 //     204. An ack of the family already installed is 204 again (the lane's ack can be lost, and it sends it again); any
 //     other is 409 `stack_ops_ack_stale` and changes nothing.
-//   - Until the ack, the account's state says so: `pending_persist` in the container's view, `problem: "not_persisted"`
-//     in Gray's (stack_ops.go `refreshHealth`). A lane that cannot write keeps not acknowledging; egress keeps the old
-//     token and lists the family again on every read.
+//   - Until the ack, the account's state says so: `pending_persist` in the container's `login` view. A lane that
+//     cannot write keeps not acknowledging; egress keeps the old token and lists the family again on every read.
 //   - A push of the same account carries the pending family on the terms egress's own token carries (the same sign-in,
 //     or a credential version not past the one it was refreshed from); a newer sealed credential drops it.
 //   - A push's `login.pacing` (the vault's) is taken only when egress holds no pacing of its own for that sign-in (after
@@ -93,6 +98,7 @@ func (o *stackOps) ack(body []byte) string {
 func (o *stackOps) installPendingLocked(account *opsAccount, now time.Time) {
 	family := account.pending
 	account.pending = nil
+	o.wakeLocked()
 	if family.login {
 		o.installLoginFamilyLocked(account, family, now)
 		return
@@ -103,9 +109,171 @@ func (o *stackOps) installPendingLocked(account *opsAccount, now time.Time) {
 		account.fields["refresh_token"] = family.refresh
 	}
 	account.expiresAt = family.expiresAt
-	if o.refreshes(account) {
-		account.next[opRefresh] = o.refreshAt(account, now)
+}
+
+// wakeLocked tells the token answers waiting for their family (awaitPersisted) that a family was installed or a push
+// replaced the set.
+func (o *stackOps) wakeLocked() {
+	close(o.familyChanged)
+	o.familyChanged = make(chan struct{})
+}
+
+// awaitPersisted waits until the family seq is the account's installed one (the lane wrote it to the vault and
+// acknowledged it; in phase 1 it is at once): true. False when persistWait passes first, the caller goes away, or the
+// family is no longer pending (a push dropped it, or a newer one replaced it): its answer is never handed out. A family
+// still pending stays so, and the lane's next poll persists it.
+func (o *stackOps) awaitPersisted(ctx context.Context, accountID string, seq uint64) bool {
+	timer := time.NewTimer(o.persistWait)
+	defer timer.Stop()
+	for {
+		o.mu.Lock()
+		account := o.accounts[accountID]
+		installed := account != nil && account.token != nil && account.token.seq == seq
+		pending := account != nil && account.pending != nil && account.pending.seq == seq
+		changed := o.familyChanged
+		o.mu.Unlock()
+		if installed || !pending {
+			return installed
+		}
+		select {
+		case <-changed:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
 	}
+}
+
+// ------------------------------------------------------------------------------------------- one token call at a time
+
+// tokenCalls lets one token-endpoint call per account run at a time: the relay's through the sign-in route and egress's
+// own refresh. A refresh rotates the refresh token; two at once would present the same one twice. Its own lock, so the
+// schedule's tick can take a slot under stackOps.mu. One slot per account id egress was pushed (at most a few thousand).
+type tokenCalls struct {
+	mu    sync.Mutex
+	slots map[string]chan struct{}
+	// waiting counts the calls waiting for a slot (tests).
+	waiting atomic.Int32
+}
+
+func (t *tokenCalls) slot(accountID string) chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.slots == nil {
+		t.slots = map[string]chan struct{}{}
+	}
+	slot := t.slots[accountID]
+	if slot == nil {
+		slot = make(chan struct{}, 1)
+		t.slots[accountID] = slot
+	}
+	return slot
+}
+
+// take waits up to max for the account's slot; the func gives it back.
+func (t *tokenCalls) take(ctx context.Context, accountID string, max time.Duration) (func(), bool) {
+	slot := t.slot(accountID)
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, true
+	default:
+	}
+	t.waiting.Add(1)
+	defer t.waiting.Add(-1)
+	timer := time.NewTimer(max)
+	defer timer.Stop()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, true
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	return nil, false
+}
+
+func (t *tokenCalls) give(accountID string) { <-t.slot(accountID) }
+
+// readTokenCall reads a token-endpoint call as the vendor would, by RFC 6749's members in a form body, a JSON body
+// (strict: no duplicate member hides a second value) or the query: the grant types it names and the refresh tokens it
+// presents; a code when egress cannot read it so.
+func readTokenCall(query string, body []byte) (grants, refresh []string, code string) {
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return nil, nil, errLoginPathRefused
+	}
+	grants, refresh = values["grant_type"], values["refresh_token"]
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	switch {
+	case len(trimmed) == 0:
+	case trimmed[0] == '{' || trimmed[0] == '[':
+		if checkStrictJSON(body) != nil {
+			return nil, nil, errLoginBodyRefused
+		}
+		value, _ := answerValue(body)
+		members, _ := value.(map[string]any)
+		for name, into := range map[string]*[]string{"grant_type": &grants, "refresh_token": &refresh} {
+			member, present := members[name]
+			if !present {
+				continue
+			}
+			text, isText := member.(string)
+			if !isText {
+				return nil, nil, errLoginBodyRefused
+			}
+			*into = append(*into, text)
+		}
+	default:
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, nil, errLoginBodyRefused
+		}
+		grants, refresh = append(grants, form["grant_type"]...), append(refresh, form["refresh_token"]...)
+	}
+	return grants, refresh, ""
+}
+
+func allGrantsKnown(grants []string) bool {
+	for _, grant := range grants {
+		if !loginGrantTypes[grant] {
+			return false
+		}
+	}
+	return true
+}
+
+// tokenCallRefusal checks a token-endpoint call holding its account's slot, just before it goes out: `login_held`
+// under the lane's hold (a draining instance, or one that has not read the vault's newest version), and
+// `login_refresh_stale` for a refresh token other than the account's current one: the pending family's while one waits
+// for the lane, else the installed one's (the vault's). It answers the account's current refresh token as the call goes
+// out: a token the call brings back is installed only while the account still holds it (recordLogin).
+func (o *stackOps) tokenCallRefusal(accountID string, presented []string) (string, string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.hold {
+		return errLoginHeld, ""
+	}
+	account := o.accounts[accountID]
+	// A proxied subscription account (signin_proxy.go) is held to the same rule as a password account.
+	if account == nil || (account.login == nil && !subscriptionAccount(account)) {
+		return errLoginAccountUnknown, ""
+	}
+	current := currentRefresh(account)
+	for _, token := range presented {
+		if current == "" || subtle.ConstantTimeCompare([]byte(token), []byte(current)) != 1 {
+			return errLoginRefreshStale, ""
+		}
+	}
+	return "", current
+}
+
+// currentRefresh is the account's current refresh token: the pending family's while one waits for the lane, else the
+// installed one's (the vault's, or the maintainer's newest sealed one).
+func currentRefresh(account *opsAccount) string {
+	if p := account.pending; p != nil && (p.refresh != "" || p.login) {
+		return p.refresh
+	}
+	return account.fields["refresh_token"]
 }
 
 // ------------------------------------------------------------------------------------------- the sign-in's pacing

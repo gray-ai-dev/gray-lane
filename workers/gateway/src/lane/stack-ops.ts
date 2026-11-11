@@ -6,13 +6,12 @@ import {
   egressValue,
   type Credential,
   type RelayVaultLogin,
-  type RefreshedRequest,
-  type RefreshedToken,
   type StackSealedAccount,
 } from "@gray/relay-connector";
 import { z } from "zod";
 import { LEASE_UNTIL_HEADER } from "./kms-lease.ts";
 import { BridgeCallError } from "./remote/client.ts";
+import { signInHandle, signsIn } from "./sign-in-proxy.ts";
 import type { StackExclusion } from "./stack-document.ts";
 
 /**
@@ -25,17 +24,13 @@ import type { StackExclusion } from "./stack-document.ts";
  *
  * 1. `PUT /v1/stack/ops/accounts`: the panel's served accounts with the credential fields egress's templates read
  *    (the access token or API key, ChatGPT's account id, a refresh token when one is sealed), the sealed version, the
- *    proxy, and the panel's own-call settings: each account's refresh mode (`source`, the default: the relay's
- *    software refreshes outside the VM; `gray`: egress does) and the relay's cadence for `limits` and `models`.
+ *    proxy, and the panel's own-call settings: the relay's cadence for `limits` and `models`.
  *    Sent when it differs from the last one egress took, and at least every `LANE_STACK_OPS_RESEND_MS` (egress keeps
  *    the set in memory only, so a restarted egress gets it back within that).
  * 2. `GET /v1/stack/ops/tokens`: each token egress refreshed and the sealed version it was refreshed from. A token
  *    newer than the one held goes into the credential store (`applyRefreshed`), where it stands in for that sealed
  *    version: the config document's `credentials_version` moves, the container fetches it through `/credentials`, and
  *    egress's request table follows its hash. `onRefreshed` then rebuilds the document at once.
- * 3. The write-back: tokens taken are held for gray-relay, which asks for them with a signed request
- *    (`POST /v1/aci/relay-credentials/refreshed`, `@gray/relay-connector` refreshed.ts) and writes each to the relay's
- *    account source. A token stays held until gray-relay acknowledges its `seq` or a newer sealed version replaces it.
  *
  * **Persist first (P2e-2, docs/design/relay-no-always-on-host.md H12, I9).** With a vault (`persist`), the push says
  * `"persist_first": true`, and egress holds every new token family pending (egress stack_persist.go): it keeps using the
@@ -62,13 +57,15 @@ export const STACK_OPS_ACCOUNTS_URL = "http://egress/v1/stack/ops/accounts";
 export const STACK_OPS_TOKENS_URL = "http://egress/v1/stack/ops/tokens";
 /** P2e-2: the lane wrote a pending family to the vault (egress stack_persist.go). */
 export const STACK_OPS_TOKENS_ACK_URL = "http://egress/v1/stack/ops/tokens/ack";
+/** docs/design/relay-sign-in-in-vm.md §3.1: the sign-in proxy's handle map (egress signin_session.go). */
+export const STACK_OPS_SIGN_IN_PROXY_URL = "http://egress/v1/stack/ops/sign-in-proxy";
 /** How often the account set is sent even when unchanged: egress holds it in memory only. */
 export const LANE_STACK_OPS_RESEND_MS = 60_000;
 
 /**
- * The panel's own-call settings, as the console serves them in `stack.config` (the relay's `own_calls` and each
- * account's `refresh`, set in the panel or the relay-stack document): `@gray/lane-wire` stackOwnCallSettings, which the
- * console's tests hold to what a console write serves.
+ * The panel's own-call settings, as the console serves them in `stack.config` (the relay's `own_calls`, set in the
+ * panel or the relay-stack document): `@gray/lane-wire` stackOwnCallSettings, which the console's tests hold to what a
+ * console write serves.
  */
 export type { StackOwnCallSettings };
 export const ownCallSettings = stackOwnCallSettings;
@@ -172,7 +169,8 @@ function errorCode(error: unknown): string {
  */
 export function opsCredentialFields(vendor: string, credential: Credential): Record<string, string> {
   if (credential.type === "api_key") return { api_key: credential.value };
-  if (credential.type === "password") return {};
+  // A password or sign_in account before its first sign-in has none: its token comes from the sign-in.
+  if (credential.type === "password" || credential.type === "sign_in") return {};
   const fields: Record<string, string> = { access_token: credential.value };
   if (vendor === "chatgpt_codex") fields.chatgpt_account_id = chatgptAccountId(credential.value);
   if (credential.refresh_token !== undefined) fields.refresh_token = credential.refresh_token;
@@ -213,19 +211,11 @@ export class StackOpsService {
   #sent: { readonly text: string; readonly at: number } | null = null;
   /** The highest token `seq` taken from egress, per account (a restarted egress numbers from 1 again: see #take). */
   #taken = new Map<string, { readonly seq: number; readonly value: string }>();
-  /** Tokens held for gray-relay's write-back, by account. */
-  #writeBack = new Map<string, RefreshedToken>();
   /**
    * P2e-2: the pending family written to the vault, per account, whose ack egress has not taken yet, and the access token
    * egress listed as installed beside it when it was written (the family it replaces), if any.
    */
   #written = new Map<string, { readonly seq: number; readonly value: string; readonly replaces: string | null }>();
-  /**
-   * Whether each account egress was last pushed is a password account (its sign-in in the push), by account id. Kept
-   * across pushes that leave the account out (a KMS lease that does not serve, an expired bundle: the credential store
-   * then lists nothing), so a token egress hands over meanwhile is still known as a sign-in's and never written back.
-   */
-  #pushedLogin = new Map<string, boolean>();
   /** P7: whether the account set egress last took carried `hold`. */
   #sentHold = false;
   /** P7: egress held, ran nothing and held no family pending, as of the last read. */
@@ -251,6 +241,7 @@ export class StackOpsService {
     if ((!force && this.#polledAt !== null && now - this.#polledAt < this.#options.pollMs) || viewNow().metadata === null) return;
     this.#running = true;
     try {
+      if (this.#tokensRun !== null) await this.#tokensRun.catch(() => undefined);
       let again = true;
       while (again) {
         this.#again = false;
@@ -267,6 +258,24 @@ export class StackOpsService {
     }
   }
 
+  /**
+   * Sign-in inside the VM (docs/design/relay-sign-in-in-vm.md §4.2, "a round on every login-operation call"): egress's
+   * tokens read now, without a push, so a sign-in's family egress holds pending is written and acknowledged within its
+   * persist wait. Nothing while a round runs (it reads them itself), and at most once a second.
+   */
+  async tokensNow(): Promise<void> {
+    const now = this.#options.now();
+    if (this.#running || this.#tokensRun !== null || this.#sent === null || (this.#tokensReadAt !== null && now - this.#tokensReadAt < 1_000)) return;
+    this.#tokensReadAt = now;
+    this.#tokensRun = this.#readTokens().finally(() => {
+      this.#tokensRun = null;
+    });
+    await this.#tokensRun;
+  }
+  /** The `tokensNow` read in flight: a round waits for it, so two reads never take one family twice. */
+  #tokensRun: Promise<void> | null = null;
+  #tokensReadAt: number | null = null;
+
   /** The `PUT /v1/stack/ops/accounts` body of now: served accounts only, in id order. */
   accountsBody(view: StackOpsView, now: number): string {
     const options = this.#options;
@@ -279,28 +288,28 @@ export class StackOpsService {
       if (held === undefined || notHeld.has(account.id) || held.vendor !== account.vendor) continue;
       let fields: Record<string, string>;
       try {
-        if (held.credential.type !== "password") authHeaders(account.vendor, held.credential);
+        if (held.credential.type !== "password" && held.credential.type !== "sign_in") authHeaders(account.vendor, held.credential);
         fields = opsCredentialFields(account.vendor, held.credential);
       } catch {
         continue;
       }
       // A password account (docs/design/relay-in-cvm-login.md): egress holds its sign-in for the relay's sign-in calls;
-      // the account is an access-token account (ChatGPT or Claude), refreshed by egress alone (its token exists only in
-      // the VM).
+      // the account is an access-token account (ChatGPT or Claude) whose token exists only in the VM.
       const login = held.login;
-      this.#pushedLogin.set(account.id, login !== undefined);
       const every: Record<string, bigint> = {};
       if (settings.everySeconds.limits !== undefined) every.limits = BigInt(settings.everySeconds.limits);
       if (settings.everySeconds.models !== undefined) every.models = BigInt(settings.everySeconds.models);
       accounts.push({
         account_id: account.id,
         vendor: account.vendor,
-        credential_type: login === undefined ? held.credential.type : "oauth_access_token",
-        credential_version: held.version.toString(),
+        // A sign_in account is a subscription (access-token) account whose token its sign-in in the VM makes.
+        credential_type: login === undefined && held.credential.type !== "sign_in" ? held.credential.type : "oauth_access_token",
+        // The version the account is the same one from (D9): egress keeps the token and the pending family it made from
+        // it across a re-seal that changed nothing (stack_ops.go carries them while this is not past their `basedOn`).
+        credential_version: (held.since ?? held.version).toString(),
         credential: fields,
         ...(held.credential.expires_at === undefined ? {} : { expires_at_s: held.credential.expires_at }),
         ...(held.egress === undefined || account.proxy_id === null ? {} : { proxy: egressValue(held.egress), proxy_id: account.proxy_id }),
-        refresh: login === undefined ? (settings.refresh.get(account.id) ?? "source") : "gray",
         every_seconds: every,
         models: [...account.models],
         ...(login === undefined
@@ -319,7 +328,26 @@ export class StackOpsService {
     return toJsonString(options.hold?.() === true ? { accounts, persist_first: true, hold: true } : { accounts, persist_first: true });
   }
 
+  /** `PUT /v1/stack/ops/sign-in-proxy`'s body: each pushed subscription account's handle, in id order (no password, D3). */
+  signInProxyBody(view: StackOpsView, now: number): string {
+    const pushed = (parsePlain(this.accountsBody(view, now)) as { accounts: { account_id: string; vendor: string; credential_type: string }[] }).accounts;
+    const accounts = pushed.filter((a) => signsIn(a.vendor, a.credential_type)).map((a) => ({ account: a.account_id, handle: signInHandle(this.#options.relayId, a.account_id) }));
+    return toJsonString({ accounts });
+  }
+
+  async #pushSignInProxy(view: StackOpsView, now: number, force: boolean): Promise<void> {
+    const body = this.signInProxyBody(view, now);
+    const sent = this.#signInProxySent;
+    if (!force && sent !== null && sent.text === body && now - sent.at < LANE_STACK_OPS_RESEND_MS) return;
+    const answer = await this.#egress(STACK_OPS_SIGN_IN_PROXY_URL, { method: "PUT", headers: { "content-type": "application/json" }, body });
+    if (answer === null) return;
+    if (answer.status === 204) this.#signInProxySent = { text: body, at: now };
+    else this.#log({ level: "warn", event: "lane_stack_ops_sign_in_proxy_failed", relay_id: this.#options.relayId, status: answer.status });
+  }
+  #signInProxySent: { readonly text: string; readonly at: number } | null = null;
+
   async #push(view: StackOpsView, now: number, force = false): Promise<void> {
+    await this.#pushSignInProxy(view, now, force);
     const body = this.accountsBody(view, now);
     const until = this.#options.leaseUntil?.();
     // The lease's end is part of what egress holds: a changed end (a renewal, a refusal) is pushed even with the same set.
@@ -415,7 +443,7 @@ export class StackOpsService {
       this.#log({ level: "warn", event: "lane_stack_ops_token_refused", relay_id: this.#options.relayId, account_id: token.account_id });
       return false;
     }
-    this.#recordTaken(token, credential);
+    this.#recordTaken(token);
     return true;
   }
 
@@ -428,21 +456,11 @@ export class StackOpsService {
     };
   }
 
-  /** A taken token: its seq for the next round, and the write-back gray-relay asks for. */
-  #recordTaken(token: z.infer<typeof tokensSchema>["tokens"][number], credential: Credential): void {
+  /** A taken token: its seq for the next round. */
+  #recordTaken(token: z.infer<typeof tokensSchema>["tokens"][number]): void {
     const held = this.#taken.get(token.account_id);
     const seq = Math.max(token.seq, (held?.seq ?? 0) + 1);
     this.#taken.set(token.account_id, { seq, value: token.credential.value });
-    // A password account's tokens stay in the VM: nothing is written back to the relay's source, which holds the
-    // password (docs/design/relay-in-cvm-login.md §1). Known from what egress was pushed, not from the store as served
-    // now, which lists nothing while the KMS lease does not serve.
-    if (!this.#isLogin(token.account_id)) this.#writeBack.set(token.account_id, { account_id: token.account_id, seq, credential });
-  }
-
-  /** Whether `accountId` is a password account: as egress was last pushed it, or as the store serves it now. */
-  #isLogin(accountId: string): boolean {
-    if (this.#pushedLogin.get(accountId) === true) return true;
-    return this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now()).some((a) => a.account_id === accountId && a.login !== undefined);
   }
 
   /**
@@ -467,7 +485,7 @@ export class StackOpsService {
       return false;
     }
     this.#written.set(token.account_id, { seq: token.seq, value: token.credential.value, replaces: installed?.credential.value ?? null });
-    this.#recordTaken(token, credential);
+    this.#recordTaken(token);
     await this.#ack(token.account_id, token.seq);
     return true;
   }
@@ -483,28 +501,6 @@ export class StackOpsService {
     this.#log({ level: "warn", event: "lane_stack_ops_ack_failed", relay_id: this.#options.relayId, account_id: accountId, status: answer.status });
     // 409: egress holds another family now (a newer one, or a push dropped it); the next round offers what it holds.
     if (answer.status === 409) this.#written.delete(accountId);
-  }
-
-  /**
-   * The tokens gray-relay has not acknowledged (`POST /v1/aci/relay-credentials/refreshed`): an acknowledged one,
-   * and one whose account a newer sealed version replaced, are dropped.
-   */
-  writeBackTokens(request: RefreshedRequest): readonly RefreshedToken[] {
-    if (request.relayId !== this.#options.relayId) return [];
-    const served = this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now());
-    const current = new Map(served.map((a) => [a.account_id, a.credential.value]));
-    const out: RefreshedToken[] = [];
-    for (const [accountId, token] of this.#writeBack) {
-      const acked = request.acked.get(accountId);
-      // A password account's token never leaves the VM, however it came to be held (checked again at the exit).
-      const login = this.#pushedLogin.get(accountId) === true || served.some((a) => a.account_id === accountId && a.login !== undefined);
-      if (login || (acked !== undefined && acked >= token.seq) || current.get(accountId) !== token.credential.value) {
-        this.#writeBack.delete(accountId);
-        continue;
-      }
-      out.push(token);
-    }
-    return out.sort((l, r) => (l.account_id < r.account_id ? -1 : l.account_id > r.account_id ? 1 : 0));
   }
 
   async #egress(url: string, init: RequestInit): Promise<{ readonly status: number; readonly text: string } | null> {

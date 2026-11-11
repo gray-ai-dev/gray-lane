@@ -60,8 +60,6 @@ const (
 	stackOpsAnswerMax    = 1 << 20
 	stackOpsModelsMax    = 1000
 	stackOpsLimitTextMax = 128
-	stackOpsBackoffFirst = 60 * time.Second
-	stackOpsBackoffMax   = 15 * time.Minute
 	stackOpsFirstRunMax  = 60 * time.Second
 	stackOpsAccountsMax  = 4096
 	stackOpsPushMax      = 16 << 20
@@ -93,6 +91,14 @@ type stackOps struct {
 	wg   sync.WaitGroup
 	// loginSlots bounds the sign-in calls in flight (stack_login.go).
 	loginSlots loginSlots
+	// loginRate bounds one account's sign-in calls in a minute (stack_login.go, -login-calls-per-minute).
+	loginRate loginRate
+	// tokenCalls: one token-endpoint call per account at a time, the relay's or egress's refresh (stack_persist.go).
+	tokenCalls tokenCalls
+	// familyChanged is closed and replaced when a family is installed or a push lands (wakeLocked), and persistWait
+	// bounds how long a token answer waits for its family to be persisted (-login-persist-wait).
+	familyChanged chan struct{}
+	persistWait   time.Duration
 }
 
 type opsAccount struct {
@@ -101,24 +107,22 @@ type opsAccount struct {
 	fields                     map[string]string
 	expiresAt                  int64 // Unix seconds, 0 unknown
 	spec                       *egressSpec
-	refreshMode                string
 	every                      map[string]time.Duration
 	models                     []string
 
-	next     map[string]time.Time
-	failures int
-	busy     bool
-	results  map[string]*opsResult
-	token    *opsToken
+	next    map[string]time.Time
+	busy    bool
+	results map[string]*opsResult
+	token   *opsToken
 	// pending is a token family egress holds but does not use until the lane acknowledges it persisted it (persist
 	// first, stack_persist.go); nil otherwise.
 	pending *opsToken
-	// generation is the seq of the last token family egress made for the account, by a sign-in or a refresh: a
-	// refresh records its outcome only if no other family was made while it ran (run).
-	generation uint64
-	test       *opsTestResult
+	test    *opsTestResult
 	// login is a `password` account's sealed sign-in (stack_login.go); nil for every other account.
 	login *opsLogin
+	// rejected: the vendor refused the refresh token of the account's current credential (stack_login.go recordLogin);
+	// it needs a sign-in until a token replaces that credential.
+	rejected bool
 }
 
 type opsToken struct {
@@ -151,7 +155,9 @@ type opsTestResult struct {
 }
 
 func newStackOps(srv *server, table opTable, now func() time.Time) *stackOps {
-	return &stackOps{srv: srv, table: table, now: now, jitter: randomJitter, accounts: map[string]*opsAccount{}}
+	return &stackOps{srv: srv, table: table, now: now, jitter: randomJitter, accounts: map[string]*opsAccount{},
+		familyChanged: make(chan struct{}), persistWait: defaultLoginPersistWait,
+		loginRate: loginRate{perMinute: defaultLoginCallsPerMinute}}
 }
 
 // randomJitter is a uniform duration in [0, max) from crypto/rand: the container cannot predict or move it.
@@ -209,7 +215,7 @@ func (o *stackOps) tick(ctx context.Context) {
 		if account.busy {
 			continue
 		}
-		for _, op := range []string{opRefresh, opLimits, opModels} {
+		for _, op := range []string{opLimits, opModels} {
 			if at, scheduled := account.next[op]; scheduled && !now.Before(at) {
 				account.busy = true
 				o.running++
@@ -270,40 +276,6 @@ func (o *stackOps) scheduleLocked(account *opsAccount, now time.Time) {
 		}
 		account.next[op] = now.Add(o.jitter(min(account.every[op], stackOpsFirstRunMax)))
 	}
-	if _, has := account.next[opRefresh]; !has && o.refreshes(account) {
-		account.next[opRefresh] = o.refreshAt(account, now)
-	}
-	if !o.refreshes(account) {
-		delete(account.next, opRefresh)
-	}
-}
-
-// refreshes is an account egress refreshes: `refresh: "gray"`, an operation in the table and a refresh token, and no
-// hold (P7: only the relay's serving instance refreshes).
-func (o *stackOps) refreshes(account *opsAccount) bool {
-	return !o.hold && o.refreshable(account)
-}
-
-// refreshable is an account egress refreshes when it does not hold: what decides whether a refresh's result is kept. A
-// refresh already at the vendor when the hold arrives keeps its result (P7 case 0: the vendor has rotated the refresh
-// token by then, so a dropped family would leave no instance able to refresh the account); the hold stops new ones.
-func (o *stackOps) refreshable(account *opsAccount) bool {
-	return account.refreshMode == "gray" && o.table.op(account.vendor, account.credentialType, opRefresh) != nil && account.fields["refresh_token"] != ""
-}
-
-// refreshAt is the next refresh: before expiry by the table's lead less up to a tenth of it; with no expiry known,
-// within a minute (the answer then says when it expires).
-func (o *stackOps) refreshAt(account *opsAccount, now time.Time) time.Time {
-	op := o.table.op(account.vendor, account.credentialType, opRefresh)
-	if account.expiresAt == 0 {
-		return now.Add(o.jitter(stackOpsFirstRunMax))
-	}
-	lead := time.Duration(op.beforeExpiry) * time.Second
-	at := time.Unix(account.expiresAt, 0).Add(-lead - o.jitter(lead/10))
-	if at.Before(now) {
-		return now
-	}
-	return at
 }
 
 // run performs one operation and records its outcome and the next run.
@@ -312,7 +284,7 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	entry := o.table[account.vendor+"/"+account.credentialType]
 	template := entry.ops[op]
 	inputs := opInputs{account: copyFields(account.fields)}
-	spec, vendor, id, version, generation := account.spec, account.vendor, account.id, account.credentialVersion, account.generation
+	spec, vendor, id := account.spec, account.vendor, account.id
 	o.mu.Unlock()
 
 	// The lease may have ended since the tick: checked again just before the vendor call, which is then not made.
@@ -330,11 +302,8 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	if status != 0 {
 		result.Status = &status
 	}
-	var refreshed *opsToken
 	if code == "" {
 		switch op {
-		case opRefresh:
-			refreshed, code = readRefresh(template.result, answer, now)
 		case opModels:
 			result.IDs, code = readModels(template.result, answer)
 		case opLimits:
@@ -351,74 +320,20 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	defer o.mu.Unlock()
 	o.running--
 	account.busy = false
-	// A push may have replaced the account while the call ran: the result goes to the account now held, and a
-	// refreshed token only when no newer credential arrived meanwhile.
+	// A push may have replaced the account while the call ran: the result goes to the account now held.
 	account = o.accounts[id]
 	if account == nil || account.vendor != vendor {
 		return
 	}
 	account.busy = false
-	if op == opRefresh && account.generation != generation {
-		// A sign-in made the account's tokens while the refresh ran, from the refresh token it read before: its
-		// outcome, a token or a failure, is of a family the account no longer holds. The sign-in scheduled the next
-		// refresh.
+	account.results[op] = result
+	every := account.every[op]
+	if every <= 0 {
+		// Turned off while the call ran: no next run (a zero interval would run it every tick).
+		delete(account.next, op)
 		return
 	}
-	account.results[op] = result
-	switch op {
-	case opRefresh:
-		switch {
-		case !o.refreshable(account):
-			delete(account.next, opRefresh)
-		case refreshed != nil && account.credentialVersion == version && o.persistFirst:
-			// Persist first: the family waits for the lane's ack, and no refresh runs until it is installed (the vendor
-			// may have rotated the refresh token egress holds).
-			o.tokenSeq++
-			refreshed.seq, refreshed.basedOn = o.tokenSeq, account.credentialVersion
-			account.generation = refreshed.seq
-			account.pending = refreshed
-			if refreshed.expiresAt != 0 {
-				result.ExpiresAt = &refreshed.expiresAt
-			}
-			account.failures = 0
-			delete(account.next, opRefresh)
-		case refreshed != nil && account.credentialVersion == version:
-			o.tokenSeq++
-			refreshed.seq, refreshed.basedOn = o.tokenSeq, account.credentialVersion
-			account.generation = refreshed.seq
-			account.token = refreshed
-			account.fields["access_token"] = refreshed.access
-			if refreshed.refresh != "" {
-				account.fields["refresh_token"] = refreshed.refresh
-			}
-			account.expiresAt = refreshed.expiresAt
-			if refreshed.expiresAt != 0 {
-				result.ExpiresAt = &refreshed.expiresAt
-			}
-			account.failures = 0
-			account.next[opRefresh] = o.refreshAt(account, now)
-		case refreshed != nil:
-			// A newer credential arrived while the call ran: its own expiry schedules the next refresh.
-			account.failures = 0
-			account.next[opRefresh] = o.refreshAt(account, now)
-		default:
-			account.failures++
-			backoff := stackOpsBackoffFirst << min(account.failures-1, 4)
-			account.next[opRefresh] = now.Add(min(backoff, stackOpsBackoffMax))
-		}
-		if o.hold {
-			// Held: the result is kept above, and nothing more is scheduled.
-			delete(account.next, opRefresh)
-		}
-	default:
-		every := account.every[op]
-		if every <= 0 {
-			// Turned off while the call ran: no next run (a zero interval would run it every tick).
-			delete(account.next, op)
-			break
-		}
-		account.next[op] = now.Add(every + o.jitter(every/10))
-	}
+	account.next[op] = now.Add(every + o.jitter(every/10))
 }
 
 func copyFields(fields map[string]string) map[string]string {
@@ -528,42 +443,6 @@ func pointerValue(value any, pointer string) (any, bool) {
 	return value, true
 }
 
-func readRefresh(spec opResultSpec, answer []byte, now time.Time) (*opsToken, string) {
-	value, ok := answerValue(answer)
-	if !ok {
-		return nil, opsCodeInvalidAnswer
-	}
-	access, ok := pointerValue(value, spec.AccessToken)
-	accessText, isText := access.(string)
-	if !ok || !isText || !validCredentialValue(accessText) {
-		return nil, opsCodeInvalidAnswer
-	}
-	token := &opsToken{access: accessText}
-	if spec.RefreshToken != "" {
-		if refresh, found := pointerValue(value, spec.RefreshToken); found {
-			text, isText := refresh.(string)
-			if !isText || !validCredentialValue(text) {
-				return nil, opsCodeInvalidAnswer
-			}
-			token.refresh = text
-		}
-	}
-	if spec.ExpiresIn != "" {
-		if expires, found := pointerValue(value, spec.ExpiresIn); found {
-			number, isNumber := expires.(json.Number)
-			seconds, err := number.Int64()
-			if !isNumber || err != nil || seconds <= 0 || seconds > 366*86400 {
-				return nil, opsCodeInvalidAnswer
-			}
-			token.expiresAt = now.Unix() + seconds
-		}
-	}
-	if token.expiresAt == 0 {
-		token.expiresAt = jwtExpiry(accessText)
-	}
-	return token, ""
-}
-
 // jwtExpiry is a JWT access token's `exp` claim, or 0: the vendor's own answer, read for the schedule only.
 func jwtExpiry(token string) int64 {
 	parts := strings.Split(token, ".")
@@ -652,7 +531,6 @@ type wireOpsAccount struct {
 	ExpiresAt         *int64             `json:"expires_at_s"`
 	Proxy             json.RawMessage    `json:"proxy"`
 	ProxyID           *string            `json:"proxy_id"`
-	Refresh           *string            `json:"refresh"`
 	Every             *map[string]int64  `json:"every_seconds"`
 	Models            *[]string          `json:"models"`
 	// Login is a `password` account's sealed sign-in (stack_login.go): its e-mail, password and TOTP secret. Such an
@@ -715,7 +593,8 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 		}
 		rec.WriteHeader(http.StatusNoContent)
 	default:
-		refuse(errRouteRefused)
+		// The sign-in routes (signin_session.go) refuse every other path.
+		s.serveSignInControl(rec, r, entry)
 	}
 }
 
@@ -747,16 +626,15 @@ func (o *stackOps) put(body []byte) bool {
 		held := o.accounts[id]
 		carried := false
 		if held != nil && held.vendor == account.vendor && held.credentialType == account.credentialType {
-			account.next, account.results, account.test, account.failures = held.next, held.results, held.test, held.failures
-			account.generation = held.generation
+			account.next, account.results, account.test = held.next, held.results, held.test
 			sameLogin := account.login.sameIdentity(held.login)
 			if sameLogin {
 				account.login.carry(held.login)
 				carried = true
 			}
-			// egress's own refresh is newer than any push from the version it was refreshed from. A password
-			// account's token exists only in the VM: egress's own (from a sign-in or a refresh of one) is always the
-			// newest, whatever the version; the lane's pushed copy stands in only after egress restarted.
+			// The token egress holds from a sign-in or a relay token call is newer than any push from the version it was
+			// made from. A password account's token exists only in the VM: egress's own is always the newest, whatever
+			// the version; the lane's pushed copy stands in only after egress restarted.
 			if held.token != nil && (sameLogin || account.credentialVersion <= held.token.basedOn) {
 				account.token = held.token
 				account.fields["access_token"] = held.token.access
@@ -765,11 +643,15 @@ func (o *stackOps) put(body []byte) bool {
 				}
 				account.expiresAt = held.token.expiresAt
 				account.credentialVersion = held.credentialVersion
-				if sameLogin && held.fields["chatgpt_account_id"] != "" {
+				// The token's ChatGPT account id goes with it, whoever's push kept it.
+				if held.fields["chatgpt_account_id"] != "" {
 					account.fields["chatgpt_account_id"] = held.fields["chatgpt_account_id"]
 				}
-			} else if account.expiresAt != held.expiresAt {
-				delete(account.next, opRefresh) // a new expiry moves the refresh
+				account.rejected = held.rejected
+			} else if held.rejected && held.token == nil && account.fields["access_token"] == held.fields["access_token"] &&
+				account.fields["refresh_token"] == held.fields["refresh_token"] {
+				// The same sealed tokens again: the vendor's refusal of them still stands.
+				account.rejected = true
 			}
 			// A pending family (persist first) stays pending on the same terms as egress's token: the lane has not
 			// written it yet. A newer sealed credential drops it.
@@ -785,19 +667,17 @@ func (o *stackOps) put(body []byte) bool {
 			account.login.adoptPushedPacing()
 		}
 		o.scheduleLocked(account, now)
-		if account.pending != nil {
-			delete(account.next, opRefresh) // no refresh while a family waits for the lane
-		}
 		next[id] = account
 	}
 	o.accounts = next
 	o.persistFirst = wire.PersistFirst != nil && *wire.PersistFirst
+	o.wakeLocked()
 	return true
 }
 
 func (o *stackOps) parseAccount(w wireOpsAccount) (*opsAccount, bool) {
 	if w.AccountID == nil || !validStackID(*w.AccountID) || w.Vendor == nil || w.CredentialType == nil || w.CredentialVersion == nil ||
-		w.Credential == nil || w.Refresh == nil || w.Every == nil || w.Models == nil {
+		w.Credential == nil || w.Every == nil || w.Models == nil {
 		return nil, false
 	}
 	if _, known := stackVendors[*w.Vendor]; !known || !inList(stackCredentialTypes[*w.Vendor], *w.CredentialType) {
@@ -807,11 +687,8 @@ func (o *stackOps) parseAccount(w wireOpsAccount) (*opsAccount, bool) {
 	if err != nil || strconv.FormatUint(version, 10) != *w.CredentialVersion {
 		return nil, false
 	}
-	if *w.Refresh != "source" && *w.Refresh != "gray" {
-		return nil, false
-	}
 	account := &opsAccount{id: *w.AccountID, vendor: *w.Vendor, credentialType: *w.CredentialType, credentialVersion: version,
-		fields: map[string]string{}, refreshMode: *w.Refresh, every: map[string]time.Duration{}, next: map[string]time.Time{},
+		fields: map[string]string{}, every: map[string]time.Duration{}, next: map[string]time.Time{},
 		results: map[string]*opsResult{}}
 	allowed := stackOpsAccountFields[account.credentialType]
 	for name, value := range *w.Credential {
@@ -828,8 +705,10 @@ func (o *stackOps) parseAccount(w wireOpsAccount) (*opsAccount, bool) {
 			return nil, false
 		}
 		account.login = login
-		account.refreshMode = "gray"
-	} else if account.fields["access_token"] == "" && account.fields["api_key"] == "" {
+	} else if account.fields["access_token"] == "" && account.fields["api_key"] == "" && !subscriptionAccount(account) {
+		// A subscription account with no credential yet is waiting for its first sign-in through the proxy
+		// (docs/design/relay-sign-in-in-vm.md): it is kept, with no upkeep and no refresh until a sign-in installs a
+		// token (scheduleLocked runs nothing without one); the lane serves it only once it has one.
 		return nil, false
 	}
 	if w.ExpiresAt != nil {
@@ -949,20 +828,15 @@ func (o *stackOps) recordTest(accountID, model string, answer *accountTestAnswer
 // ------------------------------------------------------------------------------------------- the container's view
 
 type opsAccountState struct {
-	ID      string          `json:"id"`
-	Refresh *opsRefreshView `json:"refresh"`
-	Limits  *opsResult      `json:"limits"`
-	Models  *opsResult      `json:"models"`
-	Test    *opsTestResult  `json:"test"`
+	ID string `json:"id"`
+	// Vendor names the account's vendor, so the relay's software knows which sign-in to run for an account it has no
+	// token for yet (a `sign_in` account is not in the config document before its first sign-in).
+	Vendor string         `json:"vendor"`
+	Limits *opsResult     `json:"limits"`
+	Models *opsResult     `json:"models"`
+	Test   *opsTestResult `json:"test"`
 	// Login is a password account's sign-in (stack_login.go), absent for every other account.
 	Login *opsLoginView `json:"login,omitempty"`
-}
-
-type opsRefreshView struct {
-	Mode string     `json:"mode"`
-	Last *opsResult `json:"last"`
-	// PendingPersist (persist first): a new token family waits for the lane to write it; the token in use is the old one.
-	PendingPersist bool `json:"pending_persist,omitempty"`
 }
 
 // state is `GET /v1/relay/account-state`: per account, the last result of each operation. Results come from the
@@ -973,116 +847,11 @@ func (o *stackOps) state() map[string]any {
 	defer o.mu.Unlock()
 	accounts := []opsAccountState{}
 	for _, account := range o.accounts {
-		accounts = append(accounts, opsAccountState{ID: account.id, Refresh: &opsRefreshView{Mode: account.refreshMode, Last: account.results[opRefresh], PendingPersist: account.pending != nil},
+		accounts = append(accounts, opsAccountState{ID: account.id, Vendor: account.vendor,
 			Limits: account.results[opLimits], Models: account.results[opModels], Test: account.test, Login: o.loginViewLocked(account, now)})
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
 	return map[string]any{"as_of_ms": o.now().UnixMilli(), "accounts": accounts}
-}
-
-// ------------------------------------------------------------------------------------------- Gray's view
-
-// The closed refresh codes Gray's view carries (`@gray/lane-wire` STACK_REFRESH_CODES): why the last refresh failed,
-// in words the panel turns into a next step.
-const (
-	refreshCodeVendorRejected = "vendor_rejected" // 400, 401 or 403: the refresh token is refused (sign in again)
-	refreshCodeVendorError    = "vendor_error"
-	refreshCodeProxyFailed    = "proxy_failed"
-	refreshCodeConnectFailed  = "connect_failed"
-	refreshCodeTimeout        = "timeout"
-	refreshCodeInvalidAnswer  = "invalid_answer"
-	refreshCodeInputMissing   = "input_missing"
-	refreshCodeEgressError    = "egress_error"
-	refreshProblemNoToken     = "no_refresh_token"
-	// refreshProblemNotPersisted: a new token family waits for the lane to write it to the VM's vault (persist first).
-	refreshProblemNotPersisted = "not_persisted"
-)
-
-// opsRefreshHealth is one account's token refresh as `GET /v1/stack/health` carries it to the entry, which reports it
-// to Gray: who refreshes it (`source` or `gray`), why egress cannot (`no_refresh_token`: a `gray` account whose source
-// gave no refresh token is never refreshed), its last attempt and the next one, and the failed attempts in a row. A
-// `source` account names its mode only. No value in it is a credential.
-type opsRefreshHealth struct {
-	Mode string `json:"mode"`
-	// HasRefreshToken is whether the credential egress holds carries a refresh token (never the token), in either mode:
-	// the panel offers `gray` only for an account that has one.
-	HasRefreshToken bool            `json:"has_refresh_token"`
-	Problem         *string         `json:"problem"`
-	Last            *opsRefreshLast `json:"last"`
-	NextMS          *int64          `json:"next_ms"`
-	Failures        int             `json:"failures"`
-}
-
-type opsRefreshLast struct {
-	Outcome string  `json:"outcome"`
-	Code    *string `json:"code"`
-	AtMS    int64   `json:"at_ms"`
-}
-
-// refreshHealth is each account's refresh by id, for the accounts whose vendor's table has a refresh.
-func (o *stackOps) refreshHealth() map[string]*opsRefreshHealth {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	out := map[string]*opsRefreshHealth{}
-	for id, account := range o.accounts {
-		if o.table.op(account.vendor, account.credentialType, opRefresh) == nil {
-			continue
-		}
-		view := &opsRefreshHealth{Mode: account.refreshMode, HasRefreshToken: account.fields["refresh_token"] != ""}
-		if account.refreshMode == "gray" {
-			// A password account's refresh token comes with its sign-in: without one it needs a sign-in, which its
-			// login view says, not a problem of its refresh.
-			if !view.HasRefreshToken && account.login == nil {
-				problem := refreshProblemNoToken
-				view.Problem = &problem
-			}
-			// Persist first: a family the lane has not written yet (stack_persist.go); egress keeps the token it had.
-			if account.pending != nil {
-				problem := refreshProblemNotPersisted
-				view.Problem = &problem
-			}
-			if last := account.results[opRefresh]; last != nil {
-				view.Last = &opsRefreshLast{Outcome: last.Outcome, AtMS: last.AsOfMS}
-				if last.Outcome != "ok" {
-					code := refreshCode(last)
-					view.Last.Code = &code
-				}
-			}
-			if at, scheduled := account.next[opRefresh]; scheduled {
-				ms := at.UnixMilli()
-				view.NextMS = &ms
-			}
-			view.Failures = account.failures
-		}
-		out[id] = view
-	}
-	return out
-}
-
-// refreshCode is a failed refresh's closed code: the operation's outcome code, or forward's own for no answer.
-func refreshCode(result *opsResult) string {
-	code := ""
-	if result.Code != nil {
-		code = *result.Code
-	}
-	switch code {
-	case opsCodeVendorError:
-		if result.Status != nil && (*result.Status == http.StatusBadRequest || *result.Status == http.StatusUnauthorized || *result.Status == http.StatusForbidden) {
-			return refreshCodeVendorRejected
-		}
-		return refreshCodeVendorError
-	case opsCodeInvalidAnswer:
-		return refreshCodeInvalidAnswer
-	case opsCodeInputMissing:
-		return refreshCodeInputMissing
-	case opsCodeTimeout:
-		return refreshCodeTimeout
-	case errProxyFailed:
-		return refreshCodeProxyFailed
-	case errConnectFailed, errTLSFailed, errUpstreamFailed:
-		return refreshCodeConnectFailed
-	}
-	return refreshCodeEgressError
 }
 
 // serveAccountState is the relay listener's one own route: a GET without a body or a query. Everything else on the
@@ -1102,10 +871,20 @@ func (s *server) serveAccountState(rec *responseRecorder, r *http.Request, entry
 func (s *server) relayHandler(w http.ResponseWriter, r *http.Request) {
 	path := rawPathOf(r)
 	switch {
+	case r.Method == http.MethodConnect:
+		// The sign-in proxy (signin_proxy.go); without ops there is no account to sign in.
+		if s.ops == nil {
+			s.handled(w, r, func(rec *responseRecorder, _ *http.Request, entry *requestLog) {
+				entry.Route, entry.Error = routeSignInProxyCall, errMethodRefused
+				writeRefusal(rec, errMethodRefused)
+			})
+			return
+		}
+		s.handled(w, r, s.serveSignInConnect)
+	case s.ops != nil && strings.HasPrefix(path, relayLoginPrompt):
+		s.handled(w, r, s.serveLoginPrompt)
 	case s.ops != nil && path == relayAccountStatePath:
 		s.handled(w, r, s.serveAccountState)
-	case s.ops != nil && strings.HasPrefix(path, relayLoginPrefix):
-		s.handled(w, r, s.serveLogin)
 	case strings.HasPrefix(path, relayOwnPrefix):
 		s.handled(w, r, func(rec *responseRecorder, _ *http.Request, entry *requestLog) {
 			entry.Route, entry.Error = relayOwnPrefix, errRelayRouteUnknown
