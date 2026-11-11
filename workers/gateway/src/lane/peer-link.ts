@@ -29,8 +29,9 @@ import {
  *   carries bytes only (O7). `?keyset=` names one boot: while an image rollout runs two instances of the relay's app,
  *   gray-relay reaches each of its replicas' VMs by it. Without it, the relay's newest boot (docs/design/relay-zero-
  *   downtime.md): its newest pinned one, else (a VM that just started) peerlink's newest unverified session;
- * - `GET /v1/peer/relays/<relay>/healthz` (public, R4): the VM's own `/healthz` through egress's pinned stream, with
- *   `x-gray-peer-keyset` and `x-gray-peer-sessions`;
+ * - `GET /v1/peer/relays/<relay>/healthz` (public, R4): the VM's own `/healthz` through egress's pinned stream, of the
+ *   boot a request would go to (the registry's usable boots, a sealed one first), with `x-gray-peer-keyset` and
+ *   `x-gray-peer-sessions`;
  * - `GET /v1/peer/relays/<relay>/boots` (public): every boot of the relay with a session, newest first: its keyset, app
  *   and instance ids, relay image, sessions, open streams, and whether it is ready (pinned, usable, holding the relay's
  *   sealed credentials). The provisioner's image rollout reads it to know the new instance serves and the old one has
@@ -68,7 +69,7 @@ export interface PeerLinkDeps extends Omit<PeerSessionsDeps, "pinOf"> {
   readonly keysetDigest: string;
   /** The registry's pin of (relay, keyset), or null. */
   readonly pinOf: (relay: string, keyset: string) => KeysetPin | null;
-  /** What the registry knows of one boot (`PeerRegistry.bootOf`), for the boots route. */
+  /** What the registry knows of one boot (`PeerRegistry.bootOf`), for the boots and health routes; without it no boot is usable. */
   readonly bootOf?: (relay: string, keyset: string) => { readonly appId: string | null; readonly instanceId: string | null; readonly relayImage: string | null; readonly usable: boolean; readonly sealed: boolean | null } | null;
 }
 
@@ -153,11 +154,21 @@ export class PeerLink implements PeerChannel {
     }
   }
 
-  /** `GET /v1/peer/relays/<relay>/healthz` (section 5, fault test 13). */
+  /**
+   * `GET /v1/peer/relays/<relay>/healthz` (section 5, fault test 13). It asks the boot a request would go to
+   * (`PeerRegistry.usable`): of the boots the registry holds usable, a sealed one, the newest of them, else the oldest.
+   * During an image rollout a new boot is pinned before it can serve; asking it then answered 502 (2026-11-11).
+   */
   async health(relay: string): Promise<Response> {
     if (!this.#deps.isStackRelay(relay)) return this.#error(404, "peer_relay_unknown", "No relay by that name is routed here.");
     if (!(await this.sync())) return this.#error(503, "peer_link_unavailable", "The entry cannot reach its sessions right now; try again shortly.");
-    const keyset = this.sessions.keysetsOf(relay).find((row) => row.pinned > 0 && this.#deps.pinOf(relay, row.keyset) !== null);
+    // keysetsOf lists the newest boot first.
+    const usable = this.sessions
+      .keysetsOf(relay)
+      .filter((row) => row.pinned > 0 && this.#deps.pinOf(relay, row.keyset) !== null)
+      .map((row) => ({ row, boot: this.#deps.bootOf?.(relay, row.keyset) ?? null }))
+      .filter(({ boot }) => boot?.usable === true);
+    const keyset = (usable.find(({ boot }) => boot?.sealed === true) ?? usable.at(-1))?.row;
     if (keyset === undefined) return this.#error(503, "peer_session_missing", "The relay's stack VM is not connected to this entry right now.");
     let answer: Response;
     try {

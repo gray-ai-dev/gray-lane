@@ -1082,14 +1082,19 @@ func (c *signInCall) persistFailed() {
 	}
 }
 
-// deviceObserver keeps the device-code answer (at most signInObserveMax) and, when it ends whole with a 2xx, makes the
-// person's prompt from it. It never stops or changes the answer.
+// deviceObserver keeps the device-code answer (at most signInObserveMax) and makes the person's prompt from a 2xx one.
+// It never stops or changes the answer. The prompt is made in chunk, before the bytes that complete the answer are
+// written: once the relay's software holds the device code, the session shows it (the relay reads the session right
+// after the call, and the person is shown that code). Made at the vendor's end of stream instead, as it was, the
+// prompt came after the client had every byte (forward writes and flushes each chunk, then reads on for the end or
+// stops at the declared length), so a session read right after the call could still find none.
 type deviceObserver struct {
 	call   *signInCall
 	row    signInRow
 	status int
 	body   bytes.Buffer
 	over   bool
+	made   bool
 }
 
 func (d *deviceObserver) failed(string) {}
@@ -1100,32 +1105,37 @@ func (d *deviceObserver) response(status int, _ http.Header) bool {
 }
 
 func (d *deviceObserver) chunk(p []byte) bool {
+	if d.over || d.made {
+		return true
+	}
 	if d.body.Len()+len(p) > signInObserveMax {
 		d.over = true
-	} else {
-		d.body.Write(p)
+		return true
 	}
-	return true
-}
-
-func (d *deviceObserver) finished(code string) {
-	if code != "" || d.over || d.status < 200 || d.status > 299 {
-		return
+	d.body.Write(p)
+	if d.status < 200 || d.status > 299 {
+		return true
 	}
+	// Until the answer's JSON value is whole, readDeviceCode finds no value in what is kept. A whole one is the device
+	// code the client is about to hold, whatever happens to the stream after it.
 	now := d.call.srv.ops.now()
 	device, ok := readDeviceCode(d.row, d.body.Bytes(), now)
 	if !ok {
-		return
+		return true
 	}
+	d.made = true
 	st := d.call.srv.signIn
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	session := st.openLocked(d.call.account, now)
 	if session == nil || session.template != "" {
-		return
+		return true
 	}
 	session.device, session.flow, session.result = device, flowDeviceCode, nil
+	return true
 }
+
+func (d *deviceObserver) finished(string) {}
 
 // readDeviceCode reads a device-code answer: the user code by the row's field map, the verification URI (the row's
 // constant, or RFC 8628's `verification_uri` on an authorize host), the expiry (RFC 8628 `expires_in`, else the row's).
