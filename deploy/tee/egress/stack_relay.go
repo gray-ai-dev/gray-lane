@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -138,23 +139,29 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	// buffer and a direct call's HTTP/2 window (relayCallBytes), and its body.
 	hold := stackHold{budget: &s.stack.budget}
 	defer hold.free()
-	if !hold.grow(headerBytes(r.Header) + relayCallBytes(account.spec == nil)) {
+	// A call in a vendor tunnel whose hello offers HTTP/2 may get an HTTP/2 vendor connection through a proxy too.
+	// Its window is the one the vendor connection announces: relayStreamWindow on the direct transport, the
+	// learned preface's on a mirrored HTTP/2 connection (mirrorStreamWindow).
+	hello := mirroredHelloOf(r.Context())
+	var window int64
+	if account.spec == nil {
+		window = relayStreamWindow
+	}
+	if hello != nil && hello.h2 {
+		window = max(window, mirrorStreamWindow(s.cfg, hello))
+	}
+	if !hold.grow(headerBytes(r.Header) + relayCallBytes(window)) {
 		refuse(errEgressLimit, "", "")
 		return
 	}
 	relayHeader := outboundHeader(r.Header)
 	relayHeader.Del(stackRequestHeader)
 	oauth := plan.route.name == "/anthropic" && callType == "oauth_access_token"
-	// Under relay_changes (stack_changes.go) the relay's header values reach the vendor, recorded; without it the
-	// headers are checked and replaced (S32, S32a).
+	// The relay's header values reach the vendor, recorded (stack_changes.go), for every customer; `relay_changes`
+	// decides the body's rule, and whether the customer's own behaviour headers may change (stack_headers.go).
 	relayChanges := stackRelayChangesOn(req.rewrite)
-	if relayChanges {
-		if name := stackAccountRefusal(plan.route, relayHeader); name != "" {
-			refuse(errStackHeaderRefused, "", refusedHeaderName(name))
-			return
-		}
-	} else if name, code := checkStackHeaders(plan.route, req, relayHeader, oauth, account.identity); name != "" {
-		refuse(code, "", refusedHeaderName(name))
+	if name := stackHeaderRefusal(plan.route, req, relayHeader, !relayChanges); name != "" {
+		refuse(errStackHeaderRefused, "", refusedHeaderName(name))
 		return
 	}
 	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &hold)
@@ -183,19 +190,21 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		return
 	}
 
-	// S32a: egress writes the vendor's headers itself; of the relay's only the credential passes. It asks for the
-	// events uncoded (S16: egress digests them), whatever the relay asked for.
+	// Gray's own header set (S32a), then each header the relay sent in its place, recorded as the relay's change, then
+	// the relay's own content type and coding preference (stack_coding.go: egress decodes the answer for its digests).
 	header := stackVendorHeader(plan.route, relayHeader, req.headers, oauth, account.identity, req.sessionID)
-	var headerChanges []stackChange
-	if relayChanges {
-		header, headerChanges = stackRelayHeader(plan.route, header, relayHeader, oauth)
-	}
+	header, headerChanges := stackRelayHeader(plan.route, header, relayHeader, oauth)
+	headerChanges = stackRelayFraming(header, relayHeader, headerChanges)
 	changed := encodeStackChanged(accepted.Changed, headerChanges)
 	if !hold.grow(headerBytes(header)) {
 		refuse(errEgressLimit, "", "")
 		return
 	}
 	plan.spec = account.spec
+	tlsHello := ""
+	if hello != nil {
+		tlsHello = stackTLSHelloRelay
+	}
 	attempt, code := req.begin(feedAttempt{
 		T:             "attempt",
 		AccountID:     account.id,
@@ -209,6 +218,7 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		Ops:           accepted.Ops,
 		Appended:      accepted.Appended,
 		Changed:       changed,
+		TLSHello:      tlsHello,
 	})
 	switch code {
 	case errEgressLimit:
@@ -231,9 +241,10 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	observer := &attemptObserver{stack: s.stack, req: req, attempt: attempt, account: account, credHash: credential, route: plan.route,
 		relay: r.Context(), hold: stackHold{budget: &s.stack.budget}}
 	entry.Error = s.forward(ctx, s.relayClient, rec, r.Method, plan, header, body, observer)
-	if entry.Error == errEgressLimit {
-		// S17: an answer egress could not hold is cut, not ended: the connection closes without the
-		// response's end, so the relay cannot take what it got for the whole answer.
+	if entry.Error == errEgressLimit || entry.Error == errResponseRead {
+		// S17: an answer egress could not hold or read whole is cut, not ended: the connection closes (in an HTTP/2
+		// tunnel, the call's stream is reset) without the response's end, so the relay cannot take what it got for the
+		// whole answer.
 		panic(http.ErrAbortHandler)
 	}
 	if entry.Error == "" && observer.full {
@@ -367,8 +378,8 @@ func allowlistedHeaders(h http.Header) map[string]string {
 }
 
 // attemptObserver turns one accepted call's vendor answer into its S17 records; the bytes themselves go to
-// the relay unchanged (S20). Its methods run on the call's own goroutine, in forward's order. A vendor that
-// codes its answer although egress asked for identity gets no digest (fail closed).
+// the relay unchanged (S20). Its methods run on the call's own goroutine, in forward's order. A coded answer is
+// decoded for what egress reads (stack_coding.go); one in a coding egress does not decode is cut (response_read).
 type attemptObserver struct {
 	stack   *stack
 	req     *stackRequest
@@ -382,17 +393,25 @@ type attemptObserver struct {
 	relay context.Context
 
 	status int
-	// digester is set for an SSE answer, whole for any other answer, both only in identity coding: egress
-	// digests what the vendor's bytes say, and a coded body would need decoding first.
+	// digester is set for an SSE answer, whole for any other answer: egress digests what the vendor's bytes say,
+	// decoded when the vendor coded them (decoder).
 	digester stackEventDigester
 	whole    bool
+	// decoder undoes the answer's content codings (nil for an uncoded answer); contentBytes counts the bytes the
+	// records read: the answer's own bytes, after decoding.
+	decoder      *stackDecoder
+	contentBytes int64
+	// stopped is why the observer stopped the answer when that is not the budget (egress_limit): response_read
+	// for a coding egress does not decode or a coded stream that does not decode.
+	stopped string
 	// held is the body while a record may still need it: whole up to -stack-max-answer-bytes for its
-	// digest, an error body up to 64 KiB. keep is that bound (0: nothing is held); past it held is dropped.
+	// digest, an error body up to 64 KiB, both decoded. keep is that bound (0: nothing is held); past it held is
+	// dropped.
 	held []byte
 	keep int64
 	seq  int
-	// hold is the attempt's share of the budget (S17): the vendor's response headers, held's capacity and
-	// the digester's buffers (digesterHeld), until the attempt ends.
+	// hold is the attempt's share of the budget (S17): the vendor's response headers, held's capacity, the
+	// digester's buffers (digesterHeld) and the decoder's state (stackDecodeSink.charge), until the attempt ends.
 	hold         stackHold
 	digesterHeld int64
 	// pending is an error answer while it is held (S35), observed is set once the answer was classified and the
@@ -422,11 +441,63 @@ func (o *attemptObserver) afterHold(wait time.Duration, fire func()) *time.Timer
 func (o *attemptObserver) release(status int, header http.Header, complete bool) ([]byte, bool) {
 	held := o.pending
 	o.pending = nil
-	o.observe(status, header, held, complete)
+	body, readable := o.errorText(header, held, complete)
+	o.observe(status, header, body, readable)
 	if !o.response(status, header) {
 		return nil, false
 	}
 	return held, true
+}
+
+// errorText is what S35 reads of a held error answer: the held bytes, decoded when the vendor coded them (at most
+// what the hold keeps, stackErrorBodyMax and one read), and whether that is the whole body. A coding egress does not
+// decode, or held bytes that do not decode, leave the status and headers alone to classify.
+func (o *attemptObserver) errorText(header http.Header, held []byte, complete bool) ([]byte, bool) {
+	codings, known := stackResponseCodings(header)
+	if !known {
+		return nil, false
+	}
+	if len(codings) == 0 {
+		return held, complete
+	}
+	reader := &heldDecode{hold: stackHold{budget: o.hold.budget}, limit: stackErrorBodyMax + forwardBufferBytes}
+	defer reader.hold.free()
+	decoder, err := newStackDecoder(codings, reader)
+	if err != nil {
+		return nil, false
+	}
+	defer decoder.close()
+	if err := decoder.write(held); err != nil {
+		// Past the hold's bound (S35 reads no partial body) or not decodable.
+		return reader.text, false
+	}
+	if complete {
+		complete = decoder.end() == nil
+	}
+	return reader.text, complete && !reader.over
+}
+
+// heldDecode is errorText's sink: the decoded text up to limit, under its own share of the budget.
+type heldDecode struct {
+	hold  stackHold
+	limit int
+	text  []byte
+	over  bool
+}
+
+func (h *heldDecode) charge(n int64) bool { return h.hold.grow(n) }
+
+func (h *heldDecode) decoded(p []byte) bool {
+	if len(h.text)+len(p) > h.limit {
+		h.over = true
+		return false
+	}
+	var ok bool
+	if h.text, ok = growHeld(h.text, len(p), int64(h.limit), &h.hold); !ok {
+		return false
+	}
+	h.text = append(h.text, p...)
+	return true
 }
 
 // observe reads the vendor answer once (S35, S36), gives it to the health and the rules (S38), and keeps its
@@ -462,24 +533,80 @@ func (o *attemptObserver) response(status int, header http.Header) bool {
 		return false
 	}
 	stream := streamAnswer(o.route, status, header)
-	if identityCoding(header) {
+	codings, known := stackResponseCodings(header)
+	if known {
 		if stream {
 			o.digester = o.stack.newDigester()
 		} else {
 			o.whole = true
 			o.keep = o.stack.maxAnswerBytes
 		}
+		if status >= http.StatusBadRequest && o.keep < stackErrorBodyMax {
+			o.keep = stackErrorBodyMax
+		}
 	}
-	if status >= http.StatusBadRequest && o.keep < stackErrorBodyMax {
-		o.keep = stackErrorBodyMax
+	if !o.req.record(feedResponse{T: "response", N: o.attempt.n, Status: status, Stream: stream, Headers: allowlistedHeaders(header)}) {
+		return false
 	}
-	return o.req.record(feedResponse{T: "response", N: o.attempt.n, Status: status, Stream: stream, Headers: allowlistedHeaders(header)})
+	if !known {
+		// Nothing of it could be digested: the vendor coded it in a way the relay did not offer egress to decode
+		// (stack_coding.go only forwards codings egress decodes). The `response` record names the coding.
+		o.stopped = errResponseRead
+		return false
+	}
+	if len(codings) > 0 {
+		decoder, err := newStackDecoder(codings, o)
+		if err != nil {
+			o.decodeFailed(err)
+			return false
+		}
+		o.decoder = decoder
+	}
+	return true
+}
+
+// stopCode is why the observer stopped the answer: response_read, or "" for the budget (egress_limit).
+func (o *attemptObserver) stopCode() string { return o.stopped }
+
+// decodeFailed notes why the decoder stopped: the budget or the ratio bound said so already (egress_limit);
+// anything else is a coded stream egress could not read.
+func (o *attemptObserver) decodeFailed(err error) {
+	if !errors.Is(err, errDecodeStopped) {
+		o.stopped = errResponseRead
+	}
 }
 
 // chunk holds what the records still need of p and digests it, all under the budget, before p goes to the
-// relay; false stops the answer (S17 egress_limit).
+// relay; false stops the answer (S17 egress_limit, or response_read for a coded stream that does not decode).
+// A coded chunk goes through the decoder, which hands what it says to decoded.
 func (o *attemptObserver) chunk(p []byte) bool {
-	total := o.attempt.bytes.Add(int64(len(p)))
+	o.attempt.bytes.Add(int64(len(p)))
+	if o.decoder == nil {
+		return o.content(p)
+	}
+	if err := o.decoder.write(p); err != nil {
+		o.decodeFailed(err)
+		return false
+	}
+	return true
+}
+
+// charge is the decoder's state in the attempt's hold (stackDecodeSink).
+func (o *attemptObserver) charge(n int64) bool { return o.hold.grow(n) }
+
+// decoded takes one decoded piece (stackDecodeSink), within stackDecodeRatioMax of the vendor bytes read.
+func (o *attemptObserver) decoded(p []byte) bool {
+	if o.contentBytes+int64(len(p)) > stackDecodeRatioMax*o.attempt.bytes.Load()+stackDecodeSlackBytes {
+		return false
+	}
+	return o.content(p)
+}
+
+// content is p of what the answer says, the vendor's bytes or their decoding: held while a record needs it, and
+// digested.
+func (o *attemptObserver) content(p []byte) bool {
+	o.contentBytes += int64(len(p))
+	total := o.contentBytes
 	if o.keep > 0 {
 		if total > o.keep {
 			// No record can use the body any more (it outgrew the body digest's and the error body's bounds).
@@ -519,10 +646,22 @@ func (o *attemptObserver) events(digests []string) []any {
 }
 
 // finished writes the trailing records and `end` together. Only a clean EOF has a final event, a body
-// digest or an error body: after a break the relay has a cut answer, and nothing about it is released.
+// digest or an error body: after a break the relay has a cut answer, and nothing about it is released. A coded
+// answer's EOF first takes the decoder's last output; a coded stream that does not end cleanly there (cut inside
+// its coding, or bytes after its end) ends as a vendor read that failed.
 func (o *attemptObserver) finished(code string) {
 	n := o.attempt.n
-	total := o.attempt.bytes.Load()
+	if o.decoder != nil {
+		if code == "" {
+			if err := o.decoder.end(); err != nil {
+				o.decodeFailed(err)
+				code = cmp.Or(o.stopped, errEgressLimit)
+			}
+		}
+		o.decoder.close()
+		o.decoder = nil
+	}
+	total := o.contentBytes
 	var records []any
 	reason := endEOF
 	// S34 stream_error: read before Close, which resets the digester.
@@ -559,18 +698,6 @@ func (o *attemptObserver) finished(code string) {
 	o.held, o.digester, o.pending = nil, nil, nil
 	o.hold.free()
 	o.req.finish(n, records, reason, streamFailed)
-}
-
-// identityCoding is true when the vendor applied no content coding.
-func identityCoding(h http.Header) bool {
-	for _, value := range h.Values("Content-Encoding") {
-		for _, coding := range strings.Split(value, ",") {
-			if coding = strings.TrimSpace(coding); coding != "" && !strings.EqualFold(coding, "identity") {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func eventStream(h http.Header) bool {

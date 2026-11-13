@@ -222,9 +222,16 @@ func (s *server) runAccountTest(ctx context.Context, t accountTest) *accountTest
 		target: &url.URL{Scheme: "https", Host: rt.host, Opaque: "/" + strings.TrimPrefix(path, rt.prefix)}}
 	oauth := rt.name == "/anthropic" && t.account.credentialType == "oauth_access_token"
 	header := stackVendorHeader(rt, t.credential, map[string]string{}, oauth, t.account.identity, randomUUID())
+	// An account test is egress's own call, with no relay preference to repeat; its observer reads the events
+	// uncoded.
+	header.Set("Accept-Encoding", "identity")
 	credHash, _ := stackCredential(rt, t.credential)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if hello := s.profiles.defaultHello(false); hello != nil && mirroredHelloOf(ctx) == nil {
+		ctx = context.WithValue(ctx, mirrorHelloKey{}, hello)
+		ctx = withOwnSessionScope(ctx, t.account.id)
+	}
 	var timedOut atomic.Bool
 	timer := st.afterFunc(proxyConnectCap, func() {
 		timedOut.Store(true)

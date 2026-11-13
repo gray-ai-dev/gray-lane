@@ -41,6 +41,10 @@ const (
 	minPhaseTimeout     = 10 * time.Minute // never shorter than the gateway's header wait
 	maxPhaseTimeout     = time.Hour        // UPSTREAM_HEADER_MS / STREAM_TOTAL_SECONDS max
 
+	// The idle timeout of pooled vendor connections, mirrored ones included. It is not learned from the relay's
+	// client: its warm-up tunnels close at once by design and its later calls come after learning, so no idle time
+	// of its own is seen. The floor is the gateway's UPSTREAM_SILENCE_MS: a vendor connection is never closed for
+	// idleness sooner than a call on it may stay silent, so a pooled connection outlives the longest quiet answer.
 	defaultIdleConnTimeout = time.Hour        // STREAM_TOTAL_SECONDS max
 	minIdleConnTimeout     = 10 * time.Minute // UPSTREAM_SILENCE_MS default
 	maxIdleConnTimeout     = time.Hour        // STREAM_TOTAL_SECONDS max

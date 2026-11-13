@@ -57,6 +57,7 @@ import {
   adoptKeyset,
   eventType,
   findEvent,
+  STACK_TLS_HELLOS,
   findEvents,
   isDigestField,
   isJcsValue,
@@ -73,6 +74,7 @@ import {
   type RelayStackChanges,
   type RequestModifiedEvent,
   type SealedKeyset,
+  type StackTlsHello,
   type WorkloadKeyset,
 } from "@gray/attest";
 import {
@@ -174,6 +176,11 @@ export interface StackAttemptRecord {
    * docs/relay-request-changes.md), or null when it forwarded the request as Gray declared it.
    */
   readonly changed: RelayStackChanges | null;
+  /**
+   * `request.forwarded.tls_hello`: `relay` when the TLS handshake with the vendor had the shape the relay's software
+   * showed the egress (a call made in a vendor tunnel), null when it was the egress's own.
+   */
+  readonly tls_hello: StackTlsHello | null;
 }
 
 /** What a stack receipt's `response.returned` says the client got. */
@@ -467,6 +474,7 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
         modified: [],
         appended: [],
         changed: null,
+        tls_hello: null,
       });
     } else if (current === undefined) {
       continue;
@@ -485,6 +493,8 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     } else if (type === EVENT_REQUEST_FORWARDED) {
       current.forwarded_body_hash = stringMember(event, "body_hash");
       current.forwarded_body_jcs_sha256 = stringMember(event, "body_jcs_sha256");
+      const hello = get(event, "tls_hello");
+      current.tls_hello = typeof hello === "string" && (STACK_TLS_HELLOS as readonly string[]).includes(hello) ? (hello as StackTlsHello) : null;
     } else if (type === EVENT_UPSTREAM_RESPONSE) {
       const status = get(event, "status");
       current.outcome = typeof status === "bigint" ? "answered" : "no_response";
@@ -507,6 +517,8 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     checks.push(pass(id, attemptSummary(attempt)));
     if (attempt.forwarded_body_jcs_sha256 === null) continue;
     checks.push(pass(`${id}:relay_changes`, changesSummary(attempt.changed)));
+    // Reported only when it differs from the egress's own handshake, like a change.
+    if (attempt.tls_hello !== null) checks.push(pass(`${id}:tls_hello`, "the TLS handshake with the vendor had the shape the relay's software showed the egress (a vendor tunnel), not the egress's own"));
     const applied: AppliedAppend[] = [];
     const missing: string[] = [];
     let textsOk = true;

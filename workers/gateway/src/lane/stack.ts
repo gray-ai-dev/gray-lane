@@ -3,6 +3,7 @@ import {
   RELAY_CHANGE_OPS,
   RELAY_CHANGE_VALUES,
   STACK_EGRESS_END_REASONS,
+  STACK_TLS_HELLOS,
   attemptRefusedEvent,
   attemptStartedEvent,
   bodyHash,
@@ -26,6 +27,7 @@ import {
   type StackFeedIncompleteReason,
   type StackRefusalCode,
   type StackServedAs,
+  type StackTlsHello,
 } from "@gray/attest";
 import { ApiError, ERROR_BODY_LIMIT } from "@gray/errors";
 import { get, isObject, parseStrict, parseStrictBytes, type Json, type JsonObject } from "@gray/json";
@@ -45,6 +47,7 @@ import { SseDecoder, SseFrames, type SseEvent } from "@gray/protocol";
 import type { StreamTimers } from "../client.ts";
 import { bytesBase64 } from "../crypto.ts";
 import type { StackRelayAppend, StackRelayConfig, StackRelayRoute, StackVendor, StackViolationFound } from "./stack-config.ts";
+import { StackDecodeError, stackDecodedBody } from "./stack-coding.ts";
 import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rewrite.ts";
 
 /**
@@ -73,7 +76,9 @@ import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rew
  * rounds an integer past 2^53). A non-stream answer is released as the container's body bytes once
  * their S19 digest (JCS) equals the feed's `body` record. Which of the two the answer is comes from
  * egress's `response` record (`stream`, S21b), never from the container's headers, all of which are
- * ignored; a container whose answer is the other kind fails closed.
+ * ignored but `Content-Encoding`; a container whose answer is the other kind fails closed. A coded answer (the
+ * vendor's coded bytes passed through, S20) is decoded first, with egress's bounds (`stack-coding.ts`): the events
+ * and the body are those of the decoded bytes, and the client gets them uncoded, as from an uncoded answer.
  *
  * What the container may add and Gray drops: comments (the decoder never makes them events) and one
  * usage-only Chat chunk (`"choices":[]` with `usage`, the measured new-api behaviour the relay standard
@@ -331,6 +336,12 @@ export interface StackFeedAttempt {
      * it changed nothing outside the declared rules: the receipt's `relay_stack.changed`.
      */
     readonly changed: RelayStackChanges | null;
+    /**
+     * The record's `tls_hello`: `relay` when the call was made in a vendor tunnel, so the vendor's TLS handshake had
+     * the shape of the relay's software (egress mirror_hello.go); null otherwise. The receipt's
+     * `request.forwarded.tls_hello`.
+     */
+    readonly tlsHello: StackTlsHello | null;
   } | null;
   /**
    * The `refused` record: before acceptance (a check code, with the account egress resolved, null for
@@ -520,6 +531,7 @@ export class StackFeed {
           ops: ops as JsonObject[],
           appended: appended.map(relayAppend),
           changed: relayChanges(get(record, "changed")),
+          tlsHello: tlsHello(get(record, "tls_hello")),
         };
         this.current = attempt;
         return attempt;
@@ -671,6 +683,13 @@ function relayAppend(value: Json): RelayAppend {
   const position = str(get(value, "position"));
   if (!(RELAY_APPEND_POSITIONS as readonly string[]).includes(position)) throw new Error("position");
   return { template_id: str(get(value, "template_id")), position: position as RelayAppend["position"], text_sha256: hex32(get(value, "text_sha256")) };
+}
+
+/** An `attempt` record's `tls_hello` (egress stack.go): absent, or one of the receipt's values. */
+function tlsHello(value: Json | undefined): StackTlsHello | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || !(STACK_TLS_HELLOS as readonly string[]).includes(value)) throw new Error("tls_hello");
+  return value as StackTlsHello;
 }
 
 /**
@@ -1031,13 +1050,14 @@ export class StackCall {
         if (response.status < 200 || response.status > 299) {
           // A container's own error never reaches the client (S24): the vendor's, or Gray's fixed one. Its decline
           // (`relayDeclined`) is named apart; whether it is one is the feed's to say (no vendor dialed, `decided`).
-          const declined = DECLINE_CODES.has(response.status) && relayDeclined(response.status, await readAtMost(response.body, DECLINE_READ_MAX_BYTES));
-          await response.body?.cancel().catch(() => {});
+          const errorBody = response.body === null ? null : stackDecodedBody(response.body, response.headers.get("content-encoding"));
+          const declined = DECLINE_CODES.has(response.status) && relayDeclined(response.status, await readAtMost(errorBody, DECLINE_READ_MAX_BYTES));
+          await errorBody?.cancel().catch(() => {});
           return { kind: "failed", outcome: await this.#failed({ by: "relay", why: declined ? RELAY_DECLINED : "relay_error_status" }) };
         }
         if (response.body === null) return { kind: "failed", outcome: await this.#failed({ by: "relay", why: "relay_no_body" }) };
-        // S21b: every header the container answered with is ignored; whether its answer is a stream is
-        // egress's record of the vendor's answer.
+        // S21b: every header the container answered with is ignored but its content coding (S20, `stack-coding.ts`);
+        // whether its answer is a stream is egress's record of the vendor's answer.
         stream = await this.#answerIsStream(this.#relayAbort.signal);
       } catch (error) {
         await response?.body?.cancel().catch(() => {});
@@ -1051,11 +1071,12 @@ export class StackCall {
       }
       // A container that answers a body where the vendor streamed, or the other way round, fails closed:
       // its body is no SSE the decoder takes, or its digest is not the feed's `body`.
+      const decoded = stackDecodedBody(response!.body!, response!.headers.get("content-encoding"));
       if (stream) {
         this.streamed = true;
-        return { kind: "answered", response: new Response(this.#verifiedStream(response!.body!), { status: 200, headers: { "content-type": "text/event-stream" } }) };
+        return { kind: "answered", response: new Response(this.#verifiedStream(decoded), { status: 200, headers: { "content-type": "text/event-stream" } }) };
       }
-      return await this.#verifiedBody(response!.body!);
+      return await this.#verifiedBody(decoded);
     } catch (error) {
       if (input.signal.aborted) return { kind: "aborted" };
       // Nothing but a fault leaves the call (S24): before the container had the rid, egress's control API
@@ -1143,7 +1164,12 @@ export class StackCall {
       timers.clearTimeout(timer);
       if (next === "changed") continue;
       if (next === "bound") throw new StackFaultError({ by: "relay", why: "relay_end_bound" });
-      if ("error" in next) throw await this.#readFault();
+      if ("error" in next) {
+        // A coded answer that does not decode, or decodes past egress's bound (`stack-coding.ts`), is the container's
+        // unless the feed says egress cut the call first; any other failed read is the transport's.
+        if (next.error instanceof StackDecodeError) throw await this.#readFault({ by: "relay", why: next.error.kind === "too_large" ? "answer_too_large" : "relay_stream_invalid" });
+        throw await this.#readFault();
+      }
       return next.result;
     }
   }
@@ -1153,10 +1179,10 @@ export class StackCall {
    * egress cuts its call, and that can reach the entry before egress's `end` (`egress_limit`) does. The
    * feed is given ERROR_BODY_WAIT_MS to say so: egress's cut is `egress_limit`, anything else (the
    * current attempt ended otherwise, the feed ended, the bound passed) the container's
-   * (`relay_transport`); both end the request with S24's 502. A read the entry broke itself (`close`)
-   * is the entry's own ending.
+   * (`relay_transport`, or `otherwise`: a coded answer that does not decode or decodes past the bound); both end
+   * the request with S24's 502. A read the entry broke itself (`close`) is the entry's own ending.
    */
-  async #readFault(): Promise<StackFaultError> {
+  async #readFault(otherwise: StackFault = { by: "relay", why: "relay_transport" }): Promise<StackFaultError> {
     const { clock, settleMs } = this.#input;
     if (this.#closing !== null) return new StackFaultError({ by: "gray", why: "entry_closed" });
     const until = clock() + settleMs;
@@ -1168,7 +1194,7 @@ export class StackCall {
       if (left <= 0) break;
       if (!(await this.#next(left, null))) break;
     }
-    return new StackFaultError({ by: "relay", why: "relay_transport" });
+    return new StackFaultError(otherwise);
   }
 
   /**
@@ -1911,6 +1937,7 @@ function writeStackAttempt(writer: StackGroupWriter, attempt: StackFeedAttempt, 
     querySha256: accepted.querySha256,
     bodySha256: accepted.bodySha256,
     bodyJcsSha256: accepted.bodyJcsSha256,
+    ...(accepted.tlsHello === null ? {} : { tlsHello: accepted.tlsHello }),
   });
   if (refusal !== null) {
     writer.addAttemptRefused(refusal);

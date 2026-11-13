@@ -91,6 +91,8 @@ type errorBody struct {
 	Stage  string `json:"stage,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Header string `json:"header,omitempty"`
+	// Detail is stack_hello_refused's: what egress cannot repeat of a tunnel's ClientHello, in words of its own.
+	Detail string `json:"detail,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, body errorBody) {
@@ -129,11 +131,11 @@ func refusalStatus(code string) int {
 		return http.StatusForbidden
 	case errStackAttemptsExceeded, errStackAccountCooling:
 		return http.StatusTooManyRequests
-	case errStackRewriteRefused, errStackRouteRefused, errStackHeaderRefused, errStackIdentityMismatch:
+	case errStackRewriteRefused, errStackRouteRefused, errStackHeaderRefused, errStackIdentityMismatch, errStackHelloRefused:
 		return http.StatusUnprocessableEntity
 	case errStackRequestExists, errStackFeedBusy, errStackAccountsStale, errStackCoolingStale, errPeerPinsStale, errStackOpsAckStale:
 		return http.StatusConflict
-	case errStackRequestsFull, errEgressLimit, errStackTestsBusy:
+	case errStackRequestsFull, errEgressLimit, errStackTestsBusy, errStackTunnelReady, errStackRelayNotReady:
 		return http.StatusServiceUnavailable
 	// The hop's own failures are 502 like a vendor connection's: the peer was not reached, or failed.
 	case errPeerUnpinned, errPeerConnectFailed, errPeerTLSFailed, errPeerPinMismatch, errPeerFailedAfterSend, errPeerTimeout,

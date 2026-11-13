@@ -267,13 +267,10 @@ func relayHTTP2Config(cfg config) *http.HTTP2Config {
 }
 
 // relayCallBytes is what a relay call holds in the transport and in forward besides its headers and body:
-// forward's copy buffer, and on a direct (HTTP/2) call its stream window. A proxied call is HTTP/1.1, whose
-// backlog sits in the kernel's socket buffer (README "Memory budget").
-func relayCallBytes(direct bool) int64 {
-	if direct {
-		return forwardBufferBytes + relayStreamWindow
-	}
-	return forwardBufferBytes
+// forward's copy buffer and, on an HTTP/2 vendor connection, its stream's receive window (window; 0 on HTTP/1.1,
+// whose backlog sits in the kernel's socket buffer, README "Memory budget").
+func relayCallBytes(window int64) int64 {
+	return forwardBufferBytes + window
 }
 
 // holdConnections takes relayConnBytes from the budget for each accepted relay connection until it closes. A

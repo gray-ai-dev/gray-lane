@@ -15,7 +15,6 @@
     "test": "vitest run -c vitest.config.ts",
     "test:workerd": "vitest run -c vitest.workerd.config.ts",
     "test:smoke": "vitest run -c vitest.smoke.config.ts",
-    "test:tunnel": "test/tunnel-e2e/run.sh",
     "fixtures": "node test/fixtures/generate.mjs",
     "assets": "node assets/build.mjs",
     "test:anvil": "vitest run -c vitest.anvil.config.ts"

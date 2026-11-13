@@ -296,7 +296,7 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 		o.mu.Unlock()
 		return
 	}
-	status, answer, code := o.call(ctx, vendor, spec, entry, template, inputs)
+	status, answer, code := o.call(withOwnSessionScope(ctx, id), vendor, spec, entry, template, inputs)
 	now := o.now()
 	result := &opsResult{Outcome: "failed", AsOfMS: now.UnixMilli()}
 	if status != 0 {
@@ -357,6 +357,10 @@ func (o *stackOps) call(ctx context.Context, vendor string, spec *egressSpec, en
 	}
 	ctx, cancel := context.WithTimeout(ctx, stackOpsCallCap)
 	defer cancel()
+	isSignIn := signInRows[vendor].tunnelHost(target.Host, true)
+	if hello := o.srv.profiles.defaultHello(isSignIn); hello != nil && mirroredHelloOf(ctx) == nil {
+		ctx = context.WithValue(ctx, mirrorHelloKey{}, hello)
+	}
 	capture := &captureWriter{header: http.Header{}}
 	rec := &responseRecorder{ResponseWriter: capture}
 	plan := requestPlan{route: route{name: stackVendors[vendor], host: target.Host}, target: target, spec: spec}
@@ -416,10 +420,15 @@ func answerValue(answer []byte) (any, bool) {
 	return value, true
 }
 
-// pointerValue resolves a JSON pointer (RFC 6901) in a parsed value.
+// pointerValue resolves a JSON pointer (RFC 6901) in a parsed value. encoding/json/jsontext's Pointer would do this,
+// but Go 1.27.2 builds it only under GOEXPERIMENT=jsonv2 (every file carries //go:build goexperiment.jsonv2).
 func pointerValue(value any, pointer string) (any, bool) {
 	if pointer == "" {
 		return value, true
+	}
+	// RFC 6901 3: a non-empty pointer is "/"-prefixed reference tokens.
+	if !strings.HasPrefix(pointer, "/") {
+		return nil, false
 	}
 	for _, token := range strings.Split(pointer[1:], "/") {
 		token = strings.ReplaceAll(strings.ReplaceAll(token, "~1", "/"), "~0", "~")
@@ -431,8 +440,12 @@ func pointerValue(value any, pointer string) (any, bool) {
 			}
 			value = next
 		case []any:
+			// RFC 6901 4: array-index = %x30 / ( %x31-39 *%x30-39 ); no sign, no leading zero.
+			if !validArrayIndex(token) {
+				return nil, false
+			}
 			index, err := strconv.Atoi(token)
-			if err != nil || index < 0 || index >= len(v) {
+			if err != nil || index >= len(v) {
 				return nil, false
 			}
 			value = v[index]
@@ -441,6 +454,19 @@ func pointerValue(value any, pointer string) (any, bool) {
 		}
 	}
 	return value, true
+}
+
+// validArrayIndex reports whether token is an RFC 6901 array-index: "0", or a decimal without a leading zero.
+func validArrayIndex(token string) bool {
+	if token == "" || (len(token) > 1 && token[0] == '0') {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // jwtExpiry is a JWT access token's `exp` claim, or 0: the vendor's own answer, read for the schedule only.
@@ -701,7 +727,7 @@ func (o *stackOps) parseAccount(w wireOpsAccount) (*opsAccount, bool) {
 		// A password account (ChatGPT or Claude) signs in inside the VM: an access-token account whose token comes from
 		// its sign-in, refreshed by egress alone (the token exists only in the VM).
 		login, ok := parseLogin(w.Login)
-		if _, signsIn := loginHosts[account.vendor]; !ok || !signsIn || account.credentialType != "oauth_access_token" {
+		if _, signsIn := signInRows[account.vendor]; !ok || !signsIn || account.credentialType != "oauth_access_token" {
 			return nil, false
 		}
 		account.login = login
@@ -872,6 +898,13 @@ func (s *server) relayHandler(w http.ResponseWriter, r *http.Request) {
 	path := rawPathOf(r)
 	switch {
 	case r.Method == http.MethodConnect:
+		// A vendor API host is a vendor tunnel (mirror_tunnel.go): relay calls with the relay's own TLS handshake.
+		if rt, ok := vendorTunnelTarget(r); ok {
+			s.handled(w, r, func(rec *responseRecorder, r *http.Request, entry *requestLog) {
+				s.serveVendorConnect(rec, r, entry, rt)
+			})
+			return
+		}
 		// The sign-in proxy (signin_proxy.go); without ops there is no account to sign in.
 		if s.ops == nil {
 			s.handled(w, r, func(rec *responseRecorder, _ *http.Request, entry *requestLog) {
@@ -885,6 +918,8 @@ func (s *server) relayHandler(w http.ResponseWriter, r *http.Request) {
 		s.handled(w, r, s.serveLoginPrompt)
 	case s.ops != nil && path == relayAccountStatePath:
 		s.handled(w, r, s.serveAccountState)
+	case path == relayTransportHealthPath:
+		s.handled(w, r, s.serveTransportHealth)
 	case strings.HasPrefix(path, relayOwnPrefix):
 		s.handled(w, r, func(rec *responseRecorder, _ *http.Request, entry *requestLog) {
 			entry.Route, entry.Error = relayOwnPrefix, errRelayRouteUnknown

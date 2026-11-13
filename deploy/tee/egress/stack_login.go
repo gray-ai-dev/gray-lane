@@ -31,11 +31,12 @@ import (
 //
 // How it signs in is the relay's: egress keeps only the customer's line. A call that names a customer request
 // (X-Gray-Request) is refused, so no sign-in call is bound to one or writes into its feed; the call goes only to the
-// vendor's own sign-in hosts (loginHosts: the ones its official client signs in at), through the account's own proxy,
-// never following a redirect; and a path that would send text the call chose to an address it names, or store it in the
-// account where it can be read outside the VM (sign-up, password reset, a change of e-mail or profile, an invite, MFA
-// enrolment), is refused. The rest are bounds on egress's own resources (loginInFlightMax, loginBodyMax,
-// loginTokenAnswerMax).
+// exact calls of the vendor's row (vendor-sign-in-v2.json, signin_rows.go), and for a password account also to its
+// sign-in steps' hosts and paths, where a path that would send text the call chose to an address it names, or store it
+// in the account where it can be read outside the VM (sign-up, password reset, a change of e-mail or profile, an
+// invite, MFA enrolment), is refused; through the account's own proxy, never following a redirect. No call names an
+// address but the account's sealed one (loginAddressCode). The rest are bounds on egress's own resources
+// (loginInFlightMax, loginBodyMax, loginTokenAnswerMax).
 //
 // The secrets: the container may hold them (the account-state view serves them) or write {{gray.username}},
 // {{gray.password}} and {{gray.totp}} where its logic puts them, which egress fills in on the way out (the TOTP code
@@ -74,25 +75,26 @@ const (
 	placeholderTOTP     = "{{gray.totp}}"
 )
 
-// loginHostRule is one sign-in host of a vendor: the paths it opens (nil: every path but the refused ones).
+// loginHostRule is one host of a password account's sign-in steps: the paths it opens (nil: every path but the refused
+// ones).
 type loginHostRule struct {
 	prefixes []string
 }
 
-// loginHosts are each vendor's sign-in hosts and loginTokenEndpoints where its sign-in ends (an answer there with a token
-// makes it the account's), both read from the vendor sign-in rows (vendor-sign-in-v1.json, signin_rows.go), reviewed as
-// data:
+// loginTokenEndpoints are where each vendor's sign-in ends (an answer there with a token makes it the account's), read
+// from the vendor sign-in rows (vendor-sign-in-v2.json, signin_rows.go), reviewed as data. Beside its exact calls, a
+// row holds the hosts a password account's own sign-in steps reach (password_steps), as version 1 had them:
 //
 //   - chatgpt_codex: auth.openai.com, the issuer of the Codex CLI's sign-in and token exchange (openai/codex
 //     codex-rs/login/src/server.rs DEFAULT_ISSUER; relay-kit login/codex-oauth.ts). It serves sign-in only, so every
-//     path is open but the refused ones.
+//     path is open to a password step but the refused ones.
 //   - anthropic: the hosts Claude Code 2.1.319 names in its OAuth configuration (read from the published client,
 //     2026-11-09): claude.com/cai/oauth/authorize (a Claude subscription's authorize), platform.claude.com/oauth/authorize
-//     (a Console account's), platform.claude.com/oauth/code/callback, platform.claude.com/v1/oauth/token, and the origin
-//     https://claude.ai. claude.ai and platform.claude.com also serve stored content (conversations, projects, files,
-//     the Console), so only their sign-in paths are open: the OAuth paths the client names, and on claude.ai the
-//     sign-in pages by their names (`/login`, `/api/auth/`), which the client does not list.
-var loginHosts, loginTokenEndpoints = loginTables(signInRows)
+//     (a Console account's), platform.claude.com/oauth/code/callback, and the origin https://claude.ai. claude.ai and
+//     platform.claude.com also serve stored content (conversations, projects, files, the Console), so only their
+//     sign-in paths are open to a password step: the OAuth paths the client names, and on claude.ai the sign-in pages
+//     by their names (`/login`, `/api/auth/`), which the client does not list.
+var loginTokenEndpoints = loginTables(signInRows)
 
 // loginTokenRule is a vendor's token endpoints, where its sign-in ends (an answer there with a token makes it the
 // account's), and what a token answer must carry beyond RFC 6749's fields.
@@ -361,10 +363,11 @@ var loginDeniedWords = map[string]bool{
 
 var loginDeniedJoined = []string{"signup", "aboutyou", "createaccount"}
 
-// loginPathAllowed reads the decoded path against the host's rule: its prefixes, no refused word, and no `%` left after
-// one decoding (a second decoding by the server could spell a refused word).
+// loginPathAllowed reads the decoded path of a password account's sign-in step against the host's rule: its prefixes,
+// no refused word, no `%` left after one decoding (a second decoding by the server could spell a refused word), and no
+// `@` (no address, loginAddressCode).
 func loginPathAllowed(rule loginHostRule, decoded string) bool {
-	if strings.Contains(decoded, "%") || strings.Contains(decoded, placeholderMark) {
+	if strings.ContainsAny(decoded, "%@") || strings.Contains(decoded, placeholderMark) {
 		return false
 	}
 	if rule.prefixes != nil {
@@ -400,6 +403,69 @@ func loginPathAllowed(rule loginHostRule, decoded string) bool {
 		}
 	}
 	return true
+}
+
+// loginAddressCode is the address rule (the review of 2026-11-13): a sign-in call names no address but the account's
+// sealed e-mail. A vendor step that takes an e-mail (a sign-in's first step, "send me a code") mails the address it is
+// given; an address the container chose could carry data out of the VM in its local part or its domain (the vendor's
+// mail and DNS lookups), so the container may name only the one sealed with the account, by `{{gray.username}}` or by
+// its value. A text is taken to name an address when it holds an `@`, or `%40` (an `@` a second decoding makes). The
+// texts are every query name and value and, in a JSON body, every string and member name, in a form body every name
+// and value, each as decoded; a body of another type is refused anyway (loginCall). A text that is exactly the sealed
+// e-mail, or the sealed password (which may hold an `@`), passes: the relay sealed both before any customer request,
+// so neither can carry one. An account without a sealed sign-in names no address at all. The code is
+// login_path_refused for the query and login_body_refused for the body.
+func loginAddressCode(query, media string, body []byte, login opsLogin) string {
+	names := func(text string) bool {
+		if !strings.Contains(text, "@") && !strings.Contains(strings.ToLower(text), "%40") {
+			return false
+		}
+		return login.username == "" || (text != login.username && text != login.password)
+	}
+	if formNamesAddress(query, names) {
+		return errLoginPathRefused
+	}
+	if len(body) == 0 {
+		return ""
+	}
+	switch media {
+	case "application/json":
+		dec := jsontext.NewDecoder(bytes.NewReader(body))
+		for {
+			tok, err := dec.ReadToken()
+			if errors.Is(err, io.EOF) {
+				return ""
+			}
+			if err != nil {
+				return errLoginBodyRefused
+			}
+			if tok.Kind() == '"' && names(tok.String()) {
+				return errLoginBodyRefused
+			}
+		}
+	case "application/x-www-form-urlencoded":
+		if formNamesAddress(string(body), names) {
+			return errLoginBodyRefused
+		}
+	}
+	return ""
+}
+
+// formNamesAddress is whether a form text (a query or a form body) has a pair that names an address, or one that does
+// not decode (egress could not tell).
+func formNamesAddress(raw string, names func(string) bool) bool {
+	if raw == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(raw, "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, errKey := url.QueryUnescape(rawKey)
+		value, errValue := url.QueryUnescape(rawValue)
+		if errKey != nil || errValue != nil || names(key) || names(value) {
+			return true
+		}
+	}
+	return false
 }
 
 // loginFill is what the placeholders of one call become; the TOTP code is computed once per call, at its start.
@@ -640,13 +706,14 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		refuse(errLoginRateLimited, "")
 		return
 	}
-	rule, known := loginHosts[vendor][host]
-	if !known {
+	// Every account: the row's exact calls. A password account (a sealed sign-in) also: its own sign-in steps.
+	row, password := signInRows[vendor], login.username != ""
+	if !row.tunnelHost(host, password) {
 		refuse(errLoginHostRefused, "")
 		return
 	}
 	decodedPath, err := url.PathUnescape(vendorPath)
-	if err != nil || !loginPathAllowed(rule, decodedPath) {
+	if err != nil || (!row.call(r.Method, host, vendorPath) && !(password && row.passwordStep(host, decodedPath))) {
 		refuse(errLoginPathRefused, "")
 		return
 	}
@@ -687,13 +754,18 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		}
 		body = read
 	}
+	media := ""
+	if parsed, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil {
+		media = strings.ToLower(parsed)
+	}
+	// The address rule, on the text the container wrote (a placeholder is not an address).
+	if code := loginAddressCode(r.URL.RawQuery, media, body, login); code != "" {
+		refuse(code, "")
+		return
+	}
 	fill := &loginFill{username: login.username, password: login.password, totp: login.totp, at: o.now(), left: loginBodyMax}
 	query, _, code := fillForm(r.URL.RawQuery, fill, errLoginPathRefused)
 	if code == "" && len(body) > 0 {
-		media := ""
-		if parsed, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil {
-			media = strings.ToLower(parsed)
-		}
 		// A placeholder is found in the body as its type decodes it.
 		switch media {
 		case "application/json":
@@ -705,9 +777,13 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 				body = []byte(text)
 			}
 		default:
-			// Egress fills a placeholder only where it can find one: in a JSON string or a form value.
+			// Egress fills a placeholder only where it can find one: in a JSON string or a form value. And it reads
+			// a body for an address only as JSON or a form: a body of another type, which egress cannot read, could
+			// name one, so it is refused.
 			if bytes.Contains(body, []byte(placeholderMark)) {
 				code = errLoginPlaceholderRefused
+			} else {
+				code = errLoginBodyRefused
 			}
 		}
 	}

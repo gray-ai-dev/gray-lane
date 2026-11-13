@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "vendors": {
+    "chatgpt_codex": {
+      "calls": [
+        {"flow": "token", "method": "POST", "host": "auth.openai.com", "path": "/oauth/token"},
+        {"flow": "token", "method": "POST", "host": "auth.openai.com", "path": "/api/accounts/oauth/token"},
+        {"flow": "device_code", "method": "POST", "host": "auth.openai.com", "path": "/api/accounts/deviceauth/usercode"},
+        {"flow": "device_poll", "method": "POST", "host": "auth.openai.com", "path": "/api/accounts/deviceauth/token"}
+      ],
+      "password_steps": {
+        "auth.openai.com": null
+      },
+      "account_id_claim": true,
+      "authorize_hosts": ["auth.openai.com"],
+      "device_code": {
+        "user_code_fields": ["user_code", "usercode"],
+        "verification_uri": "https://auth.openai.com/codex/device",
+        "expires_in_seconds": 900
+      }
+    },
+    "anthropic": {
+      "calls": [
+        {"flow": "token", "method": "POST", "host": "platform.claude.com", "path": "/v1/oauth/token"}
+      ],
+      "password_steps": {
+        "claude.com": ["/cai/oauth/"],
+        "claude.ai": ["/oauth/", "/login", "/api/auth/"],
+        "platform.claude.com": ["/oauth/"]
+      },
+      "account_id_claim": false,
+      "authorize_hosts": ["claude.ai", "claude.com"],
+      "device_code": null
+    }
+  }
+}

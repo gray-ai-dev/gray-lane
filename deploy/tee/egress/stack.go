@@ -515,7 +515,14 @@ type feedAttempt struct {
 	Appended      json.RawMessage `json:"appended"`
 	// Changed is the relay's own changes (stack_changes.go), absent when it made none.
 	Changed json.RawMessage `json:"changed,omitempty"`
+	// TLSHello is stackTLSHelloRelay for a call made in a vendor tunnel: the vendor's TLS handshake had the shape
+	// the relay's software showed egress (mirror_hello.go), not egress's own. Absent for every other call. The entry
+	// writes it into the receipt's `request.forwarded`.
+	TLSHello string `json:"tls_hello,omitempty"`
 }
+
+// stackTLSHelloRelay is the one value of an attempt record's `tls_hello`.
+const stackTLSHelloRelay = "relay"
 
 // feedRefused names the account the call resolved to before it was refused (the entry's
 // attempt.started{account_id}, S26: a refused call has no `attempt` record); both ids are null only for

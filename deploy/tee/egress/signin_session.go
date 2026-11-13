@@ -327,7 +327,7 @@ func (s *server) serveSignInControl(rec *responseRecorder, r *http.Request, entr
 		}
 		pins := map[string]string{}
 		for _, pin := range *wire.Pins {
-			if pin.Vendor == nil || pin.Flow == nil || pin.Template == nil || signInRows[*pin.Vendor].Hosts == nil || !validFlow(*pin.Flow) ||
+			if pin.Vendor == nil || pin.Flow == nil || pin.Template == nil || signInRows[*pin.Vendor].Calls == nil || !validFlow(*pin.Flow) ||
 				len(*pin.Template) > signInPromptURLMax || *pin.Template == "" {
 				refuse(errStackControlInvalid)
 				return

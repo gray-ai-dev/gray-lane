@@ -1,0 +1,1125 @@
+diff -ruN a/http2/api.go b/http2/api.go
+--- a/http2/api.go
++++ b/http2/api.go
+@@ -10,9 +10,6 @@
+ 	"errors"
+ 	"github.com/megaeth-labs/gray/deploy/tee/egress/third_party/stdhttp2/internal"
+ 	"io"
+-	"log"
+-	"mime/multipart"
+-	"net"
+ 	"net/textproto"
+ 	"net/url"
+ 	"time"
+@@ -104,58 +101,5 @@
+ 	HTTP2Config() Config
+ }
+ 
+-// ServerConfig is configuration from an http.Server.
+-type ServerConfig interface {
+-	MaxHeaderBytes() int
+-	MaxHeaderValueCount() int
+-	ConnState(net.Conn, ConnState)
+-	DoKeepAlives() bool
+-	WriteTimeout() time.Duration
+-	SendPingTimeout() time.Duration
+-	ErrorLog() *log.Logger
+-	ReadTimeout() time.Duration
+-	HTTP2Config() Config
+-	DisableClientPriority() bool
+-	IdleTimeout() time.Duration
+-}
+-
+-type Handler interface {
+-	ServeHTTP(*ResponseWriter, *ServerRequest)
+-}
+-
+-type ResponseWriter = responseWriter
+-
+-type PushOptions struct {
+-	Method string
+-	Header Header
+-}
+-
+-// A ServerRequest is a Request used by the HTTP/2 server.
+-type ServerRequest struct {
+-	Context       context.Context
+-	Proto         string // e.g. "HTTP/1.0"
+-	ProtoMajor    int    // e.g. 1
+-	ProtoMinor    int    // e.g. 0
+-	Method        string
+-	URL           *url.URL
+-	Header        Header
+-	Trailer       Header
+-	Body          io.ReadCloser
+-	Host          string
+-	ContentLength int64
+-	RemoteAddr    string
+-	RequestURI    string
+-	TLS           *tls.ConnectionState
+-	MultipartForm *multipart.Form
+-}
+-
+-// ConnState is identical to net/http.ConnState.
+-type ConnState int
+-
+-const (
+-	ConnStateNew ConnState = iota
+-	ConnStateActive
+-	ConnStateIdle
+-	ConnStateHijacked
+-	ConnStateClosed
+-)
++// Gray: the server half of api.go (ServerConfig, Handler, ResponseWriter, PushOptions, ServerRequest,
++// ConnState) is left out with the server.
+diff -ruN a/http2/client_conn_pool.go b/http2/client_conn_pool.go
+--- a/http2/client_conn_pool.go
++++ b/http2/client_conn_pool.go
+@@ -48,7 +48,10 @@
+ 		}
+ 		return cc, nil
+ 	}
+-	for {
++	for unusable := 0; ; { // Gray: unusable
++		if unusable == maxDialsPerCall { // Gray
++			return nil, errFreshConnUnusable
++		}
+ 		p.mu.Lock()
+ 		for _, cc := range p.conns[addr] {
+ 			if cc.ReserveNewRequest() {
+@@ -80,6 +83,9 @@
+ 		}
+ 		if cc.ReserveNewRequest() {
+ 			return cc, nil
++		}
++		if cc.grayNeverUsed() { // Gray: a new connection no request could take; one other requests took is not counted
++			unusable++
+ 		}
+ 	}
+ }
+diff -ruN a/http2/config.go b/http2/config.go
+--- a/http2/config.go
++++ b/http2/config.go
+@@ -25,12 +25,7 @@
+ 	CountError                    func(errType string)
+ }
+ 
+-func configFromServer(h1 ServerConfig) Config {
+-	conf := Config{}
+-	fillNetHTTPConfig(&conf, h1.HTTP2Config())
+-	setConfigDefaults(&conf, true)
+-	return conf
+-}
++// Gray: configFromServer is left out with the server.
+ 
+ func configFromTransport(h2 *Transport) Config {
+ 	conf := Config{}
+diff -ruN a/http2/flow.go b/http2/flow.go
+--- a/http2/flow.go
++++ b/http2/flow.go
+@@ -19,6 +19,8 @@
+ type inflow struct {
+ 	avail  int32
+ 	unsent int32
++	// Gray: minRefresh, when non-zero, replaces inflowMinRefresh (GrayConfig.Refund).
++	minRefresh int32
+ }
+ 
+ // init sets the initial window.
+@@ -45,7 +47,11 @@
+ 		panic("flow control update exceeds maximum window size")
+ 	}
+ 	f.unsent = int32(unsent)
+-	if f.unsent < inflowMinRefresh && f.unsent < f.avail {
++	if f.minRefresh != 0 { // Gray: a learned threshold alone, as the client returns window
++		if f.unsent < f.minRefresh {
++			return 0
++		}
++	} else if f.unsent < inflowMinRefresh && f.unsent < f.avail {
+ 		// If there aren't at least inflowMinRefresh bytes of window to send,
+ 		// and this update won't at least double the window, buffer the update for later.
+ 		return 0
+diff -ruN a/http2/gray.go b/http2/gray.go
+--- a/http2/gray.go
++++ b/http2/gray.go
+@@ -0,0 +1,342 @@
++// Copyright 2026 The Gray Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Gray: the wire layout of the client connection preface and of each request's HEADERS frame, the Transport's dial
++// function and response field count limit. This file, gray_nethttp.go and the hunks marked "Gray:" in transport.go,
++// api.go, config.go and ../internal/httpcommon/httpcommon.go are the whole patch on Go's net/http/internal/http2
++// (../README.md, ../gray.patch).
++
++package http2
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"fmt"
++	"log"
++	"net"
++	"net/textproto"
++	"strings"
++
++	"github.com/megaeth-labs/gray/deploy/tee/egress/third_party/stdhttp2/internal/httpcommon"
++	"golang.org/x/net/http2/hpack"
++)
++
++// GrayConfig is a Transport's Gray-only configuration (HTTPTransport sets it).
++type GrayConfig struct {
++	// DialTLSContext dials every new connection; the Transport has no dial of its own. Without it a new connection
++	// fails with errNoDialTLSContext.
++	DialTLSContext func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error)
++
++	// Preface, when non-nil, is the connection preface new connections write instead of the Transport's own. A new
++	// connection fails if it is invalid.
++	Preface *ConnPreface
++
++	// RequestLayout, when non-nil, gives each request's HEADERS priority, pseudo-header order and header order.
++	RequestLayout func(*ClientRequest) RequestLayout
++
++	// Refund, when set, is when the connection returns flow-control window to the peer (WINDOW_UPDATE): once the
++	// window read and not yet returned reaches the fraction of the window, as the client being repeated does. Zero
++	// fields keep the transport's rule (4 KiB, or when the return would at least double the window left).
++	Refund RefundPolicy
++
++	// MaxConcurrentStreams, when non-zero, bounds the streams one connection carries at once below what the peer
++	// allows; a request past it takes another connection.
++	MaxConcurrentStreams uint32
++
++	// MaxHeaderValueCount bounds the number of fields in one response's header block (and, separately, its
++	// trailers); a response over it fails like one over MaxHeaderListSize (Framer.MaxHeaderValueCount, which
++	// net/http sets only on its server). 0 means 500, net/http's DefaultMaxHeaderValueCount; a negative value means
++	// no limit.
++	MaxHeaderValueCount int
++}
++
++var errNoDialTLSContext = errors.New("http2: Transport has no DialTLSContext")
++
++func (t *Transport) grayPreface() *ConnPreface {
++	if t.gray == nil {
++		return nil
++	}
++	return t.gray.Preface
++}
++
++func (t *Transport) maxHeaderValueCount() int {
++	n := 0
++	if t.gray != nil {
++		n = t.gray.MaxHeaderValueCount
++	}
++	switch {
++	case n == 0:
++		return defaultMaxHeaderValueCount
++	case n < 0:
++		return 0
++	}
++	return n
++}
++
++// PrefaceFrame is one frame of a ConnPreface. Type is FrameSettings, FrameWindowUpdate or FramePriority.
++type PrefaceFrame struct {
++	Type FrameType
++	// Settings is a SETTINGS frame's parameters, sent in this order with these values.
++	Settings []Setting
++	// Increment is a stream-0 WINDOW_UPDATE frame's increment.
++	Increment uint32
++	// StreamID and Priority are a PRIORITY frame's stream and priority fields.
++	StreamID uint32
++	Priority PriorityParam
++}
++
++// ConnPreface replaces the Transport's own connection preface: after the client magic, a new connection writes
++// exactly Frames, in order. RFC 9113 3.4 requires the first frame to be SETTINGS; there is exactly one SETTINGS
++// frame, at most one stream-0 WINDOW_UPDATE and any number of PRIORITY frames. The connection's receive windows are
++// accounted from what the frames announce: each stream's from SETTINGS_INITIAL_WINDOW_SIZE (65535 when absent), the
++// connection's 65535 plus the WINDOW_UPDATE increment (65535 when no WINDOW_UPDATE is sent). The HPACK decoder's
++// table is SETTINGS_HEADER_TABLE_SIZE (4096 when absent), which may not exceed Config.MaxDecoderHeaderTableSize.
++// The first request's stream ID is above every PRIORITY frame's stream.
++type ConnPreface struct {
++	Frames []PrefaceFrame
++}
++
++// RequestLayout is the wire layout of one request's HEADERS frame.
++type RequestLayout struct {
++	// Priority, when non-nil and non-zero, is sent in the HEADERS frame's priority fields (PRIORITY flag set).
++	Priority *PriorityParam
++	// PseudoOrder orders the request pseudo-header fields (":method", ":authority", ":scheme", ":path",
++	// ":protocol"); fields it leaves out follow in the default order. Unknown names are an error.
++	PseudoOrder []string
++	// HeaderOrder lists lower-case regular field names in the order to encode them; fields it leaves out follow,
++	// sorted by name. "content-length" places the Content-Length field the transport adds.
++	HeaderOrder []string
++	// ContentLength says whether the HEADERS frame carries content-length (ContentLengthDefault, ContentLengthSend,
++	// ContentLengthOmit). The body's framing is the same either way: DATA frames and END_STREAM.
++	ContentLength ContentLengthMode
++	// NeverIndexed lists lower-case field names written as HPACK literals never indexed (RFC 7541 6.2.3,
++	// hpack.HeaderField.Sensitive), as a client marks its credentials.
++	NeverIndexed []string
++	// CookieAsSent writes each Cookie value as one field, as the client split its cookies, instead of one field per
++	// cookie-pair (RFC 9113 8.2.3 allows either).
++	CookieAsSent bool
++}
++
++// ContentLengthMode is RequestLayout.ContentLength.
++type ContentLengthMode = httpcommon.ContentLengthMode
++
++const (
++	// ContentLengthDefault is the transport's own rule: a known non-zero length, or 0 for POST, PUT and PATCH.
++	ContentLengthDefault = httpcommon.ContentLengthDefault
++	// ContentLengthSend sends content-length whenever the body's length is known, 0 included (a GET's too).
++	ContentLengthSend = httpcommon.ContentLengthSend
++	// ContentLengthOmit never sends content-length.
++	ContentLengthOmit = httpcommon.ContentLengthOmit
++)
++
++// neverIndexed reports whether the lower-case field name is in l.NeverIndexed.
++func (l RequestLayout) neverIndexed(name string) bool {
++	for _, n := range l.NeverIndexed {
++		if n == name {
++			return true
++		}
++	}
++	return false
++}
++
++// grayWriteHeader is writeHeader with the field's HPACK representation: never indexed when sensitive.
++func (cc *ClientConn) grayWriteHeader(name, value string, sensitive bool) {
++	if VerboseLogs {
++		log.Printf("http2: Transport encoding header %q = %q", name, value)
++	}
++	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value, Sensitive: sensitive})
++}
++
++// prefacePlan is a validated ConnPreface and what it means for the connection's accounting.
++type prefacePlan struct {
++	frames           []PrefaceFrame
++	streamRecvWindow int32
++	connRecvWindow   int32
++	headerTableSize  uint32
++	maxReadFrameSize uint32 // 0: keep the configured read limit
++	firstStreamID    uint32
++}
++
++const defaultInitialWindowSize = 65535 // RFC 9113 6.5.2
++
++// MaxPrefacePriorityStream is the highest stream ID a ConnPreface PRIORITY frame may name. The first request's stream
++// comes after it, and a connection is usable only while its next stream ID stays below 2^31-1 (isUsableLocked), so a
++// PRIORITY frame near 2^31 would make every new connection unusable at once. The clients that send startup PRIORITY
++// frames (Firefox up to 119) name streams 3 to 13; 255 leaves more than 2^31-256 stream IDs to the connection.
++const MaxPrefacePriorityStream = 255
++
++// maxDialsPerCall bounds the new connections one request finds, in a row, that no request could take (a peer that
++// allows no stream, a connection that closed at once, a stream ID space used up): without it the pool dials again
++// for ever. A new connection that other requests filled first is not counted.
++const maxDialsPerCall = 3
++
++// grayNeverUsed reports whether no request ever reserved or used cc: a fresh connection that could not take one.
++func (cc *ClientConn) grayNeverUsed() bool {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	return cc.nextStreamID == cc.firstStreamID && cc.streamsReserved == 0
++}
++
++// errFreshConnUnusable is a request whose fresh connections could not take it, maxDialsPerCall times.
++var errFreshConnUnusable = errors.New("http2: new connections cannot take the request")
++
++// RefundPolicy is GrayConfig.Refund: a fraction of each window, in 1/1024ths.
++type RefundPolicy struct {
++	Stream uint16
++	Conn   uint16
++}
++
++// grayRefresh is the WINDOW_UPDATE threshold of a window under a policy fraction (1/1024ths); 0 keeps the default.
++// The threshold is at most the window, so a reader that reads what the window let in always returns some of it.
++func grayRefresh(window int32, fraction uint16) int32 {
++	if fraction == 0 || fraction > 1024 {
++		return 0
++	}
++	return max(1, int32(int64(window)*int64(fraction)/1024))
++}
++
++func (t *Transport) grayRefund() RefundPolicy {
++	if t.gray == nil {
++		return RefundPolicy{}
++	}
++	return t.gray.Refund
++}
++
++// grayCapStreams is the peer's MAX_CONCURRENT_STREAMS lowered to GrayConfig.MaxConcurrentStreams.
++func (t *Transport) grayCapStreams(n uint32) uint32 {
++	if t.gray != nil && t.gray.MaxConcurrentStreams != 0 {
++		return min(n, t.gray.MaxConcurrentStreams)
++	}
++	return n
++}
++
++func (p *ConnPreface) plan(maxDecoderTable uint32) (*prefacePlan, error) {
++	if p == nil {
++		return nil, nil
++	}
++	if len(p.Frames) == 0 || p.Frames[0].Type != FrameSettings {
++		return nil, errors.New("http2: ConnPreface must start with a SETTINGS frame")
++	}
++	pl := &prefacePlan{
++		frames:           p.Frames,
++		streamRecvWindow: defaultInitialWindowSize,
++		connRecvWindow:   defaultInitialWindowSize,
++		headerTableSize:  initialHeaderTableSize,
++		firstStreamID:    1,
++	}
++	var sawSettings, sawWindowUpdate bool
++	for _, f := range p.Frames {
++		switch f.Type {
++		case FrameSettings:
++			if sawSettings {
++				return nil, errors.New("http2: ConnPreface has more than one SETTINGS frame")
++			}
++			sawSettings = true
++			for _, s := range f.Settings {
++				if err := s.Valid(); err != nil {
++					return nil, fmt.Errorf("http2: ConnPreface setting %v=%d: %w", s.ID, s.Val, err)
++				}
++				switch s.ID {
++				case SettingNoRFC7540Priorities: // RFC 9218 2.1
++					if s.Val > 1 {
++						return nil, fmt.Errorf("http2: ConnPreface setting %v=%d is not 0 or 1", s.ID, s.Val)
++					}
++				case SettingInitialWindowSize:
++					// RFC 9113 allows 0, but this client only refunds stream window as the body is read, so a
++					// stream would never receive its first DATA byte.
++					if s.Val == 0 {
++						return nil, errors.New("http2: ConnPreface INITIAL_WINDOW_SIZE 0 would stall every response")
++					}
++					pl.streamRecvWindow = int32(s.Val)
++				case SettingHeaderTableSize:
++					if s.Val > maxDecoderTable {
++						return nil, fmt.Errorf("http2: ConnPreface HEADER_TABLE_SIZE %d is above the decoder limit %d", s.Val, maxDecoderTable)
++					}
++					pl.headerTableSize = s.Val
++				case SettingMaxFrameSize:
++					pl.maxReadFrameSize = s.Val
++				}
++			}
++		case FrameWindowUpdate:
++			if sawWindowUpdate {
++				return nil, errors.New("http2: ConnPreface has more than one WINDOW_UPDATE frame")
++			}
++			sawWindowUpdate = true
++			if f.Increment < 1 || f.Increment > maxFlowWindow-defaultInitialWindowSize {
++				return nil, fmt.Errorf("http2: ConnPreface WINDOW_UPDATE increment %d is outside 1..%d", f.Increment, maxFlowWindow-defaultInitialWindowSize)
++			}
++			pl.connRecvWindow = defaultInitialWindowSize + int32(f.Increment)
++		case FramePriority:
++			if f.StreamID == 0 || f.StreamID%2 == 0 || f.StreamID > MaxPrefacePriorityStream {
++				return nil, fmt.Errorf("http2: ConnPreface PRIORITY stream %d is not an odd stream ID up to %d", f.StreamID, MaxPrefacePriorityStream)
++			}
++			if f.Priority.StreamDep == f.StreamID || !validStreamIDOrZero(f.Priority.StreamDep) {
++				return nil, fmt.Errorf("http2: ConnPreface PRIORITY stream %d has dependency %d", f.StreamID, f.Priority.StreamDep)
++			}
++			if f.StreamID >= pl.firstStreamID {
++				pl.firstStreamID = f.StreamID + 2
++			}
++		default:
++			return nil, fmt.Errorf("http2: ConnPreface cannot send a %v frame", f.Type)
++		}
++	}
++	return pl, nil
++}
++
++// write writes the planned frames; the caller has written the client magic.
++func (pl *prefacePlan) write(fr *Framer) {
++	for _, f := range pl.frames {
++		switch f.Type {
++		case FrameSettings:
++			fr.WriteSettings(f.Settings...)
++		case FrameWindowUpdate:
++			fr.WriteWindowUpdate(0, f.Increment)
++		case FramePriority:
++			fr.WritePriority(f.StreamID, f.Priority)
++		}
++	}
++}
++
++// requestLayout returns req's layout, or the zero layout when the Transport has no RequestLayout.
++func (t *Transport) requestLayout(req *ClientRequest) RequestLayout {
++	if t.gray == nil || t.gray.RequestLayout == nil {
++		return RequestLayout{}
++	}
++	return t.gray.RequestLayout(req)
++}
++
++// defaultMaxHeaderValueCount bounds the header (and trailer) fields of one response when
++// GrayConfig.MaxHeaderValueCount is 0: net/http's DefaultMaxHeaderValueCount.
++const defaultMaxHeaderValueCount = 500
++
++// defaultMaxStreams is server.go's, left out with the server; setConfigDefaults uses it.
++const defaultMaxStreams = 250 // TODO: make this 100 as the GFE seems to?
++
++// connHeaders is server.go's, verbatim, left out with the server; the client's response handling uses it.
++// From http://httpwg.org/specs/rfc7540.html#rfc.section.8.1.2.2
++var connHeaders = []string{
++	"Connection",
++	"Keep-Alive",
++	"Proxy-Connection",
++	"Transfer-Encoding",
++	"Upgrade",
++}
++
++// foreachHeaderElement is server.go's, verbatim, left out with the server; the client's response handling uses it.
++func foreachHeaderElement(v string, fn func(string)) {
++	v = textproto.TrimString(v)
++	if v == "" {
++		return
++	}
++	if !strings.Contains(v, ",") {
++		fn(v)
++		return
++	}
++	for f := range strings.SplitSeq(v, ",") {
++		if f = textproto.TrimString(f); f != "" {
++			fn(f)
++		}
++	}
++}
+diff -ruN a/http2/gray_nethttp.go b/http2/gray_nethttp.go
+--- a/http2/gray_nethttp.go
++++ b/http2/gray_nethttp.go
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Gray Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Gray: the net/http side of the client for a caller outside net/http. net/http/http2.go connects net/http's own
++// Transport to this package; HTTPTransport does the same for the client half only, with the conversions written as
++// there. Line numbers are Go 1.27.2's src/net/http/http2.go (../BASE).
++
++package http2
++
++import (
++	"errors"
++	"net/http"
++	"sync"
++	"time"
++)
++
++// As http2.go:37-47: NoBody and LocalAddrContextKey must be net/http's values (transport.go compares request and
++// response bodies with NoBody).
++func init() {
++	LocalAddrContextKey = http.LocalAddrContextKey
++	NoBody = http.NoBody
++}
++
++// HTTPTransport is an http.RoundTripper speaking HTTP/2 only, over connections GrayConfig.DialTLSContext makes. Its
++// fields are read when it is first used and must not change afterwards.
++type HTTPTransport struct {
++	// The net/http.Transport settings the client reads through TransportConfig (api.go; transportConfig,
++	// http2.go:456-493).
++	DisableCompression     bool
++	DisableKeepAlives      bool
++	MaxHeaderListSize      int64 // as x/net/http2.Transport.MaxHeaderListSize (http2.go:470-475); 0 means 10 MiB
++	MaxResponseHeaderBytes int64
++	ExpectContinueTimeout  time.Duration
++	ResponseHeaderTimeout  time.Duration
++	IdleConnTimeout        time.Duration
++	// HTTP2 is net/http.Transport.HTTP2, already merged (mergeHTTP2Config, http2.go:495-552).
++	HTTP2 Config
++
++	Gray GrayConfig
++
++	once sync.Once
++	t2   *Transport
++}
++
++// transport is the HTTP/2 Transport, made once (as configureHTTP2, http2.go:284-292).
++func (t *HTTPTransport) transport() *Transport {
++	t.once.Do(func() {
++		t2 := NewTransport(httpTransportConfig{t})
++		t2.gray = &t.Gray
++		t.t2 = t2
++	})
++	return t.t2
++}
++
++var errUnsupportedScheme = errors.New("http2: unsupported scheme")
++
++// RoundTrip is http2RoundTrip (http2.go:319-351) over the Transport. Only https URLs are sent, as x/net/http2's
++// Transport without AllowHTTP: the dial function always speaks TLS.
++func (t *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	if req.URL == nil || req.URL.Scheme != "https" {
++		return nil, errUnsupportedScheme
++	}
++	resp := &http.Response{}
++	cresp, err := t.transport().RoundTrip(&ClientRequest{
++		Context:       req.Context(),
++		Method:        req.Method,
++		URL:           req.URL,
++		Header:        Header(req.Header),
++		Trailer:       Header(req.Trailer),
++		Body:          req.Body,
++		Host:          req.Host,
++		GetBody:       req.GetBody,
++		ContentLength: req.ContentLength,
++		Cancel:        req.Cancel,
++		Close:         req.Close,
++		// The read loop fills resp.Trailer through this pointer once the body has been read to its end.
++		ResTrailer: (*Header)(&resp.Trailer),
++	})
++	if err != nil {
++		return nil, err
++	}
++	resp.Status = cresp.Status + " " + http.StatusText(cresp.StatusCode)
++	resp.StatusCode = cresp.StatusCode
++	resp.Proto = "HTTP/2.0"
++	resp.ProtoMajor = 2
++	resp.ProtoMinor = 0
++	resp.ContentLength = cresp.ContentLength
++	resp.Uncompressed = cresp.Uncompressed
++	resp.Header = http.Header(cresp.Header)
++	resp.Trailer = http.Header(cresp.Trailer)
++	resp.Body = cresp.Body
++	resp.TLS = cresp.TLS
++	resp.Request = req
++	return resp, nil
++}
++
++// CloseIdleConnections closes the Transport's idle connections.
++func (t *HTTPTransport) CloseIdleConnections() {
++	t.transport().CloseIdleConnections()
++}
++
++// Retire closes the Transport's idle connections now and each busy one as its last call ends; none takes a new
++// call (ClientConn.SetDoNotReuse).
++func (t *HTTPTransport) Retire() {
++	p := t.transport().connPool.clientConnPool
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for _, conns := range p.conns {
++		for _, cc := range conns {
++			cc.SetDoNotReuse()
++			cc.closeIfIdle()
++		}
++	}
++}
++
++// httpTransportConfig implements TransportConfig from an HTTPTransport (transportConfig, http2.go:456-552).
++type httpTransportConfig struct{ t *HTTPTransport }
++
++func (c httpTransportConfig) MaxHeaderListSize() int64             { return c.t.MaxHeaderListSize }
++func (c httpTransportConfig) MaxResponseHeaderBytes() int64        { return c.t.MaxResponseHeaderBytes }
++func (c httpTransportConfig) DisableCompression() bool             { return c.t.DisableCompression }
++func (c httpTransportConfig) DisableKeepAlives() bool              { return c.t.DisableKeepAlives }
++func (c httpTransportConfig) ExpectContinueTimeout() time.Duration { return c.t.ExpectContinueTimeout }
++func (c httpTransportConfig) ResponseHeaderTimeout() time.Duration { return c.t.ResponseHeaderTimeout }
++func (c httpTransportConfig) IdleConnTimeout() time.Duration       { return c.t.IdleConnTimeout }
++func (c httpTransportConfig) HTTP2Config() Config                  { return c.t.HTTP2 }
+diff -ruN a/http2/transport.go b/http2/transport.go
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -69,6 +69,7 @@
+ 	t1       TransportConfig
+ 	connPool noDialClientConnPool
+ 	*transportTestHooks
++	gray *GrayConfig // Gray: gray.go
+ }
+ 
+ // Hook points used for testing.
+@@ -160,6 +161,7 @@
+ 	streams          map[uint32]*clientStream // client-initiated
+ 	streamsReserved  int                      // incr by ReserveNewRequest; decr on RoundTrip
+ 	nextStreamID     uint32
++	firstStreamID    uint32                    // Gray: nextStreamID before the first request
+ 	pendingRequests  int                       // requests blocked and waiting to be sent because len(streams) == maxConcurrentStreams
+ 	pings            map[[8]byte]chan struct{} // in flight ping data to notification channel
+ 	br               *bufio.Reader
+@@ -414,7 +416,7 @@
+ 
+ 	addr := authorityAddr(req.URL.Scheme, req.URL.Host)
+ 	for retry := 0; ; retry++ {
+-		cc, err := t.connPool.GetClientConn(req, addr)
++		cc, err := t.connPool.clientConnPool.GetClientConn(req, addr) // Gray: dial on a miss (dialTLS)
+ 		if err != nil {
+ 			t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
+ 			return nil, err
+@@ -570,18 +572,11 @@
+ }
+ 
+ func (t *Transport) dialTLS(ctx context.Context, network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
+-	tlsCn, err := t.dialTLSWithContext(ctx, network, addr, tlsCfg)
+-	if err != nil {
+-		return nil, err
++	// Gray: only GrayConfig.DialTLSContext dials; there is no crypto/tls dial (dialTLSWithContext is removed).
++	if t.gray == nil || t.gray.DialTLSContext == nil {
++		return nil, errNoDialTLSContext
+ 	}
+-	state := tlsCn.ConnectionState()
+-	if p := state.NegotiatedProtocol; p != NextProtoTLS {
+-		return nil, fmt.Errorf("http2: unexpected ALPN protocol %q; want %q", p, NextProtoTLS)
+-	}
+-	if !state.NegotiatedProtocolIsMutual {
+-		return nil, errors.New("http2: could not negotiate protocol mutually")
+-	}
+-	return tlsCn, nil
++	return t.gray.DialTLSContext(ctx, network, addr, tlsCfg)
+ }
+ 
+ // disableKeepAlives reports whether connections should be closed as
+@@ -612,14 +607,21 @@
+ 
+ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook func()) (*ClientConn, error) {
+ 	conf := configFromTransport(t)
++	// Gray: a configured preface sets the windows, decoder table and first stream ID it announces.
++	plan, err := t.grayPreface().plan(uint32(conf.MaxDecoderHeaderTableSize))
++	if err != nil {
++		c.Close()
++		return nil, err
++	}
+ 	cc := &ClientConn{
+ 		t:                           t,
+ 		tconn:                       c,
+ 		readerDone:                  make(chan struct{}),
+ 		nextStreamID:                1,
++		firstStreamID:               1,        // Gray
+ 		maxFrameSize:                16 << 10, // spec default
+ 		initialStreamRecvWindowSize: int32(conf.MaxReceiveBufferPerStream),
+-		maxConcurrentStreams:        initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
++		maxConcurrentStreams:        t.grayCapStreams(initialMaxConcurrentStreams), // Gray: grayCapStreams
+ 		strictMaxConcurrentStreams:  conf.StrictMaxConcurrentRequests,
+ 		peerMaxHeaderListSize:       0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
+ 		streams:                     make(map[uint32]*clientStream),
+@@ -658,8 +660,18 @@
+ 		cc.fr.countError = conf.CountError
+ 	}
+ 	maxHeaderTableSize := uint32(conf.MaxDecoderHeaderTableSize)
++	if plan != nil { // Gray
++		maxHeaderTableSize = plan.headerTableSize
++		cc.initialStreamRecvWindowSize = plan.streamRecvWindow
++		cc.nextStreamID = plan.firstStreamID
++		cc.firstStreamID = plan.firstStreamID
++		if plan.maxReadFrameSize != 0 {
++			cc.fr.SetMaxReadFrameSize(plan.maxReadFrameSize)
++		}
++	}
+ 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
+ 	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
++	cc.fr.MaxHeaderValueCount = t.maxHeaderValueCount() // Gray
+ 
+ 	cc.henc = hpack.NewEncoder(&cc.hbuf)
+ 	cc.henc.SetMaxDynamicTableSizeLimit(uint32(conf.MaxEncoderHeaderTableSize))
+@@ -683,9 +695,15 @@
+ 	}
+ 
+ 	cc.bw.Write(clientPreface)
+-	cc.fr.WriteSettings(initialSettings...)
+-	cc.fr.WriteWindowUpdate(0, uint32(conf.MaxReceiveBufferPerConnection))
+-	cc.inflow.init(int32(conf.MaxReceiveBufferPerConnection) + initialWindowSize)
++	if plan != nil { // Gray
++		plan.write(cc.fr)
++		cc.inflow.init(plan.connRecvWindow)
++		cc.inflow.minRefresh = grayRefresh(plan.connRecvWindow, t.grayRefund().Conn)
++	} else {
++		cc.fr.WriteSettings(initialSettings...)
++		cc.fr.WriteWindowUpdate(0, uint32(conf.MaxReceiveBufferPerConnection))
++		cc.inflow.init(int32(conf.MaxReceiveBufferPerConnection) + initialWindowSize)
++	}
+ 	cc.bw.Flush()
+ 	if cc.werr != nil {
+ 		cc.Close()
+@@ -817,7 +835,7 @@
+ }
+ 
+ func (cc *ClientConn) idleStateLocked() (st clientConnIdleState) {
+-	if cc.singleUse && cc.nextStreamID > 1 {
++	if cc.singleUse && cc.nextStreamID > cc.firstStreamID { // Gray: was > 1
+ 		return
+ 	}
+ 	var maxConcurrentOkay bool
+@@ -846,7 +864,7 @@
+ 	//
+ 	// This avoids a situation where an error early in a connection's lifetime
+ 	// goes unreported.
+-	if cc.nextStreamID == 1 && cc.streamsReserved == 0 && cc.closed && !cc.closedOnIdle {
++	if cc.nextStreamID == cc.firstStreamID && cc.streamsReserved == 0 && cc.closed && !cc.closedOnIdle { // Gray: was == 1
+ 		st.canTakeNewRequest = true
+ 	}
+ 
+@@ -927,7 +945,7 @@
+ // A tls.Conn.Close can hang for a long time if the peer is unresponsive.
+ // Try to shut it down more aggressively.
+ func (cc *ClientConn) forceCloseConn() {
+-	tc, ok := cc.tconn.(*tls.Conn)
++	tc, ok := cc.tconn.(interface{ NetConn() net.Conn }) // Gray: was *tls.Conn; uTLS's UConn too
+ 	if !ok {
+ 		return
+ 	}
+@@ -1419,8 +1437,9 @@
+ 	// sent by writeRequestBody below, along with any Trailers,
+ 	// again in form HEADERS{1}, CONTINUATION{0,})
+ 	cc.hbuf.Reset()
+-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, func(name, value string) {
+-		cc.writeHeader(name, value)
++	layout := cc.t.requestLayout(req) // Gray
++	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, layout, func(name, value string) {
++		cc.grayWriteHeader(name, value, layout.neverIndexed(name)) // Gray: was cc.writeHeader(name, value)
+ 	})
+ 	if err != nil {
+ 		return fmt.Errorf("http2: %w", err)
+@@ -1430,12 +1449,12 @@
+ 	// Write the request.
+ 	endStream := !res.HasBody && !res.HasTrailers
+ 	cs.sentHeaders = true
+-	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
++	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), layout.Priority, hdrs)
+ 	traceWroteHeaders(cs.trace)
+ 	return err
+ }
+ 
+-func encodeRequestHeaders(req *ClientRequest, addGzipHeader bool, peerMaxHeaderListSize uint64, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
++func encodeRequestHeaders(req *ClientRequest, addGzipHeader bool, peerMaxHeaderListSize uint64, layout RequestLayout, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) { // Gray: layout
+ 	return httpcommon.EncodeHeaders(req.Context, httpcommon.EncodeHeadersParam{
+ 		Request: httpcommon.Request{
+ 			Header:              req.Header,
+@@ -1448,6 +1467,10 @@
+ 		AddGzipHeader:         addGzipHeader,
+ 		PeerMaxHeaderListSize: peerMaxHeaderListSize,
+ 		DefaultUserAgent:      defaultUserAgent,
++		PseudoOrder:           layout.PseudoOrder,   // Gray
++		HeaderOrder:           layout.HeaderOrder,   // Gray
++		ContentLength:         layout.ContentLength, // Gray
++		CookieAsSent:          layout.CookieAsSent,  // Gray
+ 	}, headerf)
+ }
+ 
+@@ -1564,7 +1587,7 @@
+ // Must hold cc.mu.
+ func (cc *ClientConn) awaitOpenSlotForStreamLocked(cs *clientStream) error {
+ 	for {
+-		if cc.closed && cc.nextStreamID == 1 && cc.streamsReserved == 0 {
++		if cc.closed && cc.nextStreamID == cc.firstStreamID && cc.streamsReserved == 0 { // Gray: was == 1
+ 			// This is the very first request sent to this connection.
+ 			// Return a fatal error which aborts the retry loop.
+ 			return errClientConnNotEstablished
+@@ -1589,7 +1612,7 @@
+ }
+ 
+ // requires cc.wmu be held
+-func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
++func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, prio *PriorityParam, hdrs []byte) error { // Gray: prio
+ 	first := true // first frame written (HEADERS is first, then CONTINUATION)
+ 	for len(hdrs) > 0 && cc.werr == nil {
+ 		chunk := hdrs
+@@ -1599,12 +1622,16 @@
+ 		hdrs = hdrs[len(chunk):]
+ 		endHeaders := len(hdrs) == 0
+ 		if first {
+-			cc.fr.WriteHeaders(HeadersFrameParam{
++			p := HeadersFrameParam{
+ 				StreamID:      streamID,
+ 				BlockFragment: chunk,
+ 				EndStream:     endStream,
+ 				EndHeaders:    endHeaders,
+-			})
++			}
++			if prio != nil { // Gray
++				p.Priority = *prio
++			}
++			cc.fr.WriteHeaders(p)
+ 			first = false
+ 		} else {
+ 			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
+@@ -1790,7 +1817,7 @@
+ 	// Two ways to send END_STREAM: either with trailers, or
+ 	// with an empty DATA frame.
+ 	if len(trls) > 0 {
+-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls)
++		err = cc.writeHeaders(cs.ID, true, maxFrameSize, nil, trls) // Gray: nil
+ 	} else {
+ 		err = cc.fr.WriteData(cs.ID, true, nil)
+ 	}
+@@ -1893,6 +1920,7 @@
+ func (cc *ClientConn) addStreamLocked(cs *clientStream) {
+ 	cs.flow.conn = &cc.flow
+ 	cs.inflow.init(cc.initialStreamRecvWindowSize)
++	cs.inflow.minRefresh = grayRefresh(cc.initialStreamRecvWindowSize, cc.t.grayRefund().Stream) // Gray
+ 	cs.ID = cc.nextStreamID
+ 	cc.nextStreamID += 2
+ 	cc.streams[cs.ID] = cs
+@@ -2706,7 +2734,7 @@
+ 			// without doing so. Either way, leave the stream alone for now.
+ 			continue
+ 		}
+-		if streamID == 1 && cc.goAway.ErrCode != ErrCodeNo {
++		if streamID == cc.firstStreamID && cc.goAway.ErrCode != ErrCodeNo { // Gray: was == 1
+ 			// Don't retry the first stream on a connection if we get a non-NO error.
+ 			// If the server is sending an error on a new connection,
+ 			// retrying the request on a new one probably isn't going to work.
+@@ -2760,7 +2788,7 @@
+ 		case SettingMaxFrameSize:
+ 			cc.maxFrameSize = s.Val
+ 		case SettingMaxConcurrentStreams:
+-			cc.maxConcurrentStreams = s.Val
++			cc.maxConcurrentStreams = cc.t.grayCapStreams(s.Val) // Gray: grayCapStreams
+ 			seenMaxConcurrentStreams = true
+ 		case SettingMaxHeaderListSize:
+ 			cc.peerMaxHeaderListSize = uint64(s.Val)
+@@ -2799,7 +2827,7 @@
+ 			// didn't contain a MAX_CONCURRENT_STREAMS field so
+ 			// increase the number of concurrent streams this
+ 			// connection can establish to our default.
+-			cc.maxConcurrentStreams = defaultMaxConcurrentStreams
++			cc.maxConcurrentStreams = cc.t.grayCapStreams(defaultMaxConcurrentStreams) // Gray: grayCapStreams
+ 		}
+ 		close(cc.seenSettingsChan)
+ 		cc.seenSettings = true
+@@ -3252,16 +3280,4 @@
+ 	return nil
+ }
+ 
+-// dialTLSWithContext uses tls.Dialer, added in Go 1.15, to open a TLS
+-// connection.
+-func (t *Transport) dialTLSWithContext(ctx context.Context, network, addr string, cfg *tls.Config) (*tls.Conn, error) {
+-	dialer := &tls.Dialer{
+-		Config: cfg,
+-	}
+-	cn, err := dialer.DialContext(ctx, network, addr)
+-	if err != nil {
+-		return nil, err
+-	}
+-	tlsCn := cn.(*tls.Conn) // DialContext comment promises this will always succeed
+-	return tlsCn, nil
+-}
++// Gray: dialTLSWithContext (a crypto/tls dial) is removed; dialTLS dials only through GrayConfig.DialTLSContext.
+diff -ruN a/internal/httpcommon/gray.go b/internal/httpcommon/gray.go
+--- a/internal/httpcommon/gray.go
++++ b/internal/httpcommon/gray.go
+@@ -0,0 +1,119 @@
++// Copyright 2026 The Gray Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Gray: ordered request field encoding (../../http2/gray.go, ../../README.md).
++
++package httpcommon
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++)
++
++// orderedContentLength marks where EncodeHeaders writes the Content-Length field. It is not a valid field name, so
++// no header map key equals it once validateHeaders has passed.
++const orderedContentLength = "\x00content-length"
++
++// ContentLengthMode is whether a request's header block carries content-length (EncodeHeadersParam.ContentLength).
++type ContentLengthMode uint8
++
++const (
++	// ContentLengthDefault is shouldSendReqContentLength's rule.
++	ContentLengthDefault ContentLengthMode = iota
++	// ContentLengthSend sends it whenever the length is known, 0 included.
++	ContentLengthSend
++	// ContentLengthOmit never sends it.
++	ContentLengthOmit
++)
++
++// sendContentLength is whether EncodeHeaders writes content-length under mode.
++func sendContentLength(mode ContentLengthMode, method string, contentLength int64) bool {
++	switch mode {
++	case ContentLengthSend:
++		return contentLength >= 0
++	case ContentLengthOmit:
++		return false
++	}
++	return shouldSendReqContentLength(method, contentLength)
++}
++
++var defaultPseudoOrder = []string{":authority", ":method", ":path", ":scheme", ":protocol"}
++
++// orderPseudo returns the request pseudo-header names in order: order's, then the rest in the default order.
++func orderPseudo(order []string) ([]string, error) {
++	if len(order) == 0 {
++		return defaultPseudoOrder, nil
++	}
++	out := make([]string, 0, len(defaultPseudoOrder))
++	seen := make(map[string]bool, len(defaultPseudoOrder))
++	for _, p := range order {
++		known := false
++		for _, d := range defaultPseudoOrder {
++			known = known || d == p
++		}
++		if !known || seen[p] {
++			return nil, fmt.Errorf("invalid pseudo-header order entry %q", p)
++		}
++		seen[p] = true
++		out = append(out, p)
++	}
++	for _, d := range defaultPseudoOrder {
++		if !seen[d] {
++			out = append(out, d)
++		}
++	}
++	return out, nil
++}
++
++// orderHeaderKeys returns h's keys in order: the keys order names (case-insensitively; orderedContentLength where it
++// names "content-length"), then the rest sorted by lower-cased name.
++func orderHeaderKeys(h map[string][]string, order []string) []string {
++	out := make([]string, 0, len(h)+1)
++	if len(order) == 0 {
++		for k := range h {
++			out = append(out, k)
++		}
++		sortHeaderKeys(out)
++		return out
++	}
++	byLower := make(map[string][]string, len(h))
++	for k := range h {
++		lower := strings.ToLower(k)
++		byLower[lower] = append(byLower[lower], k)
++	}
++	used := make(map[string]bool, len(order))
++	for _, name := range order {
++		lower := strings.ToLower(name)
++		if used[lower] {
++			continue
++		}
++		used[lower] = true
++		if lower == "content-length" {
++			out = append(out, orderedContentLength)
++			continue
++		}
++		keys := byLower[lower]
++		sort.Strings(keys)
++		out = append(out, keys...)
++	}
++	rest := make([]string, 0, len(h))
++	for lower, keys := range byLower {
++		if !used[lower] {
++			rest = append(rest, keys...)
++		}
++	}
++	sortHeaderKeys(rest)
++	return append(out, rest...)
++}
++
++func sortHeaderKeys(keys []string) {
++	sort.Slice(keys, func(i, j int) bool {
++		li, lj := strings.ToLower(keys[i]), strings.ToLower(keys[j])
++		if li != lj {
++			return li < lj
++		}
++		return keys[i] < keys[j]
++	})
++}
+diff -ruN a/internal/httpcommon/httpcommon.go b/internal/httpcommon/httpcommon.go
+--- a/internal/httpcommon/httpcommon.go
++++ b/internal/httpcommon/httpcommon.go
+@@ -200,6 +200,15 @@
+ 	// DefaultUserAgent is the User-Agent header to send when the request
+ 	// neither contains a User-Agent nor disables it.
+ 	DefaultUserAgent string
++
++	// Gray: PseudoOrder and HeaderOrder are the wire order of the pseudo-header
++	// and regular fields (http2.RequestLayout); nil keeps the default order.
++	PseudoOrder []string
++	HeaderOrder []string
++	// Gray: ContentLength is whether content-length is sent (gray.go).
++	ContentLength ContentLengthMode
++	// Gray: CookieAsSent writes each Cookie value as one field (http2.RequestLayout).
++	CookieAsSent bool
+ }
+ 
+ // EncodeHeadersResult is the result of EncodeHeaders.
+@@ -280,31 +289,56 @@
+ 		return res, err
+ 	}
+ 
++	pseudoOrder, err := orderPseudo(param.PseudoOrder) // Gray
++	if err != nil {
++		return res, err
++	}
++	headerKeys := orderHeaderKeys(req.Header, param.HeaderOrder) // Gray
++
+ 	enumerateHeaders := func(f func(name, value string)) {
+ 		// 8.1.2.3 Request Pseudo-Header Fields
+ 		// The :path pseudo-header field includes the path and query parts of the
+ 		// target URI (the path-absolute production and optionally a '?' character
+ 		// followed by the query production, see Sections 3.3 and 3.4 of
+ 		// [RFC3986]).
+-		f(":authority", host)
+ 		m := req.Method
+ 		if m == "" {
+ 			m = "GET"
+ 		}
+-		f(":method", m)
+-		if !isNormalConnect {
+-			f(":path", path)
+-			f(":scheme", req.URL.Scheme)
++		for _, p := range pseudoOrder { // Gray: was :authority, :method, :path, :scheme, :protocol
++			switch p {
++			case ":authority":
++				f(":authority", host)
++			case ":method":
++				f(":method", m)
++			case ":path":
++				if !isNormalConnect {
++					f(":path", path)
++				}
++			case ":scheme":
++				if !isNormalConnect {
++					f(":scheme", req.URL.Scheme)
++				}
++			case ":protocol":
++				if protocol != "" {
++					f(":protocol", protocol)
++				}
++			}
+ 		}
+-		if protocol != "" {
+-			f(":protocol", protocol)
+-		}
+ 		if trailers != "" {
+ 			f("trailer", trailers)
+ 		}
+ 
+-		var didUA bool
+-		for k, vv := range req.Header {
++		var didUA, didCL bool          // Gray: didCL
++		for _, k := range headerKeys { // Gray: was range req.Header
++			vv := req.Header[k]
++			if k == orderedContentLength { // Gray: Content-Length where HeaderOrder puts it
++				if !didCL && sendContentLength(param.ContentLength, req.Method, req.ActualContentLength) { // Gray: was shouldSendReqContentLength
++					f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
++				}
++				didCL = true
++				continue
++			}
+ 			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
+ 				// Host is :authority, already sent.
+ 				// Content-Length is automatic, set below.
+@@ -336,6 +370,12 @@
+ 				// Per 8.1.2.5 To allow for better compression efficiency, the
+ 				// Cookie header field MAY be split into separate header fields,
+ 				// each with one or more cookie-pairs.
++				if param.CookieAsSent { // Gray: the client's own split
++					for _, v := range vv {
++						f("cookie", v)
++					}
++					continue
++				}
+ 				for _, v := range vv {
+ 					for {
+ 						p := strings.IndexByte(v, ';')
+@@ -364,7 +404,7 @@
+ 				f(k, v)
+ 			}
+ 		}
+-		if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
++		if !didCL && sendContentLength(param.ContentLength, req.Method, req.ActualContentLength) { // Gray: !didCL, sendContentLength
+ 			f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+ 		}
+ 		if param.AddGzipHeader {

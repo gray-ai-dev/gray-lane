@@ -63,7 +63,15 @@ type server struct {
 	relayClient           *http.Client
 	relayTransport        *http.Transport
 	relayProxiedTransport *http.Transport
-	logger                *log.Logger
+	// mirror is the pool of vendor connections that repeat a container's ClientHello (mirror_dial.go).
+	mirror *mirrorPool
+	// profiles are the handshake shapes egress learned and repeats; relayProbe, when set, says whether the relay
+	// container listens (mirror_profiles.go).
+	profiles   *helloProfiles
+	relayProbe func(context.Context) bool
+	// mirrorSignals counts what the tunnels' taps did not record (mirror_signals.go).
+	mirrorSignals mirrorSignals
+	logger        *log.Logger
 	// afterFunc arms the connect-phase timer (D66). It is time.AfterFunc in production; a test
 	// replaces it to fire the phase deterministically instead of waiting on the wall clock.
 	afterFunc func(time.Duration, func()) *time.Timer
@@ -101,12 +109,15 @@ func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logg
 	relayDirect := newTransport(cfg, roots, dial, true)
 	relayDirect.HTTP2 = relayHTTP2Config(cfg)
 	relayProxied := newTransport(cfg, roots, dial, false)
+	mirror := newMirrorPool(cfg, roots, dial)
 	srv := &server{
 		cfg:                   cfg,
 		client:                newVendorClient(direct, proxied),
 		transport:             direct,
 		proxiedTransport:      proxied,
 		relayClient:           newVendorClient(relayDirect, relayProxied),
+		mirror:                mirror,
+		profiles:              newHelloProfilesWithin("", cfg.stackMaxBytes),
 		relayTransport:        relayDirect,
 		relayProxiedTransport: relayProxied,
 		logger:                logger,
@@ -115,6 +126,8 @@ func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logg
 		roots:                 roots,
 		dial:                  dial,
 	}
+	// Relay calls made in a vendor tunnel repeat the tunnel's ClientHello (mirror_dial.go).
+	srv.relayClient.Transport.(*modeRoundTripper).mirror = mirror
 	if cfg.peer {
 		srv.peers = newPeerTable(srv)
 	}
@@ -135,6 +148,7 @@ func (s *server) closeIdleConnections() {
 	for _, transport := range []*http.Transport{s.transport, s.proxiedTransport, s.relayTransport, s.relayProxiedTransport} {
 		transport.CloseIdleConnections()
 	}
+	s.mirror.closeIdle()
 	if s.peers != nil {
 		s.peers.closeIdleConnections()
 	}
@@ -173,9 +187,14 @@ func newTransport(cfg config, roots *x509.CertPool, dial dialFunc, allowHTTP2 bo
 type modeRoundTripper struct {
 	direct  *http.Transport
 	proxied *http.Transport
+	// mirror, when set, carries the requests that have a container's ClientHello to repeat (mirror_dial.go).
+	mirror *mirrorPool
 }
 
 func (m *modeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if m.mirror != nil && mirroredHelloOf(req.Context()) != nil {
+		return m.mirror.RoundTrip(req)
+	}
 	if spec, _ := req.Context().Value(proxyContextKey{}).(*egressSpec); spec != nil {
 		return m.proxied.RoundTrip(req)
 	}
@@ -405,6 +424,15 @@ type upstreamObserver interface {
 	finished(code string)
 }
 
+// stoppedCode is the code of an answer obs stopped (false from response or chunk): errEgressLimit, unless obs
+// names another (a relay call's coded answer egress cannot decode is errResponseRead, stack_coding.go).
+func stoppedCode(obs upstreamObserver) string {
+	if named, ok := obs.(interface{ stopCode() string }); ok && named.stopCode() != "" {
+		return named.stopCode()
+	}
+	return errEgressLimit
+}
+
 // forward sends the planned request to the vendor and streams the answer back unchanged; obs,
 // when not nil, observes it. It returns the log's error code ("" on success).
 func (s *server) forward(ctx context.Context, client *http.Client, rec *responseRecorder, method string, plan requestPlan, header http.Header, body []byte, obs upstreamObserver) string {
@@ -431,6 +459,9 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 		ctx = phaseContext
 		trace.phaseTimer = s.afterFunc(phase, cancel)
 		defer trace.phaseTimer.Stop()
+	}
+	if accounted, ok := obs.(mirrorAccounted); ok {
+		ctx = context.WithValue(ctx, mirrorAccountKey{}, accounted.mirrorAccount())
 	}
 	ctx = httptrace.WithClientTrace(ctx, trace.clientTrace())
 	// Seed the request from a constant URL and then assign the parsed target. Building it from
@@ -482,7 +513,7 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 		return finish(s.forwardHeld(rec, resp, obs, holder))
 	}
 	if obs != nil && !obs.response(resp.StatusCode, resp.Header) {
-		return finish(errEgressLimit)
+		return finish(stoppedCode(obs))
 	}
 	copyHeader(rec.Header(), resp.Header)
 	rec.WriteHeader(resp.StatusCode)
@@ -500,7 +531,7 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 			// The observer digests a chunk before it is written, so the entry can hold the
 			// feed record by the time the relay forwards the event (S24).
 			if obs != nil && !obs.chunk(buffer[:n]) {
-				return finish(errEgressLimit)
+				return finish(stoppedCode(obs))
 			}
 			if _, writeErr := rec.Write(buffer[:n]); writeErr != nil {
 				return finish(errClientWrite)
@@ -610,7 +641,7 @@ func isTLSError(err error) bool {
 		return true
 	}
 	var alert *tls.AlertError
-	return errors.As(err, &alert)
+	return errors.As(err, &alert) || isMirrorTLSError(err)
 }
 
 // proxyStage classifies a failed request that had a proxy spec. "dial" is the

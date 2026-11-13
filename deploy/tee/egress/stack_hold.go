@@ -69,7 +69,7 @@ holding:
 	}
 	body, ok := holder.release(resp.StatusCode, resp.Header, complete)
 	if !ok {
-		return errEgressLimit
+		return stoppedCode(obs)
 	}
 	copyHeader(rec.Header(), resp.Header)
 	rec.WriteHeader(resp.StatusCode)
@@ -111,7 +111,7 @@ holding:
 func writeObserved(rec *responseRecorder, controller *http.ResponseController, obs upstreamObserver, p []byte) string {
 	if len(p) > 0 {
 		if !obs.chunk(p) {
-			return errEgressLimit
+			return stoppedCode(obs)
 		}
 		if _, err := rec.Write(p); err != nil {
 			return errClientWrite

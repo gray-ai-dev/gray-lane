@@ -4,7 +4,7 @@ import { intSchema, uintSchema } from "./ints.ts";
 
 /**
  * `lane.acme_failed`: a lane VM's report that this boot's certificate order failed (D133), so an operator can read
- * why in the bridge's Workers Logs while the VM's own container log is not public (Phala `public_logs` off).
+ * why in the bridge's Workers Logs, also where the VM's own container log stays in the VM (Phala `public_logs` off).
  *
  * The lane's entrypoint (deploy/tee/bin/entrypoint.mjs) sends one per failed gray-acme run, before it holds and
  * retries, signed with the lane's bridge key like every other bridge call: who it is (the app id the guest agent

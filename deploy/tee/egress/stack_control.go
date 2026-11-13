@@ -320,6 +320,12 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 		refuse(errStackControlInvalid)
 		return
 	}
+	// The first customer request ends the learning of handshake shapes, before the container can hold it
+	// (mirror_profiles.go).
+	if code := s.admitRegistration(r.Context()); code != "" {
+		refuse(code)
+		return
+	}
 	code := s.stack.register(&stackRequest{
 		rid:         rid,
 		protocol:    protocol,

@@ -3,7 +3,6 @@ package main
 import (
 	"net/http"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -47,9 +46,9 @@ var stackBehaviourHeaders = withCompat(map[string][]string{
 	"chatgpt_codex": {"openai-beta"},
 }, false, func(openAICompatibleVendor) []string { return []string{"openai-beta"} })
 
-// stackPassHeaders are the names a relay call may carry besides its behaviour headers, by route: the
-// credential form's, the body's type, Accept, the identity headers above, and Accept-Encoding, which egress
-// replaces with identity (S16).
+// stackPassHeaders are the names of Gray's own header set by route (S32's lists): the credential form's, the
+// body's type, Accept, the identity headers above and Accept-Encoding. They no longer bound what a relay call may
+// carry (stackHeaderRefusal); the tests hold every name egress writes to one role on them.
 var stackPassHeaders = withCompat(map[string]map[string]bool{
 	"/anthropic": setOf("x-api-key", "authorization", "content-type", "accept", "accept-encoding", "user-agent",
 		"x-app", "anthropic-dangerous-direct-browser-access", "x-claude-code-session-id", "x-client-request-id"),
@@ -60,7 +59,7 @@ var stackPassHeaders = withCompat(map[string]map[string]bool{
 	return setOf("authorization", "content-type", "accept", "accept-encoding", "user-agent")
 })
 
-// stackPassPrefixes are name prefixes allowed the same way: the Stainless SDK telemetry of Claude Code.
+// stackPassPrefixes are name prefixes that are client identity the same way: the Stainless SDK telemetry of Claude Code.
 var stackPassPrefixes = map[string][]string{
 	"/anthropic": {"x-stainless-"},
 }
@@ -77,53 +76,54 @@ func setOf(names ...string) map[string]bool {
 	return set
 }
 
-// checkStackHeaders is S32's header check of a relay call's headers (hop-by-hop and X-Gray-Request already
-// removed). It returns the lower-case name of the first header refused and its code, or "" twice:
-// stack_header_refused for a name off the route's lists (in name order), then for a behaviour header other than the
-// client's. oauth is an Anthropic OAuth call (authorization on /anthropic), whose credential form adds the OAuth
-// beta; an identity's betas may be added too. A client-identity value is never compared (S32a, owner 2026-10-29):
-// egress writes the vendor's header set itself (stackVendorHeader), the account's registered values in place of
-// whatever the relay sent, so stack_identity_mismatch is reserved and never returned.
-func checkStackHeaders(rt route, req *stackRequest, header http.Header, oauth bool, identity *stackIdentity) (string, string) {
-	forwarded := make(map[string]string, len(header))
-	names := make([]string, 0, len(header))
-	for name, values := range header {
-		lower := strings.ToLower(name)
-		if _, seen := forwarded[lower]; !seen {
-			names = append(names, lower)
-		}
-		forwarded[lower] = joinValues(forwarded[lower], values)
+// stackHeaderRefusal is the header of a relay call egress refuses, or "". A relay's headers reach the vendor as it
+// sent them, each change recorded (stack_changes.go `stackRelayHeader`), whatever the customer chose (owner,
+// 2026-11-12: a customer who asks for relays that change nothing means the request's content, not the client's
+// headers). Refused are the headers that add a credential or switch the account (stackAccountRefusal), and, for a
+// customer who chose that (kept: the rid has no `relay_changes`), a change to a behaviour header the customer sent.
+func stackHeaderRefusal(rt route, req *stackRequest, relay http.Header, kept bool) string {
+	if name := stackAccountRefusal(rt, relay); name != "" {
+		return name
 	}
-	sort.Strings(names)
-	behaviour := map[string]bool{}
-	for _, name := range stackBehaviourHeaders[req.vendor] {
-		behaviour[name] = true
+	if kept {
+		return stackKeptBehaviourRefusal(req, relay)
 	}
-	for _, name := range names {
-		if !behaviour[name] && !stackPassHeaders[rt.name][name] && !hasPrefix(name, stackPassPrefixes[rt.name]) {
-			return name, errStackHeaderRefused
-		}
-	}
-	for _, name := range stackBehaviourHeaders[req.vendor] {
-		value, present := forwarded[name]
-		client, sent := req.headers[name]
-		var ok bool
-		switch name {
-		case "anthropic-version":
-			ok = (sent && present && value == client) || (!sent && (!present || value == stackAnthropicVersion))
-		case "anthropic-beta":
-			ok = sameValues(value, client, stackBetaExtras(oauth, identity))
-		default:
-			ok = sameValues(value, client, nil)
-		}
-		if !ok {
-			return name, errStackHeaderRefused
-		}
-	}
-	return "", ""
+	return ""
 }
 
-// joinValues is a header's values as fetch's Headers joins them, and as the registration carries them: ", ".
+// stackKeptBehaviourRefusal names a behaviour header (`anthropic-version`, a beta list) the customer sent and the
+// relay's call would change: another version, or a beta list without one of the customer's values. They are the
+// customer's own request parameters, as the body is. A header the relay does not send keeps the customer's value
+// (Gray's set carries it), and a relay may add values to a list.
+func stackKeptBehaviourRefusal(req *stackRequest, relay http.Header) string {
+	sent := map[string]string{}
+	present := map[string]bool{}
+	for name, values := range relay {
+		lower := strings.ToLower(name)
+		sent[lower] = joinValues(sent[lower], values)
+		present[lower] = true
+	}
+	for _, name := range stackBehaviourHeaders[req.vendor] {
+		client, asked := req.headers[name]
+		if !asked || !present[name] {
+			continue
+		}
+		if name == "anthropic-version" {
+			if sent[name] != client {
+				return name
+			}
+			continue
+		}
+		got := listValues(sent[name])
+		for value := range listValues(client) {
+			if !got[value] {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
 func joinValues(joined string, values []string) string {
 	for _, value := range values {
 		if joined != "" {

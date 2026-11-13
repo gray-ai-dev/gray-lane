@@ -522,6 +522,16 @@ export const relayStackChangedSchema = z
   });
 
 /**
+ * `request.forwarded.tls_hello`, present only when the call was made in a vendor tunnel (egress's `attempt` record's
+ * `tls_hello`): `relay` says the TLS handshake egress made with the vendor had the shape the relay's software showed
+ * it (cipher suites, extensions and their order), learned before the relay could hold any customer request; absent,
+ * the handshake was egress's own.
+ */
+export const STACK_TLS_HELLOS = Object.freeze(["relay"] as const);
+
+export type StackTlsHello = (typeof STACK_TLS_HELLOS)[number];
+
+/**
  * The per-attempt `request.forwarded`: §7.4's `body_hash` (`sha256:` + the feed's `body_sha256`, the
  * bytes the relay's call carried to egress) plus the call's method, vendor path, the SHA-256 of its
  * raw query (egress's `query_sha256`), and `body_jcs_sha256`, the SHA-256 of the body's RFC 8785 form:
@@ -536,6 +546,7 @@ export const stackRequestForwardedSchema = z.object({
   path: vendorPathSchema,
   query_sha256: hex32,
   body_jcs_sha256: hex32,
+  tls_hello: z.enum(STACK_TLS_HELLOS).optional(),
 });
 
 /**
@@ -968,15 +979,19 @@ export function stackRequestForwardedEvent(input: {
   readonly querySha256: string;
   readonly bodySha256: string;
   readonly bodyJcsSha256: string;
+  /** The record's `tls_hello`, when it has one ([`STACK_TLS_HELLOS`]). */
+  readonly tlsHello?: StackTlsHello;
 }): JsonObject {
-  return shaped(stackRequestForwardedSchema, {
+  const event: JsonObject = {
     type: EVENT_REQUEST_FORWARDED,
     body_hash: `sha256:${input.bodySha256}`,
     method: input.method,
     path: input.path,
     query_sha256: input.querySha256,
     body_jcs_sha256: input.bodyJcsSha256,
-  });
+  };
+  if (input.tlsHello !== undefined) setMember(event, "tls_hello", input.tlsHello);
+  return shaped(stackRequestForwardedSchema, event);
 }
 
 /** `upstream.response`: the vendor's status, header digest, content digest (if any) and how it ended. */

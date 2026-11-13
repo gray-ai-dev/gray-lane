@@ -32,6 +32,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"mime"
 	"net/http"
 	"slices"
 	"sort"
@@ -401,8 +402,9 @@ func encodeStackChanged(body *stackChanged, headers []stackChange) json.RawMessa
 // ---------------------------------------------------------------------------------------------------
 
 // stackFramingHeaders are egress's own (P5): the body's type and coding (S18 proved it JSON and egress forwards it as
-// read), its length, the answer's coding (identity, so egress digests what the vendor said, S16), and the hop. A
-// relay's value for them is not used and is no change.
+// read), its length, the answer's coding, and the hop. stackRelayHeader passes over them; a relay's value for them
+// is no change. Two take the relay's value afterwards (stackRelayFraming, stack_coding.go): a JSON content type, and
+// the accept-encoding less the codings egress cannot decode, which is the one framing change recorded.
 var stackFramingHeaders = setOf("content-type", "content-encoding", "content-length", "accept-encoding", "host",
 	"transfer-encoding", "connection", "te", "trailer", "upgrade", "keep-alive", "proxy-connection")
 
@@ -501,4 +503,83 @@ func stackRelayHeader(rt route, base, relay http.Header, oauth bool) (http.Heade
 		changes = append(changes, change)
 	}
 	return out, changes
+}
+
+// stackDecodableCodings are the content codings egress decodes, by lower-case name (RFC 9110 §8.4.1: `x-gzip` is
+// `gzip`; RFC 7932 `br`; RFC 9659 `zstd`). `compress` (LZW) and anything else are not.
+var stackDecodableCodings = setOf("gzip", "x-gzip", "deflate", "br", "zstd")
+
+// stackContentType is a relay call's vendor Content-Type: the relay's one value when it names application/json with
+// no parameter but a UTF-8 charset (S18 read the body as UTF-8 JSON; another charset would have the vendor read
+// other text), else application/json as before.
+func stackContentType(sent []string) string {
+	if len(sent) != 1 {
+		return "application/json"
+	}
+	mediaType, params, err := mime.ParseMediaType(sent[0])
+	if err != nil || mediaType != "application/json" {
+		return "application/json"
+	}
+	for name, value := range params {
+		if name != "charset" || !strings.EqualFold(value, "utf-8") {
+			return "application/json"
+		}
+	}
+	return sent[0]
+}
+
+// stackAcceptEncoding is a relay call's vendor Accept-Encoding: the relay's field lines as it sent them when every
+// element names identity or a coding egress decodes, else those elements in order with their parameters, joined with
+// ", " (`identity` when none is left, since an empty or missing field would accept any coding), with the change
+// that records the difference. No lines: the relay sent none, and the vendor gets none.
+func stackAcceptEncoding(sent []string) ([]string, *stackChange) {
+	if len(sent) == 0 {
+		return nil, nil
+	}
+	var kept []string
+	dropped := false
+	for _, line := range sent {
+		for _, element := range strings.Split(line, ",") {
+			element = strings.Trim(element, " \t")
+			if element == "" {
+				continue
+			}
+			coding, _, _ := strings.Cut(element, ";")
+			coding = strings.ToLower(strings.Trim(coding, " \t"))
+			if coding == "identity" || stackDecodableCodings[coding] {
+				kept = append(kept, element)
+			} else {
+				dropped = true
+			}
+		}
+	}
+	if !dropped {
+		return slices.Clone(sent), nil
+	}
+	value := strings.Join(kept, ", ")
+	if value == "" {
+		value = "identity"
+	}
+	change := &stackChange{Op: "replace", Name: "accept-encoding", RemovedBytes: len(joinValues("", sent)), AddedBytes: len(value)}
+	if utf8.ValidString(value) {
+		change.Value = value
+	}
+	return []string{value}, change
+}
+
+// stackRelayFraming puts the relay's Content-Type and Accept-Encoding on a relay call's vendor header set (out, the
+// result of stackRelayHeader, which leaves framing names to egress) and adds the coding change, if any, to
+// changes in name order.
+func stackRelayFraming(out, relay http.Header, changes []stackChange) []stackChange {
+	out.Set("Content-Type", stackContentType(relay.Values("Content-Type")))
+	values, change := stackAcceptEncoding(relay.Values("Accept-Encoding"))
+	out.Del("Accept-Encoding")
+	if values != nil {
+		out["Accept-Encoding"] = values
+	}
+	if change == nil {
+		return changes
+	}
+	at, _ := slices.BinarySearchFunc(changes, change.Name, func(c stackChange, name string) int { return strings.Compare(c.Name, name) })
+	return slices.Insert(changes, at, *change)
 }

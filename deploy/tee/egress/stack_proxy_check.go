@@ -105,6 +105,33 @@ func stackVendorHost(vendor string) (string, bool) {
 }
 
 func (s *server) checkProxy(ctx context.Context, spec *egressSpec, host string) proxyCheckAnswer {
+	if hello := s.profiles.defaultHello(false); hello != nil && s.mirror != nil {
+		var connectStatus atomic.Int64
+		ctx = context.WithValue(ctx, proxyConnectStatusKey{}, func(status int) {
+			connectStatus.Store(int64(status))
+		})
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var timedOut atomic.Bool
+		timer := s.afterFunc(proxyConnectCap, func() {
+			timedOut.Store(true)
+			cancel()
+		})
+		defer timer.Stop()
+		var handshakes atomic.Int64
+		start := time.Now()
+		trace := &httptrace.ClientTrace{
+			TLSHandshakeStart: func() { handshakes.Add(1) },
+		}
+		conn, _, err := s.mirror.dialVendor(httptrace.WithClientTrace(ctx, trace), hello, spec, net.JoinHostPort(host, "443"), nil)
+		if err == nil {
+			ms := time.Since(start).Milliseconds()
+			_ = conn.Close()
+			return proxyCheckAnswer{Outcome: "ok", LatencyMs: &ms}
+		}
+		code := proxyCheckCode(err, spec.kind, int(connectStatus.Load()), handshakes.Load(), timedOut.Load())
+		return proxyCheckAnswer{Outcome: "failed", Code: &code}
+	}
 	transport := s.proxiedTransport.Clone()
 	transport.DisableKeepAlives = true
 	defer transport.CloseIdleConnections()

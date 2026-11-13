@@ -38,6 +38,7 @@ import {
   type StackDroppedKind,
   type StackEndReason,
   type StackFeedIncompleteReason,
+  type StackTlsHello,
   type StackRefusalCode,
   type PeerFailedCode,
   type StackServedAs,
@@ -388,7 +389,7 @@ export class ReceiptBuilder {
   /**
    * Relay stack (S26): the call egress accepted for the current attempt, from its `attempt` record
    * (`bodySha256` is the record's bare-hex `body_sha256`, written as `body_hash`; `bodyJcsSha256` its
-   * `body_jcs_sha256`).
+   * `body_jcs_sha256`; `tlsHello` its `tls_hello`, when the call was made in a vendor tunnel).
    */
   addStackRequestForwarded(input: {
     readonly method: string;
@@ -396,6 +397,7 @@ export class ReceiptBuilder {
     readonly querySha256: string;
     readonly bodySha256: string;
     readonly bodyJcsSha256: string;
+    readonly tlsHello?: StackTlsHello;
   }): void {
     this.#push(stackRequestForwardedEvent(input));
   }

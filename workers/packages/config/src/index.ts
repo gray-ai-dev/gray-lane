@@ -3749,11 +3749,13 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "relayChainKmsIds",
     workers: ["console"],
     type: "text",
-    default: "kms_kpw4DwWL,kms_23e2EjXz",
+    default: "kms_r5wVLPed,kms_kpw4DwWL,kms_23e2EjXz",
     textCheck: kmsIdListProblem,
     source:
-      "docs/design/relay-no-always-on-host.md 13.2: Phala's Base KMS records on our nodes, kms-base-prod9 (kms_kpw4DwWL) and " +
-      "kms-base-prod5 (kms_23e2EjXz), read on 2026-11-09; A1 step 0 provisioned on the first.",
+      "docs/design/relay-no-always-on-host.md 13.2: Phala's Base KMS records, kms-base-prod9 (kms_kpw4DwWL) and " +
+      "kms-base-prod5 (kms_23e2EjXz), read on 2026-11-09; A1 step 0 provisioned on the first. Phala disabled both for new " +
+      "deployments between 2026-11-11 11:19Z and 2026-11-12 07:02Z (ERR-02-030); `GET /kms/base/nodes` then listed only " +
+      "kms-base-prod2 (kms_r5wVLPed), which new phase-2 profiles use. The old ids stay for the profiles published on them.",
     doc:
       "The Phala KMS ids (`kms_…`, comma-separated) on the relays' chain: a phase-2 release profile must name one of them as its kms_id " +
       "and a phase-1 profile none, so a phase-2 VM is provisioned on an on-chain KMS and a phase-1 VM never is.",

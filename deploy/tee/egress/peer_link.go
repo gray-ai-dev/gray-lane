@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
@@ -52,14 +52,17 @@ func (s *server) dialPeerLink(ctx context.Context, target peerTarget) (net.Conn,
 	defer stop()
 
 	authority := target.digest + peerLinkHostSuffix + ":443"
-	var head strings.Builder
-	head.WriteString("CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n")
-	head.WriteString(peerLinkRelayHeader + ": " + target.relay + "\r\n")
-	if target.attest {
-		head.WriteString(peerLinkModeHeader + ": attest\r\n")
+	// The request net/http's Transport writes for a tunnel, as mirror_dial.go's CONNECT.
+	connect := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: authority},
+		Host:   authority,
+		Header: http.Header{peerLinkRelayHeader: {target.relay}},
 	}
-	head.WriteString("\r\n")
-	if _, err := io.WriteString(conn, head.String()); err != nil {
+	if target.attest {
+		connect.Header.Set(peerLinkModeHeader, "attest")
+	}
+	if err := connect.Write(conn); err != nil {
 		return fail(errPeerConnectFailed, err)
 	}
 	reader := bufio.NewReader(conn)

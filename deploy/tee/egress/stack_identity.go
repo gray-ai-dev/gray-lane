@@ -22,9 +22,10 @@ import (
 // writes the vendor's header set itself:
 //
 //   - the credential headers, the relay's (S15: their values are the sealed credential's);
-//   - content-type application/json (S18 proved the body JSON), accept-encoding identity (S16), and accept `*/*`
-//     (@gray/protocol DEFAULT_ACCEPT, what Gray's own requests send when the client names none) unless the
-//     account's identity registers one;
+//   - content-type application/json (S18 proved the body JSON) and accept `*/*` (@gray/protocol DEFAULT_ACCEPT,
+//     what Gray's own requests send when the client names none) unless the account's identity registers one; a
+//     relay call then takes the relay's own content type and accept-encoding (stackRelayFraming, stack_coding.go:
+//     egress decodes the answer it digests), an account test asks for identity;
 //   - the behaviour headers from the registration (S32): the client's anthropic-version (else 2023-06-01), the
 //     client's anthropic-beta tokens plus the OAuth beta on an Anthropic OAuth call plus the identity's betas,
 //     the client's openai-beta; each list in the client's order, without repeats, joined with ", ";
@@ -232,7 +233,6 @@ func stackVendorHeader(rt route, credential http.Header, client map[string]strin
 	}
 	out.Set("Content-Type", "application/json")
 	out.Set("Accept", stackDefaultAccept)
-	out.Set("Accept-Encoding", "identity")
 	if rt.name == "/anthropic" {
 		version := stackAnthropicVersion
 		if sent, ok := client["anthropic-version"]; ok {

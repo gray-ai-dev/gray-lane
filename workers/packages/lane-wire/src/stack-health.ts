@@ -369,5 +369,6 @@ export const STACK_IDENTITY_STATIC_CHATGPT = ["user-agent", "accept", "originato
 export const STACK_IDENTITY_GENERATED_CHATGPT = ["x-client-request-id", "session_id", "session-id", "conversation_id", "thread-id"] as const;
 
 /** The kinds of the "needs re-login" list (S45), in the order the panel lists them. */
-export const STACK_CREDENTIAL_ISSUE_KINDS = ["credential_expiring", "not_sealed", "credential_waiting", "lease_expiring", "agent_silent"] as const;
+/** `not_in_source` (2026-11-12): panel accounts gray-assistant's source no longer lists; Gray keeps them (it only adopts). */
+export const STACK_CREDENTIAL_ISSUE_KINDS = ["credential_expiring", "not_sealed", "credential_waiting", "not_in_source", "lease_expiring", "agent_silent"] as const;
 export type StackCredentialIssueKind = (typeof STACK_CREDENTIAL_ISSUE_KINDS)[number];

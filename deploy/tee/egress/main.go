@@ -56,6 +56,9 @@ func run(cfg config, stdout, stderr io.Writer) error {
 	var relayListener net.Listener
 	if cfg.relayListen != "" {
 		srv.stack = newRelayStack(cfg)
+		if cfg.relayListen == stackRelayListen {
+			srv.relayProbe = relayListening(stackRelayContainer)
+		}
 		relayListener, err = listenRelay(cfg.relayListen)
 		if err != nil {
 			return err
@@ -70,7 +73,7 @@ func run(cfg config, stdout, stderr io.Writer) error {
 		// relay's trust bundle, written before the relay listener serves (compose starts the relay after egress is
 		// healthy, which the bundle's presence is).
 		if cfg.signInKeyDir != "" {
-			ca, err := loadOrMakeSignInCA(cfg.signInKeyDir, signInDomains(signInRows), time.Now())
+			ca, err := loadOrMakeSignInCA(cfg.signInKeyDir, tunnelDomains(signInRows), time.Now())
 			if err != nil {
 				return fmt.Errorf("sign-in CA: %w", err)
 			}
@@ -78,6 +81,8 @@ func run(cfg config, stdout, stderr io.Writer) error {
 				return fmt.Errorf("sign-in bundle: %w", err)
 			}
 			srv.signIn.ca = ca
+			// The learned handshake shapes live beside the CA, for this boot (mirror_profiles.go).
+			srv.profiles = newHelloProfilesWithin(cfg.signInKeyDir, cfg.stackMaxBytes)
 		}
 	}
 

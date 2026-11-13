@@ -87,9 +87,16 @@
 // - `manifest_version: "3"` (string): 0.6 guests read `requirements` only at "3", and an older guest
 //   refuses the compose instead of silently ignoring the requirement. `docs/upgrading-to-0.6.md`.
 // - `runner: "docker-compose"`: the embedded file is a compose file.
-// - `public_logs: false`, `public_sysinfo: false`: the lane's logs and system info are not published. Both
-//   are set explicitly, because dstack's own default is `false` but a reviewer should not have to know
-//   that to read this file.
+// - `public_logs` (`PUBLIC_LOGS`, owner 2026-11-12): `true` for the entry (the default layout), `false` for a
+//   relay stack VM. Since Phala's log access of 2026-11-11 (dstack 0.6.3) it no longer publishes anything:
+//   it lets the containers' stdout/stderr leave the VM to members of Gray's Phala workspace, through links
+//   Phala signs per member (docs.phala.com/phala-cloud/monitoring/public-logs). The entry's containers log
+//   only event names, ids and error codes (IMPLEMENTATION_NOTES.md §9, "public_logs"); a stack VM runs the
+//   relay's own software, whose output Gray must not read, so its containers' logs never leave the VM. The
+//   serial console and the VM's own stdout/stderr are readable to the workspace either way.
+// - `public_sysinfo: false`: the lane's system info is not published (Phala relays it to the owner
+//   anyway, `phala-deploy.mjs stats`). Set explicitly, because dstack's own default is `false` but a
+//   reviewer should not have to know that to read this file.
 // - `public_tcbinfo: true`: TCB/measurement info stays public — it is what a verifier needs, and it
 //   contains no request data.
 // - `kms_enabled: true` and `key_provider: "kms"`: keys are derived through dstack's KMS, so the host
@@ -335,6 +342,13 @@ export const FORBIDDEN_KEYSET_NOT_AFTER = 4102444800;
  * sealed-credential relays); `stack` is compose.stack.yaml, where a relay's own image runs in the VM.
  */
 export const LAYOUTS = Object.freeze(["default", "stack"]);
+/**
+ * The measured `public_logs` per layout (owner, 2026-11-12; the header's field list says why): the entry's container
+ * logs are readable to Gray's Phala workspace, a relay stack VM's never leave it. @gray/lane-compose's stack policy
+ * (`STACK_LAYOUT.appCompose.common.public_logs`) refuses anything but `false`; lane-verify's gates test holds the two
+ * to each other.
+ */
+export const PUBLIC_LOGS = Object.freeze({ default: true, stack: false });
 
 export const STACK_COMPOSE_PATH = join(here, "compose.stack.yaml");
 export const STACK_APP_COMPOSE_PATH = join(here, "app-compose.stack.json");
@@ -2077,7 +2091,7 @@ export function appComposeFor(composeText, options = {}) {
     name: APP_NAME,
     runner: RUNNER,
     docker_compose_file: composeText,
-    public_logs: false,
+    public_logs: PUBLIC_LOGS[spec.name],
     public_sysinfo: false,
     public_tcbinfo: true,
     kms_enabled: true,
@@ -2342,7 +2356,7 @@ export function main(argv = process.argv.slice(2), log = console.log) {
   log(`  layout       ${spec.name} (${composePath})`);
   log(`  target       ${rendered.target}${rendered.target === "phala" ? " (Phala-normalized; key_provider_id set; D101)" : ""}`);
   log(`  images       ${images.join(", ")}`);
-  log(`  fields       ${Object.keys(rendered.appCompose).length} (public_logs=false, public_sysinfo=false, kms, port_policy ${rendered.appCompose.port_policy.ports.map((entry) => entry.port).join(",") || "none"})`);
+  log(`  fields       ${Object.keys(rendered.appCompose).length} (public_logs=${rendered.appCompose.public_logs}, public_sysinfo=false, kms, port_policy ${rendered.appCompose.port_policy.ports.map((entry) => entry.port).join(",") || "none"})`);
   log(`  allowed_envs ${rendered.appCompose.allowed_envs.join(", ")}`);
   const laneEnvironment = (() => {
     const parsed = parseCompose(rendered.composeText);

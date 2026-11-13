@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"errors"
 	"io"
 	"log"
 	"net"
@@ -18,16 +17,24 @@ import (
 // answers `CONNECT <host>:443` with the account's proxy handle as the Basic username (`Proxy-Authorization: Basic`; the
 // lane makes the handle, `PUT /v1/stack/ops/sign-in-proxy`; there is no password, D3). It
 // opens a tunnel only to a sign-in host of the account vendor's row, ends TLS there with a leaf from the Gray sign-in
-// CA (signin_ca.go), HTTP/1.1 only, and runs each request inside through the sign-in route's own checks and call
-// (stack_login.go loginCall): the row's paths and refused words, no `X-Gray-Request`, no `x-gray-*` header, the body
-// bound, GET or POST, the account's own outbound proxy, no redirect followed; plus the session rules (signin_session.go).
+// CA (signin_ca.go), speaks HTTP/2 or HTTP/1.1 inside as the hello's ALPN offer allows (as a vendor tunnel does,
+// mirror_tunnel.go; the owner's decision of 2026-11-12, which replaces D10's HTTP/1.1 only), and runs each request
+// inside, on HTTP/2 each stream, through the sign-in route's own checks and call
+// (stack_login.go loginCall): the row's exact calls (and a password account's sign-in steps), no address but the
+// sealed one, no `X-Gray-Request`, no `x-gray-*` header, the body bound, GET or POST, the account's own outbound proxy,
+// no redirect followed; plus the session rules (signin_session.go).
 // Inference never goes this way: the rows hold no inference path.
 
 const (
 	routeSignInProxyCall = "/v1/relay/sign-in-proxy"
-	// signInTunnelsMax bounds the open tunnels (each holds a TLS connection and its HTTP/1.1 buffers, about 100 KiB);
-	// calls in them are bounded again by loginInFlightMax.
-	signInTunnelsMax      = 32
+	// signInTunnelsMax bounds the open tunnels (each holds a TLS connection, its HTTP/1.1 buffers, about 100 KiB, and
+	// an HTTP/2 connection's, vendorTunnelHTTP2Bytes, about 92 KiB); calls in them are bounded again by
+	// loginInFlightMax.
+	signInTunnelsMax = 32
+	// signInTunnelStreams is an HTTP/2 sign-in tunnel's SETTINGS_MAX_CONCURRENT_STREAMS. A tunnel is one account's and
+	// an account signs in one call at a time (stack_login.go), so four leaves room for a client that overlaps a
+	// step's calls, and no tunnel alone takes the loginInFlightMax calls egress runs at once.
+	signInTunnelStreams   = 4
 	signInTunnelIdle      = 90 * time.Second
 	signInHandshakeCap    = 10 * time.Second
 	errLoginProxyAuth     = "login_proxy_auth"
@@ -78,7 +85,8 @@ func (s *server) serveSignInConnect(rec *responseRecorder, r *http.Request, entr
 		refuse(errLoginHeld)
 		return
 	}
-	if _, open := signInRows[vendor].Hosts[host]; !open {
+	// A host of the row's calls; for a password account also one of its sign-in steps' (signin_rows.go).
+	if !signInRows[vendor].tunnelHost(host, password) {
 		refuseHost()
 		return
 	}
@@ -114,6 +122,8 @@ func (s *server) serveSignInConnect(rec *responseRecorder, r *http.Request, entr
 	}
 	go func() {
 		defer st.tunnels.Add(-1)
+		defer func() { _ = conn.Close() }()
+		defer recoverTunnel("sign-in")
 		s.serveTunnel(&bufferedConn{Conn: conn, reader: buffered.Reader}, host, accountID, vendor, password, leaf)
 	}()
 }
@@ -141,32 +151,54 @@ type bufferedConn struct {
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
-// serveTunnel ends TLS for host and serves HTTP/1.1 requests inside until the client closes or goes idle.
+// serveTunnel ends TLS for host and serves the requests inside, over HTTP/2 or HTTP/1.1 as the handshake chose, until
+// the client closes or goes idle.
 func (s *server) serveTunnel(conn net.Conn, host, accountID, vendor string, password bool, leaf *tls.Certificate) {
-	tlsConn := tls.Server(conn, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"http/1.1"},
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			// The name the client checks must be the CONNECT's host.
-			if hello.ServerName != "" && strings.ToLower(hello.ServerName) != host {
-				return nil, errors.New("server name differs from the CONNECT host")
-			}
-			return leaf, nil
-		},
+	// The sign-in calls reach the vendor with the container's own handshake, session state and HTTP framing, as relay
+	// calls in a vendor tunnel do (mirror_tunnel.go).
+	tlsConn, hello, sessInfo, reason, err := tunnelHandshake(conn, host, leaf, signInHandshakeCap, tunnelProtocols, s.mirrorBinder(), func(h *mirroredHello) (*mirroredHello, string) {
+		return s.profiles.admitFor(h, true)
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), signInHandshakeCap)
-	err := tlsConn.HandshakeContext(ctx)
-	cancel()
 	if err != nil {
-		_ = tlsConn.Close()
 		return
+	}
+	var innerConn net.Conn = tlsConn
+	var h2Tap *h2TapConn
+	var h1Tap *h1TapConn
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		h2Tap = newH2TapConn(tlsConn, func(p *h2Preface) {
+			s.profiles.recordH2Preface(hello, p)
+		})
+		h2Tap.signals = &s.mirrorSignals
+		innerConn = h2Tap
+	} else {
+		h1Tap = newH1TapConn(tlsConn)
+		h1Tap.signals = &s.mirrorSignals
+		innerConn = h1Tap
 	}
 	done := make(chan struct{})
 	var once sync.Once
 	inner := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var meta *wireRequestMeta
+			if h2Tap != nil {
+				meta = h2Tap.take(r)
+			} else if h1Tap != nil {
+				meta = h1Tap.takeFor(r)
+			}
+			s.mirrorSignals.wireMeta(meta)
+			ctx := withTunnelSession(r.Context(), sessInfo)
+			if meta != nil {
+				ctx = context.WithValue(ctx, wireMetaKey{}, meta)
+			}
+			r = r.WithContext(ctx)
 			s.handled(w, r, func(rec *responseRecorder, r *http.Request, entry *requestLog) {
-				s.tunnelCall(rec, r, entry, host, accountID, vendor, password)
+				if hello == nil {
+					entry.Route, entry.Error = routeSignInProxyCall, errStackHelloRefused
+					writeHelloRefusal(rec, reason)
+					return
+				}
+				s.tunnelCall(rec, r.WithContext(context.WithValue(r.Context(), mirrorHelloKey{}, hello)), entry, host, accountID, vendor, password)
 			})
 		}),
 		// A sign-in call is a few KiB: a tunnel that sends nothing gives its slot back within signInTunnelIdle.
@@ -176,16 +208,16 @@ func (s *server) serveTunnel(conn net.Conn, host, accountID, vendor string, pass
 		WriteTimeout:   loginCallCap + maxLoginPersistWait + signInHandshakeCap,
 		IdleTimeout:    signInTunnelIdle,
 		MaxHeaderBytes: relayMaxHeaderBytes,
-		// HTTP/1.1 only (D10): no protocol beside it is served on the connection.
-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
-		ErrorLog:     log.New(io.Discard, "", 0),
+		// HTTP/2 when the handshake chose it; the timeouts above are then each stream's.
+		HTTP2:    tunnelHTTP2Config(signInTunnelStreams),
+		ErrorLog: log.New(io.Discard, "", 0),
 		ConnState: func(_ net.Conn, state http.ConnState) {
 			if state == http.StateClosed || state == http.StateHijacked {
 				once.Do(func() { close(done) })
 			}
 		},
 	}
-	_ = inner.Serve(&oneConnListener{conn: tlsConn, done: done})
+	_ = inner.Serve(&oneConnListener{conn: innerConn, done: done})
 }
 
 // tunnelCall is one request inside a tunnel: the sign-in route's checks and call, for the tunnel's account and host.

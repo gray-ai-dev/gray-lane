@@ -39,14 +39,17 @@ ARG GO_IMAGE
 ARG LOCAL_BUILD=0
 
 # ---------------------------------------------------------------------------------------------------
-# gray-egress (deploy/tee/egress): standard library only, static.
+# gray-egress (deploy/tee/egress): static; uTLS and x/net at the go.mod/go.sum pin, plus the in-repo fork of the standard
+# library's HTTP/2 client (egress/third_party/stdhttp2: net/http/internal/http2 of this GO_IMAGE's Go release, recorded in
+# its BASE, + gray.patch) for the mirrored transport.
 # ---------------------------------------------------------------------------------------------------
 FROM ${GO_IMAGE} AS egress
 ARG TARGETARCH=amd64
 WORKDIR /src
 COPY egress/ /src/
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-    go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/gray-egress .
+RUN GOTOOLCHAIN=local go mod download \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/gray-egress .
 
 # ---------------------------------------------------------------------------------------------------
 # gray-isolation-check (deploy/tee/isolation-check): standard library only, static, flags as egress.

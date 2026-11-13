@@ -31,7 +31,8 @@
 //   gray-acme run holds ISSUE_FAILURE_HOLD_MS after its start before the container exits. Why these
 //   numbers: deploy/tee/IMPLEMENTATION_NOTES.md D133.
 // - A failed gray-acme run is reported to the bridge before the hold (`lane.acme_failed`, @gray/lane-wire
-//   lane-acme.ts), because this container's log is not public (Phala `public_logs` off): gray-acme's lines, which
+//   lane-acme.ts), so the reason reaches the bridge's Workers Logs even where this container's log stays in the VM
+//   (Phala `public_logs` off; the entry's is on since 2026-11-12): gray-acme's lines, which
 //   carry no key material, token or EAB value, read from its stderr and passed through to this process's, are
 //   grouped by CA, cut to the wire's bounds, cleaned of the EAB values and the bridge seed once more, and sent as
 //   one call signed with the bridge key the way the lane's Worker signs every bridge call (`gray-lane-bridge-v1`).
