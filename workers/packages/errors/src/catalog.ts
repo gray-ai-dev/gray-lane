@@ -26,7 +26,7 @@ export function helpSentence(help: Help, origins: Origins): string {
     case "docs":
       return `API reference: ${console}/#/app/docs.`;
     case "provider_setup":
-      return `Provider setup: ${console}/#/partner/onboarding.`;
+      return `Provider setup: ${console}/provider/onboarding.`;
   }
 }
 

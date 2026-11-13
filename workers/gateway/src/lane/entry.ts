@@ -23,6 +23,7 @@ import { ACI_API_VERSION, ACI_KEYSET_DIGEST_HEADER, ACI_VERSION_HEADER, aciHeade
 import { createLaneState, DEFAULT_KEYSET_NOT_AFTER, type LaneProcessState, type LaneVaultSettings } from "./state.ts";
 import { appIdOfSubject, VAULT_DISK_BINDING, type LaneVault } from "./vault.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
+import { catalogRoute, serveCatalog } from "../listings.ts";
 import { RemoteEndpointShard } from "./remote/endpoint.ts";
 import { snapshots, snapshotTiming } from "../snapshot.ts";
 import { LaneRouteWarmer, laneRoutesOf } from "./warm.ts";
@@ -966,8 +967,14 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
     if (backend !== null) return peerRoute(request, env, cfg, state, backend, laneIsolateOnce(), path, ctx);
     if (path.startsWith("/v1/peer/")) return unmatched(request, cfg, url, path);
   }
+  // `GET /v1/models` and `/v1/models/{id}` (listings.ts): the models this lane serves, with their list prices, from the
+  // lane's own snapshot. The public catalog lists the main lane's routes only (snapshot gateway.ts `routeInMode`), and
+  // every error's text points at this origin's `/v1/models` (hosts.ts `originsOf`): without it that pointer led to a
+  // 404 (rehearsal of 2026-11-13). The Gemini listings and `/v1/key` stay the main gateway's.
+  const listing = catalogRoute(request.method, path);
   const served = servedProtocol(request.method, path);
-  if (served === null || served.protocol === "gemini") return unmatched(request, cfg, url, path);
+  if (listing === null && (served === null || served.protocol === "gemini")) return unmatched(request, cfg, url, path);
+  if (listing !== null && listing.kind !== "models" && listing.kind !== "model") return unmatched(request, cfg, url, path);
   // The generation path: the same `InferenceRun` the main lane runs, with the lane's dependencies.
   const lane: LaneRequestState = {
     cfg,
@@ -977,6 +984,8 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
     ...(peers === null ? {} : { peers }),
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
+  if (listing !== null) return serveCatalog(request, listing, path, { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => ctx.waitUntil(p) });
+  if (served === null) return unmatched(request, cfg, url, path);
   // The sinks' buffered points flush at the request's end, from inside `InferenceRun`'s own
   // `waitUntil` block, after the record is emitted (F2 bridge-1, design v2 §C.10): a flush scheduled
   // here would run before `serve()` buffered anything. A slow record never delays the answer.

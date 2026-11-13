@@ -2,11 +2,11 @@
   "schema": "gray-public-source/1",
   "image": "gray-lane",
   "image_repository": "ghcr.io/gray-ai-dev/gray-lane",
-  "image_ref": "ghcr.io/gray-ai-dev/gray-lane@sha256:20b02bc5e041ad6064e9354934ba372dec302855747cae7762ce9ae96b52b297",
-  "tag": "2026.11.13-9502a4476729",
+  "image_ref": "ghcr.io/gray-ai-dev/gray-lane@sha256:8ba891575bf841f1f4613ee009cb58b1ad0f2fb70f08778169746e3fcfc67edf",
+  "tag": "2026.11.13-42125faf34f9",
   "version": "2026.11.13",
-  "commit": "9502a4476729ed686ab156fab944fdba4658cf89",
-  "commit_time": 1794567120,
-  "files": 665,
+  "commit": "42125faf34f9837f12e0dcd06088c49aba8e3b50",
+  "commit_time": 1794593226,
+  "files": 670,
   "npm_packages_bundled": 48
 }

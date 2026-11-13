@@ -13,6 +13,7 @@ import {
   ERROR_BODY_WAIT_MS,
   attemptsAllowed,
   bareOutcome,
+  classDisposition,
   classify,
   classifyEvent,
   clientRetrying,
@@ -5028,7 +5029,8 @@ export class InferenceRun {
    * An entry's peer attempt that ended without an answer the request path relays (section 4.7): not dialed is closed
    * as a connection that never reached an upstream, and the next route may go (with none left, the client gets a
    * connection's `upstream_unavailable`; the attempt's record keeps the stack VM's code); the vendor's error ends the
-   * request with it (`passthrough`); anything else is `lane_relay_failed`, no other route, nothing charged.
+   * request with it (`passthrough`), unless it refused the relay's own account (`relayAccountRefused`: Gray's error, and
+   * the next route may go); anything else is `lane_relay_failed`, no other route, nothing charged.
    */
   private peerFailed(d: Dispatcher, attempt: Attempt, model: string, outcome: PeerOutcome): { readonly kind: "continue" } | Stopped {
     const { clock } = this.deps;
@@ -5045,6 +5047,7 @@ export class InferenceRun {
       const classified = classify(outcome.status, headerReader(new Headers()), outcome.body, this.classifyContext(model, attempt.route), elapsed, clock());
       this.noteAgentRefusal(attempt, classified.outcome, { status: outcome.status, body: outcome.body });
       this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_attempt_failed", false, false, outcome.body);
+      if (refusedTheRelaysAccount(classified.outcome)) return this.relayAccountRefused(outcome.accountId);
       // The vendor's error is the served attempt's answer (S32), as the stack VM's receipt says it.
       if (attempt.peer !== undefined) attempt.peer.served = true;
       return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: {}, accountId: outcome.accountId } };
@@ -5081,7 +5084,8 @@ export class InferenceRun {
    *   nothing reached a vendor, so no answer was withheld; the attempt's record names the fault, as the
    *   stack VM's `end.code` does);
    * - the vendor answered an error: the request ends with it (`passthrough`), its classification for the
-   *   record and for a stream whose headers went;
+   *   record and for a stream whose headers went; an error that refused the relay's own account is not
+   *   passed on, and the next route may go (`relayAccountRefused`);
    * - a vendor attempt was dialed and nothing of it can be released: `lane_relay_failed` (the bound's
    *   own error when the bound ended it), and no other route;
    * - egress cut an answer at its memory budget (`egress_limit`): `lane_relay_failed`, whatever followed.
@@ -5110,7 +5114,13 @@ export class InferenceRun {
       const classified = classify(outcome.status, headerReader(new Headers(outcome.headers)), outcome.body, this.classifyContext(model, attempt.route), elapsed, clock());
       this.noteAgentRefusal(attempt, classified.outcome, { status: outcome.status, body: outcome.body });
       this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_attempt_failed", false, false, outcome.body);
-      return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId: outcome.attempt.accepted?.accountId ?? null } };
+      const accountId = outcome.attempt.accepted?.accountId ?? null;
+      if (refusedTheRelaysAccount(classified.outcome)) {
+        // Nothing of the vendor's reaches the client: no attempt of this call served it (S32 `served_attempt`).
+        if (attempt.stack !== undefined) attempt.stack.served = null;
+        return this.relayAccountRefused(accountId);
+      }
+      return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId } };
     }
     const timedOut = bound && !limited;
     const error = failure !== undefined && !relayFault ? failure.error : timedOut ? upstreamUnavailable() : laneRelayFailed();
@@ -5129,6 +5139,21 @@ export class InferenceRun {
     if (outcome.kind !== "vendor_error") attempt.stack!.served = null;
     this.answerShare.hold(0, this.deps.cfg.answerHeldMaxBytes);
     return this.stackFailed(d, attempt, model, outcome, null, { ...failure, outcome: { ...failure.outcome, answered: true } });
+  }
+
+  /**
+   * A stack relay's vendor error that refused the relay's own upstream account (`refusedTheRelaysAccount`: a 401, 402
+   * or 403, a quota, the provider's key, credit or standing, or the vendor's block of the account) is the provider's
+   * failure, not the client's: passed on, its status and text would tell the client that its own key was refused. So
+   * it is not the client's answer (`passthrough`): the attempt failed with its classification as any route's does
+   * (`upstream_auth_failed`, `upstream_account_refused`, nothing charged), and the dispatcher's rules for its class
+   * decide the next route (the vendor did no work for it). With none left the client gets that error, Gray's own
+   * (`replaced_error` true, no served attempt). The account stays named on the request's row (S27: errors per
+   * account) unless a later attempt's answer ends the request.
+   */
+  private relayAccountRefused(accountId: string | null): { readonly kind: "continue" } {
+    this.stackAnsweredAccount = accountId;
+    return { kind: "continue" };
   }
 
   /**
@@ -7532,6 +7557,15 @@ function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): Pe
   if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid" };
   if (end.outcome === "vendor_error") return { kind: "vendor_error", status, body, accountId: end.relay_account_id };
   return { kind: "relay_failed", code: end.code ?? "peer_invalid" };
+}
+
+/**
+ * Whether a stack relay's vendor error refused the relay's own upstream account rather than the request: the
+ * classes the request log records as `credential` (@gray/errors `classDisposition`: `credential` and
+ * `account_request`).
+ */
+function refusedTheRelaysAccount(outcome: RetryOutcome): boolean {
+  return classDisposition(outcome.class, outcome.status, outcome.serverCode) === "credential";
 }
 
 /** A lane receipt id: `rcpt_` and 32 lowercase hex digits, the shape the entry's route and the tests pin. */
