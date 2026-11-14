@@ -1,4 +1,22 @@
-import { CONTENT_STATUSES, COLUMNS, ORIGINS, OUTCOMES, REQUEST_INDEX_FORMAT, type RequestIndexMessage, type RequestIndexRow } from "@gray/request-index";
+import { PROTOCOLS, type Protocol } from "@gray/protocol";
+import {
+  ATTEMPT_MEASURE_MAX_MS,
+  ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS,
+  attemptMeasuresOf,
+  CONTENT_STATUSES,
+  COLUMNS,
+  MAX_ROW_ATTEMPTS,
+  ORIGINS,
+  OUTCOMES,
+  OUTPUT_CHECKS,
+  REQUEST_INDEX_FORMAT,
+  RETRY_CLASSES,
+  SUPPLIER_OUTCOMES,
+  TOOL_CALL_CHECKS,
+  type RequestIndexMessage,
+  type RequestIndexRow,
+  type RouteAttempt,
+} from "@gray/request-index";
 import { z } from "zod";
 import { BridgeWireError } from "./error.ts";
 import { MAX_SAFE_INTEGER, asBigint, asNumber, intSchema, uintSchema } from "./ints.ts";
@@ -14,7 +32,9 @@ import { fitStackTrace, stackTraceDtoOf, stackTraceOf, stackTraceSchema, type St
  *
  * - the index row's `clientIp`, `userAgent`, `client`, `clientVersion`, `sessionId`,
  *   `parentSessionId`, `toolCount`, `turnStart`, `toolCalls` and `toolNames` are `null`
- *   (`LANE_FORBIDDEN_ROW_FIELDS`; bridge-7);
+ *   (`LANE_FORBIDDEN_ROW_FIELDS`; bridge-7), and its `routeAttempts` are each exactly a
+ *   `RouteAttempt` of route keys and closed words (`laneRouteAttemptSchema`, r14) and its five
+ *   measures, a word, a boolean and bounded counts (r15);
  * - the wide event carries no `client_app`, `client_app_version` (the parsed User-Agent), no
  *   `request_tools`, no `response_tool_calls`, no `trust_request_violations`/
  *   `trust_response_violations` and no `trust_outcome` (`LANE_FORBIDDEN_EVENT_COLUMNS`; hooks-8),
@@ -40,13 +60,99 @@ export const LANE_FORBIDDEN_EVENT_COLUMNS = Object.freeze(["client_app", "client
 
 /**
  * The index row's members added after the records ops were first deployed (S27 `relayAccountId`, a
- * stack relay's account; S43 `stackTrace`, a stack relay's per-request trace, which is no column):
+ * stack relay's account; S43 `stackTrace`, a stack relay's per-request trace, which is no column; the
+ * charge's input and output sides and the route's API of a translated request, workers/db/migrations/0076;
+ * r14's `routeAttempts`, the route attempts with their two answer checks, workers/db/migrations/0079; r15's five
+ * measures on each attempt are later still, docs/live-speed.md, and go first when a bridge refuses them):
  * absent from the wire document when null, and taken absent. A bridge that predates one still takes
  * every row that does not carry it (every row but a stack relay's), and a bridge that knows it takes
  * the rows of a lane that predates it, so neither deploy order loses rows of the lanes that existed
  * before.
  */
-export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace"] as const);
+export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace", "chargedInputMicrousd", "chargedOutputMicrousd", "upstreamProtocol", "routeAttempts"] as const);
+
+/**
+ * A route's key on the lane's wire, an endpoint id or a model name: 1 to 256 printable ASCII characters without a space.
+ * The peer envelope's route holds them to it (peer.ts), the S43 trace to the same 256 (stack-trace.ts); no sentence fits.
+ */
+export const LANE_ROUTE_NAME_PATTERN = /^[\x21-\x7e]{1,256}$/;
+
+/** A measure's count on the wire (ints.ts): a bigint from 0 to its bound. */
+const measureCount = (max: number) => z.bigint().min(0n).max(BigInt(max));
+
+/**
+ * One route attempt of a lane row (docs/error-rates.md "The TEE lane", r14): exactly `RouteAttempt`'s seven members,
+ * each a route's key (`endpointId`, `model`) or a closed word (the protocol it was sent in, `RETRY_CLASSES`, the two
+ * answer checks; null where a class or a check does not apply), and its five measures (docs/live-speed.md "The TEE
+ * lane", r15), each absent where the attempt has none: how it counted for its route (`SUPPLIER_OUTCOMES`), whether it
+ * streamed, and three counts within their bounds (`ATTEMPT_MEASURE_MAX_MS`, `ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS`): its
+ * own time to first token, its latency and its charged output tokens. No code, tool name, argument, schema, call count,
+ * raw finish reason or free text: the product owner let these, and nothing more, leave the TEE (2026-11-12 for the
+ * seven, 2026-11-13 for the measures), as metadata of the attempt, not the customer's content; the lane already
+ * reports each attempt's latency, time to first token, output tokens and failure kind to its endpoint shard through
+ * the bridge (`ReleaseInput.measure`).
+ */
+const laneRouteAttemptSchema = z
+  .object({
+    endpointId: z.string().regex(LANE_ROUTE_NAME_PATTERN),
+    model: z.string().regex(LANE_ROUTE_NAME_PATTERN),
+    protocol: z.enum(PROTOCOLS as unknown as [Protocol, ...Protocol[]]),
+    served: z.boolean(),
+    retryClass: z.enum(RETRY_CLASSES).nullable(),
+    toolCallCheck: z.enum(TOOL_CALL_CHECKS).nullable(),
+    outputCheck: z.enum(OUTPUT_CHECKS).nullable(),
+    supplierOutcome: z.enum(SUPPLIER_OUTCOMES).optional(),
+    streamed: z.boolean().optional(),
+    ttftMs: measureCount(ATTEMPT_MEASURE_MAX_MS).optional(),
+    durationMs: measureCount(ATTEMPT_MEASURE_MAX_MS).optional(),
+    outputTokens: measureCount(ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS).optional(),
+  })
+  .strict();
+type LaneRouteAttemptDto = z.infer<typeof laneRouteAttemptSchema>;
+
+const routeAttemptsSchema = z.array(laneRouteAttemptSchema).max(MAX_ROW_ATTEMPTS);
+
+/** The three measures that are counts: bigints on the wire, safe numbers in the row. */
+const MEASURE_COUNTS = ["ttftMs", "durationMs", "outputTokens"] as const;
+
+/**
+ * A row's route attempts as the CVM sends them: the latest MAX_ROW_ATTEMPTS (the gateway keeps no more), each projected
+ * to its seven members and its measures (r15: those it has, all five or none as @gray/request-index `attemptMeasuresOf`
+ * keeps them, the counts as bigints), so nothing else on an attempt ever leaves. Null when the list would not pass
+ * `laneRouteAttemptSchema` (a word the wire does not know, a key past its bound): the row goes without it, as a row of
+ * a gateway before it, and counts in no error rate; the row itself is never lost with it.
+ */
+function routeAttemptsDtoOf(attempts: readonly RouteAttempt[]): LaneRouteAttemptDto[] | null {
+  const projected = attempts.slice(-MAX_ROW_ATTEMPTS).map((a) => {
+    const measures: Record<string, unknown> = { ...attemptMeasuresOf(a) };
+    for (const key of MEASURE_COUNTS) {
+      const count = measures[key];
+      if (typeof count === "number") measures[key] = BigInt(count);
+    }
+    return {
+      endpointId: a.endpointId,
+      model: a.model,
+      protocol: a.protocol,
+      served: a.served,
+      retryClass: a.retryClass ?? null,
+      toolCallCheck: a.toolCallCheck ?? null,
+      outputCheck: a.outputCheck ?? null,
+      ...measures,
+    };
+  });
+  const parsed = routeAttemptsSchema.safeParse(projected);
+  return parsed.success ? parsed.data : null;
+}
+
+/** A wire route attempt as the row's: its counts back to safe numbers (within their bounds, so always safe). */
+function routeAttemptOf(dto: LaneRouteAttemptDto): RouteAttempt {
+  const out: Record<string, unknown> = { ...dto };
+  for (const key of MEASURE_COUNTS) {
+    const count = dto[key];
+    if (count !== undefined) out[key] = asNumber(count, key);
+  }
+  return out as unknown as RouteAttempt;
+}
 
 const FORBIDDEN_ROW = new Set<string>(LANE_FORBIDDEN_ROW_FIELDS);
 const LATER_ROW = new Set<string>(LANE_LATER_ROW_FIELDS);
@@ -79,10 +185,15 @@ function rowColumnSchema(column: (typeof COLUMNS)[number]): z.ZodType {
 }
 
 /**
- * One `request_logs` row, column for column, with the lane-forbidden columns null; and a stack relay's
- * trace (S43, stack-trace.ts), which the strict trace schema holds to its closed words and bounds.
+ * One `request_logs` row, column for column, with the lane-forbidden columns null; a stack relay's
+ * trace (S43, stack-trace.ts), which the strict trace schema holds to its closed words and bounds; and
+ * the route attempts (r14), each held to `laneRouteAttemptSchema`.
  */
-const LANE_ROW_SHAPE: Record<string, z.ZodType> = { ...Object.fromEntries(COLUMNS.map((column) => [column.key, rowColumnSchema(column)])), stackTrace: stackTraceSchema.optional() };
+const LANE_ROW_SHAPE: Record<string, z.ZodType> = {
+  ...Object.fromEntries(COLUMNS.map((column) => [column.key, rowColumnSchema(column)])),
+  stackTrace: stackTraceSchema.optional(),
+  routeAttempts: routeAttemptsSchema.optional(),
+};
 export const laneIndexRowSchema = z.object(LANE_ROW_SHAPE).strict();
 export type LaneIndexRowDto = z.infer<typeof laneIndexRowSchema>;
 
@@ -104,7 +215,9 @@ function indexIntegerKind(key: string): "int8" | "int4" | null {
 /**
  * The real row as its wire document: forbidden fields null, integers bigint. A trace is sent within S43's
  * bounds (`fitStackTrace`); one the bridge's schema would refuse is left out, so the row it belongs to is
- * never lost with it.
+ * never lost with it. The route attempts go as their seven members and their measures (`routeAttemptsDtoOf`), or not
+ * at all.
+ * `routes` and `admitted` are no lane row's (the console's route view reads the row's final route instead).
  */
 export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
   const out: Record<string, unknown> = {};
@@ -124,6 +237,10 @@ export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
       if (!(error instanceof BridgeWireError)) throw error;
     }
   }
+  if (row.routeAttempts !== undefined) {
+    const attempts = routeAttemptsDtoOf(row.routeAttempts);
+    if (attempts !== null) out.routeAttempts = attempts;
+  }
   return out as LaneIndexRowDto;
 }
 
@@ -136,6 +253,8 @@ export function laneIndexRowOf(dto: LaneIndexRowDto): RequestIndexRow {
     out[column.key] = value === null || indexIntegerKind(column.key) === null ? value : asNumber(value as bigint, column.key);
   }
   if (dto.stackTrace !== undefined) out.stackTrace = stackTraceOf(dto.stackTrace as StackTraceDto);
+  // The schema's members as they came, the measures' counts as numbers.
+  if (dto.routeAttempts !== undefined) out.routeAttempts = (dto.routeAttempts as readonly LaneRouteAttemptDto[]).map(routeAttemptOf);
   return out as unknown as RequestIndexRow;
 }
 
@@ -426,7 +545,13 @@ export type RecordsAcceptedDto = z.infer<typeof recordsAcceptedSchema>;
  *
  * **Lane-forbidden fields.** Design v2 §D forbids the index row's and the wide event's
  * content-adjacent columns (client address, User-Agent, session ids, tool names and counts,
- * `turnStart`, trust-violation codes, `retrySignature`). The `gray.usage_refusal/1` envelope has none
+ * `turnStart`, trust-violation codes, `retrySignature`). §D changes in one place since r14: whether an
+ * attempt had tool calls, and the class of how they fared, may leave the TEE; names, counts and
+ * arguments still do not. The row's route attempts say it in two closed words per attempt
+ * (`laneRouteAttemptSchema`): a tool-call word other than `none` means the answer had a call, or was
+ * truncated while the request declared tools; an output word other than `not_requested` means the
+ * request asked for structured output. Metadata the product owner let out on 2026-11-12. The
+ * `gray.usage_refusal/1` envelope has none
  * of them — its members are identifiers Gray already assigns, closed counters and Gray's own words —
  * so nothing is nulled here, and `strict` is what keeps it that way: a document carrying one of those
  * names (`LANE_FORBIDDEN_SERVICE_EVENT_FIELDS`) is refused, and `laneServiceEventDtoOf` never copies

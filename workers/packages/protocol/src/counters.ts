@@ -114,12 +114,23 @@ function weighted(parts: readonly (readonly [bigint, bigint])[]): bigint | undef
 }
 
 /**
- * `usage_cost`: text input, image and audio input, cache reads, default and 1-hour cache writes at
+ * The amounts a charge is the sum of, each a whole micro-USD rounded up on its own (gray-ledger `CostParts`):
+ * the input side (text, image and audio input, cache reads and both cache writes), the output side (text,
+ * image and audio output) and the units. Their sum is within i64.
+ */
+export interface CostParts {
+  readonly input: bigint;
+  readonly output: bigint;
+  readonly units: bigint;
+}
+
+/**
+ * `usage_cost_parts`: text input, image and audio input, cache reads, default and 1-hour cache writes at
  * their own rates, rounded up together to a whole micro-USD; text, image and audio output rounded
  * up together; units rounded up separately. Undefined where the ledger refuses the amount
  * (`Error::Amount`): subsets larger than their totals, or a sum past i64.
  */
-export function usageCost(usage: UsageCounters, rates: CostRates): bigint | undefined {
+export function usageCostParts(usage: UsageCounters, rates: CostRates): CostParts | undefined {
   const textInput = textInputTokens(usage);
   const textOutput = textOutputTokens(usage);
   const cacheWrite = cacheWriteDefaultInputTokens(usage);
@@ -147,7 +158,23 @@ export function usageCost(usage: UsageCounters, rates: CostRates): bigint | unde
   const outputCost = whole(output);
   if (units === undefined || inputCost === undefined || outputCost === undefined) return undefined;
   const sum = inputCost + outputCost + units;
-  return sum > I64_MAX ? undefined : sum;
+  return sum > I64_MAX ? undefined : { input: inputCost, output: outputCost, units };
+}
+
+/** `usage_cost`: the charge, the sum of its parts (`usageCostParts`); undefined where the ledger refuses the amount. */
+export function usageCost(usage: UsageCounters, rates: CostRates): bigint | undefined {
+  const parts = usageCostParts(usage, rates);
+  return parts === undefined ? undefined : parts.input + parts.output + parts.units;
+}
+
+/**
+ * `CostParts::token_sides`: the input side and the output side as a request's record keeps them
+ * (`request_logs.charged_input_microusd`, `charged_output_microusd`, docs/effective-prices.md): those of a
+ * charge billed by tokens, which is their sum, at zero too. Null for a charge billed by units, which has no
+ * input and output side: `unit` names what its units count, as the evidence does, whatever they cost.
+ */
+export function tokenSides(parts: CostParts, unit: string | null): { readonly input: bigint; readonly output: bigint } | null {
+  return unit === null && parts.units === 0n ? { input: parts.input, output: parts.output } : null;
 }
 
 /** Why counters cannot be charged; `reason` is the gateway's own text. */
@@ -156,15 +183,22 @@ export class MeteringError extends Error {
 }
 
 /**
- * `charge`: the cost of `counters` at `rates`, refused above `maxRequestMicroUsd` (the request's
- * bound, docs/holds-debt-mode.md 4.1).
+ * `charge_parts`: the parts of the cost of `counters` at `rates`, refused where their sum is above
+ * `maxRequestMicroUsd` (the request's bound, docs/holds-debt-mode.md 4.1).
  */
-export function charge(counters: UsageCounters, rates: CostRates, maxRequestMicroUsd: bigint): bigint {
-  const cost = usageCost(counters, rates);
+export function chargeParts(counters: UsageCounters, rates: CostRates, maxRequestMicroUsd: bigint): CostParts {
+  const parts = usageCostParts(counters, rates);
   // gray-ledger `Error::Amount`'s text.
-  if (cost === undefined) throw new MeteringError("invalid amount or arithmetic overflow");
+  if (parts === undefined) throw new MeteringError("invalid amount or arithmetic overflow");
+  const cost = parts.input + parts.output + parts.units;
   if (cost > maxRequestMicroUsd) throw new MeteringError(`the usage costs ${cost} micro-USD, more than the ${maxRequestMicroUsd} micro-USD held for the request`);
-  return cost;
+  return parts;
+}
+
+/** `charge`: the cost of `counters` at `rates`, the sum of `chargeParts`, refused as it refuses. */
+export function charge(counters: UsageCounters, rates: CostRates, maxRequestMicroUsd: bigint): bigint {
+  const parts = chargeParts(counters, rates, maxRequestMicroUsd);
+  return parts.input + parts.output + parts.units;
 }
 
 /**

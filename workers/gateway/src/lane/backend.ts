@@ -8,9 +8,11 @@ import {
   encodePeerRefusal,
   fitStackTrace,
   laneReportedUsageDtoOf,
+  PEER_CHECKS_WORDS,
   PEER_COMMENT,
   PEER_FRAME_MAX_BYTES,
   PEER_REFUSAL_STATUS,
+  peerReadsOf,
   stackTraceDtoOf,
   type PeerEndDto,
   type PeerEnvelopeDto,
@@ -18,13 +20,14 @@ import {
   type StackTraceDto,
 } from "@gray/lane-wire";
 import { safeUsageCounters } from "@gray/ledger-keys";
-import { bufferedUsage, parseResponse } from "@gray/protocol";
-import { AnswerRelay } from "../answer.ts";
+import { type AnswerChecks, bufferedUsage, parseResponse, UNCOUNTED_CHECKS } from "@gray/protocol";
+import { AnswerRelay, keepsAnswerText } from "../answer.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, ClientStream, errorFrame, type StreamTimers } from "../client.ts";
 import type { FragmentUse, StreamInspector, ToolGate } from "../gate.ts";
-import { PASS_THROUGH } from "../gate.ts";
+import { PASS_THROUGH, refusedAnswerChecks } from "../gate.ts";
 import { parseHeld, type ParsedRequest } from "../parse.ts";
 import { primeStream, relayStream } from "../relay.ts";
+import { countedChecks } from "../sinks.ts";
 import { AnswerShare, Retained } from "../retained.ts";
 import { completedResponse } from "./codex.ts";
 import { bodyHashOf, responseHash } from "./hooks.ts";
@@ -74,6 +77,16 @@ import type { LaneState, StackTransport } from "./types.ts";
  *
  * The inner receipt is the S26 v2 receipt of the attempt with `peer.entry` right after `request.received` (section
  * 4.8), signed with this boot's receipt key; it goes in `end` and stays in the attempts table for the late follow-up.
+ *
+ * The attempt's two answer checks (docs/error-rates.md, r14) go in `end.checks` to an entry that named `checks` in
+ * `x-gray-peer-reads`: the entry gets no byte of an answer refused here, so they are the attempt's only reading. They are
+ * read where `InferenceRun` reads a direct client's: a stream's once as the relay ends it (relay.ts `StreamEnd.checks`),
+ * its priming's not finished when it failed before its commit, a buffered answer's from `ToolGate.responseChecks` (its
+ * text whole when its structured output is checked, `keepsAnswerText`) or from the call check that refused it on the
+ * way, a Codex request's from its terminal response or its stream's inspector; and they count nothing where the stack
+ * VM ended the answer itself (sinks.ts `countedChecks`: its hold limits and own failures, its deadline, the entry gone).
+ * What the vendor's answer was for the attempt's record (its error's class) is the entry's, which counts the checks
+ * again by its record of the attempt.
  */
 
 /** The hop comment's cadence while nothing else is written (section 4.5: every 15 s; egress's silence bound is 45 s). */
@@ -263,12 +276,20 @@ class BackendRun {
   #undelivered = false;
   #rawUsage: Json | null = null;
   #call: StackCall | null = null;
+  /** The entry named `checks` in `x-gray-peer-reads`: its `end` reads them (an entry before r14 refuses them). */
+  readonly #readsChecks: boolean;
+  /** The gate's reading of the answer, once a path made it: none until then. */
+  #checks: AnswerChecks = UNCOUNTED_CHECKS;
+  /** How the stack VM itself ended the answer, for `countedChecks`: its own limit or failure, the entry gone, its deadline. */
+  #ownEnd: "gray_error" | "client_left" | null = null;
+  #deadlineCut = false;
 
   constructor(input: BackendInput, route: StackRelayRoute | null, key: string, hop: HopStream) {
     this.#input = input;
     this.#route = route;
     this.#key = key;
     this.#hop = hop;
+    this.#readsChecks = peerReadsOf(input.request.headers).has("checks");
     this.#presence = new ClientPresence(null, input.clock, 0);
     hop.onLeave(() => this.#presence.leave("client_left"));
     this.#presence.onLeave(() => {
@@ -286,6 +307,7 @@ class BackendRun {
       const dialed = (this.#call?.feed.dialed().length ?? 0) > 0;
       ended = { outcome: !dialed ? "not_dialed" : this.#headed && this.#status === 200 ? "cut" : "relay_failed", code: "entry_internal" };
       this.#replacedError = true;
+      this.#ownEnd = "gray_error";
       if (ended.outcome === "cut" && this.#stream) await this.#data(errorFrame(this.#input.protocol, "internal_error", 0n));
     }
     const call = this.#call;
@@ -362,6 +384,28 @@ class BackendRun {
       code: ended.code,
       receipt: receipt === null ? null : (receiptDocument(receipt) as Record<string, unknown>),
       ...(trace === null ? {} : { trace }),
+      ...(this.#readsChecks ? { checks: this.#endChecks(ended) } : {}),
+    };
+  }
+
+  /**
+   * The attempt's checks for `end`: the gate's reading, counted as `InferenceRun` counts a direct client's attempt
+   * (sinks.ts `countedChecks`) where the stack VM or its egress ended the answer itself, in the words the entry's `checks` names
+   * (`PEER_CHECKS_WORDS`: a word of a later list goes as null, review r14 finding 1).
+   */
+  #endChecks(ended: Ended): NonNullable<PeerEndDto["checks"]> {
+    // Egress is Gray's process: an answer it cut at its budget (`feed.limited`, a fault by egress) is Gray's hold limit, and
+    // a fault of Gray's own (its ending of the rid: `timeout`, `entry_closed`) is Gray's too, on every path alike (review
+    // r14 blocker 7). A fault of the relay's container stands as the main gateway counts a stack route's.
+    const call = this.#call;
+    const fault = call?.fault ?? null;
+    const gray = (call !== null && call.feed.limited !== null) || fault?.by === "egress" || fault?.by === "gray";
+    const counted = countedChecks(this.#checks, { outcome: gray ? "gray_error" : (this.#ownEnd ?? ended.outcome), code: ended.code, rejected: false, deadlineCut: this.#deadlineCut });
+    const tool = counted.toolCallCheck;
+    const output = counted.outputCheck;
+    return {
+      tool_call_check: tool !== null && (PEER_CHECKS_WORDS.tool_call_check as readonly string[]).includes(tool) ? (tool as NonNullable<PeerEndDto["checks"]>["tool_call_check"]) : null,
+      output_check: output !== null && (PEER_CHECKS_WORDS.output_check as readonly string[]).includes(output) ? (output as NonNullable<PeerEndDto["checks"]>["output_check"]) : null,
     };
   }
 
@@ -450,7 +494,7 @@ class BackendRun {
       if (sent.kind === "aborted") return this.#failed(call, await call.decided(), controller.signal.reason === "attempt_deadline");
       if (sent.kind === "failed") return this.#failed(call, sent.outcome, false);
       if (stream) return await this.#relayStream(call, sent.response, deadline, parsed);
-      if (protocol === "open_ai_responses" && route.vendor === "chatgpt_codex") return await this.#codex(call, sent.response, deadline);
+      if (protocol === "open_ai_responses" && route.vendor === "chatgpt_codex") return await this.#codex(call, sent.response, deadline, parsed);
       return await this.#buffered(call, sent.response, deadline, parsed);
     } finally {
       input.timers.clearTimeout(timer);
@@ -503,11 +547,12 @@ class BackendRun {
         return PASS_THROUGH.stream(contract, Number.MAX_SAFE_INTEGER, false);
       }
     };
+    const primer = inspector();
     const primed = await primeStream({
       protocol,
       response,
       presence: this.#presence,
-      inspector: inspector(),
+      inspector: primer,
       answerLimit: Number.MAX_SAFE_INTEGER,
       frameLimit: cfg.answerHeldMaxBytes,
       deadline,
@@ -517,7 +562,17 @@ class BackendRun {
       isolate: this.#input.share,
       heldLimit: cfg.answerHeldMaxBytes,
     });
-    if (primed.kind === "left") return { outcome: call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
+    if (primed.kind === "left") {
+      this.#ownEnd = "client_left";
+      return { outcome: call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
+    }
+    if (primed.kind === "gray") this.#ownEnd = "gray_error";
+    if (primed.kind === "uncommitted") {
+      // It failed before its commit, so before its finish: its checks are its priming's inspector's, the only one that
+      // read it (`InferenceRun.prime`).
+      this.#checks = primer.checks(false);
+      if (primed.cutByDeadline === true) this.#deadlineCut = true;
+    }
     if (primed.kind !== "committed") return this.#uncommitted(call);
     await this.#head(200, true);
     const client = new ClientStream(this.#presence, clock, cfg.streamClientStallMs, undefined, (bytes) => this.#tap(bytes), this.#input.timers);
@@ -551,16 +606,22 @@ class BackendRun {
       drainMs: 0,
       stalledEnd: errorFrame(protocol, "client_read_timeout", 0n),
     });
+    // The answer's checks as the relay read them once the stream ended (`InferenceRun.relay`).
+    this.#checks = end.checks;
     if (end.kind === "settled") {
       await pumped;
       if (!end.delivered) this.#undelivered = true;
       return { outcome: "served", code: null };
     }
     if (end.kind === "client_left") {
+      this.#ownEnd = "client_left";
       client.end();
       await pumped;
       return { outcome: "cut", code: "attempt_ended" };
     }
+    // A failure of none of the vendor's doing is Gray's own, and Gray's deadline cut the answer (`InferenceRun.relay`).
+    if (end.supplierFailure === null) this.#ownEnd = "gray_error";
+    if (end.cutByDeadline === true) this.#deadlineCut = true;
     // S24: a container whose answer stopped matching the feed, or egress's cut at its budget, ends the stream with
     // the lane's own error; a vendor stream that was cut keeps the relay's own code.
     const fault = call.fault;
@@ -576,6 +637,8 @@ class BackendRun {
     const { cfg, clock, protocol } = this.#input;
     if (response.body === null) return this.#uncommitted(call);
     let pumped: Promise<void> = Promise.resolve();
+    const contract = this.#input.gate.contract({ request: parsed.canonical, body: parsed.value });
+    const answerInspector = this.#input.gate.answer(contract, protocol, Number.MAX_SAFE_INTEGER);
     const relay = new AnswerRelay({
       protocol,
       body: response.body,
@@ -590,7 +653,9 @@ class BackendRun {
       stallMs: cfg.streamClientStallMs,
       timers: this.#input.timers,
       drainMs: Math.max(0, AFTER_CLIENT_LEFT_MS - cfg.accountAdmitBudgetMs),
-      inspector: this.#input.gate.answer(this.#input.gate.contract({ request: parsed.canonical, body: parsed.value }), protocol, Number.MAX_SAFE_INTEGER),
+      inspector: answerInspector,
+      // The structured output check reads the answer's text, which the projection keeps whole for it alone.
+      wholeText: keepsAnswerText(this.#input.gate.mode, contract),
       retained: this.#retained,
       sink: null,
       tap: (bytes) => this.#tap(bytes),
@@ -600,11 +665,17 @@ class BackendRun {
     });
     const read = await relay.read();
     if (read.kind === "client_left") {
+      this.#ownEnd = "client_left";
       relay.abort(read.why);
       await pumped;
       return { outcome: relay.started ? "cut" : call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
     }
     if (read.kind === "failed") {
+      if (read.cutByDeadline === true) this.#deadlineCut = true;
+      // A call the gate refused on the way: what refused it (`InferenceRun.nativeAnswer`).
+      if (read.violation !== undefined) this.#checks = refusedAnswerChecks(answerInspector);
+      // Gray's limits: the isolate's answers together, or one answer past ANSWER_HELD_MAX_BYTES.
+      if (read.code === "gateway_capacity" || read.limitSource !== undefined) this.#ownEnd = "gray_error";
       if (!relay.started) {
         relay.abort(read.code);
         return this.#uncommitted(call);
@@ -627,8 +698,10 @@ class BackendRun {
       await pumped;
       return { outcome: "cut", code: "entry_internal" };
     }
-    // The gate's verdict on the whole answer, and a call it refused on the way (`InferenceRun.nativeAnswer`).
-    const contract = this.#input.gate.contract({ request: parsed.canonical, body: parsed.value });
+    // The gate's verdict on the whole answer, and a call it refused on the way (`InferenceRun.nativeAnswer`); the answer's
+    // checks of the same request and projection (a text it cut, `textCut`, is the output check's `unknown`), whatever the
+    // verdict, or what refused a call on the way.
+    this.#checks = relay.refusedByGate !== undefined ? refusedAnswerChecks(answerInspector) : this.#input.gate.responseChecks(contract, { protocol, body: read.projection, textCut: read.textCut });
     if (!this.#input.gate.inspectResponse(contract, { protocol, body: read.projection }, Number.MAX_SAFE_INTEGER).ok || relay.refusedByGate !== undefined) {
       relay.abort("upstream_trust_policy_rejected");
       if (!relay.started) return this.#uncommitted(call);
@@ -639,6 +712,8 @@ class BackendRun {
     const raw = bufferedUsage(protocol, read.projection) ?? null;
     this.#rawUsage = isObject(raw) && answer.usage !== null ? raw : null;
     if (!relay.finish()) {
+      // Gray's own: a tool-call id it could not account for.
+      this.#ownEnd = "gray_error";
       relay.abort("tool_call_id_rewrite_incomplete");
       return relay.started ? { outcome: "cut", code: "entry_internal" } : this.#uncommitted(call);
     }
@@ -649,8 +724,17 @@ class BackendRun {
   }
 
   /** A buffered Codex request (D129): the terminal event's `response`, as `InferenceRun.codexAnswer` answers it. */
-  async #codex(call: StackCall, response: Response, deadline: number): Promise<Ended> {
+  async #codex(call: StackCall, response: Response, deadline: number, parsed: ParsedRequest): Promise<Ended> {
     const { cfg, clock, protocol } = this.#input;
+    const contract = this.#input.gate.contract({ request: parsed.canonical, body: parsed.value });
+    // The stream's inspector, for the checks of a stream that ends before its terminal event, gated as
+    // `InferenceRun.codexAnswer` makes it (the whole stream is held for the client's one answer).
+    let inspector: StreamInspector;
+    try {
+      inspector = this.#input.gate.stream(contract, Number.MAX_SAFE_INTEGER, true);
+    } catch {
+      inspector = PASS_THROUGH.stream(contract, Number.MAX_SAFE_INTEGER, false);
+    }
     const read = await completedResponse({
       response,
       presence: this.#presence,
@@ -663,14 +747,26 @@ class BackendRun {
       retained: this.#retained,
       isolate: this.#input.share,
       heldLimit: cfg.answerHeldMaxBytes,
+      inspector,
     });
-    if (read.kind === "left") return { outcome: call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
+    if (read.kind === "left") {
+      this.#ownEnd = "client_left";
+      return { outcome: call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
+    }
+    if (read.kind === "gray") this.#ownEnd = "gray_error";
+    if (read.kind === "uncommitted") {
+      // An inspector that failed while it was fed read nothing that counts (review r14 minor 12).
+      this.#checks = read.inspectorFailed === true ? UNCOUNTED_CHECKS : inspector.checks(false);
+      if (read.cutByDeadline === true) this.#deadlineCut = true;
+    }
     if (read.kind !== "completed") return this.#uncommitted(call);
     try {
       parseResponse(protocol, read.response);
     } catch {
       return this.#uncommitted(call);
     }
+    // The terminal response is the answer, as `InferenceRun.codexAnswer` reads its checks.
+    this.#checks = this.#input.gate.responseChecks(contract, { protocol, body: read.response });
     const raw = bufferedUsage(protocol, read.response) ?? null;
     this.#rawUsage = isObject(raw) ? raw : null;
     await this.#head(200, false);

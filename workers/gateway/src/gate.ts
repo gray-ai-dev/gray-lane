@@ -1,5 +1,5 @@
 import type { Json } from "@gray/json";
-import type { CanonicalEvent, CanonicalRequest, ProjectionObserver, Protocol } from "@gray/protocol";
+import { type AnswerChecks, type CanonicalEvent, type CanonicalRequest, type ProjectionObserver, type Protocol, type ToolCallCheck, UNCOUNTED_CHECKS } from "@gray/protocol";
 
 /**
  * The tool gate's hook in the request path (the server's trust policy: crates/gray-gateway/src/
@@ -37,6 +37,17 @@ export interface GateRequest {
 }
 
 /**
+ * A non-streaming answer as its checks read it (@gray/trust `OutputAnswer`): its native JSON, or its projection, with
+ * whether the projection cut a text of it (`textCut`, @gray/protocol `AnswerProjection.textCut`; absent for an answer
+ * read whole).
+ */
+export interface GateAnswer {
+  readonly protocol: Protocol;
+  readonly body: Json;
+  readonly textCut?: boolean;
+}
+
+/**
  * What an inspection decided (@gray/trust `InspectionResult`): let through with what it found, or a
  * refusal. `violations` are what enforce mode would refuse, reported because the mode is audit;
  * `passed` are findings let through in every mode (a call the client checks itself).
@@ -68,6 +79,15 @@ export interface StreamInspector {
    * `StreamToolInspector.retainedBytes`): the relay weighs it with the frames it holds.
    */
   retainedBytes(): number;
+  /**
+   * The attempt's two answer checks (docs/error-rates.md, r14), read once its stream ended: `finished` true after
+   * `finish` (whatever it decided), false for a stream that failed before it. The main gateway's relay and the TEE
+   * lane's entry and stack VM all read them here, so every path computes them with the same code (@gray/trust
+   * `StreamCheck.toolCallCheck`, and an `OutputObserver` of `contract` fed every event `observe` hears). Not counted
+   * (null) in mode off. The relay reads them once (relay.ts `relayStream`, StreamEnd `checks`), a stream that failed
+   * before it committed from its priming's inspector (inference.ts `prime`).
+   */
+  checks(finished: boolean): AnswerChecks;
 }
 
 /**
@@ -87,6 +107,26 @@ export interface AnswerInspector extends ProjectionObserver {
   heldFrom(): number;
   /** The refusal of a checked entry: nothing more goes out, and the answer is refused. */
   readonly refused: string | undefined;
+  /**
+   * The tool-call check (docs/error-rates.md, r14) of the answer it refused (`refused`), whose rest is never read, so
+   * `ToolGate.responseChecks` has no answer to read: `missing_name` or `refused`; null when a rule of Gray's own refused
+   * it (not counted, and never the whole answer's checks instead). Absent: not counted.
+   */
+  toolCallCheck?(): ToolCallCheck | null;
+}
+
+/**
+ * The answer checks of a non-streaming answer refused on the way (`AnswerInspector.refused`): its inspector's tool-call
+ * check, never its failure (a check only classifies), and no output check (the answer's text was not read whole).
+ */
+export function refusedAnswerChecks(inspector: AnswerInspector | null): AnswerChecks {
+  let toolCallCheck: ToolCallCheck | null = null;
+  try {
+    toolCallCheck = inspector?.toolCallCheck?.() ?? null;
+  } catch {
+    // Not counted.
+  }
+  return { toolCallCheck, outputCheck: null };
 }
 
 /**
@@ -128,6 +168,12 @@ export interface ToolGate {
   answer(contract: GateRequest, protocol: Protocol, answerLimit: number): AnswerInspector | null;
   /** A non-streaming answer (`body` its native JSON, or its projection), before it is billed. */
   inspectResponse(contract: GateRequest, answer: { readonly protocol: Protocol; readonly body: Json }, answerLimit: number): GateVerdict;
+  /**
+   * A non-streaming answer's two answer checks (docs/error-rates.md, r14; @gray/trust `TrustPolicy.responseToolCallCheck`,
+   * `outputCheck`), of the same `contract` and answer as `inspectResponse`, whose verdict they do not change. Not counted
+   * (null) in mode off.
+   */
+  responseChecks(contract: GateRequest, answer: GateAnswer): AnswerChecks;
 }
 
 const NO_REPAIRS: ReadonlySet<bigint> = new Set();
@@ -139,6 +185,7 @@ const OPEN_INSPECTOR: StreamInspector = Object.freeze({
   finish: () => CLEAN,
   fragmentRepairs: () => NO_REPAIRS,
   retainedBytes: () => 0,
+  checks: () => UNCOUNTED_CHECKS,
 });
 
 /** Lets everything through and holds nothing (tests that are not about the gate). */
@@ -150,4 +197,5 @@ export const PASS_THROUGH: ToolGate = Object.freeze({
   stream: () => OPEN_INSPECTOR,
   answer: () => null,
   inspectResponse: () => CLEAN,
+  responseChecks: () => UNCOUNTED_CHECKS,
 });

@@ -44,6 +44,7 @@ export {
 } from "./stream.ts";
 export { geminiBlockFinish, mapFinish } from "./finish.ts";
 export { GeminiRefusal, geminiBlockReason, isGeminiRefusal } from "./refusal.ts";
+export { AnswerEnd, type AnswerEndFailure, type AnswerEndReason, GEMINI_ACCOUNT_LIMITED, UNFINISHED_EMPTY, unfinished } from "./answer-end.ts";
 export {
   type BilledTokens,
   type BilledUsage,
@@ -146,7 +147,7 @@ export {
 } from "./images.ts";
 export { type CanonicalResponse, type ToolCall, parseProviderError, parseResponse } from "./response.ts";
 export { KEPT_STRING_UNITS, SCAN_KEY_ENTRY_BYTES, STRING_BUFFER_BYTES, type ScanListener, type ScanPartial, type ScanString, StrictJsonScan, exactStrings, refuseByteOrderMark } from "./answer-scan.ts";
-export { AnswerProjection, type KeepRule, PROJECTION_NODE_BYTES, type PathKey, type ProjectionObserver, keepRule, keptString } from "./answer-projection.ts";
+export { AnswerProjection, type AnswerProjectionOptions, type KeepRule, PROJECTION_NODE_BYTES, type PathKey, type ProjectionObserver, keepRule, keptString } from "./answer-projection.ts";
 export { jsonHeapBytes, stringHeapBytes } from "./heap.ts";
 export {
   type ResponseContext,
@@ -185,6 +186,7 @@ export {
   TOKEN_COUNTING_SERVED,
 } from "./paths.ts";
 export {
+  type CostParts,
   type CostRates,
   type ImageTokenOverrun,
   type UsageCounters,
@@ -193,6 +195,7 @@ export {
   billableUsage,
   cacheWriteDefaultInputTokens,
   charge,
+  chargeParts,
   countsTokens,
   geminiModalityTokens,
   imageTokenOverrun,
@@ -201,10 +204,22 @@ export {
   nestedCounter,
   textInputTokens,
   textOutputTokens,
+  tokenSides,
   uncachedInputTokens,
   usageCost,
+  usageCostParts,
 } from "./counters.ts";
 export { COUNT_REPLY_LIMIT, countOverlay, countReply, countTarget, countUpstreamPath, inspectedCountRequest } from "./count.ts";
 export { madeNoImage } from "./no-image.ts";
 export { MAX_MODEL_BYTES, MAX_MODELS, takeModels } from "./models.ts";
 export { type UpstreamAuth, DEFAULT_ACCEPT, credentialHeader, nativeHeaders, upstreamAuthHeaders, withDefaultAccept } from "./auth.ts";
+export {
+  type AnswerChecks,
+  OUTPUT_CHECKS,
+  type OutputCheck,
+  TOOL_CALL_CHECKS,
+  type ToolCallCheck,
+  UNCOUNTED_CHECKS,
+  isOutputCheck,
+  isToolCallCheck,
+} from "./answer-checks.ts";

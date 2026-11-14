@@ -169,6 +169,16 @@ export class TeeListener implements ScanListener {
     return this.first.wholeString();
   }
 
+  /**
+   * The first listener's bound for a declined string kept whole all the same (@gray/protocol
+   * `ScanListener.wholeStringBytes`): the projection's with `wholeText`, which keeps an answer's text whole for its
+   * structured output check (r14); 0 without one. Typed as optional here, so this compiles with a listener type
+   * before it.
+   */
+  wholeStringBytes(): number {
+    return (this.first as ScanListener & { wholeStringBytes?(): number }).wholeStringBytes?.() ?? 0;
+  }
+
   stringRuns(offset: number): void {
     this.first.stringRuns?.(offset);
   }

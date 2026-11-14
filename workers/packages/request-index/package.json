@@ -12,6 +12,7 @@
     "test:workerd": "vitest run -c vitest.workerd.config.ts"
   },
   "dependencies": {
-    "@gray/control": "0.0.0"
+    "@gray/control": "0.0.0",
+    "@gray/protocol": "0.0.0"
   }
 }

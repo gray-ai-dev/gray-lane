@@ -796,7 +796,7 @@ export class ProtocolStreamDecoder {
         throw notGeneration(this.protocol);
     }
     events = this.trackTools(events);
-    if (this.protocol === "open_ai_chat") {
+    if (this.protocol === "open_ai_chat" || cutAtOutputLimit(this.protocol, native)) {
       const position = events.findIndex((e) => e.type === "finish");
       if (position >= 0) {
         const completed = this.completeOpenTools();
@@ -1201,6 +1201,21 @@ export class ProtocolStreamDecoder {
     }
     return this.trackTools(out);
   }
+}
+
+/**
+ * `cut_at_output_limit`: a Responses `response.incomplete` the client's `max_output_tokens` ended. A function call
+ * whose arguments were still streaming then gets no `response.function_call_arguments.done` and no
+ * `response.output_item.done`; the decoder closes it from the fragments it has, as it closes every open call of a Chat
+ * stream at its finish, so the answer is a truncated one and not an incomplete stream (docs/error-rates.md "The
+ * Responses truncation fix"). An answer `content_filter` cut keeps its call open (default 6).
+ */
+function cutAtOutputLimit(protocol: Protocol, native: Json | undefined): boolean {
+  return (
+    protocol === "open_ai_responses" &&
+    asStr(get(native, "type")) === "response.incomplete" &&
+    asStr(pointer(native, "/response/incomplete_details/reason")) === "max_output_tokens"
+  );
 }
 
 function mergeIdentity(current: string | null, incoming: string | null, protocol: Protocol, field: string): string | null {

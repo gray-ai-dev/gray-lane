@@ -9,6 +9,7 @@
     "./opencode-thinking": "./src/opencode-thinking.ts",
     "./release-traffic": "./src/release-traffic.ts",
     "./stack-agent": "./src/stack-agent.ts",
+    "./stack-messages": "./src/stack-messages.ts",
     "./stack-pairing": "./src/stack-pairing.ts",
     "./stack-provision": "./src/stack-provision.ts",
     "./tunnel": "./src/tunnel.ts"

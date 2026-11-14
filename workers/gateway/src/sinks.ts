@@ -3,10 +3,26 @@ import { IMAGE_USAGE_UNSPLIT_POLICIES } from "@gray/config";
 import { attemptRecord, type AttemptRecord as ContentAttempt, type AttemptToolCallIds, type ContentReason, type WriterResult } from "@gray/content";
 import { ACCOUNT_BLOCKS, errorCategory } from "@gray/errors";
 import type { DispatchPermit, RankingResult } from "@gray/routing";
-import type { CanonicalRequest } from "@gray/protocol";
+import { type AnswerChecks, type CanonicalRequest, type OutputCheck, TRANSLATION_CODES, type ToolCallCheck, UNCOUNTED_CHECKS } from "@gray/protocol";
 import type { TrafficEvidenceWire } from "@gray/control";
+import { NOT_COUNTED, type Outcome as EndpointOutcome, type OutcomeMeasure } from "@gray/endpoint";
+import { CLIENT_RESPONSE_INVALID, CLIENT_STREAM_INVALID, TOOL_CALL_MISMATCH } from "@gray/translation";
 import { createHash } from "node:crypto";
-import { MAX_ROW_ROUTES, REQUEST_INDEX_FORMAT, outboxEvents, outboxKey, type OutboxKind, type RequestIndexRow as IndexRow, type RouteActivity, type StackTrace } from "@gray/request-index";
+import {
+  attemptMeasuresOf,
+  type AttemptMeasures,
+  MAX_ROW_ATTEMPTS,
+  MAX_ROW_ROUTES,
+  REQUEST_INDEX_FORMAT,
+  type RetryClass,
+  outboxEvents,
+  outboxKey,
+  type OutboxKind,
+  type RequestIndexRow as IndexRow,
+  type RouteActivity,
+  type RouteAttempt,
+  type StackTrace,
+} from "@gray/request-index";
 import { providerRefOf, r2ContentStore } from "./content.ts";
 import type { ContentBucket } from "./outbound.ts";
 import type { PreferenceFacts } from "./preference.ts";
@@ -92,8 +108,7 @@ export type FreeReason = typeof FREE_NO_USAGE | typeof IMAGE_USAGE_UNSPLIT | typ
  * The class of an attempt's failure, which decides what may follow it (record.rs Attempt `retry_class`,
  * main's retry::Class; docs/api-errors.md, Retries). The dispatch line fills it.
  */
-export const RETRY_CLASSES = ["connect", "transport", "timeout", "server_error", "throttled", "credential", "route_fault", "account_request", "refusal", "final_refusal", "answer_defect", "no_image"] as const;
-export type RetryClass = (typeof RETRY_CLASSES)[number];
+export { RETRY_CLASSES, type RetryClass } from "@gray/request-index";
 /** What followed an attempt's failure (record.rs Attempt `retry_next`). */
 export const RETRY_NEXTS = ["other_operator", "same_operator", "same_route", "second_opinion", "none"] as const;
 export type RetryNext = (typeof RETRY_NEXTS)[number];
@@ -251,6 +266,68 @@ export interface AttemptRecord {
    * refused the request in an answer of its own (`refused_answer`). Absent otherwise.
    */
   readonly rejected?: boolean;
+  /**
+   * Its two answer checks (docs/error-rates.md, r14), as the gate classified its answer (gate.ts `StreamInspector.checks`,
+   * `ToolGate.responseChecks`; a peer attempt's from its stack VM's `end`), where the answer was the provider's
+   * (`countedChecks`). Absent where it is not counted: null in the row's `routeAttempts`.
+   */
+  readonly toolCallCheck?: ToolCallCheck | null;
+  readonly outputCheck?: OutputCheck | null;
+  /**
+   * Its five measures (docs/live-speed.md "How an attempt is recorded", r15), as its release took them from its ranking
+   * sample (`attemptMeasures` of the `OutcomeMeasure` it gave its endpoint shard), never from `durationMs` and `ttftMs`
+   * above, which run on the record's clock. The index row's alone (`routeAttempts`), as the server's record.rs
+   * `Attempt::measures`; absent for an attempt that had no release.
+   */
+  readonly measures?: AttemptMeasures;
+}
+
+/**
+ * An attempt's five measures (docs/live-speed.md "How an attempt is recorded", r15): its ranking sample's, the
+ * `OutcomeMeasure` its release gives its endpoint shard (`InferenceRun.endAttempt`, `settleHeld`), so what the page shows
+ * and what routing samples are one measurement. How it counted for its route (`released`, as released): a success (a
+ * free delivery and an answer Gray failed though its upstream gave it as its own API allows among them), a supplier's
+ * failure (`rate_limited` apart, which response success leaves out), none when not counted; whether it was a streaming
+ * attempt (its rank key's mode); its own time to first token (`measure[1]`, none when null); its latency (`measure[0]`);
+ * and, when the answer was `charged`, its output tokens (`measure[2]`, 0 included). Past their bounds, or a first token
+ * after the end, none of the five (@gray/request-index `attemptMeasuresOf`). The server's is inference.rs
+ * `attempt_measures`.
+ */
+export function attemptMeasures(released: EndpointOutcome, measure: OutcomeMeasure, charged: boolean, streamed: boolean): AttemptMeasures {
+  const [latencyMs, ttftMs, outputTokens] = measure;
+  const supplierOutcome = released.kind === "success" ? "success" : released.kind === "not_counted" ? undefined : released.reason === "rate_limited" ? "rate_limited" : "failure";
+  return attemptMeasuresOf({ supplierOutcome, streamed, ttftMs, durationMs: latencyMs, outputTokens: charged ? outputTokens : undefined });
+}
+
+/** The answer-side failures of a translation (@gray/translation): the upstream's answer was whole, Gray's translation of it was not. */
+const TRANSLATED_ANSWER_FAILURES: ReadonlySet<string> = new Set([CLIENT_STREAM_INVALID, CLIENT_RESPONSE_INVALID, TOOL_CALL_MISMATCH]);
+const UNCOUNTED_ENDS: ReadonlySet<string> = new Set(NOT_COUNTED);
+
+/**
+ * An attempt's answer checks as its record keeps them (docs/error-rates.md, "What Gray causes is not the provider's"):
+ * `checks` where its answer was the provider's to answer for, and none (`UNCOUNTED_CHECKS`) where Gray caused the end or
+ * the end says nothing about the supplier: `outcome` (the record's word) one no breaker counts (@gray/endpoint
+ * NOT_COUNTED: the client left, Gray's own error or hold limit, an answer Gray failed, never sent), save an answer its
+ * upstream gave as its own API allows that the client's API cannot carry (`translation_invalid_upstream_arguments`);
+ * a translated answer Gray could not make into its client's (`code`); an attempt the server records `rejected`; and an
+ * answer Gray's own request deadline cut while it arrived (`deadlineCut`).
+ *
+ * An attempt that ended on `translation_invalid_upstream_arguments` is the upstream's. A stream the translation stopped
+ * before its finish reads `refused`, which is case 2, `schema_mismatch`, by definition: arguments that are not one
+ * object (the lead's rule, r14; the server's `counted_checks` is the same). Every other value stands as the gate read
+ * it: a whole answer's (`invalid_json`, `undeclared`, ...), `truncated` (truncation wins, default 2), not counted (the
+ * gate off), and the output check (review r14 finding 1).
+ */
+export function countedChecks(checks: AnswerChecks, end: { readonly outcome: string; readonly code: string | null; readonly rejected: boolean; readonly deadlineCut: boolean }): AnswerChecks {
+  if (end.rejected || end.deadlineCut) return UNCOUNTED_CHECKS;
+  if (end.code !== null && TRANSLATED_ANSWER_FAILURES.has(end.code)) return UNCOUNTED_CHECKS;
+  if (end.code === TRANSLATION_CODES.UPSTREAM_ARGUMENTS) {
+    // A stream the translation stopped reads `refused`; what the gate read of a whole answer, and truncation (default
+    // 2), stand as read (review r14 finding 1).
+    return { toolCallCheck: checks.toolCallCheck === "refused" ? "schema_mismatch" : checks.toolCallCheck, outputCheck: checks.outputCheck };
+  }
+  if (UNCOUNTED_ENDS.has(end.outcome)) return UNCOUNTED_CHECKS;
+  return checks;
 }
 
 /** A ranked candidate as gray.request/1 `routing_candidates` keeps it (record.rs Candidate), best first, at most 8. */
@@ -365,6 +442,13 @@ export interface RequestRecord {
   readonly errorCode: string | null;
   readonly billing: BillingOutcome;
   readonly chargedMicrousd: number | null;
+  /**
+   * The input side and the output side of `chargedMicrousd` when the charge is billed by tokens (@gray/protocol
+   * `tokenSides`; docs/effective-prices.md): both set, and their sum is the charge, at zero too. Null or absent, both,
+   * on a request not charged and on a charge billed by units, which has no input and output side.
+   */
+  readonly chargedInputMicrousd?: number | null;
+  readonly chargedOutputMicrousd?: number | null;
   readonly chargeSeq: number | null;
   readonly releaseReason: string | null;
   readonly usage: Readonly<Record<string, number>> | null;
@@ -568,11 +652,41 @@ export function indexRow(r: RequestRecord, result: WriterResult): RequestIndexRo
     // S27: the CF database's own column (0029_lane_stack.sql), set on a stack relay's rows only, so every
     // other row keeps the server's insert columns (store.rs).
     ...(r.relayAccountId === undefined || r.relayAccountId === null ? {} : { relayAccountId: r.relayAccountId }),
+    // 0076 (docs/effective-prices.md): what a route's effective prices are summed from. Like the relay account, set
+    // only on the rows that have them, so every other row is the one a gateway before them sent (and a lane's row one a
+    // bridge before them takes, `LANE_LATER_ROW_FIELDS`).
+    ...chargeSides(r),
+    ...routeApi(r),
     // S43: not a column; the lane's records sink fits it to its bounds (`laneIndexRowDtoOf`), gray-jobs writes it.
     ...(r.stackTrace === undefined ? {} : { stackTrace: r.stackTrace }),
     routes: routeActivity(r),
     admitted: r.admissions.map((a) => ({ model: a.model, atMs: a.atMs })),
+    // r14 (docs/error-rates.md): the TEE lane's rows carry it too, each entry these closed fields alone.
+    routeAttempts: routeAttempts(r),
   };
+}
+
+/**
+ * The row's two sides of a charge billed by tokens (`charged_input_microusd`, `charged_output_microusd`): the record's,
+ * both or neither, so a row never carries one side alone.
+ */
+function chargeSides(r: Pick<RequestRecord, "chargedInputMicrousd" | "chargedOutputMicrousd">): Pick<RequestIndexRow, "chargedInputMicrousd" | "chargedOutputMicrousd"> {
+  const input = r.chargedInputMicrousd ?? null;
+  const output = r.chargedOutputMicrousd ?? null;
+  return input === null || output === null ? {} : { chargedInputMicrousd: input, chargedOutputMicrousd: output };
+}
+
+/**
+ * The row's `upstream_protocol`: the API of the route the request's final attempt went to (the attempt beside whose
+ * endpoint it stands, `upstreamEndpoint`; read as `routeActivity` reads an attempt's), when it is not the API the client
+ * spoke: a request Gray translated, or a Gemini client's image request served by an image route. Absent otherwise and
+ * without an attempt, so a route's API is `upstreamProtocol ?? protocol`.
+ */
+function routeApi(r: Pick<RequestRecord, "attempts" | "protocol" | "upstreamProtocol">): Pick<RequestIndexRow, "upstreamProtocol"> {
+  const last = r.attempts.at(-1);
+  if (last === undefined) return {};
+  const api = last.protocol ?? r.upstreamProtocol ?? r.protocol;
+  return api === null || api === r.protocol ? {} : { upstreamProtocol: api };
 }
 
 /**
@@ -605,6 +719,26 @@ export function routeActivity(r: Pick<RequestRecord, "attempts" | "model" | "pro
     .sort((x, y) => x.lastMs - y.lastMs)
     .slice(-MAX_ROW_ROUTES)
     .map(({ legacyTextMs, ...route }) => (legacyTextMs === null ? route : { ...route, legacyTextMs }));
+}
+
+/**
+ * Each attempt the request sent to a route, in order (r14, docs/error-rates.md "How it is recorded"): the route as
+ * `routeActivity` keys it, the same attempts left out (what the server records `rejected`, a recovery probe never
+ * dispatched, one without a model or a protocol), whether it served the answer, the class of its failure, its two
+ * answer checks (null where not counted) and its measures (r15, docs/live-speed.md: its record's `measures`, absent
+ * where it has none); past MAX_ROW_ATTEMPTS the latest. The server derives the same list (request_log/record.rs).
+ */
+export function routeAttempts(r: Pick<RequestRecord, "attempts" | "model" | "protocol" | "upstreamProtocol">): RouteAttempt[] {
+  const out: RouteAttempt[] = [];
+  for (const a of r.attempts) {
+    if (a.rejected === true || a.outcome === "not_dispatched") continue;
+    const model = a.model ?? r.model;
+    if (model === null) continue;
+    const protocol = a.protocol ?? r.upstreamProtocol ?? r.protocol;
+    if (protocol === null) continue;
+    out.push({ endpointId: a.endpointId, model, protocol, served: a.outcome === "success", retryClass: a.retryClass ?? null, toolCallCheck: a.toolCallCheck ?? null, outputCheck: a.outputCheck ?? null, ...a.measures });
+  }
+  return out.slice(-MAX_ROW_ATTEMPTS);
 }
 
 /** A reason as the index column takes it (@gray/request-index CONTENT_REASONS): `keyless_rate` never reaches a row. */

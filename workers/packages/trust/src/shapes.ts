@@ -8,10 +8,14 @@
 import { type Json, asStr, asU64, get, isArray, isObject, pointer } from "@gray/json";
 import { type Protocol, argumentValue, geminiField, isKeepAlive } from "@gray/protocol";
 import { MAX_TOOLS } from "./limits.ts";
+import type { ArgumentsReading } from "./tool-call-check.ts";
 import { refuse } from "./violations.ts";
 
-/** A call's name and arguments, as an answer states them. */
-export type Call = readonly [name: string, arguments: Json];
+/**
+ * A call's name and arguments, as an answer states them, and how the arguments read (`ArgumentsReading`, for the
+ * tool-call check; absent where nothing reads it).
+ */
+export type Call = readonly [name: string, arguments: Json, reading?: ArgumentsReading];
 
 /** `array`: a JSON array, or the answer is opaque. */
 function array(value: Json | undefined): Json[] {
@@ -62,12 +66,24 @@ function entryCarriesToolCall(key: string, value: Json): boolean {
  * `push_call`. Absent or unreadable arguments are not an object, which the call check records (or
  * refuses where an operator rule must read them). Text with a duplicate key stays text: a client's
  * parser may keep another duplicate than serde_json does, so no reading of it is the inspected one.
+ * For the tool-call check (`ArgumentsReading`, docs/error-rates.md default 3): `field` says whether the
+ * arguments are argument `text` (Chat, Responses), judged on the raw text: text that parses is JSON, a
+ * string literal (`"{\"a\":1}"`) too; or a JSON `value` (Anthropic `input`, Gemini `args`), whose
+ * string is JSON that is no object, whatever it holds (review r14 blocker 1). Absent arguments are no
+ * JSON. The gate's own reading (the value pushed) is the same for both.
  */
-function pushCall(name: Json | undefined, args: Json | undefined, calls: Call[]): void {
+function pushCall(name: Json | undefined, args: Json | undefined, calls: Call[], field: "text" | "value"): void {
   const text = asStr(name);
-  if (text === undefined || text === "") refuse("trust_opaque_tool_payload");
-  const value = args === undefined ? null : typeof args === "string" ? argumentValue(args) : args;
-  calls.push([text, value]);
+  if (text === undefined || text === "") refuse("trust_opaque_tool_payload", "missing_name");
+  if (args === undefined) {
+    calls.push([text, null, "not_json"]);
+  } else if (typeof args === "string") {
+    const value = argumentValue(args);
+    // `argumentValue` gives the text back only when it is not JSON: a string literal reads as a shorter value.
+    calls.push([text, value, field === "value" ? "not_object" : value !== args ? "json" : "not_json"]);
+  } else {
+    calls.push([text, args, field === "value" && !isObject(args) ? "not_object" : "json"]);
+  }
   if (calls.length > MAX_TOOLS) refuse("trust_payload_limit");
 }
 
@@ -112,13 +128,13 @@ export function contentCalls(protocol: Protocol, content: Json | undefined, call
       const fn = get(part, "functionCall");
       if (fn !== undefined) {
         const args = get(fn, "args");
-        pushCall(get(fn, "name"), args === undefined ? {} : args, calls);
+        pushCall(get(fn, "name"), args === undefined ? {} : args, calls, "value");
       }
       continue;
     }
     const type = asStr(get(part, "type"));
     if (type === "tool_use" && protocol === "anthropic_messages") {
-      pushCall(get(part, "name"), get(part, "input"), calls);
+      pushCall(get(part, "name"), get(part, "input"), calls, "value");
     } else if (type === "fallback" && protocol === "anthropic_messages") {
       // Rust refuses a `fallback` block as `trust_response_model_mismatch`: an answer that changed
       // models partway. Which model answered is not this gate's to judge (owner, 2026-10-16); the
@@ -147,7 +163,7 @@ function chatMessageCalls(message: Json, calls: Call[]): void {
 /** One item of a Chat message's `tool_calls` (`chat_message_calls`' loop): a function call, or the answer is opaque. */
 export function chatToolCall(tool: Json, calls: Call[]): void {
   if (asStr(get(tool, "type")) !== "function") refuse("trust_opaque_tool_payload");
-  pushCall(pointer(tool, "/function/name"), pointer(tool, "/function/arguments"), calls);
+  pushCall(pointer(tool, "/function/name"), pointer(tool, "/function/arguments"), calls, "text");
 }
 
 /**
@@ -157,7 +173,7 @@ export function chatToolCall(tool: Json, calls: Call[]): void {
 export function responseItemCalls(item: Json, calls: Call[]): void {
   switch (asStr(get(item, "type"))) {
     case "function_call":
-      return pushCall(get(item, "name"), get(item, "arguments"), calls);
+      return pushCall(get(item, "name"), get(item, "arguments"), calls, "text");
     case "message":
       return contentCalls("open_ai_responses", get(item, "content"), calls);
     case "reasoning":

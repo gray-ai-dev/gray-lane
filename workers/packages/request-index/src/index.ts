@@ -15,6 +15,10 @@
  */
 
 import type { TrafficEvidenceWire } from "@gray/control";
+import { type OutputCheck, type ToolCallCheck, isOutputCheck, isToolCallCheck } from "@gray/protocol";
+
+/** The answer checks' words with the row that carries them, for the packages that read a row (@gray/lane-wire). */
+export { OUTPUT_CHECKS, type OutputCheck, TOOL_CALL_CHECKS, type ToolCallCheck } from "@gray/protocol";
 
 /** What became of a request's content (store.rs ContentStatus). */
 export const CONTENT_STATUSES = ["stored", "withheld", "truncated", "failed", "shed"] as const;
@@ -118,6 +122,22 @@ export interface RequestIndexRow {
    */
   readonly relayAccountId?: string | null;
   /**
+   * The input side and the output side of `chargedMicrousd` when the charge is billed by tokens (gray-ledger
+   * `usage_cost`: uncached, image and audio input, cache reads and both cache writes rounded up together; output
+   * rounded up on its own): both set or both null, and their sum is `chargedMicrousd`. Null on a row not charged, on a
+   * charge billed by units, and absent from a row of a gateway before them (workers/db/migrations/0072;
+   * docs/effective-prices.md).
+   */
+  readonly chargedInputMicrousd?: number | null;
+  readonly chargedOutputMicrousd?: number | null;
+  /**
+   * The API of the route the final attempt went to when it is not `protocol`, the client's (a translated request, or
+   * a client API a route of another API serves, as a Gemini client's image request on an image route); null
+   * otherwise, so the route's API is `upstreamProtocol ?? protocol`, and a value does not by itself say "translated". The TEE lane's rows carry it, which they
+   * do not `routes`. Absent from a row of a gateway before it (0076).
+   */
+  readonly upstreamProtocol?: string | null;
+  /**
    * Not a column: a stack relay's vendor attempts for this request (S43,
    * docs/confidential-lane-supply-implementation.md), which gray-jobs writes to `lane_stack_traces` and adds to
    * `lane_stack_attempts` for the rows it inserts; absent from every other row. The lane bridge's schema holds it to
@@ -137,7 +157,94 @@ export interface RequestIndexRow {
    * when nothing was admitted. Absent as `routes` is: then `model` at `createdMs` when it held.
    */
   readonly admitted?: readonly Admitted[];
+  /**
+   * The column `route_attempts` (snake_case keys there; not in `COLUMNS`, whose kinds have no JSON), not `attempts`,
+   * which counts them: each attempt the request sent to a route, in order, with its two answer checks
+   * (docs/error-rates.md, r14), which gray-jobs writes (workers/db/migrations/0079) for the error rates' route-by-hour
+   * sums. Unlike `routes` the TEE lane's rows carry it (closed words only:
+   * `@gray/lane-wire` holds them to `RouteAttempt` exactly). Absent from a row of a gateway before it: the row is
+   * indexed and counts in no error rate. One this consumer cannot read is left out, never refusing the row.
+   */
+  readonly routeAttempts?: readonly RouteAttempt[];
 }
+
+/**
+ * The class of an attempt's failure (record.rs Attempt `retry_class`, main's retry::Class; docs/api-errors.md,
+ * Retries): the gateway's AttemptRecord `retryClass` and a row's `routeAttempts` share these words.
+ */
+export const RETRY_CLASSES = ["connect", "transport", "timeout", "server_error", "throttled", "credential", "route_fault", "account_request", "refusal", "final_refusal", "answer_defect", "no_image"] as const;
+export type RetryClass = (typeof RETRY_CLASSES)[number];
+
+/**
+ * One attempt a request sent to a route (r14): the route as `RouteActivity` keys it (endpoint, the attempt's model,
+ * the protocol it was sent in), whether it served the answer, the class of its failure (null when it served, or when
+ * no class applies) and its two answer checks (@gray/protocol `AnswerChecks`: null where it is not counted). An
+ * attempt Gray never sent (`rejected`, `not_dispatched`) is not listed, as `routeActivity` leaves it out. No code
+ * or free text: these fields and nothing else, as they leave the TEE.
+ */
+export interface RouteAttempt {
+  readonly endpointId: string;
+  readonly model: string;
+  readonly protocol: string;
+  readonly served: boolean;
+  readonly retryClass: RetryClass | null;
+  readonly toolCallCheck: ToolCallCheck | null;
+  readonly outputCheck: OutputCheck | null;
+  /**
+   * r15 (docs/live-speed.md): the attempt's measures, each its ranking sample's (the gateway's `OutcomeMeasure`, the
+   * server's `Observation`) and each absent when it has none, so an attempt of a gateway before them and one without
+   * them are alike: how it counted for its route (`SUPPLIER_OUTCOMES`; absent: not counted), whether it was a streaming
+   * attempt (its rank key's mode, the request's), its own time to first token (a stream's first content since the
+   * attempt started), how long it took from its start to its end (a stream's: the answer's end), and the output tokens it
+   * was charged, reasoning included (absent when it was not charged). Within `ATTEMPT_MEASURE_MAX_MS` and `ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS`,
+   * the time to first token no later than the end (`attemptMeasuresHold`), or none of the five.
+   */
+  readonly supplierOutcome?: SupplierOutcome;
+  readonly streamed?: boolean;
+  readonly ttftMs?: number;
+  readonly durationMs?: number;
+  readonly outputTokens?: number;
+}
+
+/**
+ * How an attempt counted for its route in the end (r15, docs/live-speed.md; the server's answer_checks.rs
+ * `SupplierOutcome`): the ranking sample's view of it, a refusal counted as a failure once another attempt served the
+ * request included. `success` (a free delivery too); `failure`, the supplier's (timeout, upstream error, invalid
+ * response); `rate_limited`, which the response success figure leaves out.
+ */
+export const SUPPLIER_OUTCOMES = ["success", "failure", "rate_limited"] as const;
+export type SupplierOutcome = (typeof SUPPLIER_OUTCOMES)[number];
+export const isSupplierOutcome = (v: unknown): v is SupplierOutcome => (SUPPLIER_OUTCOMES as readonly unknown[]).includes(v);
+
+/** The most an attempt's `ttftMs` or `durationMs` may say (24 hours), and the most `outputTokens` (answer_checks.rs). */
+export const ATTEMPT_MEASURE_MAX_MS = 86_400_000;
+export const ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS = 10_000_000;
+
+/** The five measures of a `RouteAttempt`, by name: what a list keeps all of or none of. */
+export const ATTEMPT_MEASURES = ["supplierOutcome", "streamed", "ttftMs", "durationMs", "outputTokens"] as const satisfies readonly (keyof RouteAttempt)[];
+export type AttemptMeasures = Pick<RouteAttempt, (typeof ATTEMPT_MEASURES)[number]>;
+
+/**
+ * Whether an attempt's measures hold (the server's `RouteAttempt::measures_hold`): each a word of its kind, each time a
+ * safe integer from 0 to `ATTEMPT_MEASURE_MAX_MS`, the tokens from 0 to `ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS`, the time to
+ * first token no later than the end. Absent members hold.
+ */
+export function attemptMeasuresHold(m: { readonly [K in keyof AttemptMeasures]?: unknown }): boolean {
+  const count = (v: unknown, max: number) => v === undefined || (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= max);
+  if (m.supplierOutcome !== undefined && !isSupplierOutcome(m.supplierOutcome)) return false;
+  if (m.streamed !== undefined && typeof m.streamed !== "boolean") return false;
+  if (!count(m.ttftMs, ATTEMPT_MEASURE_MAX_MS) || !count(m.durationMs, ATTEMPT_MEASURE_MAX_MS) || !count(m.outputTokens, ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS)) return false;
+  return m.ttftMs === undefined || m.durationMs === undefined || (m.ttftMs as number) <= (m.durationMs as number);
+}
+
+/** The measures of `o` that are there (a member null or absent is not), all of them when they hold, else none. */
+export function attemptMeasuresOf(o: { readonly [K in keyof AttemptMeasures]?: unknown }): AttemptMeasures {
+  const present = Object.fromEntries(ATTEMPT_MEASURES.flatMap((k) => (o[k] === undefined || o[k] === null ? [] : [[k, o[k]]])));
+  return attemptMeasuresHold(present) ? (present as AttemptMeasures) : {};
+}
+
+/** The most attempts one row carries, the latest kept, as `MAX_ROW_ROUTES`. */
+export const MAX_ROW_ATTEMPTS = 64;
 
 /**
  * One route a request's attempts went to, as the server's `route_attempt` telemetry events key it
@@ -323,6 +430,9 @@ export const COLUMNS: readonly { readonly key: keyof RequestIndexRow; readonly c
   { key: "toolNames", column: "tool_names", kind: "texts", nullable: true },
   { key: "reasoningTokens", column: "reasoning_tokens", kind: "int8", nullable: true },
   { key: "relayAccountId", column: "relay_account_id", kind: "text", nullable: true },
+  { key: "chargedInputMicrousd", column: "charged_input_microusd", kind: "int8", nullable: true },
+  { key: "chargedOutputMicrousd", column: "charged_output_microusd", kind: "int8", nullable: true },
+  { key: "upstreamProtocol", column: "upstream_protocol", kind: "text", nullable: true },
 ];
 
 function column(kind: Kind, field: string, v: unknown): unknown {
@@ -366,6 +476,14 @@ export function parseRow(v: unknown): RequestIndexRow {
   if ((out.id as string).length === 0) throw new InvalidRow("id", "must not be empty");
   if (o.routes !== undefined && o.routes !== null) out.routes = parseRoutes(o.routes);
   if (o.admitted !== undefined && o.admitted !== null) out.admitted = parseAdmitted(o.admitted);
+  if (o.routeAttempts !== undefined && o.routeAttempts !== null) {
+    // The error rates' input, not the row: a list this consumer cannot read is left out, never refusing the row.
+    try {
+      out.routeAttempts = parseRouteAttempts(o.routeAttempts);
+    } catch (err) {
+      if (!(err instanceof InvalidRow)) throw err;
+    }
+  }
   if (o.stackTrace !== undefined && o.stackTrace !== null) {
     // A trace is the panel's diagnostics, not the row: one this consumer cannot read (a newer lane's shape) is
     // left out and the row is indexed without it, never refused with its message.
@@ -459,6 +577,66 @@ function parseRoutes(v: unknown): RouteActivity[] {
       ...(legacyTextMs === null ? {} : { legacyTextMs }),
     };
   });
+}
+
+/** A row's `routeAttempts`, each exactly a `RouteAttempt` with its closed words; members it does not know are not kept. */
+export function parseRouteAttempts(v: unknown): RouteAttempt[] {
+  if (!Array.isArray(v)) throw new InvalidRow("routeAttempts", "must be an array");
+  if (v.length > MAX_ROW_ATTEMPTS) throw new InvalidRow("routeAttempts", `must hold at most ${MAX_ROW_ATTEMPTS}`);
+  return v.map((a, i) => {
+    const o = object(a, `routeAttempts[${i}]`);
+    if (typeof o.served !== "boolean") throw new InvalidRow(`routeAttempts[${i}].served`, "must be a boolean");
+    const retryClass = o.retryClass ?? null;
+    if (retryClass !== null && !(RETRY_CLASSES as readonly unknown[]).includes(retryClass)) throw new InvalidRow(`routeAttempts[${i}].retryClass`, `must be one of ${RETRY_CLASSES.join(", ")}`);
+    const toolCallCheck = o.toolCallCheck ?? null;
+    if (toolCallCheck !== null && !isToolCallCheck(toolCallCheck)) throw new InvalidRow(`routeAttempts[${i}].toolCallCheck`, "must be a tool call check");
+    const outputCheck = o.outputCheck ?? null;
+    if (outputCheck !== null && !isOutputCheck(outputCheck)) throw new InvalidRow(`routeAttempts[${i}].outputCheck`, "must be an output check");
+    return {
+      endpointId: column("text", `routeAttempts[${i}].endpointId`, o.endpointId) as string,
+      model: column("text", `routeAttempts[${i}].model`, o.model) as string,
+      protocol: column("text", `routeAttempts[${i}].protocol`, o.protocol) as string,
+      served: o.served,
+      retryClass: retryClass as RetryClass | null,
+      toolCallCheck,
+      outputCheck,
+      // r15: the five measures, all or none; ones past their bounds are left out, never refusing the list.
+      ...attemptMeasuresOf(o),
+    };
+  });
+}
+
+/**
+ * Each `RouteAttempt` field's key in `request_logs.route_attempts` (workers/db/migrations/0079: snake_case, the shape
+ * of the server's crates/gray-gateway/src/answer_checks.rs `RouteAttempt`). Typed over every field, so a field added
+ * to `RouteAttempt` without its key here fails the type check.
+ */
+export const ROUTE_ATTEMPT_COLUMN_KEYS: { readonly [K in keyof RouteAttempt]-?: string } = Object.freeze({
+  endpointId: "endpoint_id",
+  model: "model",
+  protocol: "protocol",
+  served: "served",
+  retryClass: "retry_class",
+  toolCallCheck: "tool_call_check",
+  outputCheck: "output_check",
+  supplierOutcome: "supplier_outcome",
+  streamed: "streamed",
+  ttftMs: "ttft_ms",
+  durationMs: "duration_ms",
+  outputTokens: "output_tokens",
+});
+
+/**
+ * A row's route attempts as `request_logs.route_attempts` keeps them: one object per attempt with the keys of
+ * `ROUTE_ATTEMPT_COLUMN_KEYS`; `[]` for a row of a gateway that sent none; null for a row without them (a gateway
+ * before them, or a list this consumer could not read: `parseRow` left it out). gray-jobs writes it; the conformance
+ * replay of the server's `request-log/route-attempts` holds it to the server's.
+ */
+export function routeAttemptsColumn(row: Pick<RequestIndexRow, "routeAttempts">): Record<string, unknown>[] | null {
+  if (row.routeAttempts === undefined) return null;
+  const keys = Object.entries(ROUTE_ATTEMPT_COLUMN_KEYS) as [keyof RouteAttempt, string][];
+  // An absent measure has no key (the server's `skip_serializing_if`); r14's seven are always there.
+  return row.routeAttempts.map((a) => Object.fromEntries(keys.flatMap(([field, key]) => (a[field] === undefined ? [] : [[key, a[field]]]))));
 }
 
 /** The row with the column names as keys, for jsonb_to_recordset. */

@@ -118,6 +118,39 @@ export function keepRule(protocol: Protocol, path: readonly PathKey[]): KeepRule
   }
 }
 
+/**
+ * Whether the value at `path` is the answer's text (`AnswerProjectionOptions.wholeText`): Chat
+ * `choices.*.message.content`, or its parts' `choices.*.message.content.*.text`, Responses `output.*.content.*.text`,
+ * Anthropic `content.*.text`, Gemini `candidates.*.content.parts.*.text`. Its parent is kept by the default rule: none
+ * of these is inside a subtree kept whole or emptied.
+ */
+function textPath(protocol: Protocol, path: readonly PathKey[]): boolean {
+  const n = path.length;
+  switch (protocol) {
+    case "open_ai_chat":
+      if (n < 4 || path[0] !== "choices" || !index(path[1]) || path[2] !== "message" || path[3] !== "content") return false;
+      // The content as a string, or the text of each of its parts.
+      return n === 4 || (n === 6 && index(path[4]) && path[5] === "text");
+    case "open_ai_responses":
+      return n === 5 && path[0] === "output" && index(path[1]) && path[2] === "content" && index(path[3]) && path[4] === "text";
+    case "anthropic_messages":
+      return n === 3 && path[0] === "content" && index(path[1]) && path[2] === "text";
+    case "gemini":
+      return n === 6 && path[0] === "candidates" && index(path[1]) && path[2] === "content" && path[3] === "parts" && index(path[4]) && path[5] === "text";
+    default:
+      return false;
+  }
+}
+
+/**
+ * The most answer text a projection with `wholeText` keeps whole, in UTF-8 bytes over all its text strings: 256 KiB,
+ * the structured output check's limit (@gray/trust src/output.ts `OUTPUT_TEXT_LIMIT`, the traffic evidence's
+ * `JSON_TEXT_LIMIT`), past which that check decides nothing (`unknown`). So the option keeps at most this much more
+ * text than the projection otherwise would, whatever the answer's size, weighed as every kept byte is (the gateway's
+ * `answerWeight`, workers/gateway/src/answer.ts).
+ */
+const WHOLE_TEXT_BYTES = 256 * 1024;
+
 /** A string kept by the default rule. */
 export function keptString(value: ScanString): string {
   if (value.bytes <= KEPT_STRING_UNITS) return value.text;
@@ -140,6 +173,20 @@ interface Frame {
   count: number;
 }
 
+/**
+ * How an answer is projected beyond the protocol's keep rules (r14). `wholeText`: the answer's text (Chat
+ * `choices.*.message.content` or its parts' `.text`, Responses `output.*.content.*.text`, Anthropic `content.*.text`,
+ * Gemini `candidates.*.content.parts.*.text`) is kept whole, its bytes counted as every kept byte is, for the structured
+ * output check of a request that asked for JSON (docs/error-rates.md; @gray/trust `outputCheck`). At most `WHOLE_TEXT_BYTES`
+ * of text in all: the scan keeps each text whole up to what is left of it (`wholeStringBytes`); the text that would
+ * pass it, and every text after, is cut as any long string is, and the check reads a cut text as undecided. Every other
+ * string is kept as without the option. A reader that wraps the projection must pass `wholeStringBytes` on, or every
+ * text is cut as before.
+ */
+export interface AnswerProjectionOptions {
+  readonly wholeText?: boolean;
+}
+
 /** The projection of one answer: a `StrictJsonScan` listener. */
 export class AnswerProjection implements ScanListener {
   readonly protocol: Protocol;
@@ -151,13 +198,22 @@ export class AnswerProjection implements ScanListener {
   openTopKey: string | null = null;
   /** What the projection's nodes hold beyond their text (`PROJECTION_NODE_BYTES`), in bytes. */
   nodeBytes = 0;
+  /**
+   * The projection cut some of the answer's text (`textPath`): a text string past KEPT_STRING_UNITS bytes kept as its
+   * prefix, without `wholeText` or once its bound was spent. What is left of the text is then no answer to judge
+   * (@gray/trust `outputCheck`'s `textCut`). Every other string it cuts is no text.
+   */
+  textCut = false;
   private readonly frames: Frame[] = [];
   private readonly path: PathKey[] = [];
   private readonly observer: ProjectionObserver | null;
+  /** The text bytes `wholeText` may still keep whole (`WHOLE_TEXT_BYTES`); 0 without the option, and once a text was cut. */
+  private textLeft: number;
 
-  constructor(protocol: Protocol, observer: ProjectionObserver | null = null) {
+  constructor(protocol: Protocol, observer: ProjectionObserver | null = null, options: AnswerProjectionOptions = {}) {
     this.protocol = protocol;
     this.observer = observer;
+    this.textLeft = options.wholeText === true ? WHOLE_TEXT_BYTES : 0;
   }
 
   private get top(): Frame | undefined {
@@ -178,6 +234,16 @@ export class AnswerProjection implements ScanListener {
 
   private stepOf(frame: Frame): PathKey {
     return frame.array ? frame.index : (frame.key as string);
+  }
+
+  /** The value about to start is the answer's text, which `wholeText` keeps whole while its bound lasts (`textPath`). */
+  private textNext(): boolean {
+    const frame = this.top;
+    if (frame === undefined || frame.node === null || frame.rule !== "default") return false;
+    this.path.push(this.stepOf(frame));
+    const text = textPath(this.protocol, this.path);
+    this.path.pop();
+    return text;
   }
 
   /** Puts a completed value into the innermost container; true when it is kept. */
@@ -236,6 +302,11 @@ export class AnswerProjection implements ScanListener {
     return this.ruleOfNext() === "whole";
   }
 
+  /** What of the text about to start is kept whole (`AnswerProjectionOptions.wholeText`): what is left of the bound. */
+  wholeStringBytes(): number {
+    return this.textLeft > 0 && this.textNext() ? this.textLeft : 0;
+  }
+
   stringRuns(offset: number): void {
     if (this.observer?.stringRuns === undefined) return;
     const frame = this.top;
@@ -289,7 +360,17 @@ export class AnswerProjection implements ScanListener {
       this.completed();
       return;
     }
-    const kept = rule === "whole" && value.whole ? value.text : keptString(value);
+    let kept: string;
+    if (this.textLeft > 0 && rule === "default" && this.textNext()) {
+      // The answer's text: whole as the scan kept it, within what is left of the bound; one that passed it is cut,
+      // and nothing more is kept whole.
+      kept = value.whole ? value.text : keptString(value);
+      this.textLeft = value.whole || value.bytes <= KEPT_STRING_UNITS ? Math.max(0, this.textLeft - value.bytes) : 0;
+    } else {
+      kept = rule === "whole" && value.whole ? value.text : keptString(value);
+    }
+    // Only a string past what the default rule keeps can have been cut; whether it is the answer's text is asked then.
+    if (!this.textCut && !value.whole && value.bytes > KEPT_STRING_UNITS && rule === "default" && this.textNext()) this.textCut = true;
     this.nodeBytes += PROJECTION_NODE_BYTES.string;
     this.scalar(kept, (kept === value.text ? value.bytes : utf8Length(kept)) + 2, offset);
   }

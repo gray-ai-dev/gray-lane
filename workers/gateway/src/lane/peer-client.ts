@@ -11,7 +11,9 @@ import {
   peerEnvelopeBytes,
   PEER_BUDGET_MAX_MS,
   PEER_DEBUG_PREFIX,
+  PEER_END_READS,
   PEER_HEADER,
+  PEER_READS_HEADER,
   PEER_REQUEST_ID_HEADER,
   signPeerDebugEnvelope,
   signPeerEnvelope,
@@ -888,6 +890,11 @@ export class PeerCall implements LanePeerCall {
   /** The envelope's digest (`peer.forwarded`), once one was signed. */
   envelopeSha256: string | null = null;
   head: PeerHeadDto | null = null;
+  /**
+   * The hop's `end`, once it came. Its `checks` (r14) are the attempt's two answer checks as the stack VM's gate made
+   * them, the only ones of a peer attempt (the entry gets no byte of an answer refused there); absent from a stack VM
+   * before them, which leaves the attempt uncounted.
+   */
   end: PeerEndDto | null = null;
   /** Why the hop gave no answer (`peer.failed`), when it gave none. */
   failure: { readonly code: PeerFailedCode; readonly sent: boolean } | null = null;
@@ -914,6 +921,27 @@ export class PeerCall implements LanePeerCall {
 
   get n(): number {
     return this.#input.n;
+  }
+
+  /**
+   * The hop's `end`, waited for until `untilMs` by the entry's clock (review r14 lane-wire finding 10). The request path
+   * stops reading an answer at the frame it fails on, such as Gray's error frame after a stream the stack VM's gate
+   * refused, while the stack VM writes `end` right after that frame, once it closed the rid at egress and signed its
+   * receipt (lane/backend.ts `run`). The request path keeps the hop open until it closes the call (inference.ts
+   * `endKept`), and the answer's body reads the hop one frame ahead of its reader (a stream pulls again while its queue
+   * is below its high-water mark), so `end` lands here without another read: this waits for `ended`, never reads the hop
+   * itself. Null when the hop ended without one, broke, or nothing came by `untilMs`.
+   */
+  async endWithin(untilMs: number): Promise<PeerEndDto | null> {
+    if (this.end !== null) return this.end;
+    const { timers, clock } = this.#input;
+    let timer: unknown = null;
+    const late = new Promise<null>((resolve) => (timer = timers.setTimeout(() => resolve(null), Math.max(0, untilMs - clock()))));
+    try {
+      return await Promise.race([this.ended, late]);
+    } finally {
+      timers.clearTimeout(timer);
+    }
   }
 
   /** The relay account of `end` (S27), or null. */
@@ -1030,7 +1058,14 @@ export class PeerCall implements LanePeerCall {
     try {
       response = await input.egress(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}${input.path}`, {
         method: "POST",
-        headers: { ...input.headers, "content-type": "application/json", [PEER_HEADER]: header, ...(input.requestId === undefined ? {} : { [PEER_REQUEST_ID_HEADER]: input.requestId }) },
+        // `x-gray-peer-reads`: the `end` members this entry parses (r14 `checks`), so a stack VM sends them to it alone.
+        headers: {
+          ...input.headers,
+          "content-type": "application/json",
+          [PEER_HEADER]: header,
+          [PEER_READS_HEADER]: PEER_END_READS.join(","),
+          ...(input.requestId === undefined ? {} : { [PEER_REQUEST_ID_HEADER]: input.requestId }),
+        },
         body: input.body,
         signal: input.signal,
       });
@@ -1122,8 +1157,10 @@ export class PeerCall implements LanePeerCall {
 
   /**
    * A committed answer as an upstream `Response`: the `data` bytes as the stack VM released them, read as the request
-   * path reads (nothing ahead of its consumer). The body ends once `end` is in; a hop that ends without `end`, or with a
-   * frame that is not the wire, is a broken body, as a vendor connection that broke.
+   * path reads, one frame ahead of its consumer (a stream's default highWaterMark of 1: it pulls again while its queue is
+   * empty), which is how an `end` that follows the last frame read lands in `ended` (`endWithin`). The body ends once
+   * `end` is in; a hop that ends without `end`, or with a frame that is not the wire, is a broken body, as a vendor
+   * connection that broke.
    */
   #answer(head: PeerHeadDto): Response {
     const reader = this.#reader!;

@@ -2,6 +2,7 @@ import { asStr, get, type Json } from "@gray/json";
 import { type CanonicalEvent, ProtocolError, ProtocolStreamDecoder, SseFrames, jsonHeapBytes, jsonValueBytes, keepAlive, sseData } from "@gray/protocol";
 import { wholeAnswerWeight } from "../answer.ts";
 import type { ClientPresence } from "../client.ts";
+import type { StreamInspector } from "../gate.ts";
 import { type PrimeGray, type PrimeLeft, type Retaining, type Uncommitted, type UncommittedClass, UpstreamReader, eventStream, streamWeight } from "../relay.ts";
 import type { AnswerShare, Retained } from "../retained.ts";
 
@@ -46,7 +47,11 @@ export interface CompletedResponse {
   readonly received: number;
 }
 
-export type CompletedEnd = CompletedResponse | Uncommitted | PrimeGray | PrimeLeft;
+/**
+ * How the read ended, and whether the stream's inspector it was given failed while it was fed (`inspectorFailed`): its
+ * reading is then Gray's own failure, which counts nothing (`UNCOUNTED_CHECKS`), as a failing inspector is in the relay.
+ */
+export type CompletedEnd = (CompletedResponse | Uncommitted | PrimeGray | PrimeLeft) & { readonly inspectorFailed?: true };
 
 export interface CompletedInput {
   readonly response: Response;
@@ -66,6 +71,13 @@ export interface CompletedInput {
   /** The request's part of what the isolate's answers hold, against `heldLimit` (ANSWER_HELD_MAX_BYTES). */
   readonly isolate?: AnswerShare;
   readonly heldLimit?: number;
+  /**
+   * The gate's inspector of the stream (`ToolGate.stream`), for the attempt's answer checks (docs/error-rates.md, r14):
+   * it hears every event the read decodes, and a read that ends before its terminal event has its reading, not
+   * finished (`checks(false)`), as a stream that failed before its commit has its priming's. Its verdicts change
+   * nothing: the gate's verdict is on the response object the client gets. What it keeps is weighed with the read.
+   */
+  readonly inspector?: StreamInspector;
 }
 
 /** The terminal events of a Responses stream, each carrying the whole response object. */
@@ -82,11 +94,17 @@ export function keptWeight(response: Json, bytes: number): number {
   return Math.max(wholeAnswerWeight(bytes), bytes + jsonHeapBytes(response));
 }
 
-/** No stream inspector runs here (the gate inspects the response object the client gets): nothing kept. */
+/** No stream inspector given: nothing kept beside the read's own. */
 const NOTHING: Retaining = { retainedBytes: () => 0 };
 
 /** Reads a Codex backend's answer stream to its end and returns its terminal event's `response` (D129). */
 export async function completedResponse(input: CompletedInput): Promise<CompletedEnd> {
+  const fed = { failed: false };
+  const end = await readCompleted(input, fed);
+  return fed.failed ? { ...end, inspectorFailed: true } : end;
+}
+
+async function readCompleted(input: CompletedInput, fed: { failed: boolean }): Promise<CompletedEnd> {
   const { clock } = input;
   const upstream = input.response.body === null ? null : new UpstreamReader(input.response.body, input.presence, clock);
   const limit = input.answerLimit;
@@ -115,10 +133,11 @@ export async function completedResponse(input: CompletedInput): Promise<Complete
   const frames = new SseFrames();
   const decoder = new ProtocolStreamDecoder("open_ai_responses");
   let terminal: { readonly response: Json; readonly bytes: Uint8Array; readonly weight: number } | null = null;
+  const inspector = input.inspector;
   /** What the read holds, weighed as a stream is (`streamWeight`), with the terminal event's bytes and parse. */
   const weighed = (): PrimeGray | null => {
     const kept = terminal?.weight ?? 0;
-    const bytes = streamWeight({ heldBytes: kept, heldFrames: 0, frames, queuedBytes: 0, queuedChunks: 0, decoder, inspector: NOTHING, stage: null, repairs: null });
+    const bytes = streamWeight({ heldBytes: kept, heldFrames: 0, frames, queuedBytes: 0, queuedChunks: 0, decoder, inspector: inspector ?? NOTHING, stage: null, repairs: null });
     input.retained?.set("frame", frames.length);
     input.retained?.set("stream_state", Math.max(0, bytes - frames.length));
     if (bytes <= heldLimit && (input.isolate === undefined || input.isolate.hold(bytes, heldLimit))) return null;
@@ -131,6 +150,15 @@ export async function completedResponse(input: CompletedInput): Promise<Complete
   /** One frame's events: null to read on, or how the read ends. */
   const take = (events: readonly CanonicalEvent[], frame: Uint8Array): CompletedEnd | null => {
     if (keepAlive(events)) return null;
+    // Heard for the answer checks alone; its verdict is not this read's, and nor is a failure of its own: it is heard no
+    // more, what it keeps is still weighed, and the caller is told (`inspectorFailed`).
+    if (!fed.failed) {
+      try {
+        inspector?.observe(events);
+      } catch {
+        fed.failed = true;
+      }
+    }
     answer += frame.length;
     if (answer > limit) return failed("answer_defect", "upstream_stream_limit", `the answer passed its limit of ${limit} bytes`, true);
     for (const event of events) {
@@ -215,6 +243,8 @@ export async function completedResponse(input: CompletedInput): Promise<Complete
         : draining && until < input.deadline
           ? "the client left after the final event, and the upstream did not end while the Worker could still read"
           : "the request deadline passed before the stream ended";
-    return failed("timeout", code, why, true);
+    const timedOut = failed("timeout", code, why, true);
+    // Gray's own request deadline ended the read after bytes came: Gray's limit, not the provider's (`primeStream`).
+    return next.kind === "deadline" && received > 0 ? { ...timedOut, cutByDeadline: true } : timedOut;
   }
 }

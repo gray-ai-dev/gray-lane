@@ -57,7 +57,10 @@ export interface ScanString {
   readonly bytes: number;
   /** `text` is the whole string. */
   readonly whole: boolean;
-  /** The listener asked for it whole, and it grew past the scan's `spillBytes`: only its prefix is in `text`. */
+  /**
+   * The listener asked for it whole, and it grew past the scan's `spillBytes` (or past the bytes its
+   * `wholeStringBytes` gave): only its prefix is in `text`.
+   */
   readonly spilled?: boolean;
   /** The offset of its closing quote: its raw bytes, escapes as written, are those between `offset + 1` and here. */
   readonly end?: number;
@@ -89,6 +92,13 @@ export interface ScanListener {
   literal(value: boolean | null, offset: number): void;
   /** Called at the opening quote of a string value (never of a key): keep it whole? */
   wholeString(): boolean;
+  /**
+   * Called right after `wholeString` declined a string value: how many of its UTF-8 bytes to keep
+   * whole all the same, past which it spills as one past `spillBytes` does (`ScanString.spilled`; the
+   * lesser of the two bounds holds). 0, or no such method: its prefix only. The projection keeps an
+   * answer's text so, within a bound of its own (`AnswerProjectionOptions.wholeText`).
+   */
+  wholeStringBytes?(): number;
   /**
    * A string value runs past the end of a chunk: heard once per string, at the end of the first
    * chunk it does not end in, before `releasable` is asked; `offset` is its opening quote. Its bytes
@@ -164,6 +174,13 @@ class GuardedListener implements ScanListener {
       throw new ListenerFailure(error);
     }
   }
+  wholeStringBytes(): number {
+    try {
+      return this.inner.wholeStringBytes?.() ?? 0;
+    } catch (error) {
+      throw new ListenerFailure(error);
+    }
+  }
   stringRuns(offset: number): void {
     try {
       this.inner.stringRuns?.(offset);
@@ -220,7 +237,7 @@ class ScanStrings implements StringBuilder {
   illFormed = false;
   /** The listener heard that the open string runs past a chunk (`stringRuns`). */
   heard = false;
-  /** The open string was asked for whole and grew past `spill`: its prefix only from then on. */
+  /** The open string was asked for whole and grew past its bound (`limit`): its prefix only from then on. */
   spilled = false;
   /** A spilled string's prefix is full: nothing more is kept of it. */
   private frozen = false;
@@ -228,13 +245,16 @@ class ScanStrings implements StringBuilder {
   private text = "";
   private readonly buffer = new Uint8Array(STRING_BUFFER_BYTES);
   private buffered = 0;
-  private readonly decide: () => "key" | "whole" | "prefix";
+  /** What the string about to open is: a key, a value kept whole, its prefix, or a value kept whole up to that many bytes. */
+  private readonly decide: () => "key" | "whole" | "prefix" | number;
   private readonly spill: number;
   /** The open string may spill: a value string kept whole (a key never does: the duplicate check compares keys whole). */
   private spills = false;
+  /** The bytes the open string may hold whole before it spills: `spill`, or less where `decide` gave less. */
+  private limit = Number.POSITIVE_INFINITY;
   private readonly decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-  constructor(decide: () => boolean | "key" | "whole" | "prefix", spill = Number.POSITIVE_INFINITY) {
+  constructor(decide: () => boolean | "key" | "whole" | "prefix" | number, spill = Number.POSITIVE_INFINITY) {
     this.decide = () => {
       const d = decide();
       return d === true ? "whole" : d === false ? "prefix" : d;
@@ -253,16 +273,17 @@ class ScanStrings implements StringBuilder {
     this.open = true;
     const d = this.decide();
     this.whole = d !== "prefix";
-    this.spills = d === "whole";
+    this.spills = d === "whole" || typeof d === "number";
+    this.limit = typeof d === "number" ? Math.min(d, this.spill) : this.spill;
   }
 
   /**
-   * A value string kept whole that would pass `spill` bytes with the next `size` becomes a prefix:
+   * A value string kept whole that would pass its `limit` with the next `size` bytes becomes a prefix:
    * what it gathered is decoded, and from then on only its first KEPT_STRING_UNITS units are kept, a
    * surrogate pair never split; the prefix is final once full (`frozen`).
    */
   private spillIfPast(size: number): void {
-    if (!this.whole || !this.spills || this.byteLength + size <= this.spill) return;
+    if (!this.whole || !this.spills || this.byteLength + size <= this.limit) return;
     this.flush();
     this.whole = false;
     this.spilled = true;
@@ -424,7 +445,7 @@ export class StrictJsonScan {
   private readonly tokenizer: SourceTokenizer;
   private readonly parser: TokenParser;
   private readonly strings: ScanStrings;
-  private readonly listener: ScanListener;
+  private readonly listener: GuardedListener;
   private readonly stack: Container[] = [];
   private prev: TokenType | null = null;
   private failure: unknown = null;
@@ -453,8 +474,14 @@ export class StrictJsonScan {
     this.tokenizer = new SourceTokenizer({ stringBufferSize: 0, emitPartialTokens: true });
     // No byte order mark skipped, at the start or after the first brackets.
     refuseByteOrderMark(this.tokenizer);
-    // A key is always whole (the duplicate check compares keys); a value the listener keeps whole spills past `spillBytes`.
-    this.strings = new ScanStrings(() => (this.keyNext() ? "key" : this.listener.wholeString() ? "whole" : "prefix"), options.spillBytes ?? Number.POSITIVE_INFINITY);
+    // A key is always whole (the duplicate check compares keys); a value the listener keeps whole spills past `spillBytes`,
+    // or past the bytes it keeps whole of a value it did not ask for whole (`wholeStringBytes`).
+    this.strings = new ScanStrings(() => {
+      if (this.keyNext()) return "key";
+      if (this.listener.wholeString()) return "whole";
+      const bound = this.listener.wholeStringBytes();
+      return bound > 0 ? bound : "prefix";
+    }, options.spillBytes ?? Number.POSITIVE_INFINITY);
     (this.tokenizer as unknown as { bufferedString: StringBuilder }).bufferedString = this.strings;
     this.parser = new TokenParser({ paths: [], keepStack: false });
     this.parser.onValue = () => {};

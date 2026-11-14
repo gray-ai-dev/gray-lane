@@ -5,7 +5,8 @@ import { isInlineImage } from "@gray/media";
 import {
   billableUsage,
   billedTokens,
-  charge,
+  chargeParts,
+  type CostParts,
   type CostRates,
   inLedgerRange,
   MeteringError,
@@ -150,20 +151,24 @@ export function usageCounters(protocol: Protocol, raw: Json, media: MediaRates, 
   return { ok: true, counters: unsplitBilled.counters, imageUnsplit: true };
 }
 
-/** What `priced` made of the counters: the charge, or why the usage cannot be billed and whether it was the request's bound that refused it. */
-export type PricedCharge = { readonly ok: true; readonly amount: bigint } | { readonly ok: false; readonly error: FinishError; readonly overBound: boolean };
+/**
+ * What `priced` made of the counters: the charge and the parts it is the sum of, or why the usage cannot be billed and
+ * whether it was the request's bound that refused it.
+ */
+export type PricedCharge = { readonly ok: true; readonly amount: bigint; readonly parts: CostParts } | { readonly ok: false; readonly error: FinishError; readonly overBound: boolean };
 
 /**
  * `priced`: the charge of `counters` at the attempt's `rates`, up to `bound`, the most the request may be
- * charged (@gray/protocol `charge`); or why the usage cannot be billed (`Admission::checked`). A count
- * beyond the ledger's range is the upstream's usage, not a fault of Gray's: refused here it releases the
- * hold, where the ledger would refuse the completion. At a zero rate such a count would otherwise pass the
- * charge check.
+ * charged (@gray/protocol `chargeParts`, whose sum it is); or why the usage cannot be billed
+ * (`Admission::checked`). A count beyond the ledger's range is the upstream's usage, not a fault of Gray's:
+ * refused here it releases the hold, where the ledger would refuse the completion. At a zero rate such a count
+ * would otherwise pass the charge check.
  */
 export function priced(counters: UsageCounters, rates: CostRates, bound: bigint): PricedCharge {
   if (!inLedgerRange(counters)) return { ok: false, error: { kind: "upstream_usage", reason: "a usage counter is above the ledger's range of 9223372036854775807" }, overBound: false };
   try {
-    return { ok: true, amount: charge(counters, rates, bound) };
+    const parts = chargeParts(counters, rates, bound);
+    return { ok: true, amount: parts.input + parts.output + parts.units, parts };
   } catch (error) {
     if (!(error instanceof MeteringError)) throw error;
     const cost = usageCost(counters, rates);

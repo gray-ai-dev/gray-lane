@@ -2606,6 +2606,58 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc: "How many rows the request-index consumer spreads one route's activity and one model-minute's demand over (route_activity, model_demand `slot`).",
   },
   {
+    name: "ROUTE_USAGE_HOURS_KEEP_DAYS",
+    key: "routeUsageHoursKeepDays",
+    workers: ["jobs"],
+    type: "int",
+    default: "400",
+    min: 8,
+    max: 3660,
+    source:
+      "The cache hit rate and the effective prices read 7 days of a route's usage by the hour (route_usage_hours, workers/db/migrations/" +
+      "0077_route_usage.sql; docs/effective-prices.md), so the minimum keeps 7 days and the day in progress. 400 keeps a year and a month for " +
+      "the trend chart that is to read the same table: a row per route, hour and slot (ROUTE_ACTIVITY_SLOTS), about 77,000 a year for a route " +
+      "busy every hour in all 8 slots [estimated]. The maximum is about ten years.",
+    doc:
+      "How many days of a route's usage by the hour gray-jobs keeps (route_usage_hours); its maintenance deletes the hours before the hour that " +
+      "many days ago, a page at a time.",
+  },
+  {
+    name: "ROUTE_ANSWER_CHECK_HOURS_KEEP_DAYS",
+    key: "routeAnswerCheckHoursKeepDays",
+    workers: ["jobs"],
+    type: "int",
+    default: "400",
+    min: 8,
+    max: 3660,
+    source:
+      "The tool call and structured output error rates read 7 days of a route's answer checks by the hour (route_answer_check_hours, " +
+      "workers/db/migrations/0080_route_answer_checks.sql; docs/error-rates.md), so the minimum keeps 7 days and the day in progress. 400 keeps " +
+      "as long as the route usage rollup (ROUTE_USAGE_HOURS_KEEP_DAYS): a row per route, hour and slot (ROUTE_ACTIVITY_SLOTS), about 77,000 " +
+      "over the 400 days for a route busy every hour in all 8 slots [estimated]. The maximum is about ten years.",
+    doc:
+      "How many days of a route's answer checks by the hour gray-jobs keeps (route_answer_check_hours); its maintenance deletes the hours " +
+      "before the hour that many days ago, a page at a time.",
+  },
+  {
+    name: "ROUTE_SPEED_HOURS_KEEP_DAYS",
+    key: "routeSpeedHoursKeepDays",
+    workers: ["jobs"],
+    type: "int",
+    default: "35",
+    min: 8,
+    max: 3660,
+    source:
+      "The time to first token, the output rate and the response success read 7 days of a route's speed by the hour (route_speed_hours, " +
+      "workers/db/migrations/0082_route_speed.sql; docs/live-speed.md), so the minimum keeps 7 days and the day in progress. 35 by default " +
+      "(r15 lead, 2026-11-13): the pages read 7 days, and 35 leave room for a 30-day view later, while 400 days, as the other two rollups keep, " +
+      "would be about 130 MB for a route busy every hour in all 8 slots, a row per route, hour and slot (ROUTE_ACTIVITY_SLOTS) of about 1.6 KB " +
+      "with its buckets; 35 days of such a route are 6,720 rows, about 11 MB (the migration's estimate). The maximum is about ten years.",
+    doc:
+      "How many days of a route's speed and response success by the hour gray-jobs keeps (route_speed_hours); its maintenance deletes the " +
+      "hours before the hour that many days ago, a page at a time.",
+  },
+  {
     name: "QUEUE_RETRY_BASE_SECONDS",
     key: "queueRetryBaseSeconds",
     workers: ["jobs"],
@@ -3432,6 +3484,63 @@ export const SETTINGS: readonly SettingSpec[] = [
       "the request log's sweep of closed workspaces finishes what it leaves",
   },
   {
+    name: "ROUTE_USAGE_MIN_REQUESTS",
+    key: "routeUsageMinRequests",
+    workers: ["console"],
+    type: "int",
+    default: "100",
+    min: 100,
+    max: 1000000,
+    source:
+      "GRAY_ROUTE_USAGE_MIN_REQUESTS of the server: 100, 100 to 1,000,000 (crates/gray-gateway/src/config/usage.rs). Decided by the product " +
+      "owner on 2026-11-11 and kept as the only threshold on 2026-11-12 (docs/effective-prices.md \"When a figure is not shown\"): 100 billed " +
+      "requests for a figure, and 100 requests that carry the charge's two sides for a price. Never below that: a setting raises it and never " +
+      "lowers it. The maximum is a bound of ours, far above any provider's week, so a mistyped value is refused rather than hiding every figure.",
+    doc:
+      "The fewest billed requests the last 7 days must have for a cache hit rate to be shown, a public one or a provider's own route's (GET " +
+      "/api/v1/catalog/usage, GET /api/v1/provider/usage), and the fewest of them that must carry their charge's two sides for the effective " +
+      "prices to be shown; with fewer the figures are withheld, as a small sample or, the prices alone, as not recorded yet",
+  },
+  {
+    name: "ANSWER_CHECK_MIN_ANSWERS",
+    key: "answerCheckMinAnswers",
+    workers: ["console"],
+    type: "int",
+    default: "100",
+    min: 100,
+    max: 1000000,
+    source:
+      "GRAY_ANSWER_CHECK_MIN_ANSWERS of the server: 100, 100 to 1,000,000 (crates/gray-gateway/src/config/answer_checks.rs). Decided by the " +
+      "product owner on 2026-11-12 with the data plan (docs/error-rates.md \"Who sees what\"): at least 100 answers in a rate's own " +
+      "denominator, no workspace threshold. A setting of its own, not ROUTE_USAGE_MIN_REQUESTS, which counts billed requests. Never below " +
+      "that: a setting raises it and never lowers it. The maximum is a bound of ours, far above any provider's week, so a mistyped value is " +
+      "refused rather than hiding every rate.",
+    doc:
+      "The fewest answers the last 7 days must have in a rate's own denominator for a tool call error rate or a structured output error rate " +
+      "to be shown, a public one, a provider's own route's or a model's (GET /api/v1/catalog/answer-checks, GET " +
+      "/api/v1/provider/answer-checks): tool-call answers that were not truncated, structured output answers that ended normally; with fewer " +
+      "the rate is withheld as a small sample",
+  },
+  {
+    name: "TRAFFIC_STAT_MIN_SAMPLES",
+    key: "trafficStatMinSamples",
+    workers: ["console"],
+    type: "int",
+    default: "100",
+    min: 1,
+    max: 1000000,
+    source:
+      "GRAY_TRAFFIC_STAT_MIN_SAMPLES of the server: 100, 1 to 1,000,000 (crates/gray-gateway/src/config/traffic_stats.rs). Decided by the " +
+      "product owner on 2026-11-13 with the data plan (docs/live-speed.md \"Definitions\"): 100 in each figure's own denominator. A setting " +
+      "of its own, not ANSWER_CHECK_MIN_ANSWERS or ROUTE_USAGE_MIN_REQUESTS, which count other things. It may lower the threshold to 1. " +
+      "The maximum is a bound of ours, far above any provider's week, so a mistyped value is refused rather than hiding every figure.",
+    doc:
+      "The fewest the last 7 days must have in a figure's own denominator for a provider's time to first token, output rate or response " +
+      "success to be shown (GET /api/v1/catalog/traffic-stats): successful streaming attempts for the time to first token, those of them " +
+      "with more than 50 output tokens for the output rate, successes and failures on the provider's side for the response success; with " +
+      "fewer the figure is withheld as a small sample",
+  },
+  {
     name: "MAINTENANCE_LOCATION_HINT",
     key: "maintenanceLocationHint",
     workers: ["console"],
@@ -3761,6 +3870,21 @@ export const SETTINGS: readonly SettingSpec[] = [
       "and a phase-1 profile none, so a phase-2 VM is provisioned on an on-chain KMS and a phase-1 VM never is.",
   },
   {
+    name: "RELAY_CHAIN_KMS_CLOSED_IDS",
+    key: "relayChainKmsClosedIds",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" ? null : kmsIdListProblem(v)),
+    source:
+      "Phala's `GET /kms/base/nodes` and its refusal ERR-02-030: kms-base-prod9 (kms_kpw4DwWL) took no new VM from 2026-11-12 " +
+      "(incident of 2026-11-13: a relay paired on a release there, and every Deploy failed at `provision`). Production and staging name it.",
+    doc:
+      "The Phala KMS ids (`kms_…`, comma-separated; empty: none) of RELAY_CHAIN_KMS_IDS that take no new VM. A phase-2 relay's first " +
+      "Deploy boots the release it paired on even after Gray released a newer one, unless that release's kms_id is one of these: then it " +
+      "boots a newer release effective on the relay's contract, or is refused with what to do (workers/console lane-stack/provision.ts `phase2BootOf`).",
+  },
+  {
     name: "RELAY_CHAIN_KIT_RPC_URLS",
     key: "relayChainKitRpcUrls",
     workers: ["console"],
@@ -3830,7 +3954,7 @@ export const SETTINGS: readonly SettingSpec[] = [
       "(docs/relay-stack-provisioner.md P7); the deployments turn it on in their values.",
     doc:
       "Whether a relay stack's VM quota request is approved at once when the relay has none approved, no operator refused it, and fewer than " +
-      "LANE_STACK_AUTO_VM_MAX automatically approved VMs are not deleted; otherwise it waits for Gray's operators.",
+      "LANE_STACK_AUTO_VM_MAX automatically approved quotas hold a slot (LANE_STACK_AUTO_VM_HOLD_DAYS); otherwise it waits for Gray's operators.",
   },
   {
     name: "LANE_STACK_AUTO_VM_INSTANCE_TYPE",
@@ -3841,23 +3965,61 @@ export const SETTINGS: readonly SettingSpec[] = [
     textCheck: (v) => (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? null : "is not a Phala instance type (tdx.large)"),
     source:
       "The owner's decision of 2026-11-02: an automatically approved relay VM is a tdx.large (8 GB).",
-    doc: "The Phala instance type an automatically approved relay VM quota names (LANE_STACK_AUTO_VM_QUOTA).",
+    doc:
+      "The Phala instance type an automatically approved relay VM quota records (LANE_STACK_AUTO_VM_QUOTA). A Deploy boots its " +
+      "release's own instance type whatever the quota says: the release list's OS measurements (RTMR0) are of that size.",
   },
   {
     name: "LANE_STACK_AUTO_VM_MAX",
     key: "laneStackAutoVmMax",
     workers: ["console"],
     type: "int",
-    default: "4",
+    default: "12",
     min: 0,
     max: 13,
     source:
-      "Phala's account allows 13 instances and 48 GB (the owner's brief of 2026-11-02); a tdx.large is 8 GB. Gray's own lanes used 16 GB on " +
-      "2026-11-03 (the production entry and staging lane tdx.medium, the production test relay's stack tdx.large), so four automatically " +
-      "approved relay VMs (32 GB) fill the account; more needs a larger Phala quota. The maximum is the account's instance limit.",
+      "The owner's decision of 2026-11-14 to raise it from 4: production had 2 of 4 in use and the fifth relay would have waited for an " +
+      "operator nobody tells (operator alerts are not delivered yet). The first value, 4, came from Phala's old account limit (13 instances and " +
+      "48 GB, the owner's brief of 2026-11-02, a tdx.large being 8 GB); the workspace is on Phala's PRO tier since (read 2026-11-14) and held " +
+      "8 VMs, 26 vCPU that day. 12 keeps the automatic relay VMs under the old instance limit, the maximum here, until Phala's PRO limit is " +
+      "read from its console; at tdx.large's 0.2348 USD an hour (compute and disk, Phala's API, 2026-11-14) twelve cost about 2,030 USD a month.",
     doc:
-      "The most automatically approved relay VM quotas whose relay has not deleted its VM, across the platform; past it a request waits for " +
-      "Gray's operators.",
+      "The most automatically approved relay VM quotas that hold a slot, across the platform; past it a request waits for Gray's operators. A " +
+      "quota holds a slot while its relay has a VM or a Deploy queued or running, and for LANE_STACK_AUTO_VM_HOLD_DAYS after its approval " +
+      "while no VM of it was deleted.",
+  },
+  {
+    name: "LANE_STACK_AUTO_VM_HOLD_DAYS",
+    key: "laneStackAutoVmHoldDays",
+    workers: ["console"],
+    type: "int",
+    default: "7",
+    min: 1,
+    max: 90,
+    source:
+      "The owner's request of 2026-11-14 to close the hole that an automatically approved quota nobody deploys held one of the " +
+      "LANE_STACK_AUTO_VM_MAX slots for ever. 7 days is our value: an onboarding takes under an hour from the request to Deploy (measured), so " +
+      "a quota still without a VM a week later is idle.",
+    doc:
+      "How many days an automatically approved relay VM quota holds one of the LANE_STACK_AUTO_VM_MAX slots before its relay's first " +
+      "Deploy. After it, and at once when the relay's VM is deleted, the quota stays approved but is not counted until its relay deploys; a " +
+      "Deploy asked then, with every slot held, hands the quota back to Gray's operators (state `requested`) instead of queuing.",
+  },
+  {
+    name: "LANE_STACK_DEPLOY_RETRY_SECONDS",
+    key: "laneStackDeployRetrySeconds",
+    workers: ["console"],
+    type: "int",
+    default: "60",
+    min: 0,
+    max: 3600,
+    source:
+      "The owner's request of 2026-11-14: a relay pressed Deploy 5 times in a row on the same failure that day, each a call to Phala and a " +
+      "failed operation. Phala's provision call takes a few seconds to tens of seconds. 60 seconds is our value.",
+    doc:
+      "How many seconds after a relay's Deploy ended in failure another Deploy of it is refused (409 lane_stack_provision_retry_later, with " +
+      "the seconds left); 0 turns the wait off. A Deploy that succeeded, or one refused before it was queued, starts no wait, and Gray's " +
+      "operators' reclaim is not held by it.",
   },
   {
     name: "LANE_STACK_ALERT_FROM",
@@ -5324,6 +5486,12 @@ export interface JobsConfig extends LedgerJobsConfig {
   readonly jobsStatementTimeoutMs: number;
   /** ROUTE_ACTIVITY_SLOTS: the slots of route_activity and model_demand (request-index.ts). */
   readonly routeActivitySlots: number;
+  /** ROUTE_USAGE_HOURS_KEEP_DAYS: the days of the route usage rollup the maintenance keeps (ledger/maintenance.ts `expireRouteUsage`). */
+  readonly routeUsageHoursKeepDays: number;
+  /** ROUTE_ANSWER_CHECK_HOURS_KEEP_DAYS: the days of the answer checks' rollup the maintenance keeps (ledger/maintenance.ts `expireRouteAnswerChecks`). */
+  readonly routeAnswerCheckHoursKeepDays: number;
+  /** ROUTE_SPEED_HOURS_KEEP_DAYS: the days of the speed rollup the maintenance keeps (ledger/maintenance.ts `expireRouteSpeed`). */
+  readonly routeSpeedHoursKeepDays: number;
   readonly queueRetryBaseSeconds: number;
   readonly queueRetryMaxSeconds: number;
   readonly reconcileIntervalMs: number;
@@ -5396,8 +5564,12 @@ export interface ConsoleConfig {
   readonly laneStackAutoVmQuota: "off" | "on";
   /** LANE_STACK_AUTO_VM_INSTANCE_TYPE: the instance type an automatic quota names. */
   readonly laneStackAutoVmInstanceType: string;
-  /** LANE_STACK_AUTO_VM_MAX: the most automatically approved, not deleted relay VMs. */
+  /** LANE_STACK_AUTO_VM_MAX: the most automatically approved relay VM quotas that hold a slot. */
   readonly laneStackAutoVmMax: number;
+  /** LANE_STACK_AUTO_VM_HOLD_DAYS: how long an automatic quota holds a slot without a VM. */
+  readonly laneStackAutoVmHoldDays: number;
+  /** LANE_STACK_DEPLOY_RETRY_SECONDS: how long after a failed Deploy another is refused; 0: no wait. */
+  readonly laneStackDeployRetrySeconds: number;
   /** LANE_STACK_ALERT_FROM: the sender of relay alert e-mails; empty: none sent. */
   readonly laneStackAlertFrom: string;
   /** LANE_STACK_TUNNEL_ZONE: the relays zone of Gray's tunnel rendezvous; empty: none. */
@@ -5463,6 +5635,8 @@ export interface ConsoleConfig {
   readonly relayChainDstackKms: string;
   /** RELAY_CHAIN_KMS_IDS: the Phala KMS ids on the relays' chain, comma-separated. */
   readonly relayChainKmsIds: string;
+  /** RELAY_CHAIN_KMS_CLOSED_IDS: the KMS ids of RELAY_CHAIN_KMS_IDS that take no new VM, comma-separated; "" for none. */
+  readonly relayChainKmsClosedIds: string;
   /** RELAY_CHAIN_KIT_RPC_URLS: the two endpoints a phase-2 pairing gives gray-assistant, comma-separated. */
   readonly relayChainKitRpcUrls: string;
   /** Always off on Workers (DEBT_MODE_RULE). */
@@ -5526,6 +5700,21 @@ export interface ConsoleConfig {
   readonly modeltraceLaneUrl: string;
   /** WORKSPACE_DELETION_WAIT_MS: how long a workspace's closure waits for its data's deletion before it answers. */
   readonly workspaceDeletionWaitMs: number;
+  /**
+   * ROUTE_USAGE_MIN_REQUESTS: how large a sample the cache hit rate and the effective prices need to be shown (console
+   * src/routes/provider/usage.ts; docs/effective-prices.md).
+   */
+  readonly routeUsageMinRequests: number;
+  /**
+   * ANSWER_CHECK_MIN_ANSWERS: how many answers of its own a tool call or structured output error rate needs to be shown
+   * (console src/routes/provider/answer-checks.ts; docs/error-rates.md "The reads").
+   */
+  readonly answerCheckMinAnswers: number;
+  /**
+   * TRAFFIC_STAT_MIN_SAMPLES: how many of its own denominator a time to first token, an output rate or a response success
+   * needs (console src/routes/provider/traffic-stats.ts; docs/live-speed.md "Definitions").
+   */
+  readonly trafficStatMinSamples: number;
   readonly maintenanceLocationHint: LocationHint;
   /** "" for the representative suite. */
   readonly benchmarkSuite: string;

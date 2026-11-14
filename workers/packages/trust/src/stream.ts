@@ -19,9 +19,10 @@
  * held to Rust's own relay by the `trust` fixtures (targets `gate` and `open_gate`).
  */
 import { type Json, type JsonObject, isObject, setMember } from "@gray/json";
-import { type CanonicalEvent, conversationFields } from "@gray/protocol";
+import { type CanonicalEvent, type ToolCallCheck, conversationFields } from "@gray/protocol";
 import type { FragmentUse, StreamToolInspector } from "./inspector.ts";
 import type { GateRequest, TrustPolicy } from "./policy.ts";
+import { ToolCallTally } from "./tool-call-check.ts";
 import { type InspectionResult, NOTHING_FOUND } from "./violations.ts";
 
 /** One stream's tool gate, fed every frame's decoded events in upstream order. */
@@ -50,6 +51,13 @@ export interface StreamCheck {
    * frames it holds.
    */
   retainedBytes(): number;
+  /**
+   * The attempt's tool-call check (docs/error-rates.md "Tool calls", r14), read once its stream ended: `finished` true
+   * after `finish` (whatever it decided), false for a stream that failed before it (the decoder refused a frame, an
+   * error event, the upstream stopped): then a call that had begun is `refused`, and without one it is null. Null in
+   * mode off. A refusal of the check itself counts as its site says either way (src/tool-call-check.ts).
+   */
+  toolCallCheck(finished: boolean): ToolCallCheck | null;
 }
 
 export interface StreamCheckOptions {
@@ -97,12 +105,18 @@ class GatedCheck implements StreamCheck {
   retainedBytes(): number {
     return this.inspector.retainedBytes();
   }
+
+  toolCallCheck(finished: boolean): ToolCallCheck | null {
+    return this.inspector.toolCallCheck(finished);
+  }
 }
 
 class OpenCheck implements StreamCheck {
   readonly holdsToolCalls = false;
   private readonly policy: TrustPolicy;
   private readonly gate: GateRequest;
+  /** What the stream's tool-call check reads: an open stream has calls too (to tools the request did not declare). */
+  private readonly tally = new ToolCallTally();
 
   constructor(policy: TrustPolicy, gate: GateRequest) {
     this.policy = policy;
@@ -110,7 +124,7 @@ class OpenCheck implements StreamCheck {
   }
 
   observe(events: readonly CanonicalEvent[]): InspectionResult {
-    return this.policy.inspectStreamEvents(this.gate, events);
+    return this.policy.inspectStreamEvents(this.gate, events, this.tally);
   }
 
   releasable(): boolean {
@@ -127,6 +141,10 @@ class OpenCheck implements StreamCheck {
 
   retainedBytes(): number {
     return 0;
+  }
+
+  toolCallCheck(finished: boolean): ToolCallCheck | null {
+    return this.tally.check(this.policy.mode, this.gate.request.tools.length > 0, finished);
   }
 }
 

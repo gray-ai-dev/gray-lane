@@ -276,6 +276,8 @@ export interface LanePeerCall {
   served: boolean;
   /** Resolves when the hop's answer is over: its `end`, or null. */
   readonly ended: Promise<PeerEndDto | null>;
+  /** The hop's `end`, waited for until `untilMs` by the entry's clock; null when none came by then (`PeerCall.endWithin`). */
+  endWithin(untilMs: number): Promise<PeerEndDto | null>;
   send(): Promise<PeerSent>;
   followUp(untilMs: number): Promise<{ readonly state: PeerAttemptState; readonly receipt: Json | null } | null>;
   close(): void;

@@ -1,8 +1,8 @@
 import type { GatewayConfig } from "@gray/config";
 import { parseStrict } from "@gray/json";
-import { type InspectionResult, RegexEngineUnavailable, type StreamCheck, TrustPolicy, answerContract, configureTrust } from "@gray/trust/workerd";
-import type { Protocol } from "@gray/protocol";
-import { type AnswerInspector, type FragmentUse, GateCapacity, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate } from "./gate.ts";
+import { type InspectionResult, OutputObserver, RegexEngineUnavailable, type StreamCheck, TrustPolicy, answerContract, configureTrust, outputCheck } from "@gray/trust/workerd";
+import { type AnswerChecks, type OutputCheck, type Protocol, type ToolCallCheck, UNCOUNTED_CHECKS } from "@gray/protocol";
+import { type AnswerInspector, type FragmentUse, GateCapacity, type GateAnswer, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate } from "./gate.ts";
 
 /**
  * The production tool gate: @gray/trust's policy behind the gateway's `ToolGate` (gate.ts;
@@ -28,11 +28,41 @@ export function combined(a: GateVerdict, b: GateVerdict): GateVerdict {
   return { ok: true, violations: [...a.violations, ...b.violations], passed: [...a.passed, ...b.passed] };
 }
 
+/**
+ * The answer checks only classify (docs/error-rates.md, r14): one that throws leaves the answer as the gate decided it
+ * and is not counted, save an output check the regex engine could not decide (a schema's pattern), which is `unknown`
+ * as @gray/trust's own output check says it.
+ */
+function toolCallOf(read: () => ToolCallCheck | null): ToolCallCheck | null {
+  try {
+    return read();
+  } catch {
+    return null;
+  }
+}
+
+function outputOf(read: () => OutputCheck | null): OutputCheck | null {
+  try {
+    return read();
+  } catch (error) {
+    return failedOutput(error);
+  }
+}
+
+function failedOutput(error: unknown): OutputCheck | null {
+  return error instanceof RegexEngineUnavailable ? "unknown" : null;
+}
+
 class TrustInspector implements StreamInspector {
   private readonly check: StreamCheck;
+  /** The stream's structured output check, fed what the gate observes; null in mode off, where nothing is counted. */
+  private readonly output: OutputObserver | null;
+  /** The output observer threw while it was fed: its value from then on (`failedOutput`). */
+  private outputFailed: { readonly value: OutputCheck | null } | null = null;
 
-  constructor(check: StreamCheck) {
+  constructor(check: StreamCheck, output: OutputObserver | null) {
     this.check = check;
+    this.output = output;
   }
 
   get holdsToolCalls(): boolean {
@@ -40,6 +70,14 @@ class TrustInspector implements StreamInspector {
   }
 
   observe(events: Parameters<StreamCheck["observe"]>[0]): GateVerdict {
+    // The output check hears every event the gate observes, a frame the gate then refuses included.
+    if (this.output !== null && this.outputFailed === null) {
+      try {
+        this.output.observe(events);
+      } catch (error) {
+        this.outputFailed = { value: failedOutput(error) };
+      }
+    }
     return verdict(this.check.observe(events));
   }
 
@@ -55,8 +93,22 @@ class TrustInspector implements StreamInspector {
     return this.check.fragmentRepairs();
   }
 
+  /**
+   * What the stream check keeps of the stream and what the output observer keeps of its text, which it keeps only for a
+   * request that asked for structured output (0 otherwise, and none in mode off): the relay weighs both with the frames
+   * it holds (relay.ts `streamWeight`; review r14 output-class finding 6).
+   */
   retainedBytes(): number {
-    return this.check.retainedBytes();
+    return this.check.retainedBytes() + (this.output?.retainedBytes() ?? 0);
+  }
+
+  checks(finished: boolean): AnswerChecks {
+    const output = this.output;
+    if (output === null) return UNCOUNTED_CHECKS;
+    return {
+      toolCallCheck: toolCallOf(() => this.check.toolCallCheck(finished)),
+      outputCheck: this.outputFailed !== null ? this.outputFailed.value : outputOf(() => output.finish()),
+    };
   }
 }
 
@@ -103,7 +155,10 @@ export class TrustGate implements ToolGate {
   }
 
   stream(contract: GateRequest, answerLimit: number, gated: boolean, fragments: FragmentUse = "forwarded"): StreamInspector {
-    return new TrustInspector(this.policy.streamCheck(contract, answerLimit, gated ? { gated: true, fragments } : { fragments }));
+    const check = this.policy.streamCheck(contract, answerLimit, gated ? { gated: true, fragments } : { fragments });
+    // The output check is made from the request as the gate keeps it, the one sent upstream (a translated request's
+    // upstream contract, inference.ts `prepare`); in mode off nothing is counted (docs/error-rates.md).
+    return new TrustInspector(check, this.policy.mode === "off" ? null : new OutputObserver(contract));
   }
 
   answer(contract: GateRequest, protocol: Protocol, answerLimit: number): AnswerInspector | null {
@@ -112,6 +167,15 @@ export class TrustGate implements ToolGate {
 
   inspectResponse(contract: GateRequest, answer: { readonly protocol: GateRequest["request"]["protocol"]; readonly body: Parameters<TrustPolicy["inspectResponse"]>[1]["body"] }, answerLimit: number): GateVerdict {
     return verdict(this.policy.inspectResponse(contract, answer, answerLimit));
+  }
+
+  /** `answer.textCut`: the projection cut a text of it, which the output check reads as `unknown` (@gray/trust `OutputAnswer`). */
+  responseChecks(contract: GateRequest, answer: GateAnswer): AnswerChecks {
+    if (this.policy.mode === "off") return UNCOUNTED_CHECKS;
+    return {
+      toolCallCheck: toolCallOf(() => this.policy.responseToolCallCheck(contract, answer)),
+      outputCheck: outputOf(() => outputCheck(contract, answer)),
+    };
   }
 }
 

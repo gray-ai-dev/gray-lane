@@ -1,4 +1,5 @@
 import { asNumber, bridgeCall, laneEventsDtoOf, laneIndexMessageDtoOf, lanePointsDtoOf, laneServiceEventsDtoOf, RECORDS_TARGET } from "@gray/lane-wire";
+import { ATTEMPT_MEASURES, type RouteAttempt } from "@gray/request-index";
 import type { RequestIndexMessage, Sinks } from "../../sinks.ts";
 import { BridgeCallError, BridgeClient, type BridgeClientOptions } from "./client.ts";
 
@@ -35,6 +36,40 @@ export interface LaneSinkFlush {
   readonly failed: string | null;
 }
 
+/** Whether a route attempt carries any of its five measures (r15). */
+const measured = (a: RouteAttempt): boolean => ATTEMPT_MEASURES.some((key) => a[key] !== undefined);
+
+/** A route attempt without its five measures: r14's seven members, what a bridge before r15 knows. */
+function unmeasured(a: RouteAttempt): RouteAttempt {
+  const out: Record<string, unknown> = { ...a };
+  for (const key of ATTEMPT_MEASURES) delete out[key];
+  return out as unknown as RouteAttempt;
+}
+
+/**
+ * `message` without what a bridge that answered `error` to it may have refused it for (`RemoteSinks.sendIndex`): its
+ * rows' traces after a 404; after a 400 the newest member first, so a bridge that knows the older ones still gets them:
+ * their route attempts' five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept;
+ * then the route attempts (r14); then their charge sides and route API (0076). Null when the failure is another, or the
+ * rows carry nothing of that kind to take out: the failure stands.
+ */
+function withoutRefused(error: unknown, message: RequestIndexMessage): RequestIndexMessage | null {
+  if (!(error instanceof BridgeCallError)) return null;
+  if (error.status === 404 && message.rows.some((row) => row.stackTrace !== undefined)) {
+    return { ...message, rows: message.rows.map(({ stackTrace: _stackTrace, ...row }) => row) };
+  }
+  if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some(measured) === true)) {
+    return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(unmeasured) })) };
+  }
+  if (error.status === 400 && message.rows.some((row) => row.routeAttempts !== undefined)) {
+    return { ...message, rows: message.rows.map(({ routeAttempts: _attempts, ...row }) => row) };
+  }
+  if (error.status === 400 && message.rows.some((row) => (row.chargedInputMicrousd ?? row.chargedOutputMicrousd ?? row.upstreamProtocol ?? null) !== null)) {
+    return { ...message, rows: message.rows.map(({ chargedInputMicrousd: _input, chargedOutputMicrousd: _output, upstreamProtocol: _api, ...row }) => row) };
+  }
+  return null;
+}
+
 export class RemoteSinks extends BridgeClient implements Sinks {
   readonly #points: AnalyticsEngineDataPoint[] = [];
   readonly #serviceEvents: Record<string, unknown>[] = [];
@@ -48,13 +83,26 @@ export class RemoteSinks extends BridgeClient implements Sinks {
    * The index row as it is: `laneIndexMessageDtoOf` nulls the forbidden columns (M20). A bridge that predates an entry's
    * traces (docs/confidential-lane-stack-routing.md section 4.10) refuses a trace of another relay than the key's with
    * 404 `unknown_relay`: the rows go again without their traces, so neither deploy order loses a row, only its trace.
+   *
+   * A bridge that predates the charge's two sides and the route's API (workers/db/migrations/0072,
+   * docs/effective-prices.md) does not know them in a row, and refuses a document that carries one as it refuses any
+   * document that is not the op's: 400 `bad_request` (lane-bridge errors.ts), the one status of that. The rows go again
+   * without the three, so they are indexed, only without what that bridge could not have written. The bridge is still
+   * to be deployed first (docs/cloudflare-native/gateway.md). A bridge that predates the route attempts (r14,
+   * docs/error-rates.md "Rollout") refuses them the same way: the rows go again without them, and once more without
+   * 0076's three for a bridge older still; those rows count in no error rate. A bridge that predates the attempts'
+   * measures (r15, docs/live-speed.md "Compatibility and rollout") refuses those the same way, so they go first: the
+   * rows go again with r14's seven members of each attempt, which count in the error rates and in none of the three
+   * figures. Each is tried once, since rows sent again carry nothing left to take out: a document refused for another
+   * reason throws as before.
    */
   async sendIndex(message: RequestIndexMessage): Promise<void> {
     try {
       await this.#sendIndex(message);
     } catch (error) {
-      if (!(error instanceof BridgeCallError && error.status === 404) || !message.rows.some((row) => row.stackTrace !== undefined)) throw error;
-      await this.#sendIndex({ ...message, rows: message.rows.map(({ stackTrace: _stackTrace, ...row }) => row) });
+      const without = withoutRefused(error, message);
+      if (without === null) throw error;
+      await this.sendIndex(without);
     }
   }
 

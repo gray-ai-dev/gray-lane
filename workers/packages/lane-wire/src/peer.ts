@@ -3,7 +3,7 @@ import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { z } from "zod";
 import { BridgeWireError } from "./error.ts";
 import { uintSchema } from "./ints.ts";
-import { laneReportedUsageSchema } from "./records.ts";
+import { LANE_ROUTE_NAME_PATTERN, laneReportedUsageSchema } from "./records.ts";
 import { decodeSchedulerBody, encodeSchedulerBody } from "./scheduler.ts";
 import type { BridgeSigner } from "./signing.ts";
 import { STACK_FAULT_WHYS } from "./stack-health.ts";
@@ -22,7 +22,8 @@ import { stackTraceSchema } from "./stack-trace.ts";
  *   for the late-facts follow-up (`GET /v1/peer/attempts/<rid>`), so neither can be presented as the other.
  * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream}`), `data` (standard base64 of
  *   the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts, relay_account_id,
- *   usage, code, receipt, trace?}`). Between them the stack VM writes `PEER_COMMENT`, which is not a frame.
+ *   usage, code, receipt, trace?, checks?}`). Between them the stack VM writes `PEER_COMMENT`, which is not a frame.
+ *   `checks` goes only to an entry that named it in `PEER_READS_HEADER`.
  * - **A refusal** of checks 1 to 6 (`peer_*`, `route_unconfigured`, `foreign_relay`): an HTTP 4xx whose body is
  *   `{code, dialed: false}`, before any frame; the status is `PEER_REFUSAL_STATUS`'s.
  * - **The attempts answer**: `{state, receipt}` from the stack VM's memory.
@@ -46,6 +47,50 @@ export function peerRequestIdOf(headers: Headers): string | null {
   const value = headers.get(PEER_REQUEST_ID_HEADER);
   return value !== null && STACK_VIOLATION_REQUEST_ID_PATTERN.test(value) ? value : null;
 }
+
+/**
+ * The `end` members an entry names beside the envelope, outside it, when it reads them (docs/error-rates.md, r14): a
+ * comma-separated list of `PEER_END_READS`' words. `end` is strict on the entry, so a stack VM puts such a member in
+ * only for an entry that named it: an older entry sends none and gets the `end` it reads. The envelope cannot say it,
+ * since an older stack VM refuses a member its strict schema does not know (`peer_malformed`), while it ignores a
+ * header, as it ignores PEER_REQUEST_ID_HEADER. The hop is TLS to the attested VM, and the value only chooses whether
+ * two closed words are added to `end`: at worst an attempt is not counted.
+ */
+export const PEER_READS_HEADER = "x-gray-peer-reads";
+/**
+ * The optional `end` members an entry may name: `checks`, the attempt's two answer checks (r14), in the words of
+ * `PEER_CHECKS_WORDS`. A read word names its member together with the member's words: `end` is strict on the entry, so
+ * a word added to either check needs a new read word (`checks_v2`) that names the new lists, and to an entry that named
+ * `checks` alone a stack VM sends a word outside `PEER_CHECKS_WORDS` as null.
+ */
+export const PEER_END_READS = ["checks"] as const;
+export type PeerEndRead = (typeof PEER_END_READS)[number];
+
+/**
+ * The words the `checks` read names, frozen with it: r14's `ToolCallCheck` and `OutputCheck` (@gray/protocol
+ * answer-checks.ts). `end.checks` is read in these, whatever the gateway's lists hold later (test/peer.test.ts fails
+ * when they change, so the change comes with its read word).
+ */
+export const PEER_CHECKS_WORDS = Object.freeze({
+  tool_call_check: Object.freeze(["none", "ok", "invalid_json", "schema_mismatch", "undeclared", "missing_name", "refused", "truncated"] as const),
+  output_check: Object.freeze(["not_requested", "ok", "invalid_json", "schema_mismatch_strict", "schema_mismatch_loose", "excluded", "unknown"] as const),
+});
+
+/** The longest PEER_READS_HEADER value read: every word of a few generations, with room. */
+const PEER_READS_MAX_LENGTH = 256;
+
+/** The words of PEER_END_READS that `headers` name in PEER_READS_HEADER; none without it, past its bound, or for an unknown word. */
+export function peerReadsOf(headers: Headers): ReadonlySet<PeerEndRead> {
+  const value = headers.get(PEER_READS_HEADER);
+  const out = new Set<PeerEndRead>();
+  if (value === null || value.length > PEER_READS_MAX_LENGTH) return out;
+  for (const word of value.split(",")) {
+    const read = word.trim();
+    if ((PEER_END_READS as readonly string[]).includes(read)) out.add(read as PeerEndRead);
+  }
+  return out;
+}
+
 /** The envelope header's version, its first dot-separated part. */
 export const PEER_HEADER_VERSION = "v1";
 
@@ -73,8 +118,8 @@ const hex32 = z.string().regex(/^[0-9a-f]{32}$/);
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 /** A keyset digest as the keyset headers carry it (`x-aci-keyset-digest`): `sha256:<64 lower hex>`. */
 const keysetDigest = z.string().refine((value) => isDigestField(value), { message: "a keyset digest is sha256:<64 lower-case hex>" });
-/** An endpoint id or a model name: 1 to 256 printable ASCII characters without space (the trace bounds them to 256, stack-trace.ts). */
-const name = z.string().regex(/^[\x21-\x7e]{1,256}$/);
+/** An endpoint id or a model name: 1 to 256 printable ASCII characters without space (records.ts `LANE_ROUTE_NAME_PATTERN`). */
+const name = z.string().regex(LANE_ROUTE_NAME_PATTERN);
 
 /** The envelope (section 4.5): no workspace, key or customer identity. */
 export const peerEnvelopeSchema = z
@@ -298,6 +343,14 @@ export const peerEndSchema = z
      * index row, as a stack VM serving a client directly writes its own (section 4.10).
      */
     trace: stackTraceSchema.optional(),
+    /**
+     * The attempt's two answer checks (docs/error-rates.md, r14), which the stack VM computes with the gate code the entry
+     * runs, so the entry records them for the attempt (it never sees the bytes of an answer the stack VM refused): null
+     * where the attempt is not counted. Absent from a stack VM before it, and sent only to an entry that named it in
+     * PEER_READS_HEADER: an entry before it refuses an `end` that carries it. In the words `checks` names
+     * (`PEER_CHECKS_WORDS`), r14's, never a later word.
+     */
+    checks: z.object({ tool_call_check: z.enum(PEER_CHECKS_WORDS.tool_call_check).nullable(), output_check: z.enum(PEER_CHECKS_WORDS.output_check).nullable() }).strict().optional(),
   })
   .strict()
   .superRefine((end, ctx) => {

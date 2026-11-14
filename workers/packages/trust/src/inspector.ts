@@ -13,10 +13,11 @@
  * holds bytes keeps the raw frames, not a parsed copy (src/gate.ts).
  */
 import { type Json, asStr, get, isArray, jsonEqual, pointer, utf8Length } from "@gray/json";
-import { type CanonicalEvent, argumentValue } from "@gray/protocol";
+import { type CanonicalEvent, type ToolCallCheck, argumentValue } from "@gray/protocol";
 import { MAX_TOOLS } from "./limits.ts";
 import type { GateRequest, ToolSchemas, TrustPolicy } from "./policy.ts";
 import { type Call, carriesToolCall, inspectNativeStream, responseItemCalls } from "./shapes.ts";
+import { type ArgumentsReading, ToolCallTally } from "./tool-call-check.ts";
 import { type InspectionResult, NOTHING_FOUND, type TrustViolation, attempt, pass, refuse } from "./violations.ts";
 
 interface Fragments {
@@ -80,6 +81,8 @@ export class StreamToolInspector {
   private rejected: TrustViolation | undefined;
   private readonly passed: TrustViolation[] = [];
   private reported = 0;
+  /** What the attempt's tool-call check reads (`toolCallCheck`). */
+  private readonly tally = new ToolCallTally();
   /** What the client gets of each call's argument fragments. */
   private fragments: FragmentUse = "forwarded";
   /** The calls whose fragments differ from their complete arguments, for the caller to give the complete arguments in their place. */
@@ -139,6 +142,22 @@ export class StreamToolInspector {
     return this.kept;
   }
 
+  /**
+   * `arguments_reading`: how a complete call's arguments read, for the tool-call check
+   * (`callCheck`). A value that is no string is JSON. A string is text that is not JSON, or a JSON string
+   * literal, which only its text tells apart: a Chat or Anthropic call's are its fragments, which the
+   * decoder closes it from, and a Responses call's are its done events' own text, which its native
+   * statements give (`response.output_item.done` and the terminal snapshot, inspected too): unknown
+   * here.
+   */
+  private argumentsReading(args: Json, fragments: Fragments | undefined): ArgumentsReading | undefined {
+    if (typeof args !== "string") return "json";
+    if (this.gate.request.protocol === "open_ai_responses") return undefined;
+    const text = fragments?.text ?? "";
+    // `argumentValue` gives the text back only when it is not JSON (src/shapes.ts `pushCall`).
+    return text !== "" && argumentValue(text) !== text ? "json" : "not_json";
+  }
+
   /** The call `id` names, once complete. */
   private callOf(id: string): Call | undefined {
     const index = this.completeIds.get(id);
@@ -156,13 +175,26 @@ export class StreamToolInspector {
       const sticky = this.policy.decision(this.rejected, []);
       return sticky.ok ? { ok: true, inspection: NOTHING_FOUND } : sticky;
     }
+    // The batch's finish reason first: the decoder closes a Chat call just before the finish it comes
+    // with, and a refusal of that call would stop the walk before it (review r14 finding 2).
+    for (const event of events) if (event.type === "finish") this.tally.finish(event.reason);
     const violation = attempt(() => {
       for (const event of events) this.observeEvent(event);
-    });
+    }, this.tally);
     if (violation !== undefined) this.rejected = violation;
     const found = this.passed.slice(this.reported);
     this.reported = this.passed.length;
     return this.policy.decision(violation, found);
+  }
+
+  /**
+   * The attempt's tool-call check (docs/error-rates.md "Tool calls", r14), read once its stream ended
+   * (`StreamCheck.toolCallCheck`: `finished` true after `finish`, false for a stream that failed
+   * before it), from what `observe` and `finish` noted (src/tool-call-check.ts). A refusal of this
+   * inspector counts as its site says, whether `finish` came or not.
+   */
+  toolCallCheck(finished: boolean): ToolCallCheck | null {
+    return this.tally.check(this.policy.mode, this.gate.request.tools.length > 0, finished);
   }
 
   /**
@@ -183,10 +215,11 @@ export class StreamToolInspector {
     }
     const violation = attempt(() => {
       if (typeof this.schemas === "string") refuse(this.schemas);
+      // A call left incomplete (case 6); without any call, nothing for the check to count.
       if (!this.done || this.nativeCount === 0 || [...this.deltas.keys()].some((index) => !this.complete.has(index))) {
-        refuse("trust_opaque_tool_payload");
+        refuse("trust_opaque_tool_payload", "refused");
       }
-    });
+    }, this.tally);
     // Every passed finding was reported by the `observe` that found it.
     return this.policy.decision(violation, []);
   }
@@ -197,9 +230,11 @@ export class StreamToolInspector {
     if (typeof this.schemas === "string") refuse(this.schemas);
     const schemas = this.schemas;
     const { request } = this.gate;
+    // A call stated two ways, or whose name changes, is case 6 (`refused`), as one never completed is.
     switch (event.type) {
       case "tool_call_delta": {
-        if (this.complete.has(event.index)) refuse("trust_invalid_tool_arguments");
+        this.tally.call();
+        if (this.complete.has(event.index)) refuse("trust_invalid_tool_arguments", "refused");
         let fragments = this.deltas.get(event.index);
         if (fragments === undefined) {
           fragments = { name: undefined, text: "", bytes: 0, heap: 0 };
@@ -209,7 +244,7 @@ export class StreamToolInspector {
         if (event.name !== null) {
           const name = event.name;
           if (!request.tools.some((tool) => tool.name === name)) pass(this.passed, "trust_tool_not_allowed");
-          if (fragments.name !== undefined && fragments.name !== name) refuse("trust_opaque_tool_payload");
+          if (fragments.name !== undefined && fragments.name !== name) refuse("trust_opaque_tool_payload", "refused");
           fragments.name = name;
         }
         fragments.text += event.arguments;
@@ -222,19 +257,20 @@ export class StreamToolInspector {
         break;
       }
       case "tool_call_complete": {
-        if (event.name === null) refuse("trust_opaque_tool_payload");
+        this.tally.call();
+        if (event.name === null) refuse("trust_opaque_tool_payload", "missing_name");
         const name = event.name;
         const call: Call = [name, event.arguments];
-        this.policy.inspectCall(this.gate, schemas, name, event.arguments, this.passed, this.argumentLimit);
+        const fragments = this.deltas.get(event.index);
+        this.policy.inspectCall(this.gate, schemas, name, event.arguments, this.passed, this.argumentLimit, this.tally, this.argumentsReading(event.arguments, fragments));
         // One answer that states one call two different ways leaves which one a client runs unknown:
         // refused, not passed, unless the caller gives the client the complete call in place of the
         // fragments (`withFragmentRepair`) or the client gets no fragments (`withFragmentsUnused`).
-        const fragments = this.deltas.get(event.index);
         if (fragments !== undefined) {
-          if (fragments.name !== undefined && fragments.name !== name) refuse("trust_opaque_tool_payload");
+          if (fragments.name !== undefined && fragments.name !== name) refuse("trust_opaque_tool_payload", "refused");
           if (fragments.text !== "" && !jsonEqual(argumentValue(fragments.text), event.arguments)) {
             if (this.fragments === "repaired" && this.policy.mode === "enforce") this.repairs.add(event.index);
-            else if (this.fragments !== "unused") refuse("trust_invalid_tool_arguments");
+            else if (this.fragments !== "unused") refuse("trust_invalid_tool_arguments", "refused");
           }
           // Matched or repaired: a later snapshot of this call is compared with the complete call below.
           fragments.text = "";
@@ -243,10 +279,10 @@ export class StreamToolInspector {
           fragments.heap = 0;
         }
         const earlier = this.complete.get(event.index);
-        if (earlier !== undefined && !sameCall(earlier, call)) refuse("trust_invalid_tool_arguments");
+        if (earlier !== undefined && !sameCall(earlier, call)) refuse("trust_invalid_tool_arguments", "refused");
         if (event.id !== null) {
           const named = this.callOf(event.id);
-          if (named !== undefined && !sameCall(named, call)) refuse("trust_invalid_tool_arguments");
+          if (named !== undefined && !sameCall(named, call)) refuse("trust_invalid_tool_arguments", "refused");
         }
         if (earlier === undefined) this.kept += GATE_COMPLETE_BYTES;
         this.complete.set(event.index, call);
@@ -256,8 +292,8 @@ export class StreamToolInspector {
       case "native": {
         this.nativeCount += 1;
         if (event.protocol !== request.protocol) refuse("trust_protocol_mismatch");
-        for (const [name, args] of inspectNativeStream(event.protocol, event.payload, true)) {
-          this.policy.inspectCall(this.gate, schemas, name, args, this.passed, this.argumentLimit);
+        for (const [name, args, reading] of inspectNativeStream(event.protocol, event.payload, true)) {
+          this.policy.inspectCall(this.gate, schemas, name, args, this.passed, this.argumentLimit, this.tally, reading);
         }
         const kind = asStr(get(event.payload, "type"));
         if (event.protocol === "open_ai_responses" && (kind === "response.completed" || kind === "response.incomplete")) {
@@ -266,17 +302,17 @@ export class StreamToolInspector {
             for (const item of output) {
               if (asStr(get(item, "type")) !== "function_call") continue;
               const id = asStr(get(item, "call_id"));
-              if (id === undefined) refuse("trust_opaque_tool_payload");
+              if (id === undefined) refuse("trust_opaque_tool_payload", "refused");
               const snapshot: Call[] = [];
               responseItemCalls(item as Json, snapshot);
-              if (!sameCall(snapshot[0], this.callOf(id))) refuse("trust_invalid_tool_arguments");
+              if (!sameCall(snapshot[0], this.callOf(id))) refuse("trust_invalid_tool_arguments", "refused");
             }
           }
         }
         break;
       }
       case "error":
-        refuse("trust_opaque_tool_payload");
+        refuse("trust_opaque_tool_payload", "refused");
         break;
       case "done":
         this.done = true;

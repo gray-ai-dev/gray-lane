@@ -65,16 +65,21 @@ import { accrualId, evidenceHash, fallbackRequestId, generatedIdSeed, newRequest
 import { AnswerBytes, requestLimit, requestLimitSource } from "@gray/limits";
 import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import {
+  type AnswerChecks,
   type BodyLayout,
   type CanonicalRequest,
+  type FinishReason,
   type ClientBody,
   type OutputLimit,
   type Protocol,
   type ScrubSpan,
   type Settlement,
   type UsageCounters,
+  type AnswerEndFailure,
+  AnswerEnd,
   GeminiRefusal,
   Overlay,
+  UNFINISHED_EMPTY,
   ProtocolError,
   PromptUnits,
   RESERVED_PROMPT_OVERHEAD_TOKENS,
@@ -89,11 +94,14 @@ import {
   parseResponse,
   reasoningTokens,
   scrubNative,
+  tokenSides,
+  UNCOUNTED_CHECKS,
+  unfinished,
 } from "@gray/protocol";
 import { type Affinity, type DispatchBudgets, type DispatchPermit, Preference, affinityKey, type RankingPolicy } from "@gray/routing";
 import { type StreamStage, type Translation, TranslationFailure, admissionOutputCap, droppedHeaders, selectTranslation, translationTargets } from "@gray/translation";
 import { admitOnce, RateUnit, type DegradedAdmissions } from "./admission.ts";
-import { AnswerRelay, wholeAnswerWeight } from "./answer.ts";
+import { AnswerRelay, keepsAnswerText, wholeAnswerWeight } from "./answer.ts";
 import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { billedInputOf } from "./billed.ts";
 import { readBody, spoolReadBack, type Body } from "./body.ts";
@@ -122,8 +130,8 @@ import {
   usageCounters as countersOfUsage,
 } from "./image-usage.ts";
 import { AttemptEvidence, RequestEvidence, agentThinking, opencodeAgent, wantsJson } from "./traffic-evidence.ts";
-import { type FragmentUse, GateCapacity, PASS_THROUGH, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate } from "./gate.ts";
-import { customerTextRates, generationPriceOf, pricesModalities, quoteTextRates, safeAmount, usageCost } from "./money.ts";
+import { type FragmentUse, GateCapacity, PASS_THROUGH, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate, refusedAnswerChecks } from "./gate.ts";
+import { chargeSidesMismatch, customerTextRates, generationPriceOf, pricesModalities, quoteTextRates, recordedSides, safeAmount, usageCost, usageCostParts, type RecordedSides, type TokenSides } from "./money.ts";
 import { type ContentBucket, MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
 import { parseHeld, parseStored, type ParsedRequest } from "./parse.ts";
 import { redactedHeaders, redactedQuery } from "./redact.ts";
@@ -140,9 +148,11 @@ import {
   ToolCallNames,
   type AdmissionStage,
   bounded,
+  attemptMeasures,
   candidatesOf,
   clientFields,
   contentAttempts,
+  countedChecks,
   emitRecord,
   recordDelivery,
   usageCounters,
@@ -505,6 +515,23 @@ export interface Attempt {
   /** What the attempt has shown of its route's mapping so far (traffic-evidence.ts); none for the confidential lane. */
   evidence?: AttemptEvidence;
   /**
+   * Its answer's two checks (docs/error-rates.md, r14) as the gate classified them once the answer ended: a stream's from
+   * its inspector (relay.ts `StreamEnd.checks`, or its priming's when it failed before the commit), a non-streaming
+   * answer's from `ToolGate.responseChecks`. Absent when no answer was classified. Its record keeps them where the
+   * answer was the provider's (`endAttempt`, sinks.ts `countedChecks`); a peer attempt's are its stack VM's (`end.checks`).
+   */
+  checks?: AnswerChecks;
+  /**
+   * A non-streaming answer's checks, not read yet (`ToolGate.responseChecks` of its contract and answer): read once the
+   * answer went out (`lateChecks`), so they never delay it (review r14 output-class finding 7), or by `endAttempt` when
+   * the attempt ends without the answer going out.
+   */
+  checksLater?: () => AnswerChecks;
+  /** Gray's own request deadline cut its answer while it arrived (the evidence's `deadlineCut`, kept in the lane too). */
+  deadlineCut?: true;
+  /** A peer stream's hop as the request path reads it (`endKept`): it closes the hop, and ends the attempt's fetch, once the hop's `end` is in. */
+  hop?: { closeAfterEnd(reason: unknown): void };
+  /**
    * What Gray read from the answer's usage beyond its counters, when it billed the answer otherwise than they
    * say: `image_usage_unsplit`, a generated image the usage did not count apart, billed at the image price
    * (the request log's attempt `usage_note`).
@@ -741,8 +768,16 @@ export class InferenceRun {
   private readonly attempts: AttemptRecord[] = [];
   /** Where each ended attempt's record is in `attempts`, by its permit (`permitKey`): a refusal served later names its failure there. */
   private readonly attemptAt = new Map<string, number>();
+  /**
+   * Each peer attempt's record, by its place in `attempts`, with how the record closed it: its two answer checks are
+   * read again from the hop's `end` when the record is written (`withPeerTrace`), for an `end` that came after the
+   * attempt closed (review r14 whole-pr blocker 1).
+   */
+  private readonly peerEnded = new Map<number, { readonly attempt: Attempt; readonly ended: string; readonly code: string | null; readonly rejected: boolean }>();
   private billing: BillingOutcome = "none";
   private charged: number | null = null;
+  /** The input side and the output side of `charged`, a charge billed by tokens (`charge`; `RequestRecord.chargedInputMicrousd`). */
+  private chargedSides: RecordedSides | null = null;
   private chargeSeq: number | null = null;
   private releaseReason: string | null = null;
   /** Why the client got its answer free (`settleUncharged`): its provider reported no usage for it. */
@@ -1382,6 +1417,8 @@ export class InferenceRun {
       errorCode: code,
       billing: this.billing,
       chargedMicrousd: this.charged,
+      chargedInputMicrousd: this.chargedSides?.input ?? null,
+      chargedOutputMicrousd: this.chargedSides?.output ?? null,
       chargeSeq: this.chargeSeq,
       releaseReason: this.releaseReason,
       freeReason: this.freeReason,
@@ -1524,6 +1561,11 @@ export class InferenceRun {
    * section 4.10, `peerTraceOf`): the stack VM in backend mode makes no record, so the relay's attempts reach its panel
    * (`lane_stack_traces`, `lane_stack_attempts`) through this row alone. Each hop's answer is waited for as a stack
    * call's close is, ERROR_BODY_WAIT_MS at most; an `end` not in by then is left out.
+   *
+   * Each peer attempt's two answer checks are read again from its `end` then (`peerEnded`, `peerAttemptChecks`): a
+   * stream that failed after its commit closed its attempt before the stack VM's `end` was in, which the hop still had
+   * on its way (`endKept`), and the record takes its checks from it as the attempt's own end would have (review r14
+   * whole-pr blocker 1). Only the two checks change: the attempt's end, class and charge are as they were.
    */
   private async withPeerTrace(record: RequestRecord): Promise<RequestRecord> {
     try {
@@ -1531,8 +1573,15 @@ export class InferenceRun {
       let timer: unknown = null;
       await Promise.race([Promise.all(this.peerCalls.map((call) => call.ended)), new Promise<void>((resolve) => (timer = timers.setTimeout(resolve, ERROR_BODY_WAIT_MS)))]);
       timers.clearTimeout(timer);
+      const attempts = record.attempts.map((attempt, at) => {
+        const closed = this.peerEnded.get(at);
+        if (closed === undefined) return attempt;
+        const checks = InferenceRun.peerAttemptChecks(closed.attempt, closed.ended, closed.code, closed.rejected);
+        const { toolCallCheck: _tool, outputCheck: _output, ...rest } = attempt;
+        return { ...rest, ...(checks.toolCallCheck === null ? {} : { toolCallCheck: checks.toolCallCheck }), ...(checks.outputCheck === null ? {} : { outputCheck: checks.outputCheck }) };
+      });
       const stackTrace = peerTraceOf({ requestStart: this.started, calls: this.peerCalls.map((call) => ({ relayId: call.peer.target.relayId, startedAt: call.startedAt, trace: call.trace })) });
-      return stackTrace === null ? record : { ...record, stackTrace };
+      return stackTrace === null ? { ...record, attempts } : { ...record, attempts, stackTrace };
     } catch (error) {
       console.error(JSON.stringify({ level: "error", event: "lane_stack_trace_failed", request_id: this.requestId, ...failureNames(error) }));
       return record;
@@ -1890,15 +1939,29 @@ export class InferenceRun {
     }
     const dropped = this.droppedNulls.get(attempt);
     const ids = this.attemptIds(attempt);
-    this.attemptAt.set(InferenceRun.permitKey(attempt.permit), this.attempts.length);
+    // An answered failure's record says Gray failed it (the server's `EventStatus::Error`, no failure kind).
+    const ended = answered ? "gray_error" : outcome.kind === "success" ? "success" : outcome.reason;
+    // Its answer's checks where the answer was the provider's (docs/error-rates.md): a peer attempt's are the stack VM's,
+    // which classified the vendor's answer, a refused one too, whose bytes the entry never saw (none without them).
+    const later = attempt.checksLater;
+    attempt.checksLater = undefined;
+    const rejected = facts.rejected === true;
+    // A peer attempt's are read again from its `end` as the record is written (`withPeerTrace`): an attempt that ended
+    // before the hop's `end` was in has them only then (review r14 whole-pr blocker 1).
+    const checks =
+      attempt.peer !== undefined
+        ? InferenceRun.peerAttemptChecks(attempt, ended, code, rejected)
+        : countedChecks(attempt.checks ?? later?.() ?? UNCOUNTED_CHECKS, { outcome: ended, code, rejected, deadlineCut: attempt.deadlineCut === true });
+    const recordAt = this.attempts.length;
+    if (attempt.peer !== undefined) this.peerEnded.set(recordAt, { attempt, ended, code, rejected });
+    this.attemptAt.set(InferenceRun.permitKey(attempt.permit), recordAt);
     this.attempts.push({
       endpointId: record.endpointId,
       operator: record.operator,
       startedAt: attempt.startedAt,
       durationMs: this.deps.clock() - attempt.startedAt,
       status: attempt.status,
-      // An answered failure's record says Gray failed it (the server's `EventStatus::Error`, no failure kind).
-      outcome: answered ? "gray_error" : outcome.kind === "success" ? "success" : outcome.reason,
+      outcome: ended,
       code,
       model: record.model,
       protocol: record.protocol,
@@ -1922,6 +1985,8 @@ export class InferenceRun {
       ...(attempt.rest === undefined ? {} : { restCause: attempt.rest.cause, restUntilMs: attempt.rest.untilMs }),
       ...(facts.rejected === true ? { rejected: true } : {}),
       ...(attempt.dispatch?.committed === true ? { dispatch: dispatchRecord(attempt.dispatch, attempt.ranked, attempt.dispatchedAtMs) } : {}),
+      ...(checks.toolCallCheck === null ? {} : { toolCallCheck: checks.toolCallCheck }),
+      ...(checks.outputCheck === null ? {} : { outputCheck: checks.outputCheck }),
     });
     // F2 D9/D111: every pick the TEE made is reported. A lane attempt whose fetch took the body is
     // reported as what the vendor did with it; one that ended before the body was taken (connect,
@@ -1940,12 +2005,15 @@ export class InferenceRun {
     // Its ranking sample's measures (the server's `Observation`): its latency, its own time to first token, a charged
     // answer's output tokens (none for a free one or one Gray failed), a counted failure's kind.
     const released = freed?.outcome ?? outcome;
+    const charged = released.kind === "success" && !answered && freed === null;
     const measure: OutcomeMeasure = [
       Math.max(0, this.deps.clock() - attempt.startedAt),
       attempt.ttftMs ?? null,
-      released.kind === "success" && !answered && freed === null ? (attempt.outputTokens ?? 0) : 0,
+      charged ? (attempt.outputTokens ?? 0) : 0,
       released.kind === "supplier_failure" ? (failure ?? "protocol") : null,
     ];
+    // Its record's route attempt carries the same measures (r15, docs/live-speed.md), in its rank key's mode.
+    this.attempts[recordAt] = { ...this.attempts[recordAt]!, measures: attemptMeasures(released, measure, charged, this.stream === true) };
     const release: ReleaseFacts = {
       ...rest,
       measure,
@@ -5063,11 +5131,17 @@ export class InferenceRun {
    */
   private async peerUncommitted(d: Dispatcher, attempt: Attempt, model: string, failure: Uncommitted): Promise<{ readonly kind: "continue" } | Stopped> {
     const call = attempt.peer!;
+    // What the attempt is closed as follows the `end` that was in when the request path failed the answer, as before.
+    const end = call.end;
+    // An answer that ended (Gray's error frame) has its `end` on the way, read for the attempt's answer checks alone,
+    // within PEER_END_WAIT_MS (review r14 lane-wire finding 10); one still answering is not waited for. The hop, which
+    // its priming kept open (`endKept`), is closed after.
+    if (end === null && !failure.upstreamMayStillWork) await call.endWithin(this.deps.clock() + this.budget.preWait(PEER_END_WAIT_MS));
     call.close();
     call.served = false;
     this.answerShare.hold(0, this.deps.cfg.answerHeldMaxBytes);
-    if (call.end !== null && !call.end.dialed) return this.peerFailed(d, attempt, model, { kind: "not_dialed", code: call.end.code ?? "peer_invalid" });
-    if (call.end !== null) {
+    if (end !== null && !end.dialed) return this.peerFailed(d, attempt, model, { kind: "not_dialed", code: end.code ?? "peer_invalid" });
+    if (end !== null) {
       // A whole answer the request path refused (its trust gate, its protocol checks): the request's own error, as
       // `stackFailed` ends a released answer the request path failed. The stack VM's attempt is over (`end` is in).
       this.failAttempt(d, attempt, { ...failure.outcome, answered: true }, failure.error, failure.code, false, failure.answered === true);
@@ -5539,6 +5613,59 @@ export class InferenceRun {
     return `${permit.shard}/${permit.epoch}/${permit.id}`;
   }
 
+  /**
+   * An attempt's answer checks read after its record was written: a non-streaming answer's and a settled stream's, once
+   * the answer went out (review r14 output-class finding 7). Its record takes them as `endAttempt` would have, through
+   * `countedChecks` with the record's own end; a peer attempt's record keeps its stack VM's (`end.checks`).
+   */
+  private lateChecks(attempt: Attempt, checks: AnswerChecks): void {
+    attempt.checks = checks;
+    if (attempt.peer !== undefined) return;
+    const at = this.attemptAt.get(InferenceRun.permitKey(attempt.permit));
+    const record = at === undefined ? undefined : this.attempts[at];
+    if (at === undefined || record === undefined) return;
+    const counted = countedChecks(checks, { outcome: record.outcome, code: record.code, rejected: record.rejected === true, deadlineCut: attempt.deadlineCut === true });
+    const { toolCallCheck: _tool, outputCheck: _output, ...rest } = record;
+    this.attempts[at] = {
+      ...rest,
+      ...(counted.toolCallCheck === null ? {} : { toolCallCheck: counted.toolCallCheck }),
+      ...(counted.outputCheck === null ? {} : { outputCheck: counted.outputCheck }),
+    };
+  }
+
+  /**
+   * Gray's own request deadline cut the attempt's answer while it arrived: Gray's limit, not the provider's, for the
+   * evidence of its route's mapping (traffic_evidence.rs `cut_by_deadline`) and for its answer checks, which then count
+   * nothing (docs/error-rates.md, sinks.ts `countedChecks`; kept in the lane too, which has no evidence).
+   */
+  private static cutByDeadline(attempt: Attempt): void {
+    attempt.deadlineCut = true;
+    if (attempt.evidence !== undefined) attempt.evidence.deadlineCut = true;
+  }
+
+  /**
+   * Whether a peer attempt's answer checks are its stack VM's as they came (review r14 lane-wire finding 10): the stack
+   * VM ended the attempt itself (its `end.outcome` is not `served`: its gate refused the answer, egress cut it, the relay
+   * failed, the vendor erred) and counted that ending before it sent `end.checks` (lane/backend.ts `#endChecks`), so what
+   * the entry made of it after is not the entry's to discount again: Gray's error frame, which fails the answer at the
+   * entry before its commit (`peerUncommitted`: `lane_relay_failed` after the follow-up, or `answered`, `gray_error`, when
+   * the `end` was in), or the stream cut after its commit. Only the entry's own endings count
+   * nothing: its client left, its own deadline cut the answer, or the attempt was refused before it went (`rejected`). A
+   * served attempt, or one whose `end` never came, is counted by the entry's end as any other (`countedChecks`): a served
+   * answer the entry failed is the entry's own Gray error. The retry class, the success rate and the charge are as before.
+   */
+  private static stackVmEnded(attempt: Attempt, ended: string, rejected: boolean): boolean {
+    const end = attempt.peer?.end ?? null;
+    if (end === null || end.outcome === "served") return false;
+    return ended !== "client_left" && attempt.deadlineCut !== true && !rejected;
+  }
+
+  /** A peer attempt's two answer checks from its `end` as it is now, as its record closed it (`stackVmEnded`, `countedChecks`). */
+  private static peerAttemptChecks(attempt: Attempt, ended: string, code: string | null, rejected: boolean): AnswerChecks {
+    const classified = peerChecks(attempt.peer?.end ?? null);
+    return InferenceRun.stackVmEnded(attempt, ended, rejected) ? classified : countedChecks(classified, { outcome: ended, code, rejected, deadlineCut: attempt.deadlineCut === true });
+  }
+
   /** A refusal dropped (refused twice, or the request ended without a later attempt serving it): a probe's deferred permit goes back as nothing. */
   private dropHeld(held: HeldRefusal): void {
     const key = InferenceRun.permitKey(held.permit);
@@ -5579,8 +5706,9 @@ export class InferenceRun {
     const at = this.attemptAt.get(key);
     if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, failure: failure.reason };
     // Its sample's measures: the refusing attempt's latency, no first token, no tokens, the failure it counts as
-    // (`refusal_served_later`).
+    // (`refusal_served_later`); its record's route attempt takes them (r15, docs/live-speed.md).
     const measure: OutcomeMeasure = [at === undefined ? 0 : this.attempts[at]!.durationMs, null, 0, later.failure];
+    if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, measures: attemptMeasures(failure, measure, false, this.stream === true) };
     const deferred = this.deferred.get(key);
     if (deferred !== undefined) {
       this.deferred.delete(key);
@@ -6026,9 +6154,12 @@ export class InferenceRun {
       // The gate's failure is Gray's own, found again by the relay after the commit.
       inspector = PASS_THROUGH.stream(a.contract, a.answerLimit, false);
     }
+    // A peer answer keeps its hop open past a priming that let go of it, for the `end` that follows (`peerUncommitted`).
+    const hop = attempt.peer !== undefined ? endKept(response, this.deps.timers ?? platformTimers, (reason) => attempt.controller.abort(reason)) : null;
+    if (hop !== null) attempt.hop = hop;
     const primed = await primeStream({
       protocol: a.protocol,
-      response,
+      response: hop?.response ?? response,
       presence: this.presence,
       inspector,
       onRefused: (verdict) => this.inspected(verdict, true),
@@ -6042,6 +6173,9 @@ export class InferenceRun {
       isolate: this.answerShare,
       heldLimit: cfg.answerHeldMaxBytes,
     });
+    // Save after a failure before the commit, which `peerUncommitted` closes, what lets go of the answer closes the hop,
+    // as it did: a let-go priming kept back is passed on now.
+    if (primed.kind !== "uncommitted") hop?.commit();
     switch (primed.kind) {
       case "committed":
         return { kind: "committed", stream: primed };
@@ -6050,6 +6184,9 @@ export class InferenceRun {
       case "gray":
         return { kind: "final", code: primed.code, error: primed.code === "gateway_capacity" ? capacityError() : new ApiError(502, primed.code).withMeta("limit_source", "gateway_memory") };
       case "uncommitted":
+        // It failed before its commit, so before its finish: its checks are its priming's inspector's, the only one
+        // that read it (the relay's reads a committed stream again from its start).
+        attempt.checks = inspector.checks(false);
         return { kind: "uncommitted", failure: this.streamFailure(a, attempt, primed) };
     }
   }
@@ -6067,7 +6204,7 @@ export class InferenceRun {
       this.noteAgentRefusal(attempt, classified.outcome, { inBand: failure.event });
       return { outcome: classified.outcome, error: classified.error, code: "upstream_error", upstreamMayStillWork: failure.upstreamMayStillWork };
     }
-    if (failure.cutByDeadline === true && attempt.evidence !== undefined) attempt.evidence.deadlineCut = true;
+    if (failure.cutByDeadline === true) InferenceRun.cutByDeadline(attempt);
     return { outcome: bareOutcome(failure.class ?? "answer_defect", elapsed), error: new ApiError(502, failure.code), code: failure.code, upstreamMayStillWork: failure.upstreamMayStillWork };
   }
 
@@ -6243,13 +6380,31 @@ export class InferenceRun {
   }
 
   /**
+   * An answer whose end is its chain's failure (`AnswerEnd`, `UNFINISHED_EMPTY`): refused uncharged with its code, as
+   * any other answer defect is, so that a buffered one not yet committed may go to another route and either counts as
+   * its supplier's invalid answer. Its words are the attempt's `error_detail`; no `gray.usage_refusal/1` event is
+   * sent, since its usage is not what was refused (the event's codes are the three usage codes, lane-wire records.ts).
+   * An answer that is also a Gemini refusal is this failure, not the model's refusal (`refusedOf`, the stream's
+   * `settleRefused`): a candidate stopped for the supplier's account is the supplier's whatever the others say.
+   */
+  private answerEndFailed(attempt: Attempt, failure: AnswerEndFailure): SettleOutcome {
+    attempt.errorDetail = bounded(failure.why, ERROR_DETAIL_BYTES);
+    // The supplier's account limited by its vendor is the provider's own fault, whatever its code says to the traffic
+    // evidence (`AttemptEvidence.providerFault`): the route's next check comes forward.
+    if (failure.reason === "upstream_account_limited" && attempt.evidence !== undefined) attempt.evidence.providerFault = true;
+    return { ok: false, code: failure.code, reason: failure.code, why: failure.why };
+  }
+
+  /**
    * Settles an answer whose usage the upstream reported: missing usage is delivered free
    * (`settleUncharged`) or, under GRAY_USAGE_MISSING refuse, refused; invalid usage, output over the
    * request's limit and a charge above the bound are refused uncharged, with the reason in Gray's words
    * and counts (`finishFailed`); otherwise the charge at the attempt's frozen rates goes to the account
-   * shard with the ledger's evidence, and the call waits for its batch to commit.
+   * shard with the ledger's evidence, and the call waits for its batch to commit. An answer whose end is its
+   * chain's failure (`end`, @gray/protocol answer-end.ts) is refused before its usage is read, or, for a
+   * buffered answer with no stop reason, once its usage shows no output (`answerEndFailed`).
    */
-  private async settle(a: Answering, attempt: Attempt, settlement: Settlement, rawUsage: Json | null): Promise<SettleOutcome> {
+  private async settle(a: Answering, attempt: Attempt, settlement: Settlement, rawUsage: Json | null, end?: SettleEnd): Promise<SettleOutcome> {
     // The answer's last upstream byte is read: what follows (its tool-call id rows, a Responses bind) waits what the
     // post phase leaves (`RequestBudget`), and so do settle's own retries (`settleTiming`).
     this.budget.startPost();
@@ -6264,9 +6419,13 @@ export class InferenceRun {
     if (attempt.peer !== undefined && !attempt.peer.usageAgrees(rawUsage)) {
       return this.usageRefused(attempt, "billing_usage_invalid", "peer_usage_mismatch", "the answer's usage is not the usage its stack VM reported in the hop's end frame", rawUsage);
     }
+    // An end no API of the vendor's has is the chain's failure whatever the usage says (@gray/protocol answer-end.ts).
+    if (end?.failure !== undefined) return this.answerEndFailed(attempt, end.failure);
     if (settlement.kind === "missing") return this.finishFailed(attempt, { kind: "usage_missing", reason: settlement.reason }, rawUsage);
     if (settlement.kind === "invalid") return this.finishFailed(attempt, { kind: "upstream_usage", reason: settlement.reason }, rawUsage);
     if (settlement.kind === "output_over_limit") return this.finishFailed(attempt, { kind: "output_over_limit", reason: settlement.reason }, rawUsage);
+    // A buffered answer with no stop reason and no output (its reasoning counted) is a relay's join of a stream cut short.
+    if (end?.unfinished === true && settlement.tokens.output === 0n) return this.answerEndFailed(attempt, UNFINISHED_EMPTY);
     // A route that prices image or audio tokens apart bills each modality at its own rate (`prices_modalities`).
     const priced = generationPriceOf(route.record.quote, this.deps.cfg.platformFeeBps);
     if (priced !== undefined && pricesModalities(priced.supplierMedia)) return this.settleModalities(a, attempt, rawUsage ?? null, priced.supplierMedia);
@@ -6275,10 +6434,12 @@ export class InferenceRun {
     // range is i64 (inference.rs `checked`: "a usage counter is above the ledger's range").
     const safe = [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write, tokens.cache_write_1h].every((t) => t <= BigInt(Number.MAX_SAFE_INTEGER));
     if (!safe) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `a usage counter is above the safe integer range of ${Number.MAX_SAFE_INTEGER}`, rawUsage);
-    const cost = usageCost(tokens, customerTextRates(route.rate));
+    // The charge is the sum of its input side and its output side (`usageCostParts`), which its record keeps.
+    const sides = usageCostParts(tokens, customerTextRates(route.rate));
     const payable = usageCost(tokens, quoteTextRates(route.record.quote));
     // gray-ledger `Error::Amount`'s text, as `charge` refuses it.
-    if (cost === undefined || payable === undefined) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid amount or arithmetic overflow", rawUsage);
+    if (sides === undefined || payable === undefined) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid amount or arithmetic overflow", rawUsage);
+    const cost = sides.input + sides.output;
     const usage = {
       input_tokens: Number(tokens.input),
       output_tokens: Number(tokens.output),
@@ -6300,7 +6461,7 @@ export class InferenceRun {
       console.error(JSON.stringify(this.lane === null ? { level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId, why: evidence.why } : laneSafeLog({ level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId })));
       return { ok: false, code: "billing_usage_invalid", reason: "usage_evidence_invalid", why: evidence.why };
     }
-    return this.charge(a, attempt, cost, evidence.text, evidence.payable === null ? payable : evidence.payable, usage, rawUsage);
+    return this.charge(a, attempt, cost, sides, evidence.text, evidence.payable === null ? payable : evidence.payable, usage, rawUsage);
   }
 
   /**
@@ -6341,9 +6502,11 @@ export class InferenceRun {
   /**
    * Charges an answer whose usage was checked: `cost` at the attempt's frozen rates with the ledger's
    * `evidence` and the supplier's `payable`, to the account shard, which answers once its batch is on disk;
-   * only then may the terminal frame go (docs/cloudflare-native.md 5.1 rule 7).
+   * only then may the terminal frame go (docs/cloudflare-native.md 5.1 rule 7). `sides` are the input side and
+   * the output side `cost` is the sum of, which the request's record keeps (docs/effective-prices.md); they
+   * are no part of what the shard is sent.
    */
-  private async charge(a: Answering, attempt: Attempt, cost: bigint, evidence: string, payable: bigint, usage: Record<string, number>, rawUsage: Json | null): Promise<SettleOutcome> {
+  private async charge(a: Answering, attempt: Attempt, cost: bigint, sides: TokenSides | null, evidence: string, payable: bigint, usage: Record<string, number>, rawUsage: Json | null): Promise<SettleOutcome> {
     // A model check is delivered before it gets here (`checkAnswered`); one that did is Gray's failure, never a charge.
     if (this.modelCheck) throw new Error("a model check is never charged");
     const route = attempt.route;
@@ -6404,6 +6567,15 @@ export class InferenceRun {
     // answer delivered without usage (`settleUncharged`).
     this.billing = "charged";
     this.charged = settled.amount;
+    // A generation charge is billed by tokens (no unit): sides that are missing or are not the settled charge are not
+    // kept, and alert, and the charge stands as the shard settled it. The line holds ids and amounts only, so a lane
+    // says it too (`laneSafeLog`).
+    const kept = recordedSides(sides, settled.amount, null);
+    if (kept.mismatch) {
+      const line = chargeSidesMismatch(this.requestId, route.record.endpointId, sides, settled.amount);
+      console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
+    }
+    this.chargedSides = kept.sides;
     this.chargeSeq = settled.chargeSeq;
     // A billed answer is evidence of what it exercised (`answered`), and names its stack account.
     this.answeredBy(a, attempt, usage, rawUsage);
@@ -6467,7 +6639,8 @@ export class InferenceRun {
       console.error(JSON.stringify({ level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId, why: verdict.why }));
       return { ok: false, code: "billing_usage_invalid", reason: "usage_evidence_invalid", why: verdict.why };
     }
-    return this.charge(a, attempt, cost, verdict.text, verdict.payable ?? 0n, usage, rawUsage);
+    // A generation route bills by tokens (`generationPriceOf` leaves a unit price out): its charge has the two sides.
+    return this.charge(a, attempt, cost, tokenSides(amount.parts, null), verdict.text, verdict.payable ?? 0n, usage, rawUsage);
   }
 
   /**
@@ -6562,6 +6735,8 @@ export class InferenceRun {
     const calls = new ToolCallNames();
     this.toolCalls = 0;
     this.toolNames = calls.names;
+    // The upstream's stop reasons, read from its events for an end that is the chain's failure (`settle`).
+    const answerEnd = new AnswerEnd(a.protocol);
     const tap: ChunkTap | null = this.binding(a, attempt);
     // The answer's tool-call ids that not every client keeps get handles (TOOL_CALL_ID_MINTING).
     const mapper = this.toolIds?.beginAnswer(attempt.issuer, a.protocol) ?? null;
@@ -6584,10 +6759,14 @@ export class InferenceRun {
             silenceMs: cfg.upstreamSilenceMs,
             clock,
             outputLimit: this.outputLimit(a, route),
-            settle: (settlement, _usage, rawUsage) => this.settle(a, attempt, settlement, rawUsage),
+            settle: (settlement, _usage, rawUsage) => this.settle(a, attempt, settlement, rawUsage, { failure: answerEnd.failure(), unfinished: false }),
             // A Gemini answer is read for the model's refusal, delivered uncharged (`settleRefused`).
             refusal: a.protocol === "gemini" ? new GeminiRefusal() : undefined,
-            settleRefused: (reason) => this.settleRefused(attempt, reason),
+            // A refusal whose end is also its chain's failure is that failure (`answerEndFailed`).
+            settleRefused: (reason) => {
+              const failure = answerEnd.failure();
+              return failure === undefined ? this.settleRefused(attempt, reason) : Promise.resolve(this.answerEndFailed(attempt, failure));
+            },
             upstreamDone: () => this.endAttempt(attempt, { kind: "success" }, false, null),
             sink: this.content,
             unsent: (frames) => this.keepUnsent(attempt, frames),
@@ -6615,6 +6794,7 @@ export class InferenceRun {
             onEvents: (events) => {
               attempt.evidence?.observeEvents(events);
               for (const event of events) {
+                if (event.type === "native") answerEnd.observe(event.payload);
                 if (event.type === "tool_call_complete") calls.add(event.name);
                 // A generated image in any candidate of a Gemini event, read where its usage is read.
                 else if (event.type === "native" && event.protocol === "gemini" && attempt.answeredImage !== true && geminiImages(event.payload)) attempt.answeredImage = true;
@@ -6628,6 +6808,8 @@ export class InferenceRun {
     // the release stop); a vendor stream that was cut keeps the upstream's own code.
     const stackFault = attempt.stack?.fault ?? null;
     const end: StreamEnd = relayed.kind === "failed" && stackFault !== null && (stackFault.by === "relay" || stackFault.by === "egress") ? { ...relayed, code: LANE_RELAY_FAILED, reason: LANE_RELAY_FAILED } : relayed;
+    // The answer's checks as the relay read them once the stream ended and its end went out.
+    attempt.checks = end.checks;
     // What the relay held went with it.
     this.retained.set("held", 0);
     this.retained.set("frame", 0);
@@ -6640,6 +6822,8 @@ export class InferenceRun {
       this.responseBytes = client.written + end.unsent;
       // A client that left has the rest of the answer in the request's content (relay.ts): it is whole.
       this.responseComplete = true;
+      // Its attempt closed with the upstream (`upstreamDone`), before the checks were read after the held frames.
+      this.lateChecks(attempt, end.checks);
       this.recordCharged(end.delivered, true);
       return;
     }
@@ -6655,12 +6839,18 @@ export class InferenceRun {
       this.record(200, "cancelled", end.why);
       return;
     }
-    if (end.upstreamMayStillWork) attempt.controller.abort(end.code);
+    // A peer stream's hop still has the stack VM's `end` on its way, which the attempt's record takes its checks from
+    // (`withPeerTrace`): `endKept` ends the fetch once it is in, PEER_END_WAIT_MS later at most, or when the call closes
+    // (review r14 whole-pr blocker 1). Any other upstream that may still work is stopped here.
+    if (end.upstreamMayStillWork) {
+      if (attempt.hop !== undefined) attempt.hop.closeAfterEnd(end.code);
+      else attempt.controller.abort(end.code);
+    }
     // An answer the upstream gave as its own API allows that Gray failed (tool arguments the client's API cannot carry,
     // Gray's own failure to account for its tool-call ids) is its route's success (`answered_by_upstream`).
     const answered = answeredFailure(end.code);
     const outcome: EndpointOutcome = answered ? { kind: "success" } : end.supplierFailure === null ? { kind: "not_counted", reason: "gray_error" } : { kind: "supplier_failure", reason: end.supplierFailure };
-    if (end.cutByDeadline === true && attempt.evidence !== undefined) attempt.evidence.deadlineCut = true;
+    if (end.cutByDeadline === true) InferenceRun.cutByDeadline(attempt);
     if (outcome.kind === "supplier_failure") this.committedFailureEvidence(attempt, end.code);
     this.endAttempt(attempt, outcome, end.upstreamMayStillWork, end.code, answered ? { answered: true } : { failure: countedFailure(null, end.code) });
     const detail: Record<string, string | number | boolean | null> = { code: end.code, why: end.why.slice(0, 200), endpoint: route.record.endpointId, provider: route.record.operator, attempt: attempt.index, bytes_received: end.received };
@@ -6806,6 +6996,7 @@ export class InferenceRun {
       // The answer's tool-call ids that not every client keeps get handles as its bytes go (TOOL_CALL_ID_MINTING).
       const mapper = this.toolIds?.beginAnswer(attempt.issuer, a.protocol) ?? null;
       const answerIds = mapper === null ? null : new AnswerIds(mapper, a.protocol, () => this.holdToolIds() === null);
+      const answerInspector = this.deps.gate.answer(a.contract, a.protocol, a.answerLimit);
       relay = new AnswerRelay({
         protocol: a.protocol,
         body,
@@ -6822,7 +7013,9 @@ export class InferenceRun {
         timers: this.deps.timers,
         // What is left of the 30 s after the client left, less the settlement's retries.
         drainMs: Math.max(0, AFTER_CLIENT_LEFT_MS - cfg.accountAdmitBudgetMs),
-        inspector: this.deps.gate.answer(a.contract, a.protocol, a.answerLimit),
+        inspector: answerInspector,
+        // The structured output check reads the answer's text, which the projection keeps whole for it alone.
+        wholeText: keepsAnswerText(this.deps.gate.mode, a.contract),
         retained: this.retained,
         sink: this.content,
         queued: this.deps.meter?.clientQueued,
@@ -6876,9 +7069,13 @@ export class InferenceRun {
         return;
       }
       if (read.kind === "failed") {
-        if (read.cutByDeadline === true && attempt.evidence !== undefined) attempt.evidence.deadlineCut = true;
-        // A call the gate refused on the way: the verdict is recorded as the end's would have been.
-        if (read.violation !== undefined) this.inspected({ ok: false, violation: read.violation }, true);
+        if (read.cutByDeadline === true) InferenceRun.cutByDeadline(attempt);
+        // A call the gate refused on the way: the verdict is recorded as the end's would have been, and the answer's
+        // checks are what refused it (the rest of it is not read).
+        if (read.violation !== undefined) {
+          this.inspected({ ok: false, violation: read.violation }, true);
+          attempt.checks = refusedAnswerChecks(answerInspector);
+        }
         // The isolate's answers hold too much together: Gray's limit, a 429 the client may retry. One
         // answer kept more than ANSWER_HELD_MAX_BYTES: Gray's limit too, said as a held stream's is. Neither
         // is the supplier's, and no other attempt would hold more (a stream's `final`): the request ends here.
@@ -6915,6 +7112,12 @@ export class InferenceRun {
       for (const call of parsedAnswer.tool_calls) calls.add(call.name);
       this.toolCalls = calls.count;
       this.toolNames = calls.names;
+      // The answer's checks, of the same request and projection as the verdict (its text whole when its structured
+      // output is checked, `keepsAnswerText`), whatever follows: read once the answer went out, or as the attempt
+      // ends without it (`checksLater`), never before the answer's end.
+      // Its text cut by the projection (`textCut`) is the output check's `unknown` (@gray/trust `outputCheck`).
+      const textCut = read.textCut;
+      attempt.checksLater = () => this.deps.gate.responseChecks(a.contract, { protocol: upstream, body: payload, textCut });
       // The verdict on the projection is the verdict on the whole answer (@gray/protocol AnswerProjection).
       const verdict = this.deps.gate.inspectResponse(a.contract, { protocol: upstream, body: payload }, a.answerLimit);
       if (!this.inspected(verdict, true)) {
@@ -6928,6 +7131,9 @@ export class InferenceRun {
         // its bytes are gone, so the refusal stands even if the verdict above disagreed.
         console.error(JSON.stringify({ level: "alert", event: "answer_check_disagrees", request_id: this.requestId, violation: refused }));
         this.inspected({ ok: false, violation: refused }, true);
+        // Counted by what refused it, as an answer refused on the way is: the inspector's check, none when its refusal was
+        // a rule of Gray's own (@gray/trust AnswerCallCheck), never the whole answer's that the verdict passed.
+        attempt.checks = refusedAnswerChecks(answerInspector);
         if (uncommitted(this.defect(attempt, "upstream_trust_policy_rejected", false))) return;
         failed("upstream_trust_policy_rejected", "upstream_trust_policy_rejected", refused, "invalid_response");
         return;
@@ -6944,9 +7150,13 @@ export class InferenceRun {
       // uncharged, so it needs no usage. The projection keeps what the refusal is read from: every key, and
       // every short string whole (@gray/protocol AnswerProjection). It is settled after the commit, as main's
       // `Settlement::ModelRefused` is: a failure of its own (its handles not stored) is Gray's.
-      const refusedFor = upstream === "gemini" ? GeminiRefusal.of(payload) : undefined;
+      const refusedFor = refusedOf(upstream, payload);
       if (upstream === "gemini") attempt.answeredImage = geminiImages(payload);
+      // A served answer's checks are read once it went out (its attempt closes before).
+      let later: (() => AnswerChecks) | undefined;
       if (refusedFor !== undefined) {
+        // The model's refusal: its attempt is no route's answer, and nothing of it is counted.
+        attempt.checksLater = undefined;
         if (!current.started) this.commit(d, attempt);
         const refused = await this.settleRefused(attempt, refusedFor);
         if (!refused.ok) {
@@ -6958,7 +7168,7 @@ export class InferenceRun {
         const reported = isObject(rawUsage) && parsedAnswer.usage !== null;
         // An answer without usage is missing what it is billed on: delivered free, or refused under
         // GRAY_USAGE_MISSING refuse (`settle`), saying which.
-        const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage);
+        const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
         if (!settled.ok) {
           // A usage the gateway would not bill charged nothing: another attempt may serve the request. A
           // settlement that was not confirmed may have charged, and a failed review of Gray's own evidence
@@ -6971,6 +7181,8 @@ export class InferenceRun {
           return;
         }
         if (!current.started) this.commit(d, attempt);
+        later = attempt.checksLater;
+        attempt.checksLater = undefined;
         this.endAttempt(attempt, { kind: "success" }, false, null);
       }
       // A Responses reply that stores is bound to its endpoint before the client has its last byte (`bind`).
@@ -6994,6 +7206,8 @@ export class InferenceRun {
       this.content?.end();
       this.responseBytes = current.written;
       this.responseComplete = out.delivered;
+      // A peer attempt's are its stack VM's (`end.checks`): the entry's own would parse the answer for nothing.
+      if (later !== undefined && attempt.peer === undefined) this.lateChecks(attempt, later());
       this.recordCharged(out.delivered, current.started);
     })();
     // A failure of Gray's own (a bug) still ends the request: free, the upstream and the permit let
@@ -7088,7 +7302,7 @@ export class InferenceRun {
       return { kind: "response", response: res };
     }
     if (read.kind === "failed") {
-      if (read.cutByDeadline === true && attempt.evidence !== undefined) attempt.evidence.deadlineCut = true;
+      if (read.cutByDeadline === true) InferenceRun.cutByDeadline(attempt);
       if (read.code === "upstream_body_limit" && memoryLimit) {
         // Gray's own limit on what it translates: no other attempt translates more.
         const error = new ApiError(502, "upstream_body_limit")
@@ -7126,11 +7340,16 @@ export class InferenceRun {
     for (const call of parsedAnswer.tool_calls) calls.add(call.name);
     this.toolCalls = calls.count;
     this.toolNames = calls.names;
+    // The answer's checks, of the same request and whole answer as the verdict, whatever follows. Read here, with the
+    // verdict, not once the answer went out: the answer is read whole and made ready before any of it goes, and reading
+    // them after its delivery would keep its parse alive while the client reads, which the answer's weight no longer
+    // counts from here (review r14 output-class finding 7).
+    attempt.checks = this.deps.gate.responseChecks(a.contract, { protocol: upstream, body: payload });
     const verdict = this.deps.gate.inspectResponse(a.contract, { protocol: upstream, body: payload }, a.answerLimit);
     if (!this.inspected(verdict, true)) return uncommitted(this.defect(attempt, "upstream_trust_policy_rejected", false));
     attempt.evidence?.observeResponse(parsedAnswer, payload);
     // The model's refusal (a Gemini upstream's) is delivered translated and uncharged, so it needs no usage.
-    const refusedFor = upstream === "gemini" ? GeminiRefusal.of(payload) : undefined;
+    const refusedFor = refusedOf(upstream, payload);
     if (upstream === "gemini") attempt.answeredImage = geminiImages(payload);
     const rawUsage = bufferedUsage(upstream, payload) ?? null;
     const reported = isObject(rawUsage) && parsedAnswer.usage !== null;
@@ -7170,7 +7389,7 @@ export class InferenceRun {
       const refused = await this.settleRefused(attempt, refusedFor);
       if (!refused.ok) return failed(refused.code, refused.reason, refused.why, null);
     } else {
-      const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage);
+      const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
       if (!settled.ok) {
         if (!grayAfterCheck(settled)) return uncommitted({ ...this.defect(attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });
         this.commit(d, attempt);
@@ -7249,6 +7468,15 @@ export class InferenceRun {
       this.answerShare.hold(0, heldLimit);
       return { kind: "uncommitted", failure };
     };
+    // The stream's inspector, for the attempt's answer checks of a stream that ends before its terminal event (as
+    // `prime`'s); the terminal response's are the gate's `responseChecks` below. Gated: the whole stream is held for the
+    // client's one answer, and an open check reads no declared call.
+    let inspector: StreamInspector;
+    try {
+      inspector = this.deps.gate.stream(a.contract, a.answerLimit, true);
+    } catch {
+      inspector = PASS_THROUGH.stream(a.contract, a.answerLimit, false);
+    }
     const read = await completedResponse({
       response,
       presence: this.presence,
@@ -7262,6 +7490,7 @@ export class InferenceRun {
       retained: this.retained,
       isolate: this.answerShare,
       heldLimit,
+      inspector,
     });
     switch (read.kind) {
       case "left": {
@@ -7281,6 +7510,9 @@ export class InferenceRun {
           ...(read.code === "gateway_capacity" ? {} : { limitSource: "gateway_memory" as const }),
         });
       case "uncommitted":
+        // It ended before its terminal event: its checks are its stream's inspector's, not finished; none when the
+        // inspector failed while it was fed (Gray's own).
+        attempt.checks = read.inspectorFailed === true ? UNCOUNTED_CHECKS : inspector.checks(false);
         return uncommitted(this.streamFailure(a, attempt, read));
       case "completed":
         break;
@@ -7308,11 +7540,16 @@ export class InferenceRun {
     for (const call of parsedAnswer.tool_calls) calls.add(call.name);
     this.toolCalls = calls.count;
     this.toolNames = calls.names;
+    // The answer's checks, of the same request and whole answer as the verdict, whatever follows. Read here, with the
+    // verdict, not once the answer went out: the answer is read whole and made ready before any of it goes, and reading
+    // them after its delivery would keep its parse alive while the client reads, which the answer's weight no longer
+    // counts from here (review r14 output-class finding 7).
+    attempt.checks = this.deps.gate.responseChecks(a.contract, { protocol: upstream, body: payload });
     const verdict = this.deps.gate.inspectResponse(a.contract, { protocol: upstream, body: payload }, a.answerLimit);
     if (!this.inspected(verdict, true)) return uncommitted(this.defect(attempt, "upstream_trust_policy_rejected", false));
     const rawUsage = bufferedUsage(upstream, payload) ?? null;
     const reported = isObject(rawUsage) && parsedAnswer.usage !== null;
-    const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage);
+    const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
     if (!settled.ok) {
       if (!grayAfterCheck(settled)) return uncommitted({ ...this.defect(attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });
       this.commit(d, attempt);
@@ -7549,6 +7786,108 @@ type PeerOutcome =
   | { readonly kind: "relay_failed"; readonly code: string };
 
 /**
+ * The longest an entry waits for the hop's `end` after the request path failed a peer answer before it (Gray's error
+ * frame after a stream the stack VM's gate refused; review r14 lane-wire finding 10), for the attempt's answer checks
+ * alone: 500 ms. The stack VM writes `end` right after that frame, once it closed the rid at egress (a call within its
+ * own VM) and signed its receipt (lane/backend.ts `run`), on the hop already open, so a few milliseconds is the rule. The
+ * bound is PEER_FOLLOW_UP_MS's floor (egress's -peer-connect-timeout default), within what the request's pre phase has
+ * left; the follow-up that may come after keeps its own. An `end` not in by then counts nothing, and the attempt closes as
+ * it did.
+ */
+const PEER_END_WAIT_MS = 500;
+
+/**
+ * A peer answer as the request path reads it (`InferenceRun.prime`, then the relay), whose letting go of the answer does
+ * not close the hop at once, for the `end` the stack VM writes after its last frame, once it closed its rid at egress
+ * and signed its receipt (lane/backend.ts `run`): the attempt's answer checks come with it (review r14 lane-wire finding
+ * 10, whole-pr blocker 1). Priming lets go of an answer that ended with an error event at once (relay.ts
+ * `primeStream`, which frees a vendor's slot so), and the relay of a stream that failed after its commit lets go of it
+ * too (relay.ts `fail`), both before that `end` is in.
+ *
+ * Before the commit, a let-go is kept back until `commit` (then passed on at once, as before) or until the attempt
+ * closes the call (`peerUncommitted`: `endWithin`, then `close`). From the commit, a let-go stops the relay's reading
+ * here, and so does `closeAfterEnd`, which takes the place of the attempt's abort of an upstream that may still work
+ * (`InferenceRun.relay`): the hop is let go of, and the attempt's fetch aborted (`abort`), once `end` is in (the hop
+ * then ended itself: nothing is left to close), PEER_END_WAIT_MS later at most, or when the call closes first
+ * (`finishPeer`). Nothing the client was sent waits for it: the relay wrote its error frame and settled before
+ * (`end.usage` included). The hop is read one frame ahead meanwhile: this stream's own pull, and below it the call's
+ * body's (each pulls again while its queue is empty), so the `end` that follows the last frame read lands in `ended`.
+ */
+function endKept(response: Response, timers: StreamTimers, abort: (reason: unknown) => void): { readonly response: Response; commit(): void; closeAfterEnd(reason: unknown): void } {
+  const source = response.body;
+  if (source === null) return { response, commit: () => {}, closeAfterEnd: abort };
+  const reader = source.getReader();
+  let committed = false;
+  let kept: { readonly reason: unknown } | null = null;
+  let closing: unknown = null;
+  let closingReason: unknown = undefined;
+  let over = false;
+  /** The hop is let go of: cancelled, and with `abortToo`, the attempt's fetch aborted. */
+  const letGo = (reason: unknown, abortToo: boolean): void => {
+    if (over) return;
+    over = true;
+    if (closing !== null) timers.clearTimeout(closing);
+    closing = null;
+    reader.cancel(reason).catch(() => {});
+    if (abortToo) abort(reason);
+  };
+  /** The hop has ended (its `end`, or without it): nothing is left to let go of. */
+  const ended = (): void => {
+    over = true;
+    if (closing !== null) timers.clearTimeout(closing);
+    closing = null;
+  };
+  const closeAfterEnd = (reason: unknown): void => {
+    if (reason !== undefined) closingReason = reason;
+    if (over || closing !== null) return;
+    closing = timers.setTimeout(() => letGo(closingReason, true), PEER_END_WAIT_MS);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let read: ReadableStreamReadResult<Uint8Array>;
+      try {
+        read = await reader.read();
+      } catch (error) {
+        const lettingGo = kept !== null || closing !== null;
+        ended();
+        // Let go of meanwhile, the read's failure is the call's alone; else it is the answer's.
+        if (!lettingGo) controller.error(error);
+        return;
+      }
+      if (read.done) ended();
+      try {
+        if (read.done) controller.close();
+        else controller.enqueue(read.value);
+      } catch {
+        // Let go of meanwhile: what the hop still sends (its `end`) is the call's alone.
+      }
+    },
+    cancel(reason) {
+      if (!committed) kept = { reason };
+      else closeAfterEnd(reason);
+    },
+  });
+  return {
+    response: new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }),
+    commit: () => {
+      committed = true;
+      if (kept !== null) letGo(kept.reason, false);
+    },
+    closeAfterEnd,
+  };
+}
+
+/**
+ * A peer attempt's answer checks: the ones its stack VM computed with the gate code the entry runs and sent in `end`
+ * (docs/error-rates.md, The TEE lane), none when `end` did not come or carried none (a stack VM before them). Never the
+ * entry's own gate's: the entry gets no byte of an answer the stack VM refused.
+ */
+function peerChecks(end: PeerEndDto | null): AnswerChecks {
+  const checks = end?.checks;
+  return checks === undefined ? UNCOUNTED_CHECKS : { toolCallCheck: checks.tool_call_check, outputCheck: checks.output_check };
+}
+
+/**
  * What an entry's hop answer that did not commit ends as (section 4.7): `end.outcome` `not_dialed` is the next route's,
  * `vendor_error` the vendor's own error body (`data`), `relay_failed` Gray's `lane_relay_failed`. A `served` or `cut`
  * end with a head that is not 200 is not one the backend writes (its head is 200 once bytes are released): Gray's 502.
@@ -7643,6 +7982,27 @@ const REFUSED_AS: Readonly<Record<FinishError["kind"], string>> = {
   output_over_limit: "upstream_usage_exceeds_limit",
   image_usage_unsplit: "image_usage_unsplit",
 };
+
+/** What a settlement reads of an answer's end (@gray/protocol answer-end.ts): a failure whatever the usage, and whether a buffered answer has no stop reason. */
+interface SettleEnd {
+  readonly failure: AnswerEndFailure | undefined;
+  readonly unfinished: boolean;
+}
+
+/** `SettleEnd` of a buffered answer: its body, as `upstream` answered it, and the stop `parseResponse` read of it. */
+function bufferedEnd(upstream: Protocol, payload: Json, finish: FinishReason | null): SettleEnd {
+  return { failure: AnswerEnd.of(upstream, payload), unfinished: unfinished(upstream, payload, finish) };
+}
+
+/**
+ * The model's refusal a buffered answer of `upstream` is (a Gemini one's, `GeminiRefusal`), unless its end is its
+ * chain's failure (`AnswerEnd`): a candidate stopped for the supplier's account fails the answer as the supplier's,
+ * whatever its other candidates say.
+ */
+function refusedOf(upstream: Protocol, payload: Json): string | undefined {
+  if (upstream !== "gemini" || AnswerEnd.of(upstream, payload) !== undefined) return undefined;
+  return GeminiRefusal.of(payload);
+}
 
 /**
  * The settlement of a buffered answer whose usage did not parse into counters (inference.rs `buffered`):

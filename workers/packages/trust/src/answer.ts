@@ -33,11 +33,12 @@
  * SSE client acts on each event.
  */
 import { type Json, asStr } from "@gray/json";
-import type { PathKey, ProjectionObserver, Protocol } from "@gray/protocol";
+import type { PathKey, ProjectionObserver, Protocol, ToolCallCheck } from "@gray/protocol";
 import { withCompileAllowance } from "./engine.ts";
 import { MAX_TOOLS } from "./limits.ts";
 import { type GateRequest, ToolSchemas, type TrustPolicy } from "./policy.ts";
 import { type Call, EXECUTABLE_KEYS, GEMINI_ACCOMPANYING, GEMINI_REFUSED, GEMINI_VARIANTS, TEXT_PARTS, chatToolCall, contentCalls, responseItemCalls } from "./shapes.ts";
+import { ToolCallTally } from "./tool-call-check.ts";
 import { type TrustViolation, attempt, refuse } from "./violations.ts";
 
 /** What an entry is known to be so far. */
@@ -82,6 +83,8 @@ export class AnswerCallCheck implements ProjectionObserver {
   private calls = 0;
   /** The refusal of an entry's check, or of the request's tools; nothing goes out once set. */
   refused: TrustViolation | undefined;
+  /** What `toolCallCheck` reads: the checks' own findings (src/tool-call-check.ts). */
+  private readonly tally = new ToolCallTally();
 
   constructor(policy: TrustPolicy, gate: GateRequest, protocol: Protocol, argumentLimit: number) {
     this.policy = policy;
@@ -92,8 +95,24 @@ export class AnswerCallCheck implements ProjectionObserver {
       attempt(() => {
         if (gate.request.protocol !== protocol) refuse("trust_protocol_mismatch");
         policy.checkTools(gate, { admitted: true });
-      }),
+      }, this.tally),
     );
+  }
+
+  /**
+   * The answer's tool-call check once an entry's check refused it on the way (docs/error-rates.md
+   * "Tool calls", r14): the gateway reads no byte after that, so `TrustPolicy.responseToolCallCheck`
+   * has no answer to read. The refusal counts as its site says: `missing_name` (case 4), `refused`
+   * (case 5), or null for a refusal that is no tool-call error of the provider's (Gray's own rules
+   * and limits, the request's tools, a shape the gate cannot read): not counted. Null too while
+   * nothing refused, when `responseToolCallCheck` on the whole answer is the check, so a caller reads
+   * this one only when `refused` is set. The finish reason comes after the entries it reads, so a
+   * truncated answer refused on the way is not `truncated` here, as it is from the whole answer, nor a filtered one null
+   * (default 2; the `trust` area's declared difference, conformance/README.md).
+   */
+  toolCallCheck(): ToolCallCheck | null {
+    if (this.refused === undefined) return null;
+    return this.tally.check(this.policy.mode, this.gate.request.tools.length > 0, true);
   }
 
   /** The first byte that may not go out yet (+Infinity when none is held). After a refusal nothing more goes. */
@@ -155,8 +174,8 @@ export class AnswerCallCheck implements ProjectionObserver {
         read(calls);
         this.calls += calls.length;
         if (this.calls > MAX_TOOLS) refuse("trust_payload_limit");
-        for (const [name, args] of calls) this.policy.inspectCall(this.gate, this.schemas, name, args, [], this.argumentLimit);
-      }),
+        for (const [name, args, reading] of calls) this.policy.inspectCall(this.gate, this.schemas, name, args, [], this.argumentLimit, this.tally, reading);
+      }, this.tally),
     );
     if (violation !== undefined) {
       this.refused = violation;

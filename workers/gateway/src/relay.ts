@@ -1,6 +1,7 @@
 import { Preamble } from "@gray/errors";
 import type { Json } from "@gray/json";
 import {
+  type AnswerChecks,
   type CanonicalEvent,
   type GeminiRefusal,
   type OutputLimit,
@@ -259,8 +260,14 @@ export interface StreamRelayInput {
   readonly stalledEnd?: Uint8Array;
 }
 
-/** How a relayed stream ended. */
-export type StreamEnd =
+/**
+ * How a relayed stream ended, with the attempt's two answer checks (docs/error-rates.md, r14): the inspector's
+ * (`StreamInspector.checks`), read once as the stream ended, told whether it reached the inspector's `finish`, whatever
+ * that decided and whatever failed after it. Which of them count is the request's to say (sinks.ts `countedChecks`).
+ */
+export type StreamEnd = RelayEnd & { readonly checks: AnswerChecks };
+
+type RelayEnd =
   /**
    * Charged; `delivered`: the client was still there and took every held frame. A client that left has
    * every frame it did not take in the request's content all the same (`sink`): the answer is whole.
@@ -427,8 +434,20 @@ export class UpstreamReader {
  * Relays one stream to its end. Returns how it ended; on `failed` the caller sends the error event
  * (nothing held was released), on `settled` every held frame went out (or the client left while they
  * did); the caller releases the hold and the permit accordingly.
+ *
+ * The attempt's answer checks are read once (`StreamInspector.checks`), as the stream ends: `finished` once the relay
+ * reached the inspector's `finish`, whatever it decided and whatever failed after it (the stream's tail, a repair, the
+ * charge), not finished for a stream that failed before (a frame refused, a cut, a silence, the client gone). They are
+ * read after the stream's end went out, a settled stream's after its held frames (`upstreamDone` comes before them),
+ * so the observer's work never delays the answer (review r14 output-class finding 7); every end carries them.
  */
 export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
+  const reached = { finish: false };
+  const end = await relayAnswer(input, reached);
+  return { ...end, checks: input.inspector.checks(reached.finish) };
+}
+
+async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }): Promise<RelayEnd> {
   const { protocol, client, presence, inspector, stage, clock } = input;
   const gated = inspector.holdsToolCalls || stage !== null;
   const decoder = new ProtocolStreamDecoder(protocol);
@@ -470,10 +489,10 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
     code: string,
     reason: string,
     why: string,
-    supplierFailure: Extract<StreamEnd, { kind: "failed" }>["supplierFailure"],
+    supplierFailure: Extract<RelayEnd, { kind: "failed" }>["supplierFailure"],
     stillWorking: boolean,
     stopped: Uint8Array | null = null,
-  ): StreamEnd => {
+  ): RelayEnd => {
     if (stillWorking) upstream.cancel();
     // What Gray prepared and never released goes to the request, which may keep it as the answer not sent
     // (main 9da4b74c, `keep_unsent`): the held frames, then the frame a check stopped.
@@ -481,7 +500,7 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
     if (unsent.length > 0) input.unsent?.(unsent);
     return { kind: "failed", code, reason, why, supplierFailure, upstreamMayStillWork: stillWorking, received };
   };
-  const left = (why: string): StreamEnd => {
+  const left = (why: string): RelayEnd => {
     upstream.cancel();
     return { kind: "client_left", why, received };
   };
@@ -492,8 +511,8 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
   // answer limit is checked before), so the supplier did nothing wrong. The stream ends as an
   // upstream failure would for the client (upstream_stream_limit: "not charged"), free, and the
   // endpoint's breaker does not count it.
-  const heldTooMuch = (stillWorking: boolean): StreamEnd => ({
-    ...(fail("upstream_stream_limit", "upstream_stream_limit", `what the stream holds passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds`, null, stillWorking) as Extract<StreamEnd, { kind: "failed" }>),
+  const heldTooMuch = (stillWorking: boolean): RelayEnd => ({
+    ...(fail("upstream_stream_limit", "upstream_stream_limit", `what the stream holds passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds`, null, stillWorking) as Extract<RelayEnd, { kind: "failed" }>),
     limitSource: "gateway_memory",
   });
   /**
@@ -504,7 +523,7 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
    * the same bound, so it is the one reached first then), else past what the isolate's answers hold
    * together (gateway_capacity).
    */
-  const weighed = (stillWorking: boolean): StreamEnd | null => {
+  const weighed = (stillWorking: boolean): RelayEnd | null => {
     const weight = streamWeight({ heldBytes, heldFrames: held.length, frames, queuedBytes: upstream.queuedBytes, queuedChunks: upstream.queuedChunks, decoder, inspector, stage, repairs });
     const frame = frames.length + upstream.queuedBytes;
     input.retained?.set("held", heldBytes);
@@ -518,7 +537,7 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
   };
   const ids = input.ids ?? null;
   /** A failure of the answer's tool-call ids: too many id bytes is the route's (`upstream_tool_call_ids_too_large`), a rewrite that missed a site is not. */
-  const idFailure = (error: ToolIdFailure, stillWorking: boolean): StreamEnd => fail(error.code, error.code, error.message, error.code === TOOL_ID_CODES.tooLarge ? "invalid_response" : null, stillWorking);
+  const idFailure = (error: ToolIdFailure, stillWorking: boolean): RelayEnd => fail(error.code, error.code, error.message, error.code === TOOL_ID_CODES.tooLarge ? "invalid_response" : null, stillWorking);
   const inspected = (verdict: GateVerdict): boolean => {
     input.onVerdict?.(verdict);
     return verdict.ok;
@@ -564,7 +583,7 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
   };
 
   /** Decodes, inspects and releases or holds every complete frame; a failure or the client's leaving ends it. */
-  const drain = async (): Promise<StreamEnd | null> => {
+  const drain = async (): Promise<RelayEnd | null> => {
     for (let frame = frames.nextFrame(); frame !== undefined; frame = frames.nextFrame()) {
       let events: CanonicalEvent[];
       try {
@@ -654,7 +673,7 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
             : `the request deadline passed, ${since}`
           : `the upstream was silent past its limit, ${since}`;
     return {
-      ...(fail(code, code, why, next.kind === "broken" ? "upstream_error" : "timeout", true) as Extract<StreamEnd, { kind: "failed" }>),
+      ...(fail(code, code, why, next.kind === "broken" ? "upstream_error" : "timeout", true) as Extract<RelayEnd, { kind: "failed" }>),
       silenceMs,
       ...(next.kind === "deadline" && received > 0 ? { cutByDeadline: true } : {}),
     };
@@ -699,6 +718,8 @@ export async function relayStream(input: StreamRelayInput): Promise<StreamEnd> {
   }
   const overAtEnd = weighed(false);
   if (overAtEnd !== null) return overAtEnd;
+  // The stream reached its finish: its answer checks read as finished, whatever follows (`relayStream`).
+  reached.finish = true;
   const finished = inspector.finish();
   if (!inspected(finished)) return fail("upstream_trust_policy_rejected", "upstream_trust_policy_rejected", refusal(finished), "invalid_response", false);
   // A forwarded Responses call whose deltas fall short of its done item goes out with the done item's

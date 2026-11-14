@@ -22,6 +22,7 @@ import type { Json } from "@gray/json";
 import {
   type CanonicalEvent,
   type Protocol,
+  type ToolCallCheck,
   type Usage,
   GeminiRefusal,
   ProtocolError,
@@ -207,6 +208,8 @@ export class ToolGate {
   private readonly limit: number;
   private readonly onEvents: ((events: readonly CanonicalEvent[]) => void) | undefined;
   private readonly translation: StreamStage | undefined;
+  /** The end-of-stream checks ran (`toolCallCheck`). */
+  private finished = false;
 
   constructor(policy: TrustPolicy, gate: GateRequest, options: GateOptions) {
     this.decoder = new ProtocolStreamDecoder(gate.request.protocol);
@@ -325,6 +328,7 @@ export class ToolGate {
       // The rest of the stream is its last frame, perhaps without its blank line or ending in a lone CR.
       if (this.translation === undefined) this.hold(this.stand.rewriteFrame(tail, events));
       else this.hold(this.stage(() => (this.translation as StreamStage).push(events)));
+      this.finished = true;
       if (!this.record(this.check.finish(), findings)) throw new GateFailed("upstream_trust_policy_rejected");
       // The decoder finished, so the stream ended with its terminal event; whether it reported the
       // usage Gray bills from is the settlement's to say.
@@ -339,6 +343,14 @@ export class ToolGate {
       if (error instanceof GateFailed) return { ok: false, status: 502, code: error.code, findings };
       throw error;
     }
+  }
+
+  /**
+   * The stream's tool-call check (`StreamCheck.toolCallCheck`), read once it ended: finished when the decoder finished
+   * and the end-of-stream checks ran, whatever they decided.
+   */
+  toolCallCheck(): ToolCallCheck | null {
+    return this.check.toolCallCheck(this.finished);
   }
 
   private hold(chunk: Uint8Array): void {
@@ -402,6 +414,8 @@ export class OpenGate {
   private holdingNow = false;
   private held: Uint8Array[] = [];
   private receivedBytes = 0;
+  /** The decoder finished (`toolCallCheck`). */
+  private finished = false;
 
   constructor(policy: TrustPolicy, gate: GateRequest, options: Omit<GateOptions, "translation">) {
     this.decoder = new ProtocolStreamDecoder(gate.request.protocol);
@@ -432,6 +446,11 @@ export class OpenGate {
   /** The null members left out of the client's frames so far, as JSON pointers (the request log's `dropped_nulls`). */
   get droppedNulls(): readonly string[] {
     return this.stand.dropped;
+  }
+
+  /** The stream's tool-call check (`StreamCheck.toolCallCheck`), read once it ended: finished when the decoder finished. */
+  toolCallCheck(): ToolCallCheck | null {
+    return this.check.toolCallCheck(this.finished);
   }
 
   private inspect(events: readonly CanonicalEvent[], findings: Finding[]): void {
@@ -502,6 +521,7 @@ export class OpenGate {
       } catch {
         throw new GateFailed("upstream_stream_incomplete");
       }
+      this.finished = true;
       this.inspect(events, findings);
       this.onEvents?.(events);
       this.stand.observeContent(events);

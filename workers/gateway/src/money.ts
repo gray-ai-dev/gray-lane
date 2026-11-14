@@ -1,5 +1,6 @@
 import { customerRate, type CustomerRate, type MediaRates } from "@gray/holds";
-import type { BilledTokens } from "@gray/protocol";
+import { customerRates, type FinalizationEvidence } from "@gray/ledger-keys";
+import { tokenSides, usageCostParts as counterCostParts, type BilledTokens } from "@gray/protocol";
 import type { SupplierQuote } from "./snapshot.ts";
 
 /**
@@ -153,20 +154,108 @@ export function pricesModalities(media: MediaRates): boolean {
 const I64_MAX = 0x7fff_ffff_ffff_ffffn;
 
 /**
- * `usage_cost`: uncached input, cache reads, default (5-minute) cache writes and 1-hour cache writes
- * at their own rates, rounded up together to a whole micro-USD, plus output rounded up on its own.
+ * The input side and the output side of a charge billed by tokens, each a whole micro-USD rounded up on its own,
+ * whose sum the charge is: a text charge's two parts (gray-ledger `usage_cost_parts`; text usage has no units), and
+ * what @gray/protocol `tokenSides` gives of any other charge billed by tokens.
+ */
+export interface TokenSides {
+  readonly input: bigint;
+  readonly output: bigint;
+}
+
+/** The two sides as a request's record keeps them (`RequestRecord.chargedInputMicrousd`, `chargedOutputMicrousd`). */
+export interface RecordedSides {
+  readonly input: number;
+  readonly output: number;
+}
+
+/**
+ * What a settled charge's record keeps of its two sides: the sides, or none; and whether none is a `mismatch`, a
+ * charge billed by tokens whose sides are missing or are not the settled charge, which the request path alerts on
+ * (`chargeSidesMismatch`).
+ */
+export interface SettledSides {
+  readonly sides: RecordedSides | null;
+  readonly mismatch: boolean;
+}
+
+/**
+ * The two sides the record of a settled charge keeps (docs/effective-prices.md): `sides` as safe integers, when they
+ * add up to `amount`, the charge the shard settled. None for a charge billed by units, which `unit` names and which
+ * has none. None too, as a mismatch, for a charge billed by tokens (no `unit`) whose sides are missing, do not add up
+ * to the settled amount or are past the safe integers: a record never states two sides that are not its charge. The
+ * shard settles the amount it is sent (@gray/account rules.ts) and a token charge is priced as its two sides, so a
+ * mismatch is a fault of Gray's own to look into, not a state to expect.
+ */
+export function recordedSides(sides: TokenSides | null, amount: number, unit: string | null): SettledSides {
+  if (sides === null) return { sides: null, mismatch: unit === null };
+  const input = safeAmount(sides.input);
+  const output = safeAmount(sides.output);
+  return input === undefined || output === undefined || input + output !== amount ? { sides: null, mismatch: true } : { sides: { input, output }, mismatch: false };
+}
+
+/**
+ * The alert line of a settled token charge whose two sides are missing or are not that charge (`recordedSides`): the
+ * request, the endpoint that served it, the charge as settled and the two sides as priced (null when there were none),
+ * as text since they may be past 2^53. Amounts and ids only, so a lane says the same line (`laneSafeLog` finds nothing
+ * to drop).
+ */
+export function chargeSidesMismatch(requestId: string, endpoint: string, sides: TokenSides | null, amount: number): Record<string, unknown> {
+  return {
+    level: "alert",
+    event: "charge_sides_mismatch",
+    request_id: requestId,
+    endpoint,
+    charged_microusd: amount,
+    input_microusd: sides === null ? null : String(sides.input),
+    output_microusd: sides === null ? null : String(sides.output),
+  };
+}
+
+/**
+ * The two sides of a charge priced from its evidence (apis.ts `settle`: @gray/ledger-keys `usageCost` of the evidence's
+ * usage at its customer rates, which gives the sum alone): the same usage at the same rates through @gray/protocol's
+ * copy of the arithmetic, which gives the parts. Null for a charge billed by units, which the evidence names, and for
+ * an amount the ledger refuses.
+ */
+export function evidenceSides(evidence: FinalizationEvidence): TokenSides | null {
+  const r = customerRates(evidence);
+  const parts = counterCostParts(evidence.usage, {
+    input: r.input,
+    cacheRead: r.cache_read,
+    cacheWrite: r.cache_write,
+    cacheWrite1h: r.cache_write_1h,
+    output: r.output,
+    imageInput: r.image_input,
+    audioInput: r.audio_input,
+    imageOutput: r.image_output,
+    audioOutput: r.audio_output,
+    unit: r.unit,
+  });
+  return parts === undefined ? null : tokenSides(parts, evidence.unit);
+}
+
+/**
+ * `usage_cost_parts`: uncached input, cache reads, default (5-minute) cache writes and 1-hour cache writes
+ * at their own rates, rounded up together to a whole micro-USD, and output rounded up on its own.
  * Undefined where gray-ledger refuses the amount: cache subsets larger than their totals, or a sum
  * outside i64.
  */
-export function usageCost(tokens: BilledTokens<bigint>, rates: TextRates): bigint | undefined {
+export function usageCostParts(tokens: BilledTokens<bigint>, rates: TextRates): TokenSides | undefined {
   const uncached = tokens.input - tokens.cache_read - tokens.cache_write;
   const defaultWrites = tokens.cache_write - tokens.cache_write_1h;
   if (uncached < 0n || defaultWrites < 0n) return undefined;
   const input = uncached * rates.input + tokens.cache_read * rates.cacheRead + defaultWrites * rates.cacheWrite + tokens.cache_write_1h * rates.cacheWrite1h;
   const output = tokens.output * rates.output;
   const ceil = (micro: bigint) => (micro + 999_999n) / 1_000_000n;
-  const cost = ceil(input) + ceil(output);
-  return cost > I64_MAX ? undefined : cost;
+  const parts = { input: ceil(input), output: ceil(output) };
+  return parts.input + parts.output > I64_MAX ? undefined : parts;
+}
+
+/** `usage_cost`: the charge, the sum of its two sides (`usageCostParts`); undefined where gray-ledger refuses the amount. */
+export function usageCost(tokens: BilledTokens<bigint>, rates: TextRates): bigint | undefined {
+  const parts = usageCostParts(tokens, rates);
+  return parts === undefined ? undefined : parts.input + parts.output;
 }
 
 /** A micro-USD amount as the account shards take it: a safe integer (docs/cloudflare-native.md 6.2); undefined beyond. */

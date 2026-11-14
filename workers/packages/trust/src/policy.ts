@@ -16,7 +16,7 @@
  * Rust keeps as `raw_body`; `undefined` is Rust's `None`.
  */
 import { type Json, get, isObject, pointer, serializedLength, utf8Length } from "@gray/json";
-import type { CanonicalEvent, CanonicalRequest, Protocol } from "@gray/protocol";
+import { type CanonicalEvent, type CanonicalRequest, type FinishReason, type Protocol, ProtocolError, type ToolCallCheck, parseResponse } from "@gray/protocol";
 import { AnswerCallCheck } from "./answer.ts";
 import { type TrustMode, type TrustPolicyConfig, TrustConfigError, parseTrustPolicyConfig } from "./config.ts";
 import { inspectToolDeclarations, inspectToolSelection } from "./declarations.ts";
@@ -27,7 +27,8 @@ import { type SchemaValidator, schemaCompiles, schemaValidator, withinCompileBud
 import { inspectNativeStream, responseCalls } from "./shapes.ts";
 import { StreamToolInspector } from "./inspector.ts";
 import { type StreamCheck, type StreamCheckOptions, streamCheck } from "./stream.ts";
-import { type InspectionResult, NOTHING_FOUND, type TrustViolation, attempt, pass, refuse } from "./violations.ts";
+import { type ArgumentsReading, ToolCallTally, callCheck } from "./tool-call-check.ts";
+import { type InspectionResult, NOTHING_FOUND, type TrustViolation, attempt, countedAs, pass, refuse } from "./violations.ts";
 
 /** A canonical request with the native body it was parsed from (Rust's `raw_body`). */
 export interface GateRequest {
@@ -39,6 +40,16 @@ export interface GateRequest {
 export interface GateAnswer {
   readonly protocol: Protocol;
   readonly body: Json;
+}
+
+/** The finish reason of a non-streaming answer, as `parseResponse` reads it (Rust's `CanonicalResponse::finish_reason`); null for one it cannot read. */
+function answerFinish(answer: GateAnswer): FinishReason | null {
+  try {
+    return parseResponse(answer.protocol, answer.body).finish_reason;
+  } catch (error) {
+    if (error instanceof ProtocolError) return null;
+    throw error;
+  }
 }
 
 function problem(message: string): never {
@@ -212,15 +223,21 @@ export class TrustPolicy {
   inspectResponse(gate: GateRequest, answer: GateAnswer, argumentLimit = Number.MAX_SAFE_INTEGER): InspectionResult {
     if (this.config.mode === "off") return { ok: true, inspection: NOTHING_FOUND };
     const passed: TrustViolation[] = [];
+    return this.decision(this.walkResponse(gate, answer, passed, argumentLimit), passed);
+  }
+
+  /** `walk_response`: `inspectResponse`'s checks, noting what the answer's tool-call check needs in `tally`. */
+  private walkResponse(gate: GateRequest, answer: GateAnswer, passed: TrustViolation[], argumentLimit: number, tally?: ToolCallTally): TrustViolation | undefined {
     const schemas = new ToolSchemas();
-    const violation = withCompileAllowance(schemas.allowance, () => attempt(() => {
-      if (gate.request.protocol !== answer.protocol) refuse("trust_protocol_mismatch");
-      this.checkTools(gate, { admitted: true });
-      for (const [name, args] of responseCalls(answer.protocol, answer.body)) {
-        this.inspectCall(gate, schemas, name, args, passed, argumentLimit);
-      }
-    }));
-    return this.decision(violation, passed);
+    return withCompileAllowance(schemas.allowance, () =>
+      attempt(() => {
+        if (gate.request.protocol !== answer.protocol) refuse("trust_protocol_mismatch");
+        this.checkTools(gate, { admitted: true });
+        for (const [name, args, reading] of responseCalls(answer.protocol, answer.body)) {
+          this.inspectCall(gate, schemas, name, args, passed, argumentLimit, tally, reading);
+        }
+      }, tally),
+    );
   }
 
   /**
@@ -229,22 +246,29 @@ export class TrustPolicy {
    * `StreamToolInspector` instead; one that declared none has nothing to hold, so each call (to a tool
    * the client did not declare) is passed and recorded as it arrives.
    */
-  inspectStreamEvents(gate: GateRequest, events: readonly CanonicalEvent[]): InspectionResult {
+  inspectStreamEvents(gate: GateRequest, events: readonly CanonicalEvent[], tally?: ToolCallTally): InspectionResult {
     if (this.config.mode === "off") return { ok: true, inspection: NOTHING_FOUND };
     const { request } = gate;
     const undeclared = request.tools.length === 0;
     const passed: TrustViolation[] = [];
+    // The batch's finish reason first, as `StreamToolInspector.observe` notes it (review r14 finding 2).
+    for (const event of events) if (event.type === "finish") tally?.finish(event.reason);
     const violation = attempt(() => {
       for (const event of events) {
         if (event.type === "tool_call_delta" || event.type === "tool_call_complete") {
+          // A call the open stream does not inspect: not counted (null).
           if (!undeclared) refuse("trust_streaming_tools_unsupported");
           pass(passed, "trust_tool_not_allowed");
+          tally?.call("undeclared");
         } else if (event.type === "native") {
           if (event.protocol !== request.protocol) refuse("trust_protocol_mismatch");
-          if (inspectNativeStream(event.protocol, event.payload, undeclared).length > 0) pass(passed, "trust_tool_not_allowed");
+          if (inspectNativeStream(event.protocol, event.payload, undeclared).length > 0) {
+            pass(passed, "trust_tool_not_allowed");
+            tally?.call("undeclared");
+          }
         }
       }
-    });
+    }, tally);
     return this.decision(violation, passed);
   }
 
@@ -269,6 +293,20 @@ export class TrustPolicy {
    */
   answerCheck(gate: GateRequest, protocol: Protocol, argumentLimit = Number.MAX_SAFE_INTEGER): AnswerCallCheck | null {
     return this.holdsAnswerCalls() ? new AnswerCallCheck(this, gate, protocol, argumentLimit) : null;
+  }
+
+  /**
+   * A non-streaming answer's tool-call check (docs/error-rates.md "Tool calls", r14): the class of `answer` to `gate`,
+   * whatever `inspectResponse` decided for it, which it does not change; null in mode off. It walks the answer as
+   * `inspectResponse` does (src/tool-call-check.ts), its arguments unbounded (the answer itself is bounded by its
+   * limit before it is inspected), and reads the finish reason as `parseResponse` does.
+   */
+  responseToolCallCheck(gate: GateRequest, answer: GateAnswer): ToolCallCheck | null {
+    if (this.config.mode === "off") return null;
+    const tally = new ToolCallTally();
+    this.walkResponse(gate, answer, [], Number.MAX_SAFE_INTEGER, tally);
+    tally.finish(answerFinish(answer));
+    return tally.check(this.config.mode, gate.request.tools.length > 0, true);
   }
 
   /** Whether a non-streaming answer's calls are held until checked: enforce mode, whatever the request declared (an opaque shape is refused without any tool). */
@@ -334,29 +372,45 @@ export class TrustPolicy {
   /**
    * `inspect_call`: one call of an answer. A call to an undeclared tool, and arguments the declared
    * schema refuses, are noted in `passed` and let through; the rules below them still apply to the
-   * declared call, so a call is never refused less than its operator rules require.
+   * declared call, so a call is never refused less than its operator rules require. The call's case
+   * goes to `tally` when there is one (src/tool-call-check.ts), `reading` saying how its arguments read
+   * (`callCheck`).
    */
-  inspectCall(gate: GateRequest, schemas: ToolSchemas, name: string, args: Json, passed: TrustViolation[], argumentLimit: number): void {
-    withCompileAllowance(schemas.allowance, () => this.inspectCallWithin(gate, schemas, name, args, passed, argumentLimit));
+  inspectCall(gate: GateRequest, schemas: ToolSchemas, name: string, args: Json, passed: TrustViolation[], argumentLimit: number, tally?: ToolCallTally, reading?: ArgumentsReading): void {
+    withCompileAllowance(schemas.allowance, () => this.inspectCallWithin(gate, schemas, name, args, passed, argumentLimit, tally, reading));
   }
 
-  private inspectCallWithin(gate: GateRequest, schemas: ToolSchemas, name: string, args: Json, passed: TrustViolation[], argumentLimit: number): void {
+  private inspectCallWithin(gate: GateRequest, schemas: ToolSchemas, name: string, args: Json, passed: TrustViolation[], argumentLimit: number, tally: ToolCallTally | undefined, reading: ArgumentsReading | undefined): void {
     const { request, body } = gate;
+    tally?.call();
     const schema = schemas.declared(request, name);
     if (schema === undefined) {
       pass(passed, "trust_tool_not_allowed");
+      tally?.call("undeclared");
       return;
     }
-    // A declared tool the request's own selection excludes is one the client would run.
-    if (body !== undefined) inspectToolSelection(request, body, name);
-    if (request.tool_choice?.type === "none") refuse("trust_tool_not_allowed");
-    if (request.tool_choice?.type === "named" && request.tool_choice.name !== name) refuse("trust_tool_not_allowed");
+    // A declared tool the request's own selection excludes is one the client would run: against the
+    // request's tool choice (case 5), as the two rules below.
+    if (body !== undefined) countedAs("refused", () => inspectToolSelection(request, body, name));
+    if (request.tool_choice?.type === "none") refuse("trust_tool_not_allowed", "refused");
+    if (request.tool_choice?.type === "named" && request.tool_choice.name !== name) refuse("trust_tool_not_allowed", "refused");
     // Arguments are part of the answer that carries them: bounded by its limit, as serde_json writes them.
     if (serializedLength(args) > BigInt(argumentLimit)) refuse("trust_payload_limit");
     // The arguments are the upstream's: every format is decided as Rust does, `regex` included. Their
     // strings' translations are kept for this answer only, so a string it repeats, or that the operator
     // schema below checks too, is parsed once (`IsValidOptions`, src/pattern.ts `answerTranslations`).
-    if (!isObject(args) || !schema.isValid(args, { upstream: true })) pass(passed, "trust_invalid_tool_arguments");
+    // Arguments the regex engine could not decide are not valid, as before; the tool-call check does
+    // not count them (`SchemaVerdict`).
+    const verdict = isObject(args) ? schema.decide(args, { upstream: true }) : "invalid";
+    const valid = verdict === "valid";
+    if (!valid) pass(passed, "trust_invalid_tool_arguments");
+    // A JSON value field that holds no object is a schema mismatch whatever the schema says of the gate's reading.
+    if (verdict === "undecided" && reading !== "not_object") {
+      tally?.undecided();
+    } else {
+      const check = callCheck(reading, valid);
+      if (check !== undefined) tally?.call(check);
+    }
     // An operator schema is Gray's own rule: arguments it cannot read as an object, or refuses, are refused.
     const operator = this.operatorSchemas.get(name);
     if (operator !== undefined && (!isObject(args) || !operator.isValid(args, { upstream: true }))) refuse("trust_invalid_tool_arguments");

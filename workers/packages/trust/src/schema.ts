@@ -48,7 +48,7 @@ import {
 } from "./keywords.ts";
 import { METASCHEMAS } from "./metaschemas.ts";
 import { instanceValue, schemaValue } from "./numbers.ts";
-import { isRegexFormat } from "./pattern.ts";
+import { translate } from "./pattern.ts";
 import { RECENT_KEY_UNITS, Recent } from "./recent.ts";
 
 /** trust.rs `MAX_SCHEMA_BYTES`: a schema larger than this, as serde_json writes it, is refused. */
@@ -140,6 +140,13 @@ const drafts = new Map<DraftName, Draft>();
  */
 let rememberRegexFormat = true;
 
+/**
+ * A `format: "regex"` string the validation running now could not decide: more than the regex engine's
+ * largest instance can parse (src/pattern.ts `translate`'s `undecided`), where Rust parses it. It reads
+ * as no regex, as before; `decide` reads the instance as undecided (review r14 output-class finding 2b).
+ */
+let regexUndecided = false;
+
 /** A draft with the gate's keywords and the formats jsonschema asserts in it. */
 function gateDraft(name: DraftName): Draft {
   let draft = drafts.get(name);
@@ -171,10 +178,14 @@ function gateDraft(name: DraftName): Draft {
       const check = extended.formats[format];
       if (check !== undefined) formats[format] = check;
     }
-    formats.regex = ({ node, pointer, data }) =>
-      typeof data !== "string" || isRegexFormat(data, rememberRegexFormat)
-        ? undefined
-        : node.createError("format-regex-error", { value: data, pointer, schema: node.schema });
+    // src/pattern.ts `isRegexFormat`, noting a string it could not decide (`regexUndecided`).
+    formats.regex = ({ node, pointer, data }) => {
+      if (typeof data !== "string") return undefined;
+      const kind = translate(data, rememberRegexFormat).kind;
+      if (kind === "translated" || kind === "unsupported") return undefined;
+      if (kind === "undecided") regexUndecided = true;
+      return node.createError("format-regex-error", { value: data, pointer, schema: node.schema });
+    };
     // jsonschema's own readings (src/formats.ts), where the library's differ: its email takes neither
     // a display name, nor a UTF-8 local part, nor a quoted pair; its IP addresses take the empty string
     // and refuse an IPv6 address that starts with 0; its hostname refuses `--` in a label's third and
@@ -242,13 +253,26 @@ export interface IsValidOptions {
   readonly upstream?: boolean;
 }
 
+/**
+ * What a validation decided (`SchemaValidator.decide`): `undecided` when the regex engine could not
+ * answer (`RegexEngineUnavailable`: it trapped, the request's or answer's allowance ran out, or a text
+ * is too long for any of its instances), or the validation met a `format: "regex"` string more than
+ * the engine's largest instance can parse (`regexUndecided`), whatever it decided otherwise: where
+ * Rust's validator decides. Callers that count what an upstream sent take an undecided instance as not
+ * counted (the tool-call check: null; a structured output: `unknown`; docs/error-rates.md).
+ */
+export type SchemaVerdict = "valid" | "invalid" | "undecided";
+
 export interface SchemaValidator {
   /**
    * `Validator::is_valid`. A validation that throws is not valid: a `$ref` cycle it enters, or an
    * instance string under `format: "regex"` that is new to this isolate once the regex engine is over
-   * its budget (src/engine.ts), the one place a validation compiles a pattern.
+   * its budget (src/engine.ts), the one place a validation compiles a pattern. `decide` says which of
+   * these the regex engine could not answer; this reads them as invalid, as the gate's verdicts do.
    */
   isValid(instance: Json, options?: IsValidOptions): boolean;
+  /** `isValid`, with an instance the regex engine could not decide told apart (`SchemaVerdict`). */
+  decide(instance: Json, options?: IsValidOptions): SchemaVerdict;
 }
 
 /** Keywords whose values are data, not schemas: a `$ref` inside them is not a reference. */
@@ -489,16 +513,25 @@ function compileValidator(schema: Json, key: string): SchemaValidator | undefine
     if (error instanceof RegexEngineUnavailable) throw error;
     return undefined;
   }
+  // One validation: whether it holds, and whether it rests on something the regex engine could not decide.
+  const run = (instance: Json, options?: IsValidOptions): { readonly valid: boolean; readonly undecided: boolean } => {
+    rememberRegexFormat = options?.upstream !== true;
+    regexUndecided = false;
+    try {
+      const valid = node.validate(instanceValue(instance)).valid;
+      return { valid, undecided: regexUndecided };
+    } catch (error) {
+      return { valid: false, undecided: error instanceof RegexEngineUnavailable };
+    } finally {
+      rememberRegexFormat = true;
+      regexUndecided = false;
+    }
+  };
   return {
-    isValid(instance: Json, options?: IsValidOptions): boolean {
-      rememberRegexFormat = options?.upstream !== true;
-      try {
-        return node.validate(instanceValue(instance)).valid;
-      } catch {
-        return false;
-      } finally {
-        rememberRegexFormat = true;
-      }
+    isValid: (instance: Json, options?: IsValidOptions): boolean => run(instance, options).valid,
+    decide: (instance: Json, options?: IsValidOptions): SchemaVerdict => {
+      const { valid, undecided } = run(instance, options);
+      return undecided ? "undecided" : valid ? "valid" : "invalid";
     },
   };
 }

@@ -49,6 +49,7 @@ export {
   ToolGate,
 } from "./gate.ts";
 export { AnswerCallCheck } from "./answer.ts";
+export { type OutputAnswer, OutputObserver, asksForStructuredOutput, outputCheck } from "./output.ts";
 export { StreamToolInspector } from "./inspector.ts";
 export { MARKER_MAX_BYTES, MARKER_MIN_BYTES, MAX_TOOLS, TOOL_NAME_MAX_BYTES } from "./limits.ts";
 export { type CompiledPattern, compilePattern, isRegexFormat, translate, type Translation } from "./pattern.ts";

@@ -1,8 +1,9 @@
 import { type Json, JsonError } from "@gray/json";
 import { AnswerProjection, type ProjectionObserver, type Protocol, SCAN_KEY_ENTRY_BYTES, StrictJsonScan, editJson, parseProviderError } from "@gray/protocol";
 import { CODES as TOOL_ID_CODES, ToolIdFailure } from "@gray/tool-ids";
+import { asksForStructuredOutput } from "@gray/trust";
 import { type ClientPresence, ClientStream, type StreamTimers } from "./client.ts";
-import type { AnswerInspector } from "./gate.ts";
+import type { AnswerInspector, GateRequest } from "./gate.ts";
 import { NullUsageWatch, TeeListener, watchesNulls } from "./nulls.ts";
 import { UpstreamReader } from "./relay.ts";
 import type { AnswerShare, Retained } from "./retained.ts";
@@ -109,6 +110,17 @@ export function wholeAnswerWeight(raw: number, translated = 0): number {
 /** The top-level keys that can make a 2xx body an error (`parseProviderError`): the answer does not start while one is being read. */
 const ERROR_KEYS: ReadonlySet<string> = new Set(["error", "status", "type", "response"]);
 
+/**
+ * Whether a native non-streaming answer's projection keeps its text whole (docs/error-rates.md, r14): the request as
+ * sent upstream (the gate's contract) asks for structured output exactly as the output check reads it (@gray/trust
+ * `asksForStructuredOutput`: a JSON object or a JSON schema, and no Gemini native body whose mime type asks for plain
+ * text; review r14 output-class round 2 minor 9), and the gate counts the checks (`mode` not `off`). Otherwise the
+ * projection is what every other decision reads, its long strings cut, as before.
+ */
+export function keepsAnswerText(mode: string, gate: GateRequest): boolean {
+  return mode !== "off" && asksForStructuredOutput(gate);
+}
+
 export interface AnswerRelayInput {
   /** The upstream's protocol (a native answer: the client's too). */
   readonly protocol: Protocol;
@@ -134,6 +146,11 @@ export interface AnswerRelayInput {
   readonly drainMs: number;
   /** What the tool gate holds back; null when it holds nothing. */
   readonly inspector: AnswerInspector | null;
+  /**
+   * The projection keeps the answer's text whole (@gray/protocol `AnswerProjectionOptions.wholeText`), for the structured
+   * output check of a request that asked for it (`keepsAnswerText`); its bytes are weighed as every kept byte is.
+   */
+  readonly wholeText?: boolean;
   readonly retained: Retained;
   /** Gets the bytes in the order the client is sent them (the sealed content); null when nothing is kept. */
   readonly sink: AnswerSink | null;
@@ -171,8 +188,11 @@ export interface AnswerIdHooks {
 
 /** How reading the answer ended. */
 export type AnswerRead =
-  /** The upstream ended with one strict JSON document; `projection` is what the end checks read. */
-  | { readonly kind: "complete"; readonly projection: Json; readonly received: number }
+  /**
+   * The upstream ended with one strict JSON document; `projection` is what the end checks read, and `textCut` whether
+   * it cut a text of the answer (@gray/protocol `AnswerProjection.textCut`), which the output check reads as `unknown`.
+   */
+  | { readonly kind: "complete"; readonly projection: Json; readonly textCut: boolean; readonly received: number }
   | {
       readonly kind: "failed";
       readonly code: string;
@@ -223,7 +243,7 @@ export class AnswerRelay {
   constructor(input: AnswerRelayInput) {
     this.input = input;
     const ids = input.ids ?? null;
-    this.projection = new AnswerProjection(input.protocol, ids === null ? input.inspector : both(input.inspector, ids.sites));
+    this.projection = new AnswerProjection(input.protocol, ids === null ? input.inspector : both(input.inspector, ids.sites), input.wholeText === true ? { wholeText: true } : {});
     this.nulls = watchesNulls(input.protocol) ? new NullUsageWatch() : null;
     this.scan = new StrictJsonScan(this.nulls === null ? this.projection : new TeeListener(this.projection, this.nulls));
     this.upstream = new UpstreamReader(input.body, input.presence, input.clock);
@@ -282,7 +302,7 @@ export class AnswerRelay {
       return this.failed("invalid_upstream_json", "the answer is not strict JSON", "invalid_response", false);
     }
     this.nulls?.end();
-    return { kind: "complete", projection: this.projection.root as Json, received: this.received };
+    return { kind: "complete", projection: this.projection.root as Json, textCut: this.projection.textCut, received: this.received };
   }
 
   /** One chunk: scanned, kept, weighed, and what may go written (the response started first when it may). */

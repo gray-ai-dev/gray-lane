@@ -11,6 +11,7 @@
  *
  * One code is the TypeScript gate's own: `trust_tool_schemas_too_complex` (below).
  */
+import type { RefusalCheck, ToolCallTally } from "./tool-call-check.ts";
 
 export const TRUST_VIOLATIONS = [
   "trust_request_model_mismatch",
@@ -68,20 +69,33 @@ export const NOTHING_FOUND: TrustInspection = Object.freeze({ violations: Object
 
 /**
  * A refusal raised inside the gate and turned into a result at its edge (the Rust code's `?` on
- * `Result<_, TrustViolation>`). Never escapes the package.
+ * `Result<_, Refusal>`). Never escapes the package. `check` is how the answer's tool-call check counts
+ * it (src/tool-call-check.ts): null unless its site says otherwise.
  */
 export class Refusal extends Error {
   override readonly name = "Refusal";
   readonly violation: TrustViolation;
+  readonly check: RefusalCheck;
 
-  constructor(violation: TrustViolation) {
+  constructor(violation: TrustViolation, check: RefusalCheck = null) {
     super(violation);
     this.violation = violation;
+    this.check = check;
   }
 }
 
-export function refuse(violation: TrustViolation): never {
-  throw new Refusal(violation);
+export function refuse(violation: TrustViolation, check: RefusalCheck = null): never {
+  throw new Refusal(violation, check);
+}
+
+/** Runs `check`, counting a refusal it raises as `as` (`Refusal::counted`). */
+export function countedAs<T>(as: RefusalCheck, check: () => T): T {
+  try {
+    return check();
+  } catch (error) {
+    if (error instanceof Refusal) refuse(error.violation, as);
+    throw error;
+  }
 }
 
 /** Records a passed finding once (`pass`). */
@@ -89,13 +103,19 @@ export function pass(passed: TrustViolation[], violation: TrustViolation): void 
   if (!passed.includes(violation)) passed.push(violation);
 }
 
-/** Runs `check`, turning a refusal into its violation (Rust's `Result<(), TrustViolation>`). */
-export function attempt(check: () => void): TrustViolation | undefined {
+/**
+ * Runs `check`, turning a refusal into its violation (Rust's `Result<(), TrustViolation>`), and noting it in the
+ * answer's `tally` when there is one.
+ */
+export function attempt(check: () => void, tally?: ToolCallTally): TrustViolation | undefined {
   try {
     check();
     return undefined;
   } catch (error) {
-    if (error instanceof Refusal) return error.violation;
+    if (error instanceof Refusal) {
+      tally?.refused(error.check);
+      return error.violation;
+    }
     throw error;
   }
 }
