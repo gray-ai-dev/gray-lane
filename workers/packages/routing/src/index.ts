@@ -2050,7 +2050,11 @@ export {
   Preference,
   ROUTING_HEADER,
   type RequestedSort,
+  type RouteTag,
+  type Tags,
   type Taken,
+  parseTagPattern,
+  tagSentinel,
   affinityKey,
   affinityTtlMs,
 } from "./preferences.ts";

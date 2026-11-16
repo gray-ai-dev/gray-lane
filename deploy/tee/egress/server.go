@@ -98,8 +98,8 @@ type server struct {
 // be reached from the command line.
 func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logger) *server {
 	if dial == nil {
-		dialer := &net.Dialer{Timeout: cfg.dialTimeout, KeepAlive: 30 * time.Second}
-		dial = dialer.DialContext
+		// Every account-driven dial goes through it: no private or internal destination (dial_guard.go).
+		dial = accountDialer(cfg).DialContext
 	}
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
@@ -592,6 +592,10 @@ func mapUpstreamError(err error, spec *egressSpec, connected bool) mappedError {
 		return mappedError{code: errUpstreamFailed}
 	}
 	if isTLSError(err) {
+		// The handshake with an https proxy itself comes before any with the vendor: its failure is the proxy's.
+		if beforeProxyTunnel(err) {
+			return mappedError{code: errProxyFailed, stage: "connect"}
+		}
 		return mappedError{code: errTLSFailed}
 	}
 	if spec != nil {
@@ -606,6 +610,15 @@ func mapUpstreamError(err error, spec *egressSpec, connected bool) mappedError {
 	// D72: a direct request that never obtained a connection (dial or DNS)
 	// failed before the vendor was reached.
 	return mappedError{code: errConnectFailed}
+}
+
+// beforeProxyTunnel is a failure on the way to the proxy, before a tunnel exists: net/http wraps one in a
+// "proxyconnect" OpError (Go 1.27.2, net/http/transport.go:1871-1877: the dial to the proxy and an https proxy's own
+// TLS handshake), and the mirrored dial names an https proxy's handshake failure the same way (mirrorPool.tunnel).
+// The vendor's handshake is made inside the tunnel and is never wrapped so.
+func beforeProxyTunnel(err error) bool {
+	var operationError *net.OpError
+	return errors.As(err, &operationError) && operationError.Op == "proxyconnect"
 }
 
 func isTLSVerificationError(err error) bool {

@@ -125,7 +125,7 @@ export function readPeerAnswer(value: Json): ReadPeerAnswerResult {
   if (typeof nonce !== "string" || !HEX32.test(nonce)) return refuse("attestation.nonce is not 32 bytes as lower-case hex");
   if (typeof spki !== "string" || !HEX32.test(spki)) return refuse("attestation.tls_spki_sha256 is not 32 bytes as lower-case hex");
   if (typeof host !== "string" || (host !== "" && !HOST.test(host))) return refuse("attestation.host is not a lower-case host name or empty (a VM reached over its session)");
-  if (typeof relayId !== "string" || !STACK_RELAY_ID_PATTERN.test(relayId)) return refuse("attestation.relay_id is not a relay id");
+  if (typeof relayId !== "string" || !STACK_RELAY_ID_PATTERN.test(relayId)) return refuse("attestation.relay_id is not a deployment id");
   const receipt = get(value, "receipt");
   if (receipt === undefined) return refuse("receipt is missing (null when the stack VM holds none)");
   if (receipt !== null && !isObject(receipt)) return refuse("receipt is not a receipt document or null");
@@ -306,7 +306,7 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
   summary.compose_hash = v.composeHash;
   const listLine = verified.checks.find((check) => check.id === "release_list")?.detail ?? "";
   checks.push(pass(`${id}:attestation`, `stack VM ${served.host === "" ? "over its session" : served.host}: keyset ${v.keysetDigest}, stack release ${v.composeHash}, OS image ${v.osImageHash}; ${listLine}`));
-  checks.push(pass(`${id}:relay`, `relay ${facts.identity.relayId} runs ${relayImage} (signed by the relay key)`));
+  checks.push(pass(`${id}:relay`, `deployment ${facts.identity.relayId} runs ${relayImage} (signed by the deployment key)`));
 
   // 2. The commitment opens to this boot and the outer receipt's inner digest.
   const commitment = peerCommitment({
@@ -323,7 +323,7 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
   const receipt = answer.receipt;
   if (receipt === null) {
     const why = missingReason(attempt);
-    if (why === null) checks.push(fail(`${id}:inner_receipt`, "no inner receipt: the stack VM's record of what it did with the request (and what the relay changed) is missing"));
+    if (why === null) checks.push(fail(`${id}:inner_receipt`, "no inner receipt: the stack VM's record of what it did with the request (and what the deployment changed) is missing"));
     else checks.push(skip(`${id}:inner_receipt`, `none: ${why}`));
     return summary;
   }

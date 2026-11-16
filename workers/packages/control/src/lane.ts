@@ -90,12 +90,12 @@ export const LANE_MAPPING_PATH_RULE =
   "A confidential-lane mapping's native path is the vendor's own path for its protocol: /v1/messages on Anthropic's origin, /v1/chat/completions or /v1/responses on OpenAI's, /backend-api/codex/responses on the Codex backend's, and an OpenAI-compatible vendor's Chat Completions path on its origin.";
 export const LANE_PROBE_RULE = "A confidential-lane endpoint is verified by attestation and signatures in the lane, not by a console probe or benchmark: it accepts no probe and no benchmark.";
 export const LANE_KIND_RULE =
-  "An endpoint is a confidential-lane relay or a direct endpoint for its whole life: its auth kind, and the relay its stored credential names, cannot change. Register a new endpoint for the other kind, or for another relay.";
+  "An endpoint is a confidential-lane endpoint or a direct endpoint for its whole life: its auth kind, and the deployment its stored credential names, cannot change. Register a new endpoint for the other kind, or for another deployment.";
 export const LANE_CREDENTIAL_ROTATION_RULE =
-  "A confidential-lane endpoint holds no upstream key to rotate: its credential is the sentinel lane:<relay_id>, fixed by its lane record, and the relay's accounts are sealed to the TEE.";
+  "A confidential-lane endpoint holds no upstream key to rotate: its credential is the sentinel lane:<relay_id>, fixed by its lane record, and the deployment's accounts are sealed to the TEE.";
 /** The reason a lane relay's price is approved with when it is submitted, and the rule admission applies to one. */
 export const LANE_OFFER_RULE =
-  "A confidential-lane relay's price takes effect when it is submitted: relays set their own prices (a free market), and the lane verifies the relay by attestation and signatures, not by a console probe.";
+  "A confidential-lane endpoint's price takes effect when it is submitted: providers set their own prices (a free market), and the lane verifies the deployment by attestation and signatures, not by a console probe.";
 
 /** The vendor a lane endpoint's base URL names, or null when it names none (`@gray/lane` `checkOfficialUpstream`). */
 export function laneVendorOf(baseUrl: string): OfficialVendor | null {

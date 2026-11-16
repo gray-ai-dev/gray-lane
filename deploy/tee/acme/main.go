@@ -9,6 +9,14 @@
 // certificate obtained wins. The log names the issuing CA, the account URI (for the operator's CAA
 // `accounturi` record) and the certificate's SHA-256; never key material or EAB values.
 //
+// docs/design/entry-replicas.md ER5: an entry replica (TLS_REPLICA_DOMAIN, set by the lane's entrypoint) orders one
+// certificate for two names, the shared TLS_DOMAIN and its own replica name, and validates both by dns-01: the CA's
+// tls-alpn-01 connection for the shared name would land on any replica. The challenge TXT record is written by the
+// lane bridge (`acme.challenge`), never here: lego's own `httpreq` DNS provider posts `{fqdn, value}` to the
+// entrypoint's unix socket (ACME_DNS01_SOCKET, on the lane-only /run/lane tmpfs), and the entrypoint signs the bridge
+// call. So gray-acme holds no DNS credential and no bridge seed (D45, EI2). Without TLS_REPLICA_DOMAIN nothing of it
+// is configured: the order is for TLS_DOMAIN alone, by tls-alpn-01, as before.
+//
 // With ACME_SELF_SIGNED=1 or -self-signed (selfsigned.go, docs/design/relay-outbound-only.md §3.9) it makes the same
 // per-boot key and a certificate that key signs itself, with no CA, no account, no state directory and no network:
 // the relay-stack layout's lane, which the entry reaches only by its attested SPKI.
@@ -82,10 +90,19 @@ type config struct {
 	// SelfSigned is self-signed mode (selfsigned.go): only KeyDir is set besides it.
 	SelfSigned bool
 	Domain     string
-	CAs        []caEndpoint
-	Email      string
-	StateDir   string
-	KeyDir     string
+	// ReplicaDomain is an entry replica's own name (TLS_REPLICA_DOMAIN), or "" for a single entry. When set, the
+	// certificate names Domain and ReplicaDomain, and both are validated by dns-01 through DNS01Socket.
+	ReplicaDomain string
+	// DNS01Socket is the entrypoint's unix socket lego's httpreq provider posts present and cleanup to; set exactly
+	// when ReplicaDomain is.
+	DNS01Socket string
+	// DNS01Resolvers are the simulator's DNS servers (host:port) for lego's propagation check; production leaves
+	// them unset and lego uses the system's resolvers and the zone's authoritative servers.
+	DNS01Resolvers []string
+	CAs            []caEndpoint
+	Email          string
+	StateDir       string
+	KeyDir         string
 	// ChallengeHost is "" (every address) or an IP address; ChallengePort a TCP port.
 	ChallengeHost string
 	ChallengePort string
@@ -116,8 +133,8 @@ type acmeClient interface {
 	ResolveAccount() (string, error)
 	// Register creates the account for the client's key; eab is nil unless the directory requires it.
 	Register(eab *eabCredentials) (string, error)
-	// Obtain orders a certificate for domain with key and returns the PEM leaf and chain.
-	Obtain(domain string, key crypto.Signer) ([]byte, error)
+	// Obtain orders a certificate for names (the first is the shared name) with key and returns the PEM leaf and chain.
+	Obtain(names []string, key crypto.Signer) ([]byte, error)
 	// Details are what the CA and the ACME library said during this client's calls beyond their
 	// errors: each authorization's and challenge's state and error, and lego's own lines (details.go).
 	// The log prints them only when this CA fails.
@@ -242,6 +259,11 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		return config{}, err
 	}
 
+	replica, socket, resolvers, err := dns01FromEnv(getenv, domain)
+	if err != nil {
+		return config{}, err
+	}
+
 	// The messages below never include the values: they are credentials.
 	kid := strings.TrimSpace(getenv("ACME_EAB_KID"))
 	hmacKey := strings.TrimSpace(getenv("ACME_EAB_HMAC_KEY"))
@@ -260,7 +282,63 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		eab = &eabCredentials{KID: kid, HMACKey: hmacKey}
 	}
 
-	return config{Domain: domain, CAs: cas, Email: email, StateDir: stateDir, KeyDir: keyDir, ChallengeHost: host, ChallengePort: port, EAB: eab}, nil
+	return config{Domain: domain, ReplicaDomain: replica, DNS01Socket: socket, DNS01Resolvers: resolvers, CAs: cas, Email: email, StateDir: stateDir, KeyDir: keyDir, ChallengeHost: host, ChallengePort: port, EAB: eab}, nil
+}
+
+// dns01FromEnv reads an entry replica's settings (docs/design/entry-replicas.md ER5): TLS_REPLICA_DOMAIN and
+// ACME_DNS01_SOCKET together or neither, and ACME_DNS01_RESOLVERS (the simulator's) only with them. A single entry
+// sets none, and its order is tls-alpn-01 for TLS_DOMAIN alone.
+func dns01FromEnv(getenv func(string) string, domain string) (string, string, []string, error) {
+	replica := strings.TrimSpace(getenv("TLS_REPLICA_DOMAIN"))
+	socket := strings.TrimSpace(getenv("ACME_DNS01_SOCKET"))
+	resolverList := strings.TrimSpace(getenv("ACME_DNS01_RESOLVERS"))
+	if replica == "" {
+		if socket != "" || resolverList != "" {
+			return "", "", nil, usagef("ACME_DNS01_SOCKET or ACME_DNS01_RESOLVERS is set without TLS_REPLICA_DOMAIN: only an entry replica orders by dns-01; a single entry orders by tls-alpn-01 (D45)")
+		}
+		return "", "", nil, nil
+	}
+	if len(replica) > 253 || !domainRE.MatchString(replica) {
+		return "", "", nil, usagef("TLS_REPLICA_DOMAIN %q is not a lower-case DNS name", replica)
+	}
+	if replica == domain {
+		return "", "", nil, usagef("TLS_REPLICA_DOMAIN is TLS_DOMAIN: a replica's name is a name of its own (docs/design/entry-replicas.md ER2)")
+	}
+	if socket == "" {
+		return "", "", nil, usagef("TLS_REPLICA_DOMAIN is set without ACME_DNS01_SOCKET: an entry replica orders by dns-01 through the entrypoint's endpoint (docs/design/entry-replicas.md ER5)")
+	}
+	if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket {
+		return "", "", nil, usagef("ACME_DNS01_SOCKET %q is not a clean absolute path", socket)
+	}
+	var resolvers []string
+	if resolverList != "" {
+		for _, entry := range strings.Split(resolverList, ",") {
+			address := strings.TrimSpace(entry)
+			host, port, err := net.SplitHostPort(address)
+			if err != nil || net.ParseIP(host) == nil {
+				return "", "", nil, usagef("ACME_DNS01_RESOLVERS entry %q is not ip:port", address)
+			}
+			if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+				return "", "", nil, usagef("ACME_DNS01_RESOLVERS entry %q does not name a port", address)
+			}
+			resolvers = append(resolvers, address)
+		}
+	}
+	return replica, socket, resolvers, nil
+}
+
+// names are the certificate's names, the shared name first: TLS_DOMAIN alone for a single entry, and the replica's
+// own name beside it for an entry replica.
+func (cfg config) names() []string {
+	if cfg.ReplicaDomain == "" {
+		return []string{cfg.Domain}
+	}
+	return []string{cfg.Domain, cfg.ReplicaDomain}
+}
+
+// namesText is names for the log: TLS_DOMAIN alone, as before, for a single entry.
+func (cfg config) namesText() string {
+	return strings.Join(cfg.names(), ", ")
 }
 
 // challengeAddress reads ACME_TLS_ALPN_ADDRESS, `host:port` in workerd's LISTEN_ADDRESS form: `*` or an
@@ -393,6 +471,9 @@ func execute(cfg config, d deps) error {
 	if err != nil {
 		return fmt.Errorf("generate the certificate key: %w", err)
 	}
+	if cfg.ReplicaDomain != "" {
+		d.logf("gray-acme: challenge=dns-01 names=%s (the lane bridge writes the TXT record through the entrypoint)", cfg.namesText())
+	}
 	tried := make([]string, 0, len(cfg.CAs))
 	for i, ca := range cfg.CAs {
 		tried = append(tried, ca.Host)
@@ -415,10 +496,10 @@ func execute(cfg config, d deps) error {
 		}
 		d.logf("gray-acme: issued_by=%s", ca.Host)
 		d.logf("gray-acme: certificate_sha256=%s", certificateSHA256(leaf))
-		d.logf("gray-acme: obtained certificate for %s from %s, valid until %s", cfg.Domain, ca.Host, leaf.NotAfter.UTC().Format(time.RFC3339))
+		d.logf("gray-acme: obtained certificate for %s from %s, valid until %s", cfg.namesText(), ca.Host, leaf.NotAfter.UTC().Format(time.RFC3339))
 		return nil
 	}
-	return fmt.Errorf("no CA issued a certificate for %s (tried %s)", cfg.Domain, strings.Join(tried, ", "))
+	return fmt.Errorf("no CA issued a certificate for %s (tried %s)", cfg.namesText(), strings.Join(tried, ", "))
 }
 
 // obtainFrom loads or creates this CA's account and orders one certificate for key. Once the client
@@ -489,16 +570,18 @@ func obtainFrom(ca caEndpoint, cfg config, key crypto.Signer, newClient clientFa
 	// this account yet), the operator still has the value the record must carry.
 	logf("gray-acme: account_uri=%s", uri)
 
-	certPEM, err = client.Obtain(cfg.Domain, key)
+	certPEM, err = client.Obtain(cfg.names(), key)
 	if err != nil {
-		return nil, nil, fmt.Errorf("obtain a certificate for %s: %w", cfg.Domain, err)
+		return nil, nil, fmt.Errorf("obtain a certificate for %s: %w", cfg.namesText(), err)
 	}
 	leaf, err = parseLeaf(certPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("the CA returned no usable leaf certificate: %w", err)
 	}
-	if err := leaf.VerifyHostname(cfg.Domain); err != nil {
-		return nil, nil, fmt.Errorf("the CA returned a certificate that does not name %s: %w", cfg.Domain, err)
+	for _, name := range cfg.names() {
+		if err := leaf.VerifyHostname(name); err != nil {
+			return nil, nil, fmt.Errorf("the CA returned a certificate that does not name %s: %w", name, err)
+		}
 	}
 	if !samePublicKey(key, leaf) {
 		return nil, nil, fmt.Errorf("the CA returned a certificate for a different key")

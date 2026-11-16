@@ -214,6 +214,9 @@ type config struct {
 	// production keeps them empty and has no flag that could fill them.
 	extraRootCAPath   string
 	directDialAddress string
+	// allowInternalDials turns off the dial rule (dial_guard.go) for the local harnesses. Set only by the e2e-tagged
+	// build's -e2e-allow-internal-dials, or by a test's own config; production has no flag that could set it.
+	allowInternalDials bool
 }
 
 func defaultConfig() config {

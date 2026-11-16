@@ -44,8 +44,8 @@ type mirrorHelloKey struct{}
 // accounts never share a vendor connection, so the vendor never sees one connection carry two accounts' calls.
 type mirrorAccountKey struct{}
 
-// accountOf is the call's account for the pool's key: the relay call's or test's (mirrorAccountKey), else an own
-// call's session scope (an account id), else "".
+// accountOf is the call's account for the pool's key: the relay call's, the test's or the sign-in call's
+// (mirrorAccountKey), else an own call's session scope (an account id), else "".
 func accountOf(ctx context.Context) string {
 	if account, _ := ctx.Value(mirrorAccountKey{}).(string); account != "" {
 		return account
@@ -432,14 +432,15 @@ func (p *mirrorPool) dialVendor(ctx context.Context, hello *mirroredHello, spec 
 }
 
 // proxyConnectMaxHead bounds what egress reads of an http(s) proxy's answer to its CONNECT before the stream: the
-// status line and its fields, and on a refusal the body that Close drains. An answer egress acts on is a status line
+// status line and its fields (the answer's body is never read). An answer egress acts on is a status line
 // and a few fields (a 407's Proxy-Authenticate among them), so 64 KiB is many times one; net/http's Transport allows
 // 10 MiB by default (MaxResponseHeaderBytes, Go 1.27.2 net/http/transport.go:336-341), more than a tunnel's dial
 // should hold for a proxy. An answer past it is the proxy's connect failure (errProxyConnect).
 const proxyConnectMaxHead = 64 << 10
 
 // tunnel is a byte stream to addr: a direct connection, or one through the account's proxy. Its failures carry what
-// mapUpstreamError reads from net/http's own: errProxyAuth, errProxyConnect, a dial's *net.OpError.
+// mapUpstreamError reads from net/http's own: errProxyAuth, errProxyConnect, a dial's *net.OpError, and a
+// "proxyconnect" one around an https proxy's own TLS failure.
 func (p *mirrorPool) tunnel(ctx context.Context, spec *egressSpec, addr string) (net.Conn, error) {
 	if spec == nil {
 		return p.dial(ctx, "tcp", addr)
@@ -493,6 +494,12 @@ func (p *mirrorPool) tunnel(ctx context.Context, spec *egressSpec, addr string) 
 			trace.TLSHandshakeDone(secured.ConnectionState(), err)
 		}
 		if err != nil {
+			if isTLSError(err) {
+				// The proxy's own certificate or handshake, not the vendor's: named as net/http names a failure on the
+				// way to the proxy, which is how mapUpstreamError tells the two apart. Any other failure here (a closed
+				// connection, a timeout) is the proxy's as it is.
+				err = &net.OpError{Op: "proxyconnect", Net: "tcp", Err: err}
+			}
 			return fail(err)
 		}
 		conn = secured
@@ -523,7 +530,10 @@ func (p *mirrorPool) tunnel(ctx context.Context, spec *egressSpec, addr string) 
 		}
 		return fail(err)
 	}
-	_ = resp.Body.Close()
+	// The answer's body is never read, as net/http's Transport never reads its own CONNECT answer's (Go 1.27.2,
+	// net/http/transport.go:2013-2045). A client ignores Content-Length and Transfer-Encoding on a 2xx answer to
+	// CONNECT (RFC 9110 9.3.6): what follows the head is the tunnel, and waiting there for a body would hold the dial
+	// until its deadline. After a refusal the connection is closed, whatever body the proxy sent with it.
 	if onStatus, _ := ctx.Value(proxyConnectStatusKey{}).(func(int)); onStatus != nil {
 		onStatus(resp.StatusCode)
 	}

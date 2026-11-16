@@ -1,5 +1,5 @@
 import type { GatewayConfig } from "@gray/config";
-import { parseStrict } from "@gray/json";
+import { type Json, parseStrict } from "@gray/json";
 import { type InspectionResult, OutputObserver, RegexEngineUnavailable, type StreamCheck, TrustPolicy, answerContract, configureTrust, outputCheck } from "@gray/trust/workerd";
 import { type AnswerChecks, type OutputCheck, type Protocol, type ToolCallCheck, UNCOUNTED_CHECKS } from "@gray/protocol";
 import { type AnswerInspector, type FragmentUse, GateCapacity, type GateAnswer, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate } from "./gate.ts";
@@ -8,9 +8,11 @@ import { type AnswerInspector, type FragmentUse, GateCapacity, type GateAnswer, 
  * The production tool gate: @gray/trust's policy behind the gateway's `ToolGate` (gate.ts;
  * docs/cloudflare-native/trust.md section 2). The policy is the TRUST_POLICY var, the same JSON
  * document as the server's GRAY_TRUST_POLICY_FILE (crates/gray-gateway/src/config/mod.rs:460);
- * unset it is `{}`: enforce mode, tools authorised by the request's own declarations, no secret
- * markers. It is compiled once per isolate (and again only when the var changes), and the gate's
- * tunables (TRUST_*) are set before.
+ * unset it is `{}`: tools authorised by the request's own declarations, no secret markers. The gate
+ * observes only (owner, 2026-11-17): it records what it finds and refuses, holds or rewrites nothing
+ * (audit mode; a document naming `mode` is refused). It is compiled once per isolate (and again only
+ * when the var changes), and the gate's tunables (TRUST_*) are set before. The TEE lane's entry builds
+ * its gate here too (lane/deps.ts).
  *
  * This module imports `@gray/trust/workerd`, which hands the regex engine its wasm module at import
  * time: Worker code only (index.ts). Tests that are not about the gate use `PASS_THROUGH`.
@@ -188,13 +190,29 @@ let compiled: { readonly key: string; readonly gate: TrustGate } | null = null;
 export function trustGate(cfg: GatewayConfig): TrustGate {
   const key = JSON.stringify([cfg.trustPolicy, cfg.trustRegexCompileMaxBytes, cfg.trustSchemaCompileBudgetMs, cfg.trustSchemaCacheSubschemas, cfg.trustVerdictCacheKeyUnits]);
   if (compiled !== null && compiled.key === key) return compiled.gate;
+  configure(cfg);
+  const gate = new TrustGate(TrustPolicy.fromJson(parseStrict(cfg.trustPolicy)));
+  compiled = { key, gate };
+  return gate;
+}
+
+function configure(cfg: GatewayConfig): void {
   configureTrust({
     regexCompileMaxBytes: cfg.trustRegexCompileMaxBytes,
     schemaCompileBudgetMs: cfg.trustSchemaCompileBudgetMs,
     schemaCacheSubschemas: cfg.trustSchemaCacheSubschemas,
     verdictCacheKeyUnits: cfg.trustVerdictCacheKeyUnits,
   });
-  const gate = new TrustGate(TrustPolicy.fromJson(parseStrict(cfg.trustPolicy)));
-  compiled = { key, gate };
-  return gate;
+}
+
+/**
+ * Test-only: the gate of `document` read by @gray/trust's test-only constructor (`TrustPolicy.withTestMode`: a `mode`
+ * member, `enforce` when it names none), with `cfg`'s tunables. Production never runs another mode than the observing
+ * one `trustGate` reads (owner, 2026-11-17); the tests of enforce and off build their gate here.
+ */
+export function testTrustGate(cfg: GatewayConfig, document: Json): TrustGate {
+  configure(cfg);
+  // The isolate's cached gate was made under the tunables it was keyed by, which may be other than these.
+  compiled = null;
+  return new TrustGate(TrustPolicy.withTestMode(document));
 }

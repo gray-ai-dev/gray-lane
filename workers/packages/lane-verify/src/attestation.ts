@@ -384,42 +384,42 @@ function checkStackBoot(stackBoot: StackBootResult | null, options: VerifyAttest
   }
   if (!stackBoot.ok) {
     checks.push(fail("stack_boot", `${stackBoot.code}: ${stackBoot.message}`));
-    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane's relay-stack events do not verify"));
+    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane's deployment events do not verify"));
     return;
   }
   const facts = stackBoot.facts;
   if (facts === null) {
-    checks.push(pass("stack_boot", "no relay-stack events: a default-layout lane"));
-    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane is not a relay-stack lane: it measured no relay identity or image"));
+    checks.push(pass("stack_boot", "no deployment events: a default-layout lane"));
+    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane is not a deployment lane: it measured no deployment identity or image"));
     return;
   }
   if (facts.phase === "empty_slot") {
     // P2d: a phase-2 boot with no boot box to open runs Gray's idle program in the relay's slot and serves nothing.
     if (options.allowEmptySlot === true) {
-      checks.push(pass("stack_boot", `relay ${facts.identity.relayId}'s lane runs the empty slot: it waits for the relay's delivery`));
+      checks.push(pass("stack_boot", `deployment ${facts.identity.relayId}'s lane runs the empty slot: it waits for the provider's delivery`));
       if (options.expectedRelayId !== undefined) {
-        checks.push(facts.identity.relayId === options.expectedRelayId ? pass("relay_pin", facts.identity.relayId) : fail("relay_pin", `the lane serves relay ${facts.identity.relayId}, not ${options.expectedRelayId}`));
+        checks.push(facts.identity.relayId === options.expectedRelayId ? pass("relay_pin", facts.identity.relayId) : fail("relay_pin", `the lane serves deployment ${facts.identity.relayId}, not ${options.expectedRelayId}`));
       }
-      if (options.expectedRelayImage !== undefined) checks.push(fail("relay_image_pin", "the lane runs the empty slot: no relay image"));
+      if (options.expectedRelayImage !== undefined) checks.push(fail("relay_image_pin", "the lane runs the empty slot: no provider image"));
       return;
     }
-    checks.push(fail("stack_boot", `relay ${facts.identity.relayId}'s lane runs the empty slot: no relay image was delivered to this boot, so it serves nothing`));
+    checks.push(fail("stack_boot", `deployment ${facts.identity.relayId}'s lane runs the empty slot: no provider image was delivered to this boot, so it serves nothing`));
     for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane runs the empty slot"));
     return;
   }
   if (facts.phase !== "sealed") {
-    checks.push(fail("stack_boot", "the quote was taken before pre-launch's seal: a relay-stack lane serves only after it"));
-    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane's relay-stack boot is not sealed"));
+    checks.push(fail("stack_boot", "the quote was taken before pre-launch's seal: a deployment lane serves only after it"));
+    for (const [id, pin] of pins) if (pin !== undefined) checks.push(fail(id, "the lane's deployment boot is not sealed"));
     return;
   }
-  checks.push(pass("stack_boot", `relay ${facts.identity.relayId} runs ${facts.image.image}, ${isRelayDesignationClaim(facts.image) ? `designated (seq ${facts.image.seq}) and signed` : "signed"} by the relay key`));
+  checks.push(pass("stack_boot", `deployment ${facts.identity.relayId} runs ${facts.image.image}, ${isRelayDesignationClaim(facts.image) ? `designated (seq ${facts.image.seq}) and signed` : "signed"} by the deployment key`));
   const host = options.host;
   if (facts.identity.tlsDomain === null) {
     // Stack release B (docs/design/relay-outbound-only.md §3.9): the VM has no public name and its TLS key is bound to
     // no domain; it is reached through the entry. The identity rule is the relay the caller expected (`relay_pin`).
     checks.push(skip("relay_tls_domain", options.expectedRelayId === undefined
-      ? "the identity names no TLS domain, and no relay was expected: give the relay this lane must serve (--relay)"
-      : "the identity names no TLS domain: the relay pin is the identity rule"));
+      ? "the identity names no TLS domain, and no deployment was expected: give the deployment this lane must serve (--provider)"
+      : "the identity names no TLS domain: the deployment pin is the identity rule"));
   } else if (host === undefined || host === "") {
     checks.push(skip("relay_tls_domain", `no host given to compare with the identity's ${facts.identity.tlsDomain}`));
   } else if (isIpHost(host)) {
@@ -430,7 +430,7 @@ function checkStackBoot(stackBoot: StackBootResult | null, options: VerifyAttest
     checks.push(pass("relay_tls_domain", facts.identity.tlsDomain));
   }
   if (options.expectedRelayId !== undefined) {
-    checks.push(facts.identity.relayId === options.expectedRelayId ? pass("relay_pin", facts.identity.relayId) : fail("relay_pin", `the lane serves relay ${facts.identity.relayId}, not ${options.expectedRelayId}`));
+    checks.push(facts.identity.relayId === options.expectedRelayId ? pass("relay_pin", facts.identity.relayId) : fail("relay_pin", `the lane serves deployment ${facts.identity.relayId}, not ${options.expectedRelayId}`));
   }
   if (options.expectedRelayImage !== undefined) {
     checks.push(facts.image.image === options.expectedRelayImage ? pass("relay_image_pin", facts.image.image) : fail("relay_image_pin", `the lane runs ${facts.image.image}, not ${options.expectedRelayImage}`));

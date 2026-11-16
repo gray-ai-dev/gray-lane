@@ -1,5 +1,5 @@
 import { parseStrict } from "@gray/json";
-import { aciJson } from "./receipts.ts";
+import { aciJson, LANE_ORIGIN_HEADER } from "./receipts.ts";
 import type { PeerChannel } from "./peer-client.ts";
 import {
   PEER_ATTACH_HEADERS,
@@ -67,15 +67,21 @@ export interface PeerLinkDeps extends Omit<PeerSessionsDeps, "pinOf"> {
   readonly entrySpki: string;
   /** This boot's keyset digest, for the ACI headers of the answers. */
   readonly keysetDigest: string;
+  /** An entry replica's own origin, named beside the digest (docs/design/entry-replicas.md ER6); absent or null without one. */
+  readonly laneOrigin?: string | null;
   /** The registry's pin of (relay, keyset), or null. */
   readonly pinOf: (relay: string, keyset: string) => KeysetPin | null;
   /** What the registry knows of one boot (`PeerRegistry.bootOf`), for the boots and health routes; without it no boot is usable. */
   readonly bootOf?: (relay: string, keyset: string) => { readonly appId: string | null; readonly instanceId: string | null; readonly relayImage: string | null; readonly usable: boolean; readonly sealed: boolean | null } | null;
+  /** An entry replica stopping (docs/design/entry-replicas.md ER9 as revised, `entry-role.ts`): attaches and tunnels are refused. */
+  readonly stopping?: () => boolean;
 }
 
 /** The entry's channel: its sessions and its three routes; the registry's `PeerChannel`. */
 export class PeerLink implements PeerChannel {
   readonly #deps: PeerLinkDeps;
+  /** How many sessions peerlink's table listed at the last read (`sync`). */
+  #listed = 0;
   readonly sessions: PeerSessions;
 
   constructor(deps: PeerLinkDeps) {
@@ -120,6 +126,8 @@ export class PeerLink implements PeerChannel {
   /** `GET /v1/peer/attach` (section 3.5). */
   async attach(request: Request, url: URL): Promise<Response> {
     if (!isUpgrade(request)) return this.#error(426, "peer_upgrade_required", "Attach with a WebSocket upgrade.", { upgrade: "websocket" });
+    // ER9 as revised: a stopping replica takes no session; the VM's peerlink redials with its backoff.
+    if (this.#deps.stopping?.() === true) return this.#error(503, "peer_link_unavailable", "The entry cannot take sessions right now; try again shortly.");
     const read = readAttach(request.headers, url.hostname, this.#deps.entrySpki);
     if (read === null) return this.#error(400, "peer_attach_invalid", "The attach headers are missing or malformed.");
     if (!this.#deps.isStackRelay(read.claims.relay)) return this.#error(404, "peer_relay_unknown", "No relay by that name is routed here.");
@@ -143,6 +151,8 @@ export class PeerLink implements PeerChannel {
    */
   async tunnel(request: Request, relay: string, keyset?: string): Promise<Response> {
     if (!isUpgrade(request)) return this.#error(426, "peer_upgrade_required", "Open the tunnel with a WebSocket upgrade.", { upgrade: "websocket" });
+    // ER9 as revised: a stopping replica opens no tunnel; the caller asks another replica.
+    if (this.#deps.stopping?.() === true) return this.#error(503, "peer_link_unavailable", "The entry cannot open tunnels right now; try again shortly.");
     if (!this.#deps.isStackRelay(relay)) return this.#error(404, "peer_relay_unknown", "No relay by that name is routed here.");
     const headers = upgradeHeaders(request);
     headers.set(PEER_ATTACH_HEADERS.relay, relay);
@@ -205,7 +215,7 @@ export class PeerLink implements PeerChannel {
         ready: usable && known.sealed === true,
       };
     });
-    return aciJson(200, { relay_id: relay, boots }, this.#deps.keysetDigest, { "cache-control": "no-store" });
+    return aciJson(200, { relay_id: relay, boots }, this.#deps.keysetDigest, { "cache-control": "no-store", ...this.#origin() });
   }
 
   /** Reads peerlink's table into the sessions, and closes the unverified sessions held too long. False when peerlink did not answer. */
@@ -218,6 +228,7 @@ export class PeerLink implements PeerChannel {
     } catch {
       return false;
     }
+    this.#listed = rows.length;
     const strangers = this.sessions.sync(rows);
     const closed = [...strangers, ...this.sessions.expired()];
     if (strangers.length > 0) this.#deps.log({ level: "warn", event: "lane_peer_session_unknown", sessions: strangers.length });
@@ -263,6 +274,25 @@ export class PeerLink implements PeerChannel {
     return this.sessions.firstSeenOf(relay, keyset);
   }
 
+  /**
+   * An entry replica's stop (docs/design/entry-replicas.md ER9 as revised, `entry-role.ts`): closes every session peerlink
+   * holds, pinned or not, so workerd's SIGTERM drain, which waits for open WebSockets, can end. peerlink closes each
+   * session's WebSocket with 1000 (coder/websocket's NetConn.Close) and its streams; the VM's peerlink redials that slot
+   * with its backoff and keeps its sessions to its other entries.
+   *
+   * Answers how many sessions peerlink listed before this round's closes (the sessions this boot never admitted are
+   * closed by `sync` itself), null when peerlink did not answer: the caller is done only once it answers 0, since a
+   * close that failed (`apply` logs and swallows it) leaves its session listed. `idle` is checked again after the read,
+   * right before the closes: nothing is closed while a request is in flight.
+   */
+  async closeAll(idle: () => boolean = () => true): Promise<number | null> {
+    if (!(await this.sync())) return null;
+    const listed = this.#listed;
+    if (listed === 0 || !idle()) return listed;
+    await this.apply({ promoted: [], closed: this.sessions.sessions.map((session) => session.session) });
+    return listed;
+  }
+
   /** Tells peerlink the promotions and closes. A failure is logged; the next sync shows what peerlink holds. */
   async apply(changes: SessionChanges): Promise<void> {
     const calls: Promise<unknown>[] = [];
@@ -285,7 +315,16 @@ export class PeerLink implements PeerChannel {
    * transport and peerlink read (`error` as a string, as the lane's other control answers); the message is for a person.
    */
   #error(status: number, code: string, message: string, extra: Record<string, string> = {}): Response {
-    return aciJson(status, { error: code, message }, this.#deps.keysetDigest, extra);
+    return aciJson(status, { error: code, message }, this.#deps.keysetDigest, { ...extra, ...this.#origin() });
+  }
+
+  /**
+   * The replica's origin header for the channel's own answers: the entry returns them as they are, without the
+   * wrapper that adds it to every other answer (`entry.ts`).
+   */
+  #origin(): Record<string, string> {
+    const origin = this.#deps.laneOrigin ?? null;
+    return origin === null ? {} : { [LANE_ORIGIN_HEADER]: origin };
   }
 }
 

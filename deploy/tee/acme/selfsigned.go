@@ -55,6 +55,9 @@ var acmeOnlyEnvs = []string{
 	"ACME_EAB_KID",
 	"ACME_EAB_HMAC_KEY",
 	"ACME_CERT_DIR",
+	"TLS_REPLICA_DOMAIN",
+	"ACME_DNS01_SOCKET",
+	"ACME_DNS01_RESOLVERS",
 }
 
 // selfSignedFromEnv reads ACME_SELF_SIGNED: unset or empty is ACME mode, "1" is self-signed mode.

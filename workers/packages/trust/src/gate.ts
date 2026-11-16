@@ -390,11 +390,13 @@ export class ToolGate {
 
 /**
  * `relay_open` (crates/gray-gateway/src/inference.rs): an ungated stream, for a request
- * `TrustPolicy.requiresBufferedStream` does not gate (no tools declared, or a mode that does not
- * enforce). Frames are released as soon as their events pass `inspectStreamEvents`, so text streams
- * at once; from the first terminal event every byte is held until the end of the stream, so a client
- * that stops at the end marker cannot cancel the charge before it is recorded. A call in an answer to
- * a request that declared no tool is recorded and passed on, as the gate does.
+ * `TrustPolicy.requiresBufferedStream` does not gate (every request but in enforce mode, test-only, a
+ * streamed one that declared tools). Frames are released as soon as their events are inspected (the
+ * open stream's check, `TrustPolicy.streamCheck`: each call of a request that declared tools in full,
+ * reported only), so text and calls stream at once; from the first terminal event every byte is held
+ * until the end of the stream, so a client that stops at the end marker cannot cancel the charge before
+ * it is recorded. A call in an answer to a request that declared no tool is recorded and passed on, as
+ * the gate does.
  *
  * The same contract as `ToolGate`: `push` per chunk, `finish` at the end of the upstream's body,
  * settle as `settle` says, then release. The relay chooses the code for a stream that stops early:
@@ -454,7 +456,11 @@ export class OpenGate {
   }
 
   private inspect(events: readonly CanonicalEvent[], findings: Finding[]): void {
-    const result = this.check.observe(events);
+    this.record(this.check.observe(events), findings);
+  }
+
+  /** An inspection's findings; a refusal (enforce, test-only) ends the stream. */
+  private record(result: InspectionResult, findings: Finding[]): void {
     if (!result.ok) {
       findings.push({ kind: "refused", violation: result.violation });
       throw new GateFailed("upstream_trust_policy_rejected");
@@ -526,6 +532,8 @@ export class OpenGate {
       this.onEvents?.(events);
       this.stand.observeContent(events);
       const last = this.stand.rewriteFrame(tail, events);
+      // The end-of-stream checks, reported (`finish_stream_tail`): a call of a request that declared tools left incomplete.
+      this.record(this.check.finish(), findings);
       const raw = this.decoder.rawUsage();
       const release = last.length > 0 ? [...this.held, last] : this.held;
       this.held = [];

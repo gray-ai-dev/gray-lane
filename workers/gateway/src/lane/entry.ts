@@ -17,9 +17,9 @@ import { attestationFor } from "./attestation.ts";
 import { calibrateLaneStep, calibrationLogLine, LaneCalibrationError } from "./calibration.ts";
 import { bridgeFetch, egressBindingOf, laneBridgeKeySeed, laneGatewayDeps, laneIsolate, laneRegion, missingLaneBindings, type LaneEnv, type LaneIsolate } from "./deps.ts";
 import { acceptPolicyBundle, applyCredentialMessage, type CredentialIntake, policyRegistryDocument, readSignedLoginStart, readJsonBody, readPolicyBundle, refusalBody, INTAKE_MAX_BYTES, RELAY_CREDENTIALS_PATH, RELAY_POLICY_BUNDLE_PATH, RELAY_POLICY_PREFIX } from "./intake.ts";
-import { StackOpsService } from "./stack-ops.ts";
+import { StackOpsService, type StackOpsKeep } from "./stack-ops.ts";
 import { gatedStackCredentials, KMS_LEASE_BINDING, KMS_LEASE_PATH, KMS_LEASE_PUSH_MAX_BYTES, KMS_LEASE_REQUIRED, kmsLeasePushOf } from "./kms-lease.ts";
-import { ACI_API_VERSION, ACI_KEYSET_DIGEST_HEADER, ACI_VERSION_HEADER, aciHeaders, aciJson, RECEIPT_ID_HEADER, withAciHeaders, WORKLOAD_KEYSET_DIGEST_HEADER } from "./receipts.ts";
+import { ACI_API_VERSION, ACI_KEYSET_DIGEST_HEADER, ACI_VERSION_HEADER, aciHeaders, aciJson, LANE_ORIGIN_HEADER, RECEIPT_ID_HEADER, withAciHeaders, WORKLOAD_KEYSET_DIGEST_HEADER } from "./receipts.ts";
 import { createLaneState, DEFAULT_KEYSET_NOT_AFTER, type LaneProcessState, type LaneVaultSettings } from "./state.ts";
 import { appIdOfSubject, VAULT_DISK_BINDING, type LaneVault } from "./vault.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
@@ -41,6 +41,7 @@ import { PeerLink } from "./peer-link.ts";
 import { EntryLink } from "./entry-link.ts";
 import { BackgroundClient } from "./remote/background.ts";
 import { platformTimers } from "../client.ts";
+import { EntryRoleClient, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
 import type { LanePeers } from "./types.ts";
 
 /**
@@ -65,7 +66,8 @@ import type { LanePeers } from "./types.ts";
  * - `POST /v1/aci/relay-credentials`, `POST /v1/aci/relay-policy/bundle` → the intake routes.
  * - `POST /v1/aci/relay-boot-box` → a phase-2 VM's boot box intake (P4b, `boot-intake.ts`).
  * - `GET /v1/aci/relay-policy/{relay_id}` → the accepted bundle's templates (M22).
- * - `GET /healthz` → liveness and whether this boot's identity parsed.
+ * - `GET /healthz` → liveness and whether this boot's identity parsed; an entry replica adds its index, origin, role and
+ *   in-flight count (`entry-role.ts`).
  *
  * The relay-stack layout adds a second entrypoint, `relayConfig` below, on its own socket (S28): the
  * relay's two config GETs and nothing else. This one never serves them.
@@ -95,6 +97,15 @@ export const HEALTH_PATH = "/healthz";
  * set, so the list cannot drift from the headers.
  */
 export const LANE_EXPOSED = `${EXPOSED}, ${ACI_VERSION_HEADER}, ${ACI_KEYSET_DIGEST_HEADER}, ${WORKLOAD_KEYSET_DIGEST_HEADER}, ${RECEIPT_ID_HEADER}`;
+
+/**
+ * `LANE_EXPOSED` for a boot: an entry replica also lets the page read the origin header it sends
+ * (docs/design/entry-replicas.md ER6), which names where the receipt is. Without a replica index the list is
+ * `LANE_EXPOSED` itself.
+ */
+function laneExposed(laneOrigin: string | null): string {
+  return laneOrigin === null ? LANE_EXPOSED : `${LANE_EXPOSED}, ${LANE_ORIGIN_HEADER}`;
+}
 
 /**
  * The deployment names the image (L4) binds, locked by D6 with D17's `LANE_BRIDGE_KEY_SEED` added.
@@ -130,9 +141,11 @@ export interface LaneIdentity {
   /**
    * The TLS entry the keyset publishes: the SPKI of the certificate the client shakes hands with.
    * Required — the lane has no no-TLS mode (`workers/lane-m0/src/config.ts` VG-07), and a keyset
-   * without it would attest to an identity the client does not talk to.
+   * without it would attest to an identity the client does not talk to. `replicaDomain` is an entry
+   * replica's own name (`TLS_REPLICA_DOMAIN`, docs/design/entry-replicas.md ER2): the keyset then names
+   * it beside `domain`; null for a single entry.
    */
-  readonly tls: { readonly spkiSha256: string; readonly domain: string | null };
+  readonly tls: { readonly spkiSha256: string; readonly domain: string | null; readonly replicaDomain: string | null };
 }
 
 /** The bindings the lane entry reads: the gateway env plus the lane's own. */
@@ -140,6 +153,18 @@ export interface LaneGatewayEnv extends LaneEnv {
   readonly TEE_TYPE?: unknown;
   readonly TLS_SPKI_SHA256?: unknown;
   readonly TLS_DOMAIN?: unknown;
+  /**
+   * docs/design/entry-replicas.md ER2: this entry replica's own name, which the entrypoint renders from the measured
+   * pattern and the instance's index; absent for a single entry and in the relay-stack layout.
+   */
+  readonly TLS_REPLICA_DOMAIN?: unknown;
+  /**
+   * docs/design/entry-replicas.md ER9 as revised: this entry replica's index, 1 to 16, which the entrypoint renders beside
+   * TLS_REPLICA_DOMAIN; with it the replica reads its role through the bridge and counts its requests (`entry-role.ts`).
+   */
+  readonly LANE_REPLICA?: unknown;
+  /** ER9 as revised: the entrypoint's stop socket (`POST /stop`), an external service rendered with LANE_REPLICA only. */
+  readonly ENTRY_STOP?: unknown;
   readonly GUEST_AGENT_URL?: unknown;
   readonly GUEST_AGENT_TIMEOUT_MS?: unknown;
   readonly SOURCE_REPO_URL?: unknown;
@@ -182,6 +207,8 @@ const UNSIGNED = /^(0|[1-9][0-9]*)$/;
 const STACK_RELAY_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const LOWER_HEX_32_BYTES = /^[0-9a-f]{64}$/;
 const HTTP_URL = /^https?:\/\/[^\s]+$/;
+/** A lower-case DNS name of at least two labels (the entrypoint's `DNS_NAME`, which rendered the replica name). */
+const DNS_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /** The `tee_type` this lane serves: the only platform the v1 attestation reader decodes (§4.2). */
 export const LANE_TEE_TYPE = "tdx";
 
@@ -250,6 +277,7 @@ export function readLaneIdentity(env: Readonly<Record<string, unknown>>, deploye
   const keysetNotAfterText = textBinding(env, "KEYSET_NOT_AFTER", problems);
   const spkiSha256 = textBinding(env, "TLS_SPKI_SHA256", problems);
   const tlsDomain = textBinding(env, "TLS_DOMAIN", problems);
+  const replicaDomain = textBinding(env, "TLS_REPLICA_DOMAIN", problems);
   const keysetSubject = textBinding(env, "KEYSET_SUBJECT", problems);
   const repoUrl = textBinding(env, "SOURCE_REPO_URL", problems);
   const repoCommit = textBinding(env, "SOURCE_REPO_COMMIT", problems);
@@ -270,6 +298,13 @@ export function readLaneIdentity(env: Readonly<Record<string, unknown>>, deploye
   }
   if (tlsDomain !== undefined && spkiSha256 === undefined) {
     problems.push("TLS_DOMAIN is set without a valid TLS_SPKI_SHA256: a domain scopes a TLS entry, it is not one");
+  }
+  if (replicaDomain !== undefined) {
+    // docs/design/entry-replicas.md EI3: the replica name is a second record beside the shared name's, with the same
+    // SPKI. Without the shared name the first record applies to every host, and the second would restrict nothing.
+    if (!DNS_NAME.test(replicaDomain)) problems.push("TLS_REPLICA_DOMAIN is a lower-case DNS name");
+    if (tlsDomain === undefined) problems.push("TLS_REPLICA_DOMAIN is set without TLS_DOMAIN: a replica's name stands beside the shared name");
+    else if (replicaDomain === tlsDomain) problems.push("TLS_REPLICA_DOMAIN is TLS_DOMAIN: a replica's name is a name of its own");
   }
   let keysetNotAfter = DEFAULT_KEYSET_NOT_AFTER;
   if (keysetNotAfterText !== undefined) {
@@ -293,7 +328,7 @@ export function readLaneIdentity(env: Readonly<Record<string, unknown>>, deploye
       provenance: { repo_url: repoUrl ?? null, repo_commit: repoCommit ?? null, image_digest: imageDigest ?? null, image_provenance: null },
       keysetSubject: keysetSubject ?? null,
       keysetNotAfter,
-      tls: { spkiSha256: spkiSha256 as string, domain: tlsDomain ?? null },
+      tls: { spkiSha256: spkiSha256 as string, domain: tlsDomain ?? null, replicaDomain: replicaDomain ?? null },
     },
     problems,
     missing,
@@ -479,6 +514,10 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
   const stack = laneStackSettings(env, cfg);
   const kmsLease = laneKmsLease(env, stack !== null);
   const vault = laneVaultSettings(env, identity, stack !== null, kmsLease);
+  // ER7 (docs/design/entry-replicas.md): the entry layout's affinity key is the app's, through the guest agent the
+  // attestation route already uses. The relay-stack layout keeps a random key per boot, as does a boot without one.
+  const guest = env.GUEST_AGENT;
+  const affinity = stack === null && guest !== undefined && typeof guest.fetch === "function" ? { guest, guestUrl: identity.guestAgentUrl, guestTimeoutMs: identity.guestAgentTimeoutMs } : null;
   const receiptKey = receiptKeyId === undefined ? "" : `receipt:${receiptKeyId}`;
   // F2 D33: the memo key covers every value `createLaneState` builds the state from, the identity
   // (keyset subject and expiry, TLS entry) and the timing included, plus the transport its `fetch`
@@ -495,6 +534,8 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
     identity.keysetNotAfter.toString(),
     identity.tls.spkiSha256,
     identity.tls.domain ?? "",
+    identity.tls.replicaDomain ?? "",
+    typeof env.LANE_REPLICA === "string" ? env.LANE_REPLICA : "",
     String(timing.policyStepMs),
     String(timing.policyFuelPerMs),
     String(timing.policyOverheadMs),
@@ -507,6 +548,7 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
     stack === null ? "" : `${stack.pollMs}/${stack.attemptsMax}/${stack.rotationGraceMs}/${stack.reportMinMs}/${stack.reportHeartbeatMs}`,
     kmsLease ? "kms-lease" : "",
     vault === null ? "" : `vault/${vault.relayKey}/${vault.appId}`,
+    affinity === null ? "" : `affinity/${affinity.guestUrl}/${affinity.guestTimeoutMs}`,
   ]
     .map((part) => `${part.length}:${part}`)
     .join("|");
@@ -535,7 +577,11 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
       ...(seed === null ? {} : { bridgeKeySeed: seed }),
       keysetSubject: identity.keysetSubject,
       keysetNotAfter: identity.keysetNotAfter,
-      tls: identity.tls.domain === null ? { spkiSha256: identity.tls.spkiSha256 } : { spkiSha256: identity.tls.spkiSha256, domain: identity.tls.domain },
+      tls: {
+        spkiSha256: identity.tls.spkiSha256,
+        ...(identity.tls.domain === null ? {} : { domain: identity.tls.domain }),
+        ...(identity.tls.replicaDomain === null ? {} : { replicaDomain: identity.tls.replicaDomain }),
+      },
       policyStepMs: calibration.effective.stepMs,
       policyFuelPerMs: calibration.effective.fuelPerMs,
       policyOverheadMs: calibration.effective.overheadMs,
@@ -552,6 +598,8 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
       ...(kmsLease ? { kmsLease: true } : {}),
       // P2e: the relay's accounts come from its vault and every change goes there.
       ...(vault === null ? {} : { vault }),
+      // ER7: one bounded GetKey before the first answer; a failure serves on a random key and retries (`LaneAffinityKey`).
+      ...(affinity === null ? {} : { affinity }),
     });
   }
   return booted;
@@ -653,6 +701,43 @@ function peersOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfi
   return peers;
 }
 
+/**
+ * An entry replica's role and in-flight count (`entry-role.ts`), one per boot state: on when the deployment gives the
+ * entry a replica index (LANE_REPLICA, beside TLS_REPLICA_DOMAIN), off otherwise, and then nothing is polled or counted.
+ */
+const entryRoles = new WeakMap<LaneProcessState, LaneEntryRole | null>();
+
+/** The entrypoint's stop route on its socket (deploy/tee/bin/entrypoint.mjs `serveEntryStop`). */
+const ENTRY_STOP_URL = "http://entry-stop/stop";
+
+/** The generation path's answers, which may still be streaming when `route` returns them (`LaneEntryRole.answer`'s `live`). */
+const generationAnswers = new WeakSet<Response>();
+
+function entryRoleOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, index: number | null): LaneEntryRole | null {
+  const known = entryRoles.get(state);
+  if (known !== undefined) return known;
+  const stopBinding = bindingOf(env.ENTRY_STOP);
+  const role =
+    index === null || state.laneOrigin === null
+      ? null
+      : new LaneEntryRole({
+          index,
+          origin: state.laneOrigin,
+          source: new EntryRoleClient({ baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv), now: state.now }),
+          now: state.now,
+          pollMs: cfg.laneEntryRolePollMs,
+          // ER9 as revised: at a stop, the stack VMs' channel sessions (the WebSockets workerd's SIGTERM drain waits for).
+          closeSessions: async (idle) => {
+            const link = peerLinks.get(state);
+            return link === undefined || link === null ? 0 : link.closeAll(idle);
+          },
+          // "Review fixes, 2026-11-17 night": the entrypoint's stop socket (ENTRY_STOP, rendered with the replica index).
+          ...(stopBinding === null ? {} : { requestStop: async () => (await stopBinding.fetch(new Request(ENTRY_STOP_URL, { method: "POST" }))).status === 200 }),
+        });
+  entryRoles.set(state, role);
+  return role;
+}
+
 /** A service binding as the lane calls it (`PEERLINK`, an `external` service on peerlink's unix socket). */
 interface FetchBinding {
   fetch(request: Request): Promise<Response>;
@@ -690,6 +775,9 @@ function peerLinkOf(state: LaneProcessState, env: LaneGatewayEnv, peers: EntryPe
     egress,
     entrySpki: identity.tls.spkiSha256,
     keysetDigest: state.keysetDigest,
+    laneOrigin: state.laneOrigin,
+    // ER9 as revised: a stopping replica takes no new session or tunnel.
+    stopping: () => entryRoles.get(state)?.stopping === true,
   });
   registry.setChannel(link);
   peerLinks.set(state, link);
@@ -866,10 +954,14 @@ export default {
     const deployed = cfg.deployEnv !== "local";
     let identityRead: LaneIdentityRead;
     let identity: LaneIdentity;
+    let replicaIndex: number | null;
     try {
       identityRead = readLaneIdentity(env, deployed);
       if (identityRead.identity === null) throw new LaneBootError(identityRead.problems);
       identity = identityRead.identity;
+      const replica = laneReplicaIndex(env, identity.tls.replicaDomain);
+      if (replica.problem !== null) throw new LaneBootError([replica.problem]);
+      replicaIndex = replica.index;
     } catch (thrown) {
       return bootFailure(thrown);
     }
@@ -889,6 +981,14 @@ export default {
     const peers = missing.length === 0 ? peersOf(state, env, cfg, identity) : null;
     // M13: whatever this fetch is, the lane's routes are warmed behind it when due (the first one also primes the snapshot).
     if (missing.length === 0) warmLane(state, env, cfg, ctx, undefined, peers);
+    // ER7: an affinity key whose GetKey failed at boot is derived again behind requests when its retry is due.
+    if (state.affinity.source === "boot") ctx.waitUntil(state.affinity.tick());
+    // ER9 as revised: an entry replica reads its role behind requests when its poll is due.
+    const replica = missing.length === 0 ? entryRoleOf(state, env, cfg, replicaIndex) : null;
+    if (replica !== null) {
+      // The tick first, so a role it reads starts the stop's watch behind this same request.
+      ctx.waitUntil(replica.tick().then(() => replica.watch((work) => ctx.waitUntil(work))));
+    }
     // The outbound-only channel (docs/design/relay-outbound-only.md). A stack VM attests its entries behind each fetch.
     // An entry answers the attach, tunnel and health routes itself: an upgrade's 101 carries peerlink's WebSocket, which
     // the ACI and CORS wrappers below would drop by rebuilding the Response, so the channel's answers are returned as
@@ -899,8 +999,20 @@ export default {
       const link = peerLinkOf(state, env, peers, identity);
       if (link !== null && PeerLink.handles(url.pathname)) return link.route(request, url);
     }
-    const answer = missing.length > 0 ? misconfigured(request, url, state, missing) : await route(request, env, cfg, state, identity, url, ctx, origin, peers);
-    return withCors(withAciHeaders(answer, state.keysetDigest), origin, LANE_EXPOSED);
+    // ER9 as revised: a replica counts every request but its health route's from here to its answer's end.
+    const end = replica === null || (declaredPath(url.pathname)?.path ?? url.pathname) === HEALTH_PATH ? null : replica.begin(request.signal);
+    let answer: Response;
+    try {
+      answer = missing.length > 0 ? misconfigured(request, url, state, missing) : await route(request, env, cfg, state, identity, url, ctx, origin, peers, replica);
+    } catch (thrown) {
+      end?.();
+      throw thrown;
+    }
+    // docs/design/entry-replicas.md ER6: an entry replica names its own origin wherever it names its keyset digest.
+    const served = withCors(withAciHeaders(answer, state.keysetDigest, state.laneOrigin), origin, laneExposed(state.laneOrigin));
+    // ER9 as revised: `Connection: close` while draining, and the count ends with the body (a generation answer's) or now.
+    const live = generationAnswers.has(answer) && answer.status >= 200 && answer.status < 300;
+    return replica === null ? served : replica.answer(served, end, live);
   },
 } satisfies ExportedHandler<LaneGatewayEnv>;
 
@@ -940,13 +1052,24 @@ function misconfigured(request: Request, url: URL, state: LaneProcessState, miss
   return aciJson(503, { status: "lane_misconfigured" }, state.keysetDigest);
 }
 
-async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, identity: LaneIdentity, url: URL, ctx: ExecutionContext, origin: string | null, peers: EntryPeers | null): Promise<Response> {
+async function route(
+  request: Request,
+  env: LaneGatewayEnv,
+  cfg: GatewayConfig,
+  state: LaneProcessState,
+  identity: LaneIdentity,
+  url: URL,
+  ctx: ExecutionContext,
+  origin: string | null,
+  peers: EntryPeers | null,
+  replica: LaneEntryRole | null,
+): Promise<Response> {
   const preflighted = preflight(request, origin);
   if (preflighted !== null) return preflighted;
   const declared = declaredPath(url.pathname);
   const path = declared?.path ?? url.pathname;
   if (!isPublicPath(path) && path !== HEALTH_PATH) return unmatched(request, cfg, url, path);
-  if (path === HEALTH_PATH) return health(request, url, identity, state, warmerOf(state, env, cfg), peers);
+  if (path === HEALTH_PATH) return health(request, url, identity, state, warmerOf(state, env, cfg), peers, replica);
   if (path === ATTESTATION_PATH) return attestation(request, env, url, state, identity);
   if (path.startsWith(RECEIPTS_PATH)) return serveReceipt(request, { receipts: state.receipts, keysetDigest: state.keysetDigest, followUpMs: cfg.peerFollowUpMs, clock: state.now }, path.slice(RECEIPTS_PATH.length));
   if (path.startsWith(DEBUG_REQUESTS_PREFIX)) {
@@ -989,7 +1112,9 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
   // The sinks' buffered points flush at the request's end, from inside `InferenceRun`'s own
   // `waitUntil` block, after the record is emitted (F2 bridge-1, design v2 §C.10): a flush scheduled
   // here would run before `serve()` buffered anything. A slow record never delays the answer.
-  return new InferenceRun(request, served, deps, ctx, declared).serve();
+  const generated = await new InferenceRun(request, served, deps, ctx, declared).serve();
+  generationAnswers.add(generated);
+  return generated;
 }
 
 /**
@@ -1007,6 +1132,10 @@ async function route(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, 
  * many it holds, pinned, unverified, refused and down, and the refused and down ones by closed code, which lane-watch
  * alerts on (`lane_peer_refused`, section 5, row 16). It names no relay and no origin: the route is public, and the
  * entry's log lines name them for the operator.
+ *
+ * An entry replica (LANE_REPLICA) adds `replica`: its index, its own origin, the role it last read (`serving` or
+ * `draining`) and how many requests it holds (`in_flight`, health requests not counted), which the release tool's drain
+ * waits on (docs/design/entry-replicas.md ER9 as revised, `entry-role.ts`). An entry without an index answers as before.
  */
 /**
  * What `/healthz` says of the channel, from the tables the boot already holds (no call to peerlink): an entry's sessions
@@ -1024,7 +1153,7 @@ function sessionsSummary(state: LaneProcessState): Record<string, unknown> {
   return {};
 }
 
-function health(request: Request, url: URL, identity: LaneIdentity, state: LaneProcessState, warmer: LaneRouteWarmer, peers: EntryPeers | null): Response {
+function health(request: Request, url: URL, identity: LaneIdentity, state: LaneProcessState, warmer: LaneRouteWarmer, peers: EntryPeers | null, replica: LaneEntryRole | null): Response {
   if (request.method !== "GET") return methodNotAllowed(state.keysetDigest, "GET");
   const warm = warmer.status();
   const relayId = url.searchParams.get("relay");
@@ -1051,6 +1180,8 @@ function health(request: Request, url: URL, identity: LaneIdentity, state: LaneP
       ...(peers === null ? {} : { peers: peers.registry.summary() }),
       // The outbound-only channel (docs/design/relay-outbound-only.md): counts only, the route is public.
       ...sessionsSummary(state),
+      // ER9 as revised: an entry replica's index, origin, role and in-flight count, which the release tool's drain waits on.
+      ...(replica === null ? {} : { replica: replica.summary() }),
     },
     state.keysetDigest,
     // The TEE's own clock, which `gray-relay doctor`'s clock line compares with the relay host's: workerd adds no Date.
@@ -1216,12 +1347,37 @@ function stackOpsOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayCo
       // P7 (13.4): only the serving instance refreshes and signs in; egress holds while this VM is not it.
       // P7 (13.4, the final mark): and while a serving instance has not yet merged Gray's newest copy (`syncing`).
       ...(state.instanceRole === null ? {} : { hold: () => !(state.instanceRole?.serving ?? true) || state.vault?.syncing === true }),
+      // Review 11-16: with a vault, no push from a state that is not the relay's (`stackOpsKeep`).
+      ...(state.vault === null ? {} : { keep: () => stackOpsKeep(state, stack.relayId, Date.now()) }),
     });
     stackOpsServices.set(state, ops);
     // A change of role reaches egress at once, not at the next poll.
     state.instanceRole?.onChange(() => stackOpsRound(state, env, cfg, true));
   }
   return ops;
+}
+
+/**
+ * Review 11-16 (`StackOpsKeep`): why egress's own-call set is kept as it is now on a VM with a vault, or null to push.
+ * egress replaces the set whole, so a push from a store that does not hold the relay's accounts would drop every token
+ * egress refreshed and the lane has not written yet. Read from state the boot already holds:
+ * - the lease's gate: a refusal (`LaneVault.dropped`) or a pushed state that does not serve (ran out) is never kept: that
+ *   push empties egress at once. No state pushed yet (`KmsLeaseGate.state` null) is `lease_unknown`.
+ * - the vault: not `open` and not `dropped` is `vault_closed`: it has not opened since the boot, or a close waits for its
+ *   reopen (`LaneVault.tick` opens it whatever the lease, until a refusal).
+ * - the registry: the stack relay in `heldRelayIds()` (away from the snapshot; with a vault, held through any absence,
+ *   `MutableRelayRegistry.trackStackRelay`) is `relay_away`. A definite end (`clearRelay`, back under another key) is no
+ *   longer held, and its push empties egress.
+ */
+function stackOpsKeep(state: LaneProcessState, relayId: string, now: number): StackOpsKeep | null {
+  const vault = state.vault;
+  const lease = state.kmsLease;
+  if (vault === null) return null;
+  if (vault.dropped || (lease !== null && lease.state !== null && !lease.serving(now))) return null;
+  if (!vault.open) return "vault_closed";
+  if (lease !== null && lease.state === null) return "lease_unknown";
+  if (state.registry.heldRelayIds().includes(relayId)) return "relay_away";
+  return null;
 }
 
 function stackOpsRound(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, force = false): Promise<void> {

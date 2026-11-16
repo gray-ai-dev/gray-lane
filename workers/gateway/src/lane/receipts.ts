@@ -21,16 +21,24 @@ export const ACI_KEYSET_DIGEST_HEADER = "x-aci-keyset-digest";
 export const WORKLOAD_KEYSET_DIGEST_HEADER = "x-workload-keyset-digest";
 /** The receipt a response will be at; set only when an attempt committed (M9). */
 export const RECEIPT_ID_HEADER = "x-receipt-id";
+/**
+ * The origin of the entry replica that answered (docs/design/entry-replicas.md ER6, EI8): each replica keeps its own
+ * receipts, so a verifier asks this origin for them. A hint, and not signed: it says where to ask, never what to
+ * trust, because a receipt verifies only against the keyset the verifier attested at that origin. Sent beside the
+ * keyset digest by an entry with a replica index, and by no other lane.
+ */
+export const LANE_ORIGIN_HEADER = "x-gray-lane-origin";
 
-/** The headers every lane response carries, receipt or not. */
-export function aciHeaders(keysetDigest: string): Record<string, string> {
-  return { [ACI_VERSION_HEADER]: ACI_API_VERSION, [ACI_KEYSET_DIGEST_HEADER]: keysetDigest, [WORKLOAD_KEYSET_DIGEST_HEADER]: keysetDigest };
+/** The headers every lane response carries, receipt or not; `laneOrigin` is an entry replica's own origin, or null. */
+export function aciHeaders(keysetDigest: string, laneOrigin: string | null = null): Record<string, string> {
+  const headers = { [ACI_VERSION_HEADER]: ACI_API_VERSION, [ACI_KEYSET_DIGEST_HEADER]: keysetDigest, [WORKLOAD_KEYSET_DIGEST_HEADER]: keysetDigest };
+  return laneOrigin === null ? headers : { ...headers, [LANE_ORIGIN_HEADER]: laneOrigin };
 }
 
 /** Adds the ACI headers to `response` (a fresh response: the body is passed on, never read). */
-export function withAciHeaders(response: Response, keysetDigest: string): Response {
+export function withAciHeaders(response: Response, keysetDigest: string, laneOrigin: string | null = null): Response {
   const headers = new Headers(response.headers);
-  for (const [name, value] of Object.entries(aciHeaders(keysetDigest))) headers.set(name, value);
+  for (const [name, value] of Object.entries(aciHeaders(keysetDigest, laneOrigin))) headers.set(name, value);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 

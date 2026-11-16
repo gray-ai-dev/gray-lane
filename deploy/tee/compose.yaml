@@ -230,11 +230,13 @@ volumes:
 #   the issuing CA, the account URI and the certificate SHA-256. The operator authorizes each CA
 #   (and, where the CA supports it, each logged account URI) in the domain's CAA records once per
 #   account; that is operations, outside this file.
+# - An entry replica (docs/design/entry-replicas.md ER5) orders `TLS_DOMAIN` and its replica name by
+#   dns-01 instead: the entrypoint signs each challenge value to the lane bridge, which writes the
+#   TXT record; gray-acme gets neither the bridge seed nor a DNS token.
 # - Why per boot: the attested keyset binds this certificate's SPKI. A key on `lane-certs` could be
 #   copied out by any other compose of this app and served outside the CVM; a key that only lived
 #   in this container's memory for one boot cannot.
 # - Local host e2e (`deploy/tee/e2e.sh lane`) uses an openssl self-signed certificate instead; the
 #   simulator e2e runs this image's lane, and so its gray-acme, against a local pebble.
-# - There is no DNS-01 client and no certbot sidecar: D45 forbids a DNS credential in the CVM, and a
-#   service whose only working configuration needs a zone token would be untested code in the
-#   measured compose.
+# - There is no certbot sidecar and no DNS credential in the CVM (D45): an entry replica's dns-01
+#   record is written by the bridge with its own token, never from here.

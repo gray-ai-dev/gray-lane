@@ -22,15 +22,15 @@ import type { StackExclusion } from "./stack-document.ts";
  * **One round** (at most one at a time, at most once per `LANE_STACK_POLL_MS`, on the same traffic as the config
  * service: the relay's version polls and the credential intake):
  *
- * 1. `PUT /v1/stack/ops/accounts`: the panel's served accounts with the credential fields egress's templates read
- *    (the access token or API key, ChatGPT's account id, a refresh token when one is sealed), the sealed version, the
- *    proxy, and the panel's own-call settings: the relay's cadence for `limits` and `models`.
- *    Sent when it differs from the last one egress took, and at least every `LANE_STACK_OPS_RESEND_MS` (egress keeps
- *    the set in memory only, so a restarted egress gets it back within that).
- * 2. `GET /v1/stack/ops/tokens`: each token egress refreshed and the sealed version it was refreshed from. A token
+ * 1. `GET /v1/stack/ops/tokens`: each token egress refreshed and the sealed version it was refreshed from. A token
  *    newer than the one held goes into the credential store (`applyRefreshed`), where it stands in for that sealed
  *    version: the config document's `credentials_version` moves, the container fetches it through `/credentials`, and
  *    egress's request table follows its hash. `onRefreshed` then rebuilds the document at once.
+ * 2. `PUT /v1/stack/ops/accounts`: the panel's served accounts with the credential fields egress's templates read
+ *    (the access token or API key, ChatGPT's account id, a refresh token when one is sealed), the sealed version, the
+ *    proxy, and the panel's own-call settings: the relay's cadence for `limits` and `models`.
+ *    Sent when it differs from the last one egress took, and at least every `LANE_STACK_OPS_RESEND_MS` (egress keeps
+ *    the set in memory only, so a restarted egress gets it back within that). Sent after the read (review 11-16, below).
  *
  * **Persist first (P2e-2, docs/design/relay-no-always-on-host.md H12, I9).** With a vault (`persist`), the push says
  * `"persist_first": true`, and egress holds every new token family pending (egress stack_persist.go): it keeps using the
@@ -42,6 +42,16 @@ import type { StackExclusion } from "./stack-document.ts";
  * a lost ack cannot put the older family back into the store and onto the disk over the one the vendor issued last
  * (review 11-09b vm #1). The sign-in pacing egress reports (`logins`) goes into
  * the vault too, and back into the push (`login.pacing`) for egress to take after a restart.
+ *
+ * **Tokens first, and no push from a state that is not the relay's (review 11-16).** egress replaces its set whole
+ * (stack_ops.go): an account a push leaves out loses the token egress refreshed and the family it holds pending, and the
+ * vendor has already retired the refresh token they replace. So a round reads egress's tokens (and writes them, as
+ * above) before it pushes, and with a vault it pushes nothing while what the lane holds is not the relay's state
+ * (`keep`, `StackOpsKeep`): the vault has not opened yet (a lane restart, a close waiting for its reopen), no lease
+ * state has reached this boot yet, or the stack relay is away from Gray's snapshot and held (its accounts stay in the
+ * open vault, but no key is published for it, so the store serves none). egress keeps the set it took last, bounded by
+ * the lease end it was given with it; the first round after the reason ends pushes as always. A KMS lease that refused
+ * or ran out is never a reason: that push empties egress at once.
  *
  * **Hold (P7, docs/design/relay-no-always-on-host.md 13.4).** During a rollout two instances hold the relay's accounts;
  * only the serving one refreshes and signs in. While this VM is not serving (draining, or its role unknown: `hold`), the
@@ -61,6 +71,15 @@ export const STACK_OPS_TOKENS_ACK_URL = "http://egress/v1/stack/ops/tokens/ack";
 export const STACK_OPS_SIGN_IN_PROXY_URL = "http://egress/v1/stack/ops/sign-in-proxy";
 /** How often the account set is sent even when unchanged: egress holds it in memory only. */
 export const LANE_STACK_OPS_RESEND_MS = 60_000;
+
+/**
+ * Why a round keeps egress's account set as it is, with no push (`StackOpsOptions.keep`, review 11-16):
+ * - `vault_closed`: the vault is not open and no lease refusal closed it (the boot before its first open, a close
+ *   waiting for its reopen). The store holds none of the relay's accounts: nothing is read either.
+ * - `lease_unknown`: the vault is open but no lease state has reached this boot yet (the gate serves nothing before it).
+ * - `relay_away`: the stack relay is away from Gray's snapshot and held while the vault holds its accounts.
+ */
+export type StackOpsKeep = "vault_closed" | "lease_unknown" | "relay_away";
 
 /**
  * The panel's own-call settings, as the console serves them in `stack.config` (the relay's `own_calls`, set in the
@@ -101,11 +120,18 @@ export interface StackOpsOptions {
   readonly persist?: StackOpsPersist;
   /** P7: whether this VM is not its relay's serving instance now (with `persist` only): egress refreshes and signs in nothing. */
   readonly hold?: () => boolean;
+  /**
+   * Review 11-16: why egress's set is kept as it is now, with no push (`StackOpsKeep`), or null to push. Read before
+   * the tokens and again before the push. Absent: always null (phase 1).
+   */
+  readonly keep?: () => StackOpsKeep | null;
   readonly log?: (line: Record<string, unknown>) => void;
 }
 
 /** What persist first needs of the vault (`LaneVault`). */
 export interface StackOpsPersist {
+  /** Whether the vault is open (`LaneVault.open`); a round reads egress's tokens only then. Absent: open. */
+  readonly open?: boolean;
   persistToken(apply: () => boolean): Promise<"persisted" | "refused" | "failed">;
   /** A token taken without persist first (an egress that installed it at once) is written after the fact. */
   changed(reason: "token"): Promise<boolean>;
@@ -220,6 +246,8 @@ export class StackOpsService {
   #sentHold = false;
   /** P7: egress held, ran nothing and held no family pending, as of the last read. */
   #idle = false;
+  /** Review 11-16: the reason the last round kept egress's set (logged once per reason), null once a round pushes. */
+  #kept: StackOpsKeep | null = null;
 
   constructor(options: StackOpsOptions) {
     this.#options = options;
@@ -249,8 +277,16 @@ export class StackOpsService {
         this.#polledAt = at;
         const current = viewNow();
         if (current.metadata === null) break;
-        await this.#push(current, at, force);
-        await this.#readTokens();
+        // Review 11-16: tokens first. A push that leaves an account out drops what egress holds of it, so whatever egress
+        // refreshed is taken and written before anything is pushed. Not while the vault is closed: nothing could be
+        // written, and a lease refusal (the vault dropped its key) empties egress without waiting on a read.
+        if (this.#options.persist?.open !== false && this.#options.keep?.() !== "vault_closed") await this.#readTokens();
+        const keep = this.#options.keep?.() ?? null;
+        if (keep === null) await this.#push(current, at, force);
+        else if (this.#kept !== keep) {
+          this.#kept = keep;
+          this.#log({ level: "info", event: "lane_stack_ops_push_kept", relay_id: this.#options.relayId, code: keep });
+        }
         again = this.#again;
       }
     } finally {
@@ -286,6 +322,11 @@ export class StackOpsService {
     for (const account of [...(view.metadata?.accounts ?? [])].sort((l, r) => (l.id < r.id ? -1 : l.id > r.id ? 1 : 0))) {
       const held = sealed.get(account.id);
       if (held === undefined || notHeld.has(account.id) || held.vendor !== account.vendor) continue;
+      // One account, one address. An account sealed with a proxy the panel does not name, or named one it was not
+      // sealed with, is `proxy_mismatch` in the document; this table does not wait for that list to be current (it
+      // is the last rebuild's, and null before the first): pushed with no proxy, the account's sign-in and refresh
+      // would leave from the VM's own address.
+      if ((held.egress === undefined) !== (account.proxy_id === null)) continue;
       let fields: Record<string, string>;
       try {
         if (held.credential.type !== "password" && held.credential.type !== "sign_in") authHeaders(account.vendor, held.credential);
@@ -347,6 +388,7 @@ export class StackOpsService {
   #signInProxySent: { readonly text: string; readonly at: number } | null = null;
 
   async #push(view: StackOpsView, now: number, force = false): Promise<void> {
+    this.#kept = null;
     await this.#pushSignInProxy(view, now, force);
     const body = this.accountsBody(view, now);
     const until = this.#options.leaseUntil?.();

@@ -31,8 +31,8 @@ export class ContentBudget {
   refused = 0;
   private readonly writers = new Set<Relievable>();
   private readonly waiters: { readonly bytes: number; readonly resolve: (ok: boolean) => void }[] = [];
-  /** Holds of writers that ended (`linger`): bytes the platform may still be reading for them. */
-  private readonly lingering = new Set<{ readonly bytes: number; readonly until: number; readonly clock: () => number }>();
+  /** Holds of writers or open streams (`linger`, `lease`): bytes reclaimed once `until` passes if never released. */
+  private readonly lingering = new Set<{ readonly bytes: number; until: number; readonly clock: () => number }>();
 
   constructor(max: number) {
     if (!Number.isSafeInteger(max) || max < 1) throw new RangeError(`a content budget must be a positive integer, got ${max}`);
@@ -41,6 +41,7 @@ export class ContentBudget {
 
   /** What the writers hold now. */
   get bytes(): number {
+    this.expire();
     return this.used;
   }
 
@@ -118,11 +119,28 @@ export class ContentBudget {
    * the platform has ended the request's work and its I/O), checked whenever a reservation is asked for.
    */
   linger(bytes: number, until: number, clock: () => number): () => void {
-    if (bytes <= 0) return () => {};
+    return this.lease(bytes, until, clock).release;
+  }
+
+  /**
+   * Keeps `bytes`, already reserved for an open stream, bounded by an idle deadline `until` that each pull
+   * pushes forward (`touch`): if the caller abandons the stream without reading to its end or cancelling it,
+   * the reservation comes back once `clock` reaches `until`.
+   */
+  lease(bytes: number, until: number, clock: () => number): { readonly release: () => void; readonly touch: (until: number) => boolean } {
+    if (bytes <= 0) return { release: () => {}, touch: () => true };
     const entry = { bytes, until, clock };
     this.lingering.add(entry);
-    return () => {
-      if (this.lingering.delete(entry)) this.release(entry.bytes);
+    return {
+      release: () => {
+        if (this.lingering.delete(entry)) this.release(entry.bytes);
+      },
+      touch: (next: number) => {
+        this.expire();
+        if (!this.lingering.has(entry)) return false;
+        if (next > entry.until) entry.until = next;
+        return true;
+      },
     };
   }
 

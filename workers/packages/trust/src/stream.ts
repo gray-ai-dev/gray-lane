@@ -12,11 +12,14 @@
  * - at the end of the upstream's body the relay decodes the tail (`push` and `finish`), calls
  *   `observe` with those events and then `finish()`.
  *
- * A gated stream (`holdsToolCalls`, Rust's `requires_buffered_stream`: enforce mode, a streamed
- * request that declared tools) is checked by a `StreamToolInspector`; an open one by
- * `inspectStreamEvents` on each frame, with no end-of-stream check of its own (Rust's open relay has
- * none). `ToolGate` and `OpenGate` (src/gate.ts) are the whole release rule built on the same calls,
- * held to Rust's own relay by the `trust` fixtures (targets `gate` and `open_gate`).
+ * A gated stream (`holdsToolCalls`, Rust's `requires_buffered_stream`: enforce mode, test-only, a
+ * streamed request that declared tools; and every translated stream) is checked by a
+ * `StreamToolInspector`. An open one is released frame by frame (Rust's `open_stream_check`): a
+ * request that declared tools has each call inspected in full by a `StreamToolInspector` that only
+ * reports (the gate observes, owner 2026-11-17), its end-of-stream checks included, so its calls count
+ * in the per-route error rates; any other has `inspectStreamEvents` on each frame. `ToolGate` and
+ * `OpenGate` (src/gate.ts) are the whole release rule built on the same calls, held to Rust's own relay
+ * by the `trust` fixtures (targets `gate` and `open_gate`).
  */
 import { type Json, type JsonObject, isObject, setMember } from "@gray/json";
 import { type CanonicalEvent, type ToolCallCheck, conversationFields } from "@gray/protocol";
@@ -47,7 +50,7 @@ export interface StreamCheck {
   fragmentRepairs(): ReadonlySet<bigint>;
   /**
    * What the check keeps of the stream beyond the decoder's values, in heap bytes
-   * (`StreamToolInspector.retainedBytes`; nothing in an open stream): the relay weighs it with the
+   * (`StreamToolInspector.retainedBytes`; an open stream's inspector's, or nothing): the relay weighs it with the
    * frames it holds.
    */
   retainedBytes(): number;
@@ -111,20 +114,27 @@ class GatedCheck implements StreamCheck {
   }
 }
 
+/**
+ * An open stream's check (Rust's `OpenStreamCheck`): its frames go to the client as they pass. `inspector`: the full
+ * inspector of a request that declared tools, which only reports in audit mode (its first refusal once, as a
+ * violation); without one, `inspectStreamEvents` on each frame.
+ */
 class OpenCheck implements StreamCheck {
   readonly holdsToolCalls = false;
   private readonly policy: TrustPolicy;
   private readonly gate: GateRequest;
-  /** What the stream's tool-call check reads: an open stream has calls too (to tools the request did not declare). */
+  private readonly inspector: StreamToolInspector | undefined;
+  /** What the stream's tool-call check reads without an inspector: an open stream has calls too (to tools the request did not declare). */
   private readonly tally = new ToolCallTally();
 
-  constructor(policy: TrustPolicy, gate: GateRequest) {
+  constructor(policy: TrustPolicy, gate: GateRequest, inspector: StreamToolInspector | undefined) {
     this.policy = policy;
     this.gate = gate;
+    this.inspector = inspector;
   }
 
   observe(events: readonly CanonicalEvent[]): InspectionResult {
-    return this.policy.inspectStreamEvents(this.gate, events, this.tally);
+    return this.inspector?.observe(events) ?? this.policy.inspectStreamEvents(this.gate, events, this.tally);
   }
 
   releasable(): boolean {
@@ -132,7 +142,7 @@ class OpenCheck implements StreamCheck {
   }
 
   finish(): InspectionResult {
-    return { ok: true, inspection: NOTHING_FOUND };
+    return this.inspector?.finish() ?? { ok: true, inspection: NOTHING_FOUND };
   }
 
   fragmentRepairs(): ReadonlySet<bigint> {
@@ -140,10 +150,11 @@ class OpenCheck implements StreamCheck {
   }
 
   retainedBytes(): number {
-    return 0;
+    return this.inspector?.retainedBytes() ?? 0;
   }
 
   toolCallCheck(finished: boolean): ToolCallCheck | null {
+    if (this.inspector !== undefined) return this.inspector.toolCallCheck(finished);
     return this.tally.check(this.policy.mode, this.gate.request.tools.length > 0, finished);
   }
 }
@@ -156,7 +167,9 @@ export function streamCheck(policy: TrustPolicy, gate: GateRequest, answerLimit:
     else if (options.fragments === "unused") inspector.withFragmentsUnused();
     return new GatedCheck(inspector);
   }
-  return new OpenCheck(policy, gate);
+  // A request that declared tools: each call inspected in full as it passes, reported only (`open_stream_check`).
+  const observed = policy.mode === "audit" && gate.request.tools.length > 0;
+  return new OpenCheck(policy, gate, observed ? policy.streamToolInspector(gate, answerLimit) : undefined);
 }
 
 /**

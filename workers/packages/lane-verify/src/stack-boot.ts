@@ -277,7 +277,7 @@ export function stackBootFacts(events: readonly DstackEvent[]): StackBootResult 
   if (image === null) {
     return fail("relay_image_invalid", `the ${RELAY_IMAGE_EVENT} payload is not {image, image_sig, nonce, relay_id}, v2's {image, image_sig, issued_ms, previous, relay_id, seq} or the empty slot's {image: null, relay_id, seq: 0} in their forms`);
   }
-  if (image.relayId !== identity.relayId) return fail("relay_image_relay_mismatch", `the ${RELAY_IMAGE_EVENT} event names another relay than ${STACK_IDENTITY_EVENT}`);
+  if (image.relayId !== identity.relayId) return fail("relay_image_relay_mismatch", `the ${RELAY_IMAGE_EVENT} event names another deployment than ${STACK_IDENTITY_EVENT}`);
   const seal = lowerHexBytes((after[2] as DstackEvent).event_payload);
   if (seal === null || new TextDecoder().decode(seal) !== PRELAUNCH_SEALED_PAYLOAD) {
     return fail("stack_events_invalid", `the ${PRELAUNCH_SEALED_EVENT} payload is not ${PRELAUNCH_SEALED_PAYLOAD}`);

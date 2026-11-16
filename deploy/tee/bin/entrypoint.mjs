@@ -65,6 +65,30 @@
 //   `gray-relay-image` v2 (the relay-signed designation, no nonce), or the empty slot (`image: null`) when no boot box
 //   opened; `stackBoot` reads v2 in a phase-2 app only, and an empty slot renders LANE_STACK_EMPTY_SLOT for the Worker.
 //
+// - docs/design/entry-replicas.md ER2: an entry may be one of several replicas of its app. The measured compose then
+//   carries the replicas' name pattern (TLS_REPLICA_DOMAIN_PATTERN, one `{n}`), and the instance's encrypted env its
+//   index (LANE_REPLICA, 1 to 16), which is not measured: every replica runs the same measured compose, and a caller
+//   pins a name's key by attestation, never by the name. This file renders the replica's name from the two and gives
+//   it to the Worker as TLS_REPLICA_DOMAIN, whose keyset then names it beside TLS_DOMAIN. Without an index nothing of
+//   it is rendered: the boot is a single entry, as before, and its certificate is ordered for TLS_DOMAIN alone by
+//   tls-alpn-01.
+// - docs/design/entry-replicas.md ER5: an entry replica's certificate names TLS_DOMAIN and its replica name, and is
+//   validated by dns-01, since the CA's tls-alpn-01 connection for the shared name would land on any replica. gray-acme
+//   gets the replica name (TLS_REPLICA_DOMAIN) and a unix socket (ACME_DNS01_SOCKET, on this container's /run/lane
+//   tmpfs, 0600) that this process serves for the length of the gray-acme run only (`serveAcmeDns01`): lego's httpreq
+//   provider posts each challenge value's present and cleanup there, and this process sends it on as the signed
+//   bridge call `acme.challenge`, so the bridge writes the `_acme-challenge` TXT record. gray-acme still holds no bridge
+//   seed and no DNS credential (D45, EI2).
+// - docs/design/entry-replicas.md ER9 as the replicas' operating spec revised it ("Drain, revised 2026-11-17 evening",
+//   "Review fixes, 2026-11-17 night"): an entry replica is stopped by workerd's own SIGTERM drain, and the Worker drives
+//   it. This process serves a unix socket on the lane-only /run/lane tmpfs (ENTRY_STOP_SOCKET_NAME, 0600) with one
+//   route, `POST /stop`, which workerd reaches as the external service ENTRY_STOP (a replica's boot only): the Worker
+//   calls it on a `stopping` written during its boot. It sends workerd SIGTERM once (idempotent), restarts it never,
+//   and sends SIGKILL ENTRY_STOP_KILL_MS later if workerd still runs. Once workerd has exited it answers 443 itself with
+//   this boot's certificate (`serveStopped`): 503 `stopped` on `/healthz`, 503 `entry_stopped` elsewhere, until the CVM
+//   is updated or restarted. The process does not exit on its own then: the container's `restart: unless-stopped`
+//   would start it again, and every start orders a certificate (D133). A single entry runs none of it.
+//
 // The entrypoint refuses to start when a value is missing or malformed, and when a placeholder
 // survives rendering. It also fails closed if gray-egress never creates its socket: a lane that starts
 // workerd with no egress path would answer every request with a transport failure, which is worse than
@@ -74,8 +98,8 @@
 // an image.
 import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey, randomBytes, sign as signMessage, verify as verifySignature, X509Certificate } from "node:crypto";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
 import { isIPv4 } from "node:net";
 import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -92,6 +116,9 @@ const SEED = /^[0-9a-f]{64}$/;
 const RELAY_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 /** A lower-case DNS name of at least two labels (an entry name in LANE_PEER_ENTRIES). */
 const DNS_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+/** docs/design/entry-replicas.md ER2: where a replica's index goes in the measured name pattern, and the index's bound. */
+const REPLICA_PLACEHOLDER = "{n}";
+export const REPLICA_MAX = 16;
 /** The relay-stack layout's settings (S23, S28): the compose sets all three or none. */
 const STACK_NAMES = Object.freeze(["LANE_STACK_RELAY_ID", "LANE_STACK_CONFIG_LISTEN", "LANE_STACK_RELAY_ADDRESS"]);
 /**
@@ -545,6 +572,65 @@ export function peerFragments(peers) {
 }
 
 /**
+ * docs/design/entry-replicas.md ER2, EI3, EI4: this boot's replica name, or null for a single entry. The pattern
+ * (TLS_REPLICA_DOMAIN_PATTERN) is a literal of the measured compose and holds `{n}` exactly once; the index
+ * (LANE_REPLICA) is the instance's own, from the encrypted env, a whole number from 1 to REPLICA_MAX. No index is a
+ * single entry, whether or not the compose carries a pattern. An index needs the pattern and the shared name
+ * (TLS_DOMAIN) it stands beside, and renders a DNS name that is not the shared name. The relay-stack layout carries
+ * neither: a stack VM is never an entry and has no public name. app-compose.mjs's gate holds the measured compose to
+ * the same pattern rules; this is the boot's own check.
+ */
+export function replicaLayout(env, stack) {
+  const pattern = env.TLS_REPLICA_DOMAIN_PATTERN ?? "";
+  const index = env.LANE_REPLICA ?? "";
+  if (stack !== null && (pattern !== "" || index !== "")) {
+    fail("TLS_REPLICA_DOMAIN_PATTERN and LANE_REPLICA are an entry's settings, never set in the relay-stack layout: a stack VM has no public name (relay-outbound-only §3.9)");
+  }
+  if (pattern !== "" && pattern.split(REPLICA_PLACEHOLDER).length !== 2) fail(`TLS_REPLICA_DOMAIN_PATTERN holds ${REPLICA_PLACEHOLDER} exactly once, where a replica's index goes`);
+  if (index === "") return null;
+  if (pattern === "") fail("LANE_REPLICA is set without TLS_REPLICA_DOMAIN_PATTERN: a replica's index needs the measured name pattern it renders");
+  if (!/^[1-9][0-9]?$/.test(index) || Number(index) > REPLICA_MAX) fail(`LANE_REPLICA is a replica's index, a whole number from 1 to ${REPLICA_MAX}`);
+  const shared = env.TLS_DOMAIN ?? "";
+  if (shared === "") fail("LANE_REPLICA is set without TLS_DOMAIN: a replica's name stands beside the shared name");
+  const domain = pattern.replace(REPLICA_PLACEHOLDER, index);
+  if (!DNS_NAME.test(domain)) fail("TLS_REPLICA_DOMAIN_PATTERN does not render a lower-case DNS name for this replica's index");
+  if (domain === shared) fail("TLS_REPLICA_DOMAIN_PATTERN renders TLS_DOMAIN for this replica's index: a replica's name is a name of its own");
+  return { index, domain };
+}
+
+/**
+ * The template fragments of an entry replica: its bindings and (ER9 as revised) the stop socket's external service; empty
+ * without one (null), so a single entry renders the template's own text. Exported for the host e2e's renderers, as `stackFragments` is.
+ */
+export function replicaFragments(replica, stopSocket = null) {
+  if (replica === null) return { REPLICA_BINDINGS: "", REPLICA_SERVICES: "" };
+  if (stopSocket === null || !stopSocket.startsWith("/") || !SAFE.test(stopSocket)) fail("an entry replica's stop socket is an absolute path a workerd config string can carry");
+  const lines = [
+    "",
+    "          # docs/design/entry-replicas.md ER2: this entry replica's own name, rendered from the measured pattern and the",
+    "          # instance's index. The keyset names it beside TLS_DOMAIN, and every answer names its origin.",
+    `          ( name = "TLS_REPLICA_DOMAIN", text = "${replica.domain}" ),`,
+    "          # docs/design/entry-replicas.md ER9 as revised: the index the replica reads its role by (entry.role) and",
+    "          # /healthz names; not measured, as the name it renders is not.",
+    `          ( name = "LANE_REPLICA", text = "${replica.index}" ),`,
+    "          # ER9 as revised: this process's stop socket, which the Worker calls once its role says stopping.",
+    '          ( name = "ENTRY_STOP", service = "entry-stop" ),',
+  ];
+  const services = [
+    "    # docs/design/entry-replicas.md ER9 as revised: the entrypoint's stop socket on the lane-only tmpfs: POST /stop sends",
+    "    # workerd SIGTERM once, so its own drain stops the replica.",
+    '    ( name = "entry-stop",',
+    "      external = (",
+    `        address = "unix:${stopSocket}",`,
+    "        http = ()",
+    "      )",
+    "    ),",
+    "",
+  ];
+  return { REPLICA_BINDINGS: lines.join("\n"), REPLICA_SERVICES: services.join("\n") };
+}
+
+/**
  * docs/design/relay-outbound-only.md §3.2, §3.8: the lane's peerlink, or null when the compose names none. Both layouts
  * run gray-peerlink in its own container and share its unix socket with the lane (`PEERLINK_SOCKET`, an absolute path
  * on the socket's volume); the lane reaches it as the workerd `external` service `peerlink`, bound as `PEERLINK`. The
@@ -832,10 +918,10 @@ function bridgeHeaders({ op, target, path, body, keyId, seed, timestampMs, nonce
 /** How long a report may take: it delays the hold's start, never the hold's end (the hold is dated from the order). */
 const REPORT_TIMEOUT_MS = 15_000;
 
-/** The default `postBridge`: one https POST, its status and the first KiB of its answer. */
-function postBridgeHttps(url, headers, body) {
+/** The default `postBridge`: one https POST, its status and the first KiB of its answer, within `timeoutMs`. */
+function postBridgeHttps(url, headers, body, timeoutMs = REPORT_TIMEOUT_MS) {
   return new Promise((resolvePost, rejectPost) => {
-    const request = httpsRequest(url, { method: "POST", headers: { ...headers, "content-length": String(body.byteLength) }, timeout: REPORT_TIMEOUT_MS }, (response) => {
+    const request = httpsRequest(url, { method: "POST", headers: { ...headers, "content-length": String(body.byteLength) }, timeout: timeoutMs }, (response) => {
       const chunks = [];
       let size = 0;
       response.on("data", (chunk) => {
@@ -845,7 +931,7 @@ function postBridgeHttps(url, headers, body) {
       response.on("end", () => resolvePost({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8").slice(0, 1024) }));
       response.on("error", rejectPost);
     });
-    request.on("timeout", () => request.destroy(new Error(`no answer within ${REPORT_TIMEOUT_MS} ms`)));
+    request.on("timeout", () => request.destroy(new Error(`no answer within ${timeoutMs} ms`)));
     request.on("error", rejectPost);
     request.end(body);
   });
@@ -878,11 +964,306 @@ async function reportAcmeFailure({ bridgeUrl, keyId, seed, document, postBridge,
 }
 
 /**
+ * docs/design/entry-replicas.md ER5: where this process serves gray-acme's dns-01 calls, beside the rendered config on
+ * the lane-only /run/lane tmpfs (D63), so no other container reaches it.
+ */
+export const ACME_DNS01_SOCKET_NAME = "acme-dns01.sock";
+/** A dns-01 value: the base64url of a SHA-256 digest, 43 characters (RFC 8555 section 8.4; @gray/lane-wire acme-challenge.ts). */
+const ACME_CHALLENGE_VALUE = /^[A-Za-z0-9_-]{43}$/;
+/** lego's httpreq body is `{"fqdn","value"}`: a name of at most 253 characters and the value. */
+const ACME_DNS01_BODY_MAX = 1024;
+/**
+ * The bound on one `acme.challenge` call: the VM's bound on one bridge call (@gray/lane-wire `LANE_BRIDGE_CALL_MS`,
+ * 20 s); the bridge answers within its op budget 2 s under it (lane-bridge acme-challenge.ts `ACME_CHALLENGE_BUDGET_MS`).
+ * gray-acme's httpreq client waits 30 s (deploy/tee/acme/issuer.go `dns01CallTimeout`), so it reads this answer.
+ */
+export const ACME_CHALLENGE_CALL_MS = 20_000;
+/** A bridge error code as the wire spells it (`@gray/lane-wire` error codes: lower-case words and underscores). */
+const BRIDGE_ERROR_CODE = /^[a-z0-9_]{1,64}$/;
+
+/** One JSON answer to gray-acme. */
+function answerAcme(response, status, value) {
+  const body = JSON.stringify(value);
+  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  response.end(body);
+}
+
+/** The bridge's error code in a refused call's answer (`{ok: false, error: {code}}`), or `bridge_<status>`. */
+function bridgeErrorCode(answer) {
+  try {
+    const value = JSON.parse(answer.text);
+    const code = value !== null && typeof value === "object" && value.error !== null && typeof value.error === "object" ? value.error.code : undefined;
+    if (typeof code === "string" && BRIDGE_ERROR_CODE.test(code)) return code;
+  } catch {
+    // not JSON: the status names it
+  }
+  return `bridge_${answer.status}`;
+}
+
+/**
+ * docs/design/entry-replicas.md ER5: serve gray-acme's dns-01 calls on the unix socket `socketPath` until `close()`.
+ * lego's httpreq provider posts `{fqdn, value}` to `/present` and `/cleanup` (lego v5.6.0
+ * providers/dns/httpreq/httpreq.go:37-40,134-145,165-176). Each is checked before anything is sent: the name must be
+ * `_acme-challenge.` and one of `names` (this boot's shared and replica names), with or without the root's dot, in
+ * any case; the value 43 characters of base64url. Then it goes on as one signed bridge call `acme.challenge`, target
+ * `acme/<name>`, signed as `lane.acme_failed` is. The answer to gray-acme is 200 when the bridge answered 200, and
+ * otherwise an error status whose body names the bridge's code (`{"error": code}`), never a key, a signature or the
+ * bridge's own text. `acme_not_configured` adds a line saying the environment's bridge has no DNS settings.
+ *
+ * Why a unix socket: gray-acme runs in this container, and its HTTP client dials the socket by path
+ * (deploy/tee/acme/issuer.go `dns01Provider`), so nothing listens on any address, and the socket is 0600 on a tmpfs
+ * no other container mounts. Exported for the tests.
+ */
+export async function serveAcmeDns01({ socketPath, names, bridgeUrl, keyId, seed, postBridge, wallNow, log, error }) {
+  const allowed = new Map(names.map((name) => [`_acme-challenge.${name}`, name]));
+  const server = createHttpServer((request, response) => {
+    const action = request.method === "POST" && (request.url === "/present" || request.url === "/cleanup") ? request.url.slice(1) : null;
+    if (action === null) {
+      request.resume();
+      answerAcme(response, 404, { error: "not_found" });
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= ACME_DNS01_BODY_MAX) chunks.push(chunk);
+    });
+    request.on("error", () => response.destroy());
+    request.on("end", () => {
+      void (async () => {
+        if (size > ACME_DNS01_BODY_MAX) {
+          answerAcme(response, 413, { error: "too_large" });
+          return;
+        }
+        let document;
+        try {
+          document = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch {
+          document = null;
+        }
+        const keys = document !== null && typeof document === "object" && !Array.isArray(document) ? Object.keys(document).sort().join(",") : "";
+        if (keys !== "fqdn,value" || typeof document.fqdn !== "string" || typeof document.value !== "string") {
+          answerAcme(response, 400, { error: "bad_request" });
+          return;
+        }
+        const name = (document.fqdn.endsWith(".") ? document.fqdn.slice(0, -1) : document.fqdn).toLowerCase();
+        if (!allowed.has(name)) {
+          error(`lane: refused a dns-01 ${action} for a name that is not this boot's (${reportLine(name, 260)}): only _acme-challenge. and ${names.join(" or ")}`);
+          answerAcme(response, 403, { error: "name_not_allowed" });
+          return;
+        }
+        if (!ACME_CHALLENGE_VALUE.test(document.value)) {
+          error(`lane: refused a dns-01 ${action} for ${name}: the value is not 43 characters of base64url`);
+          answerAcme(response, 400, { error: "bad_value" });
+          return;
+        }
+        if (seed === "" || !BRIDGE_KEY_ID.test(keyId)) {
+          error(`lane: dns-01 ${action} for ${name}: no bridge key to sign it with`);
+          answerAcme(response, 503, { error: "no_bridge_key" });
+          return;
+        }
+        const op = "acme.challenge";
+        const path = "/v1/lane-bridge/acme/challenge";
+        const body = Buffer.from(JSON.stringify({ action, fqdn: name, value: document.value }), "utf8");
+        let answer;
+        try {
+          const headers = bridgeHeaders({ op, target: `acme/${name}`, path, body, keyId, seed, timestampMs: wallNow(), nonce: randomBytes(16).toString("hex") });
+          answer = await postBridge(new URL(path, bridgeUrl).toString(), headers, body, ACME_CHALLENGE_CALL_MS);
+        } catch (thrown) {
+          error(`lane: dns-01 ${action} for ${name}: the bridge was not reached: ${reportLine(thrown instanceof Error ? thrown.message : String(thrown), 300)}`);
+          answerAcme(response, 502, { error: "bridge_unreachable" });
+          return;
+        }
+        if (answer.status === 200) {
+          let changed = null;
+          try {
+            const value = JSON.parse(answer.text);
+            if (value !== null && typeof value === "object" && typeof value.changed === "boolean") changed = value.changed;
+          } catch {
+            // the status is the answer
+          }
+          log(`lane: dns-01 ${action} for ${name}: done${changed === null ? "" : changed ? " (changed)" : " (unchanged)"}`);
+          answerAcme(response, 200, { done: true });
+          return;
+        }
+        const code = bridgeErrorCode(answer);
+        if (code === "acme_not_configured") {
+          error(`lane: dns-01 ${action} for ${name}: this environment's lane bridge has no DNS settings (acme_not_configured: LANE_BRIDGE_ACME_ZONE_ID, LANE_BRIDGE_ACME_NAMES and LANE_BRIDGE_ACME_DNS_TOKEN are unset), so an entry replica cannot order its certificate`);
+          answerAcme(response, 502, { error: code, detail: "the environment's lane bridge has no DNS settings" });
+          return;
+        }
+        error(`lane: dns-01 ${action} for ${name}: the bridge answered ${answer.status} ${code}`);
+        answerAcme(response, 502, { error: code });
+      })().catch(() => response.destroy());
+    });
+  });
+  rmSync(socketPath, { force: true });
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(socketPath, () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  chmodSync(socketPath, 0o600);
+  let closed = false;
+  return {
+    async close() {
+      if (closed) return;
+      closed = true;
+      server.closeAllConnections?.();
+      await new Promise((resolveClose) => server.close(() => resolveClose()));
+      rmSync(socketPath, { force: true });
+    },
+  };
+}
+
+/**
+ * The longest a replica's stop waits for workerd's SIGTERM drain before SIGKILL: the default of PROVISION_DRAIN_MAX_MS
+ * (workers/provisioner/src/config.ts, 15 min), the bound on a stack VM's drain the replicas' stop takes over
+ * (docs/design/relay-zero-downtime.md §2).
+ */
+export const ENTRY_STOP_KILL_MS = 15 * 60_000;
+/** ER9 as revised: the stop socket's name, beside the rendered config on the lane-only /run/lane tmpfs (D63). */
+export const ENTRY_STOP_SOCKET_NAME = "entry-stop.sock";
+
+/**
+ * ER9 as revised: an entry replica's stop. `stop()` sends the running workerd (`workerd()`, null between runs) SIGTERM
+ * the first time and does nothing after (idempotent); from then `stopping` is true, so the supervisor restarts nothing,
+ * and SIGKILL follows `killMs` later if that workerd still runs (`done` resolves true then). Exported for the tests,
+ * which give it a fake clock.
+ */
+export function entryStopper({ workerd, killMs = ENTRY_STOP_KILL_MS, sleep = defaultSleep, log = console.log, error = console.error }) {
+  let stopping = false;
+  let done = Promise.resolve(false);
+  return {
+    get stopping() {
+      return stopping;
+    },
+    get done() {
+      return done;
+    },
+    stop() {
+      if (stopping) return;
+      stopping = true;
+      const child = workerd();
+      if (child === null) {
+        log("lane: entry replica: stop asked while workerd is not running: it is not started again");
+        return;
+      }
+      log(`lane: entry replica: stop: SIGTERM to workerd (its drain ends each in-flight answer, then exits); SIGKILL in ${killMs / 60_000} min if it still runs`);
+      child.kill("SIGTERM");
+      done = (async () => {
+        await sleep(killMs);
+        if (workerd() !== child) return false;
+        error(`lane: entry replica: workerd still runs ${killMs / 60_000} min after SIGTERM: SIGKILL`);
+        child.kill("SIGKILL");
+        return true;
+      })();
+    },
+  };
+}
+
+/** One JSON answer on a local socket. */
+function answerJson(response, status, value) {
+  const body = JSON.stringify(value);
+  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  response.end(body);
+}
+
+/**
+ * ER9 as revised: serve the stop socket at `socketPath` (0600) until `close()`: `POST /stop` calls `onStop()` and
+ * answers 200 `{"stop":"sent"}`, whatever came before (idempotent); 503 while no stop is wired yet (`onStop` null: the
+ * wrapper attaches it as workerd starts); any other path 404, any other method 405. Only workerd reaches it (the
+ * external service ENTRY_STOP). Exported for the tests.
+ */
+export async function serveEntryStop({ socketPath }) {
+  let onStop = null;
+  rmSync(socketPath, { force: true });
+  const server = createHttpServer((request, response) => {
+    request.resume();
+    const path = (request.url ?? "/").split("?")[0];
+    if (path !== "/stop") return answerJson(response, 404, { error: "not_found" });
+    if (request.method !== "POST") return answerJson(response, 405, { error: "method_not_allowed" });
+    if (onStop === null) return answerJson(response, 503, { error: "stop_unavailable" });
+    onStop();
+    answerJson(response, 200, { stop: "sent" });
+  });
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(socketPath, () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  chmodSync(socketPath, 0o600);
+  return {
+    attach(handler) {
+      onStop = handler;
+    },
+    close() {
+      return new Promise((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
+
+/**
+ * A stopped replica's answer to one request (ER9 as revised, "Review fixes, 2026-11-17 night"): 503 on its health route
+ * with `status: "stopped"` (the release tool reads the body whatever the code), 503 `entry_stopped` elsewhere.
+ */
+export function stoppedAnswer(method, path, replica) {
+  if (method === "GET" && path === "/healthz") {
+    return { status: 503, body: { status: "stopped", replica: { index: replica.index, origin: replica.origin, role: "stopping", in_flight: 0 } } };
+  }
+  return { status: 503, body: { error: { code: "entry_stopped" } } };
+}
+
+/** `*:443` or `<host>:<port>` as `{host, port}`; `*` is every address (host undefined). */
+function listenTarget(address) {
+  const at = address.lastIndexOf(":");
+  const host = address.slice(0, at);
+  const port = Number(address.slice(at + 1));
+  if (at < 1 || !Number.isInteger(port) || port < 0 || port > 65_535) throw new Error(`LISTEN_ADDRESS ${address} is not <host>:<port>`);
+  return { host: host === "*" ? undefined : host.replace(/^\[|\]$/g, ""), port };
+}
+
+/**
+ * ER9 as revised: once a stopped replica's workerd has exited, answer its listen address with this boot's certificate
+ * and key until the process is stopped: `GET /healthz` (any query) 503 `stopped`, anything else 503 `entry_stopped`,
+ * each answer closing its connection. Resolves with the listening server. The lane binds 443 as gray-acme and workerd
+ * do (the compose: root, no capabilities, Docker's unprivileged port start of 0). Exported for the tests.
+ */
+export function serveStopped({ listenAddress, certificate, privateKey, replica, createServer = createHttpsServer }) {
+  const { host, port } = listenTarget(listenAddress);
+  const server = createServer({ cert: readFileSync(certificate), key: readFileSync(privateKey) }, (request, response) => {
+    const path = (request.url ?? "/").split("?")[0];
+    const { status, body } = stoppedAnswer(request.method ?? "GET", path, replica);
+    const text = JSON.stringify(body);
+    response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(text), "cache-control": "no-store", connection: "close" });
+    response.end(text);
+    request.resume();
+  });
+  return new Promise((resolveServer, rejectServer) => {
+    server.once("error", rejectServer);
+    server.listen({ host, port }, () => {
+      server.off("error", rejectServer);
+      resolveServer(server);
+    });
+  });
+}
+
+/**
  * D133: gray-acme's environment: its own settings and lego's (`TLS_DOMAIN`, `ACME_*`, `LEGO_*`, and Go's
  * root-store overrides), never the rest of the lane's (the bridge seed is not its business). The
  * challenge listener is the lane's own LISTEN_ADDRESS, whatever the environment says.
+ *
+ * docs/design/entry-replicas.md ER5: an entry replica's run also gets its replica name (TLS_REPLICA_DOMAIN, rendered
+ * here, never a host value) and the socket this process serves for it (ACME_DNS01_SOCKET), and gray-acme orders both
+ * names by dns-01. A single entry's run gets neither, whatever the environment says, and orders TLS_DOMAIN alone by
+ * tls-alpn-01. Exported for the tests.
  */
-function acmeEnvironment(env, listenAddress) {
+export function acmeEnvironment(env, listenAddress, dns01 = null) {
   const out = {};
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) continue;
@@ -891,6 +1272,11 @@ function acmeEnvironment(env, listenAddress) {
     }
   }
   out.ACME_TLS_ALPN_ADDRESS = listenAddress;
+  delete out.ACME_DNS01_SOCKET;
+  if (dns01 !== null) {
+    out.TLS_REPLICA_DOMAIN = dns01.replicaDomain;
+    out.ACME_DNS01_SOCKET = dns01.socketPath;
+  }
   return out;
 }
 
@@ -1004,6 +1390,7 @@ export async function main({
   const egressSocket = fromEnvironment(env, "EGRESS_SOCKET", "/run/gray/egress.sock");
   if (!egressSocket.startsWith("/")) fail("EGRESS_SOCKET is an absolute path");
   const stack = stackLayout(env);
+  const replica = replicaLayout(env, stack);
   const peers = peerLayout(env, stack);
   const peerlink = peerlinkLayout(env, stack);
   const kmsLease = kmsLeaseLayout(env, stack);
@@ -1131,12 +1518,15 @@ export async function main({
   const kmsLeaseSocket = join(dirname(renderedPath), "kms-lease.sock");
   // P2e: the vault disk's socket, beside it.
   const vaultDiskSocket = join(dirname(renderedPath), "vault-disk.sock");
+  // ER9 as revised: an entry replica's stop socket, beside them.
+  const entryStopSocket = join(dirname(renderedPath), ENTRY_STOP_SOCKET_NAME);
   const template = readFileSync(templatePath, "utf8");
   const renderable = {
     ...values,
     TLS_SPKI_SHA256: "",
     WASM_MODULES: wasmModules,
     ...stackFragments(stack),
+    ...replicaFragments(replica, entryStopSocket),
     ...peerFragments(peers),
     ...peerlinkFragments(peerlink),
     ...kmsLeaseFragments(kmsLease, kmsLeaseSocket),
@@ -1155,10 +1545,25 @@ export async function main({
   const orderedAt = now();
   const attemptMs = wallNow();
   let issued;
+  // docs/design/entry-replicas.md ER5: an entry replica's dns-01 endpoint lives exactly as long as this run.
+  let dns01 = null;
+  if (replica !== null) {
+    const socketPath = join(dirname(renderedPath), ACME_DNS01_SOCKET_NAME);
+    mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
+    try {
+      const endpoint = await serveAcmeDns01({ socketPath, names: [values.TLS_DOMAIN, replica.domain], bridgeUrl, keyId: values.LANE_KEY_ID, seed, postBridge, wallNow, log, error });
+      dns01 = { replicaDomain: replica.domain, socketPath, endpoint };
+    } catch (thrown) {
+      fail(`cannot serve gray-acme's dns-01 endpoint on ${socketPath}: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+    }
+    log(`lane: entry replica ${replica.index}: ordering ${values.TLS_DOMAIN} and ${replica.domain} by dns-01 through the bridge (unix:${socketPath})`);
+  }
   try {
-    issued = await runAcme(spawnAcme, acme, acmeEnvironment(env, listenAddress), error);
+    issued = await runAcme(spawnAcme, acme, acmeEnvironment(env, listenAddress, dns01), error);
   } catch (thrown) {
     fail(`cannot run ${acme}: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+  } finally {
+    await dns01?.endpoint.close();
   }
   if (issued.code !== 0) {
     // The reason exists only in this container's log, which nobody outside the CVM can read: report it first.
@@ -1208,6 +1613,7 @@ export async function main({
   log(`lane: listening on ${values.LISTEN_ADDRESS} / guest agent unix:${values.GUEST_AGENT_SOCKET} / egress unix:${egressSocket}`);
   log(`lane: deploy_env=${deployEnv} tee_type=${values.TEE_TYPE} subject=${values.KEYSET_SUBJECT} not_after=${values.KEYSET_NOT_AFTER}`);
   log(`lane: tls_domain=${values.TLS_DOMAIN || "(unscoped)"} tls_spki_sha256=${values.TLS_SPKI_SHA256}`);
+  if (replica !== null) log(`lane: entry replica ${replica.index}: tls_replica_domain=${replica.domain} (the certificate names ${values.TLS_DOMAIN} and ${replica.domain})`);
   log(`lane: bridge=${bridgeUrl} key_id=${values.LANE_KEY_ID} receipt_key_id=${values.LANE_RECEIPT_KEY_ID || "(per boot)"} seed=${seed === "" ? "(none)" : "set"}`);
   log(`lane: source=${values.SOURCE_REPO_URL || "(unknown)"}@${values.SOURCE_REPO_COMMIT || "(unknown)"} image=${values.SOURCE_IMAGE_DIGEST || "(unknown)"}`);
   if (stack !== null) {
@@ -1260,7 +1666,20 @@ export async function main({
     lease?.wake();
     return child;
   };
-  return { child: restart(), restart, orderedAt, kmsLease: lease, vaultDisk };
+  // ER9 as revised: an entry replica's stop socket is served before workerd starts; the CLI wrapper attaches the stop
+  // (`entryStopper`) to it.
+  let replicaStop = null;
+  if (replica !== null) {
+    let endpoint;
+    try {
+      endpoint = await serveEntryStop({ socketPath: entryStopSocket });
+    } catch (thrown) {
+      fail(`cannot serve the entry replica's stop socket on ${entryStopSocket}: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+    }
+    log(`lane: entry replica ${replica.index}: stop socket unix:${entryStopSocket} (the Worker's ENTRY_STOP)`);
+    replicaStop = { replica: { index: Number(replica.index), origin: `https://${replica.domain}` }, listenAddress, certificate, privateKey, socketPath: entryStopSocket, endpoint };
+  }
+  return { child: restart(), restart, orderedAt, kmsLease: lease, vaultDisk, replicaStop };
 }
 
 // The CLI wrapper: production gets the process defaults; the deploy-tee tests import main() and
@@ -1300,10 +1719,27 @@ if (isMainModule()) {
     });
     return child;
   };
-  main().then(async ({ child, restart, orderedAt, kmsLease, vaultDisk }) => {
-    const code = await superviseWorkerd({ first: track(child), restart: () => track(restart()), orderedAt, stopped: () => state.stopping });
+  main().then(async ({ child, restart, orderedAt, kmsLease, vaultDisk, replicaStop }) => {
+    const first = track(child);
+    // ER9 as revised: the Worker's POST /stop stops workerd for good.
+    const stopper = replicaStop === null ? null : entryStopper({ workerd: () => (state.running ? state.child : null) });
+    if (stopper !== null) replicaStop.endpoint.attach(() => stopper.stop());
+    const code = await superviseWorkerd({ first, restart: () => track(restart()), orderedAt, stopped: () => state.stopping || stopper?.stopping === true });
     await kmsLease?.stop();
     await vaultDisk?.close();
+    if (stopper?.stopping === true && !state.stopping) {
+      await replicaStop.endpoint.close();
+      // Stopped by its role: answer as stopped until the CVM is updated or restarted. Never exit on our own: the
+      // container would be started again and order a certificate (D133). A requested stop (SIGTERM) exits 0 (`stop`).
+      try {
+        await serveStopped(replicaStop);
+        console.log(`lane: entry replica ${replicaStop.replica.index}: workerd stopped; answering ${replicaStop.listenAddress} as stopped until the CVM is updated or restarted`);
+      } catch (thrown) {
+        console.error(`lane: entry replica: cannot answer as stopped on ${replicaStop.listenAddress}: ${thrown instanceof Error ? thrown.message : String(thrown)}; staying up without it`);
+        setInterval(() => {}, 1 << 30);
+      }
+      return;
+    }
     process.exit(code);
   }).catch((thrown) => {
     console.error(`lane: ${thrown instanceof Error ? thrown.message : String(thrown)}`);

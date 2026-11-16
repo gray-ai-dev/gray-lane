@@ -30,7 +30,8 @@ import { laneRelaysOf, stackRelayOf } from "./remote/snapshot.ts";
 import type { StackRelayConfigProvider } from "./stack-config.ts";
 import { gatedStackConfig, gatedStackCredentials, KmsLeaseGate } from "./kms-lease.ts";
 import { StackConfigClient } from "./remote/stack.ts";
-import { LaneVault, VAULT_PREV_DISK_URL, vaultDiskClient, vaultKeys } from "./vault.ts";
+import { guestGetKey, LaneVault, VAULT_PREV_DISK_URL, VAULT_RETRY_FIRST_MS, VAULT_RETRY_MAX_MS, vaultDiskClient, vaultKeys } from "./vault.ts";
+import { AFFINITY_KEY_PATH, affinityKeyFromMaterial } from "./affinity.ts";
 import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
 import { keepRequestAlive } from "./background.ts";
 import { bootDiskClient, LaneBootBox } from "./boot-intake.ts";
@@ -93,8 +94,10 @@ export interface LaneStateOptions {
   /**
    * The TLS SPKI entry of the CVM's certificate: required, because the keyset binds the TLS identity
    * the client shakes hands with and this lane serves no plaintext path (VERIFY-lane-m0 VG-07).
+   * `replicaDomain` is an entry replica's own name beside the shared `domain` (docs/design/entry-replicas.md
+   * ER2); absent for a single entry.
    */
-  readonly tls: { readonly spkiSha256: string; readonly domain?: string };
+  readonly tls: LaneTlsEntry;
   /**
    * The relay registry's starting content: empty by default, because the first snapshot a boot reads
    * fills it (`MutableRelayRegistry.refresh`, design v2 section B).
@@ -147,6 +150,94 @@ export interface LaneStateOptions {
    * and every change is written there (`vault.ts`). Absent: memory only, as before.
    */
   readonly vault?: LaneVaultSettings;
+  /**
+   * ER7 (docs/design/entry-replicas.md): the guest agent the entry layout derives its affinity key from (`affinity.ts`).
+   * Absent: a random key per boot (E3), as for local dev, the tests and the relay-stack layout.
+   */
+  readonly affinity?: LaneAffinitySettings;
+}
+
+/** ER7: the guest agent (`GUEST_AGENT`) the entry's affinity key comes from, its base URL and the bound on one call. */
+export interface LaneAffinitySettings {
+  readonly guest: { fetch(input: string, init?: RequestInit): Promise<Response> };
+  readonly guestUrl: string;
+  readonly guestTimeoutMs: number;
+}
+
+/**
+ * ER7: the boot's affinity key `K_boot` (`affinity.ts`). With a guest agent it is the app's (`GetKey` of
+ * `AFFINITY_KEY_PATH`, then HKDF), the same on every replica and every boot; the boot waits for one `GetKey`, bounded
+ * by the guest agent's timeout as each of the vault's calls is. Without one it is 32 random bytes, as E3's.
+ *
+ * A `GetKey` that fails does what the vault does with its own (`LaneVault#open`): the boot is not refused, the failure
+ * is one log line with its code, and the call is tried again behind later requests (`tick`) on the vault's schedule,
+ * VAULT_RETRY_FIRST_MS doubling up to VAULT_RETRY_MAX_MS. Meanwhile the boot serves on a random key, which costs
+ * prompt-cache hits across replicas and nothing else; once a `GetKey` answers, the key becomes the app's (one more
+ * cache miss per conversation that started meanwhile). A request derives its token once (`inference.ts`
+ * `laneTokenFor`), so a change between its attempts never splits it. The `GetKey` answer is zeroed after use.
+ */
+export class LaneAffinityKey {
+  #key: Uint8Array;
+  #derived = false;
+  #failures = 0;
+  #nextAt = 0;
+  #deriving: Promise<void> | null = null;
+  readonly #settings: LaneAffinitySettings | null;
+  readonly #now: () => number;
+  readonly #log: (line: Record<string, unknown>) => void;
+
+  private constructor(settings: LaneAffinitySettings | null, now: () => number, log: (line: Record<string, unknown>) => void) {
+    this.#key = randomBytes(32);
+    this.#settings = settings;
+    this.#now = now;
+    this.#log = log;
+  }
+
+  /** The boot's key: the app's when `settings` is given and its `GetKey` answers, a random one otherwise. */
+  static async boot(options: { readonly settings: LaneAffinitySettings | null; readonly reason: string; readonly now: () => number; readonly log?: (line: Record<string, unknown>) => void }): Promise<LaneAffinityKey> {
+    const holder = new LaneAffinityKey(options.settings, options.now, options.log ?? ((line) => console.log(JSON.stringify(line))));
+    if (options.settings === null) holder.#log({ level: "info", event: "lane_affinity_key", source: "boot", reason: options.reason });
+    else await holder.#derive();
+    return holder;
+  }
+
+  /** `K_boot`, 32 bytes. Never logged. */
+  get key(): Uint8Array {
+    return this.#key;
+  }
+
+  /** `app` once derived from the app's KMS key, `boot` while random. */
+  get source(): "app" | "boot" {
+    return this.#derived ? "app" : "boot";
+  }
+
+  /** The retry behind a request: one `GetKey` when the key is still random and the retry is due. Never throws. */
+  async tick(): Promise<void> {
+    if (this.#derived || this.#settings === null || this.#now() < this.#nextAt) return;
+    this.#deriving ??= this.#derive().finally(() => {
+      this.#deriving = null;
+    });
+    await this.#deriving;
+  }
+
+  async #derive(): Promise<void> {
+    const settings = this.#settings as LaneAffinitySettings;
+    let material: Uint8Array | null = null;
+    try {
+      material = await guestGetKey({ guest: settings.guest, guestUrl: settings.guestUrl, timeoutMs: settings.guestTimeoutMs }, AFFINITY_KEY_PATH);
+      this.#key = await affinityKeyFromMaterial(material);
+      this.#derived = true;
+      this.#log({ level: "info", event: "lane_affinity_key", source: "app", failures: this.#failures });
+    } catch (error) {
+      this.#failures += 1;
+      const wait = Math.min(VAULT_RETRY_FIRST_MS * 2 ** Math.min(this.#failures - 1, 10), VAULT_RETRY_MAX_MS);
+      this.#nextAt = this.#now() + wait;
+      const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : error instanceof Error ? error.name : "error";
+      this.#log({ level: "warn", event: "lane_affinity_key_failed", source: "boot", code, failures: this.#failures, retry_ms: wait });
+    } finally {
+      material?.fill(0);
+    }
+  }
 }
 
 /** What the vault needs beyond the stack's settings: the measured relay key, the app id and its two sockets. */
@@ -307,6 +398,11 @@ export interface LaneProcessState extends LaneState {
   readonly laneKeyId: string;
   /** The process clock every signed call's timestamp comes from (`Date.now` in production). */
   readonly now: () => number;
+  /**
+   * docs/design/entry-replicas.md ER6: this replica's own origin (`https://<replica name>`), which its answers name
+   * beside the keyset digest so a verifier asks the replica that served; null for an entry without a replica index.
+   */
+  readonly laneOrigin: string | null;
   /** The relay config of a stack lane (S28, section 8): null outside the stack layout. */
   readonly stackConfig: StackRelayConfigProvider;
   /** The stack layout's config service (the relay listener's two GETs, the egress table); null otherwise. */
@@ -325,6 +421,32 @@ export interface LaneProcessState extends LaneState {
    * vault; null for a phase-1 boot and the empty slot (one instance, nothing to share).
    */
   readonly instanceRole: LaneInstanceRole | null;
+  /** ER7: where `affinityKey` comes from, and the retry of a `GetKey` that failed (`tick`, behind requests). */
+  readonly affinity: LaneAffinityKey;
+}
+
+/** A boot's TLS identity: its one SPKI, the name it is scoped to, and an entry replica's own name beside it. */
+export interface LaneTlsEntry {
+  readonly spkiSha256: string;
+  readonly domain?: string;
+  readonly replicaDomain?: string;
+}
+
+/**
+ * The keyset's TLS records. One, as before, without a replica name. An entry replica's keyset has two, both with this
+ * boot's one SPKI (docs/design/entry-replicas.md ER2, EI3): the shared name, then the replica's own. The shared name
+ * stays record 0: a stack VM's hello reads that record (`peer.ts` `verifyEntryReport`), and a VM on an image older
+ * than the replica names dials the shared name.
+ */
+function laneTlsRecords(tls: LaneTlsEntry): WorkloadKeyset["tls_public_keys"] {
+  if (tls.replicaDomain === undefined) return [tls.domain === undefined ? { spki_sha256: tls.spkiSha256 } : { spki_sha256: tls.spkiSha256, domain: tls.domain }];
+  // A record without a domain applies to every host, so a replica name beside one would restrict nothing.
+  if (tls.domain === undefined) throw new Error("a replica name stands beside the shared name: the TLS entry has no domain");
+  if (tls.replicaDomain === tls.domain) throw new Error("the replica name is the shared name");
+  return [
+    { spki_sha256: tls.spkiSha256, domain: tls.domain },
+    { spki_sha256: tls.spkiSha256, domain: tls.replicaDomain },
+  ];
 }
 
 /**
@@ -337,7 +459,7 @@ export function laneKeyset(options: {
   readonly intakeEntry: KeyedPublicKey;
   readonly subject: string | null;
   readonly notAfter: bigint;
-  readonly tls: { readonly spkiSha256: string; readonly domain?: string };
+  readonly tls: LaneTlsEntry;
 }): SealedKeyset {
   const keyset: WorkloadKeyset = {
     subject: options.subject,
@@ -345,7 +467,7 @@ export function laneKeyset(options: {
     receipt_signing_keys: [...options.receiptKeys],
     // M10: the per-boot X25519 intake key is published here, or no relay could seal anything to this boot.
     e2ee_public_keys: [options.intakeEntry],
-    tls_public_keys: [options.tls.domain === undefined ? { spki_sha256: options.tls.spkiSha256 } : { spki_sha256: options.tls.spkiSha256, domain: options.tls.domain }],
+    tls_public_keys: laneTlsRecords(options.tls),
   };
   return sealKeyset(keyset);
 }
@@ -360,9 +482,13 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   const receiptKeyId = options.receiptKeyId ?? `lane-receipt-${bytesToHex(randomBytes(8))}`;
   const receiptKey: ReceiptKeyProvider = await perBootReceiptKey(receiptKeyId);
   const intakeKey: RelayIntakeKey = await generateRelayIntakeKey(options.intakeKeyId);
-  // E3's K_boot: 32 random bytes made with the other per-boot keys, in memory only. It is not part
-  // of the keyset, so no report, receipt or log names it; a reboot makes a fresh one.
-  const affinityKey = randomBytes(32);
+  // K_boot, in memory only and not part of the keyset, so no report, receipt or log names it. ER7: the entry layout's
+  // comes from the app's KMS key through the guest agent (one bounded GetKey); otherwise E3's 32 random bytes.
+  const affinity = await LaneAffinityKey.boot({
+    settings: options.affinity ?? null,
+    reason: options.stack === undefined ? "no_guest_agent" : "stack_layout",
+    now: options.now ?? (() => Date.now()),
+  });
   const keyset = laneKeyset({
     receiptKeys: receiptKey.receiptKeys,
     intakeEntry: intakeKeyEntry(intakeKey),
@@ -373,7 +499,10 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   const registry = new MutableRelayRegistry(options.relays ?? [], { now: options.now ?? (() => Date.now()), absenceMs: options.relayAbsenceMs ?? LANE_RELAY_ABSENCE_MS });
   // S22/S28: a stack boot's relay is not a registry entry (no scheduler, no policy), but gray-relay
   // seals its credentials to this boot like any relay's, so the registry tracks its signing key too.
-  if (options.stack !== undefined) registry.trackStackRelay(options.stack.relayId);
+  // A boot that keeps the relay's accounts in a vault holds them through any absence (`trackStackRelay`).
+  if (options.stack !== undefined) {
+    registry.trackStackRelay(options.stack.relayId, { vault: options.vault !== undefined && options.kmsLease === true && (options.stack.relayImage ?? null) !== null });
+  }
   // The relay key registry the credential store authenticates bundles against, read live from the
   // same registry the schedulers come from. Live matters: the first snapshot arrives after the boot
   // (`primeRegistry`), and a relay the snapshot no longer names is revoked for use as well as intake
@@ -473,8 +602,10 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   // everything this process holds for it with it — the sealed credentials and their version state, the
   // accepted policy bundle (its prepared module and template texts), and the scheduler client with its
   // report buffer. A relay that comes back must re-submit both (gray-relay does at once: the health
-  // answer names its sealed version, null here); nothing of it survives inside this boot. D10: a relay
-  // whose scheduler URL or key changed is only rebuilt (its credentials and policy are untouched by that record).
+  // answer names its sealed version, null here); nothing of it survives inside this boot. A stack relay
+  // whose accounts this boot keeps in a vault has no host that re-submits, so an absence alone never
+  // clears it (`trackStackRelay`). D10: a relay whose scheduler URL or key changed is only rebuilt (its
+  // credentials and policy are untouched by that record).
   registry.clearWith(
     (relayId) => {
       credentials.clearRelay(relayId);
@@ -577,7 +708,11 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   });
   return {
     receiptKey,
-    affinityKey,
+    // ER7: read on each use, so a key a retried GetKey derived later serves the next request.
+    get affinityKey() {
+      return affinity.key;
+    },
+    affinity,
     receiptKeyId,
     keysetDigest: keyset.digest,
     relays: registry,
@@ -595,6 +730,7 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     bridgeUrl: options.bridgeUrl,
     laneKeyId: options.laneKeyId,
     now,
+    laneOrigin: options.tls.replicaDomain === undefined ? null : `https://${options.tls.replicaDomain}`,
     // P2c-2: the request path plans on no config while the KMS lease does not serve (`gatedStackConfig`).
     stackConfig: stack === null ? { relayId: null, relayImage: null, current: () => null } : gatedStackConfig(stack, kmsLease, now),
     stack,
@@ -738,6 +874,8 @@ function largestSelectionBytes(registry: PolicyRecord["policy"]["registry"]): nu
  * of 502s until gray-relay's lease renewal re-sealed (up to half its 3,580 s lease). A withdrawn
  * relay's routes may still be served from a signed snapshot that lasts this long, so keeping its
  * credentials as long, unusable, adds nothing a stale snapshot does not already allow.
+ *
+ * It does not apply to a stack relay whose accounts this boot keeps in a vault (`trackStackRelay`).
  */
 export const LANE_RELAY_ABSENCE_MS = 300_000;
 
@@ -760,6 +898,19 @@ export const LANE_RELAY_ABSENCE_MS = 300_000;
  * A held relay is cleared at the first refresh past its window; until then its credentials sit in
  * memory unusable. Leaving a removed relay merely absent from the registry for good would keep its
  * module and templates in memory until the next reboot.
+ *
+ * **A stack relay with a vault is held for as long as it is away** (`trackStackRelay` with `vault`).
+ * The window stands on a host that seals again when the relay is back (gray-relay's health poll). A
+ * phase-2 relay has no such host: its accounts were delivered once and live in this boot's vault, and
+ * the vault loads them into the store only when it opens. Cleared after 300 s, they stayed gone until
+ * the VM was restarted: on 2026-11-15 23:46Z Gray's snapshots lapsed for 42 minutes (an outage of
+ * Gray's, not the relay's) and production's test relay served nothing for two days after its routes
+ * were back. Holding them takes nothing from a withdrawal: while the relay is away no key is published
+ * for it, so the store serves no account of it and intake refuses it; the vault's records are on this
+ * VM's disk under a key this boot holds either way; and what takes the accounts from a VM is the KMS
+ * lease: a KMS that refuses the app (its contract paused) drops the vault's key and the accounts it
+ * opened (`LaneVault.drop`). The two definite ends still clear it: back under another signing key, and
+ * `clearRelay`.
  */
 export class MutableRelayRegistry implements LaneRelayRegistry {
   #byId = new Map<string, LaneRelay>();
@@ -767,6 +918,8 @@ export class MutableRelayRegistry implements LaneRelayRegistry {
   #changed: ((relayId: string) => void) | null = null;
   /** The stack layout's relay id (`trackStackRelay`), and its record in the last snapshot. */
   #stackRelayId: string | null = null;
+  /** The stack relay's accounts are in a vault of this boot: an absence alone never clears it. */
+  #stackVault = false;
   #stack: { readonly relayId: string; readonly signingPublicKey: string } | null = null;
   /** Each relay that left the snapshot and is not cleared yet: its signing key, and when it left. */
   #held = new Map<string, { readonly signingPublicKey: string; readonly since: number }>();
@@ -820,7 +973,8 @@ export class MutableRelayRegistry implements LaneRelayRegistry {
     // A held relay back under its key is served from what it sealed; under another key it is another relay.
     for (const [relayId, held] of this.#held) {
       const key = this.signingKeyOf(relayId);
-      if (key === undefined && now - held.since < this.#absenceMs) continue;
+      // Away: held for the window, and with no end while this boot's vault keeps its accounts.
+      if (key === undefined && (now - held.since < this.#absenceMs || (this.#stackVault && relayId === this.#stackRelayId))) continue;
       this.#held.delete(relayId);
       if (key !== held.signingPublicKey) removed.push(relayId);
     }
@@ -845,9 +999,14 @@ export class MutableRelayRegistry implements LaneRelayRegistry {
    * (`get` and `relays` never name it: it has no scheduler and runs no policy module), but its signing
    * key authenticates the credentials gray-relay seals to this boot (`signingKeyOf`), and a snapshot
    * that no longer names it clears it from every store, as a sealed relay's removal does.
+   *
+   * `vault`: this boot keeps the relay's accounts in a vault (phase 2, on the relay's image). Then an
+   * absence of any length only holds it, and it is cleared when it is back under another signing key
+   * or by `clearRelay`: nothing would seal the accounts again (the class's note).
    */
-  trackStackRelay(relayId: string): void {
+  trackStackRelay(relayId: string, options: { readonly vault?: boolean } = {}): void {
     this.#stackRelayId = relayId;
+    this.#stackVault = options.vault === true;
   }
 
   /** The Ed25519 key (lowercase hex) a relay signs its sealed credentials with: a registry entry's, or the tracked stack relay's. */

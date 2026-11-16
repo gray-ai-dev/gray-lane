@@ -8,8 +8,9 @@ import type { TranslationPolicy } from "./policy.ts";
 
 /**
  * `Fallback`: whether a Responses request with no native route that can serve it may be translated without an
- * operator rule (the implied rule, `targets`). `off` is the lever that turns it off without a deploy (the gateway's
- * TRANSLATION_FALLBACK, the server's GRAY_TRANSLATION_FALLBACK); an operator rule always applies.
+ * operator rule (the implied rule, `targets`). Off unless `open_ai_responses` turns it on (the gateway's
+ * TRANSLATION_FALLBACK, the server's GRAY_TRANSLATION_FALLBACK; off by default since 2026-11-17); an operator rule
+ * always applies.
  */
 export type Fallback = "open_ai_responses" | "off";
 

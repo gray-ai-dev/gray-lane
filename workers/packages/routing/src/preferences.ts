@@ -70,6 +70,97 @@ const MAX_REFS = 32;
 const REF_LEN = 64;
 const U64_MAX = 0xffff_ffff_ffff_ffffn;
 
+/**
+ * The public name of a route whose supplier sells under its own name, as a customer selects it (routing.rs
+ * `RouteTag`): `handle[/quantization][/region][/tier]`. A route with a `tier` is opt-in (`Preference.optsIn`).
+ */
+export interface RouteTag {
+  readonly handle: string;
+  readonly quantization: string | null;
+  readonly region: string | null;
+  readonly tier: string | null;
+}
+
+/** The handle no supplier holds: a pattern naming it is refused (`RESERVED_HANDLE`). */
+const RESERVED_HANDLE = "preset";
+const HANDLE = /^[a-z0-9][a-z0-9-]{1,31}$/;
+const SEGMENT = /^[a-z0-9][a-z0-9.-]{0,31}$/;
+const REF = new RegExp(`^[0-9A-Fa-f]{${REF_LEN}}$`);
+
+/** A tag pattern (`TagPattern`): a handle and up to three segments. */
+interface TagPattern {
+  readonly handle: string;
+  readonly segments: readonly string[];
+}
+
+/** The pattern `text` states (`TagPattern::parse`); null when it is none, or names the reserved handle. */
+export function parseTagPattern(text: string): TagPattern | null {
+  const [handle, ...segments] = text.split("/");
+  if (handle === undefined || !HANDLE.test(handle) || handle === RESERVED_HANDLE) return null;
+  if (segments.length > 3 || !segments.every((segment) => SEGMENT.test(segment))) return null;
+  return { handle, segments };
+}
+
+function tagMatches(pattern: TagPattern, tag: RouteTag): boolean {
+  return tag.handle === pattern.handle && pattern.segments.every((segment) => segment === tag.quantization || segment === tag.region || segment === tag.tier);
+}
+
+/** The reference a pattern that names no route stands for (`tag_sentinel`): hex SHA-256 of `gray.tag.v1:` and the pattern. */
+export function tagSentinel(pattern: string): string {
+  return bytesToHex(sha256(new TextEncoder().encode(`gray.tag.v1:${pattern}`)));
+}
+
+/**
+ * What a request's patterns are resolved against (`Tags`): the tagged routes of the model it asks for, each by
+ * its `provider_ref`, the registered handles with their supplier's workspace, and a supplier's reference.
+ */
+export interface Tags {
+  readonly routes: readonly (readonly [provider: string, tag: RouteTag])[];
+  readonly handles: Readonly<Record<string, string>>;
+  supplierRef(workspace: string): string;
+}
+
+/**
+ * Writes what `entry` names into `out` (`Tags::resolve`). A 64-hex reference stays. A bare handle becomes its
+ * supplier's reference; a pattern with segments the references of the routes it matches, in its place, or its
+ * sentinel when it matches none: each `known` to this request. A pattern whose handle is not registered becomes
+ * its sentinel and is not known. `opted` (a selection's) takes the routes the entry opts in to: the reference
+ * itself, and the matched routes whose tier the pattern names.
+ */
+function resolveEntry(tags: Tags, entry: string, out: string[], known: string[], opted: string[] | null): void {
+  const pattern = parseTagPattern(entry);
+  if (pattern === null) {
+    opted?.push(entry);
+    out.push(entry);
+    return;
+  }
+  const workspace = Object.hasOwn(tags.handles, pattern.handle) ? tags.handles[pattern.handle] : undefined;
+  if (workspace === undefined) {
+    out.push(tagSentinel(entry));
+    return;
+  }
+  const from = out.length;
+  if (pattern.segments.length === 0) {
+    out.push(tags.supplierRef(workspace));
+  } else {
+    for (const [provider, tag] of tags.routes) {
+      if (!tagMatches(pattern, tag) || out.indexOf(provider, from) >= 0) continue;
+      if (opted !== null && tag.tier !== null && pattern.segments.includes(tag.tier)) opted.push(provider);
+      out.push(provider);
+    }
+  }
+  if (out.length === from) out.push(tagSentinel(entry));
+  known.push(...out.slice(from));
+}
+
+/** What layering keeps of a request's resolved patterns (`known`, `opted`, `resolved`). */
+interface Resolution {
+  readonly known: readonly string[];
+  readonly opted: readonly string[];
+  readonly resolved: boolean;
+}
+const UNRESOLVED: Resolution = { known: [], opted: [], resolved: false };
+
 /** The fields of `Preference` serde reads. */
 const FIELDS = ["order", "only", "ignore", "allow_fallbacks", "sort", "max_price", "affinity", "relay_changes"] as const;
 
@@ -213,16 +304,15 @@ function statedOf(value: Json): Stated {
 }
 
 /**
- * `Preference::validated`: at most MAX_REFS references in each list, each REF_LEN ASCII hex digits (either
- * case: a reference is compared as written, so an uppercase one names nothing registered), and a
- * `max_price` stating at least one ceiling.
+ * `Preference::validated`: at most MAX_REFS entries in each list, each a reference of REF_LEN ASCII hex digits
+ * (either case: a reference is compared as written, so an uppercase one names nothing registered) or a tag
+ * pattern (`parseTagPattern`), and a `max_price` stating at least one ceiling.
  */
 function validated(stated: Stated): Stated {
   const lists = [stated.order, stated.only, stated.ignore];
   if (lists.some((list) => list.length > MAX_REFS)) refuse();
   // Rust's `len()` counts bytes; a string of REF_LEN ASCII hex digits is REF_LEN bytes, and nothing else is.
-  const hex = new RegExp(`^[0-9A-Fa-f]{${REF_LEN}}$`);
-  if (lists.some((list) => list.some((value) => !hex.test(value)))) refuse();
+  if (lists.some((list) => list.some((value) => !REF.test(value) && parseTagPattern(value) === null))) refuse();
   if (stated.maxPrice !== null && stated.maxPrice.input === null && stated.maxPrice.output === null) refuse();
   return stated;
 }
@@ -287,8 +377,14 @@ export class Preference {
    * the own `only` is `only` itself (`own_only`). What the request log counts as `only` (`ownOnlyLen`).
    */
   private readonly ownOnly: number | null;
+  /**
+   * What `resolved` keeps (`known`, `opted`, `resolved`): the references this request's patterns resolved to,
+   * registered for this request beside the snapshot's; the routes with a tier a selection opts in to (on a level
+   * `resolved` did not read, every entry of its `order` and `only` is a reference and opts in itself).
+   */
+  private readonly resolution: Resolution;
 
-  private constructor(stated: Stated, narrowedBy: readonly (readonly string[])[], requested: readonly string[] | null, ownOnly: number | null = null) {
+  private constructor(stated: Stated, narrowedBy: readonly (readonly string[])[], requested: readonly string[] | null, ownOnly: number | null = null, resolution: Resolution = UNRESOLVED) {
     this.order = stated.order;
     this.only = stated.only;
     this.ignore = stated.ignore;
@@ -300,6 +396,7 @@ export class Preference {
     this.narrowedBy = narrowedBy;
     this.requested = requested;
     this.ownOnly = ownOnly;
+    this.resolution = resolution;
   }
 
   /** No preference (`Preference::default`). */
@@ -369,6 +466,51 @@ export class Preference {
     return preference === null ? { ok: false, code: "routing_invalid" } : { ok: true, preference };
   }
 
+  /** Whether a list states a tag pattern (`states_pattern`), which `resolved` turns into references before the levels are layered. */
+  statesPattern(): boolean {
+    return [this.order, this.only, this.ignore].some((list) => list.some((value) => !REF.test(value)));
+  }
+
+  /**
+   * This level with every pattern of its lists resolved against `tags` (`Preference::resolved`), so that layering
+   * and the filters read references alone. `modelTag`, the pattern of a request's `model@pattern`, is one more
+   * allow list on top of every level's.
+   */
+  resolved(modelTag: string | null, tags: Tags): Preference {
+    const known = [...this.resolution.known];
+    const opted = [...this.resolution.opted];
+    const list = (entries: readonly string[], selects: boolean) => {
+      const out: string[] = [];
+      for (const entry of entries) resolveEntry(tags, entry, out, known, selects ? opted : null);
+      return out;
+    };
+    const order = list(this.order, true);
+    const only = list(this.only, true);
+    const ignore = list(this.ignore, false);
+    const narrowedBy = modelTag === null ? this.narrowedBy : [...this.narrowedBy, list([modelTag], true)];
+    const stated: Stated = { order, only, ignore, allowFallbacks: this.allowFallbacks, sort: this.sort, maxPrice: this.maxPrice, affinity: this.affinity, relayChanges: this.relayChanges };
+    return new Preference(stated, narrowedBy, this.requested, this.only.length, { known, opted, resolved: true });
+  }
+
+  /**
+   * Whether a route with a tier may serve the request (`opts_in`): such a route is opt-in. The layered sort asks
+   * for throughput or price, or a selection of some level names the route by its own reference or by a pattern
+   * holding its tier. Its supplier's name or a pattern without the tier does not.
+   */
+  optsIn(provider: string): boolean {
+    return this.sort === "throughput" || this.sort === "price" || this.resolution.opted.includes(provider);
+  }
+
+  /** Whether `named` is registered for this request by a pattern's resolution (`knows`). */
+  knows(named: string): boolean {
+    return this.resolution.known.includes(named);
+  }
+
+  /** Whether a level's patterns were resolved (`resolved_for_model`): the layered preference then holds for the model it was resolved for alone. */
+  resolvedForModel(): boolean {
+    return this.resolution.resolved;
+  }
+
   /** States nothing (`is_default`). */
   isDefault(): boolean {
     return (
@@ -393,12 +535,13 @@ export class Preference {
    * are not restrictions, the try order and the sort, are the caller's, so the most specific one that states
    * anything wins.
    *
-   * `published` is every published route as its (route, supplier) references, which decides whether a name in
-   * the order can still order anything once the levels' filters apply. `registered` is every reference naming
+   * `published` is every published route as its (route, supplier) references and whether it has a tier (absent:
+   * none), which decides whether a name in the order can still order anything once the levels' filters and the
+   * tier opt-in rule apply. `registered` is every reference naming
    * a registered endpoint (@gray/snapshot `registeredRefs`), which tells a name the request mistyped from one
    * whose routes left.
    */
-  layered(key: Preference | null, workspace: Preference | null, published: readonly (readonly [string, string])[], registered: ReadonlySet<string>): Preference {
+  layered(key: Preference | null, workspace: Preference | null, published: readonly (readonly [string, string, boolean?])[], registered: ReadonlySet<string>): Preference {
     const requested = [...this.selected()];
     // Whether the order settled below is the request's own, so that a name in it naming no registered
     // endpoint is the caller's to correct.
@@ -430,7 +573,12 @@ export class Preference {
       relayChanges: stated.some((p) => p.relayChanges === "exclude") ? "exclude" : "allow",
     };
     const ownOnly = this.ownOnlyLen();
-    const unsettled = new Preference(base, narrowedBy, requested, ownOnly);
+    const resolution: Resolution = {
+      known: stated.flatMap((p) => p.resolution.known),
+      opted: stated.flatMap((p) => [...p.resolution.opted, ...(p.resolution.resolved ? [] : [...p.order, ...p.only])]),
+      resolved: stated.some((p) => p.resolution.resolved),
+    };
+    const unsettled = new Preference(base, narrowedBy, requested, ownOnly, resolution);
     // With fallbacks allowed, a name keeps its place only while some route it names survives the filters; a
     // route knows both of its names. A name that names no registered endpoint at all stays when the request
     // wrote it, so the request is refused as `routing_unknown_provider`; one whose routes left the snapshot
@@ -439,14 +587,17 @@ export class Preference {
     // the no-fallback levels stated themselves): a pin decides who may serve, and every other filter leaves a
     // name where it is.
     const pins = stated.filter((p) => !p.allowFallbacks && p.order.length > 0).map((p) => p.order);
-    const survives = (provider: string, supplier: string) =>
-      unsettled.allowFallbacks ? unsettled.admits(provider, supplier) : pins.every((pin) => Preference.names(pin, provider, supplier));
+    // With fallbacks allowed, a route with a tier is a candidate only if the preference opts in to it
+    // (`tierAdmitted`): a bare handle naming a supplier whose routes all have a tier orders nothing, and left in
+    // place it would turn off cache affinity.
+    const survives = (provider: string, supplier: string, tiered: boolean) =>
+      unsettled.allowFallbacks ? (!tiered || unsettled.optsIn(provider)) && unsettled.admits(provider, supplier) : pins.every((pin) => Preference.names(pin, provider, supplier));
     const settled = order.filter((named) => {
       const routes = published.filter(([provider, supplier]) => provider === named || supplier === named);
-      if (routes.length === 0) return (ordersItself && !registered.has(named)) || !unsettled.allowFallbacks;
-      return routes.some(([provider, supplier]) => survives(provider, supplier));
+      if (routes.length === 0) return (ordersItself && !registered.has(named) && !unsettled.knows(named)) || !unsettled.allowFallbacks;
+      return routes.some(([provider, supplier, tiered]) => survives(provider, supplier, tiered === true));
     });
-    return new Preference({ ...base, order: settled }, narrowedBy, requested, ownOnly);
+    return new Preference({ ...base, order: settled }, narrowedBy, requested, ownOnly, resolution);
   }
 
   /** An explicit customer order always wins over cache affinity: the customer asked for a specific endpoint (`affinity_allowed`). */
@@ -461,7 +612,7 @@ export class Preference {
    */
   selected(): readonly string[] {
     if (this.requested !== null) return this.requested;
-    return [...this.order, ...this.only];
+    return [...this.order, ...this.only, ...this.narrowedBy.flat()];
   }
 
   /**

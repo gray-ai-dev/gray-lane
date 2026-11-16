@@ -1,5 +1,5 @@
 import { ApiError } from "@gray/errors";
-import { Affinity, Preference, type RequestedSort } from "@gray/routing";
+import { Affinity, Preference, parseTagPattern, type RequestedSort, type RouteTag, type Tags } from "@gray/routing";
 import { providerRef, supplierRef } from "@gray/snapshot";
 import type { PlanPreference } from "./plan-order.ts";
 import type { GatewaySnapshot } from "./snapshot.ts";
@@ -22,8 +22,56 @@ export type PreferenceSource = "request" | "key" | "workspace";
  * What layering reads of the snapshot (inference.rs `Snapshot`): the workspace defaults, the published routes
  * and the registered references (a `GatewaySnapshot` is one); its routes by their endpoint and supplier alone.
  */
-export interface PreferenceSnapshot extends Pick<GatewaySnapshot, "routingDefaults" | "registered" | "published"> {
-  readonly routes: readonly { readonly operator: string; readonly endpointId: string }[];
+export interface PreferenceSnapshot extends Pick<GatewaySnapshot, "routingDefaults" | "registered" | "published" | "handles"> {
+  /** With each route's model and public tag, which a tag pattern is resolved against. */
+  readonly routes: readonly { readonly operator: string; readonly endpointId: string; readonly model?: string; readonly tag?: RouteTag }[];
+}
+
+/**
+ * The model a request's model string names and the tag pattern it carries (inference.rs `untagged`, `model_tag`):
+ * `model@pattern` selects the routes of `model` the pattern matches, for a client that can only set a model
+ * string. A string the snapshot maps or routes as a model is that model, whatever it holds; `routing_invalid`
+ * when what follows the first `@` is no pattern. Every API that serves a model reads its model string through here.
+ */
+export function untagged(
+  snapshot: { readonly routes: readonly { readonly model: string }[]; readonly mapped?: readonly { readonly model: string }[] },
+  stated: string,
+): { readonly ok: true; readonly model: string; readonly tag: string | null } | { readonly ok: false; readonly code: "routing_invalid" } {
+  const at = stated.indexOf("@");
+  if (at < 0 || snapshot.mapped?.some((m) => m.model === stated) === true || snapshot.routes.some((r) => r.model === stated)) return { ok: true, model: stated, tag: null };
+  const tag = stated.slice(at + 1);
+  if (parseTagPattern(tag) === null) return { ok: false, code: "routing_invalid" };
+  return { ok: true, model: stated.slice(0, at), tag };
+}
+
+/**
+ * Takes the tag pattern off every model string of a generation request (inference.rs `take_tags`): its `model`
+ * and each of the `models` it lists (the requested one first among them). The models alone, and the pattern of
+ * each listed model in order (of the one model when it lists none); `tags` is empty when no model string
+ * carries one, the usual request.
+ */
+export function takeTags(
+  snapshot: Parameters<typeof untagged>[0],
+  model: string,
+  models: readonly string[],
+): { readonly ok: true; readonly model: string; readonly models: readonly string[]; readonly tags: readonly (string | null)[] } | { readonly ok: false; readonly code: "routing_invalid" } {
+  if (!model.includes("@") && !models.some((m) => m.includes("@"))) return { ok: true, model, models, tags: [] };
+  const own = untagged(snapshot, model);
+  if (!own.ok) return own;
+  const bare: string[] = [];
+  const tags: (string | null)[] = [];
+  for (const listed of models) {
+    const read = untagged(snapshot, listed);
+    if (!read.ok) return read;
+    bare.push(read.model);
+    tags.push(read.tag);
+  }
+  return { ok: true, model: own.model, models: bare, tags: models.length === 0 ? [own.tag] : tags };
+}
+
+/** Whether `route` is a candidate under the opt-in rule of a route with a tier (`tier_admitted`, `Preference.optsIn`); a route without one always is. */
+export function tierAdmitted(preference: Preference, route: { readonly operator: string; readonly endpointId: string; readonly tag?: RouteTag }): boolean {
+  return (route.tag?.tier ?? null) === null || preference.optsIn(providerRef(route.operator, route.endpointId));
 }
 
 /** A route's two references, (route, supplier). */
@@ -48,9 +96,9 @@ export function registeredOf(snapshot: PreferenceSnapshot): ReadonlySet<string> 
   return refs;
 }
 
-/** Every published route as its references (`layered_over`'s `published`): the snapshot's, else its routes'. */
-function publishedOf(snapshot: PreferenceSnapshot): readonly (readonly [string, string])[] {
-  return snapshot.published ?? snapshot.routes.map((r) => refsOf(r));
+/** Every published route as its references and whether it has a tier (`layered_over`'s `published`): the snapshot's, else its routes'. */
+function publishedOf(snapshot: PreferenceSnapshot): readonly (readonly [string, string, boolean?])[] {
+  return snapshot.published ?? snapshot.routes.map((r) => [...refsOf(r), (r.tag?.tier ?? null) !== null] as const);
 }
 
 /** A request's layered preference and the levels that stated one, or the refusal of a default it cannot read. */
@@ -62,13 +110,28 @@ export type Layered = { readonly ok: true; readonly preference: Preference; read
  * the snapshot, the published routes and the registered references. A stored default that cannot be parsed
  * refuses the request (the key's first): an organization's constraint is never silently dropped. With the
  * levels that stated something: `request`, `key`, `workspace`.
+ *
+ * `model` is the model the request is served as and `tag` the pattern its model string carried (`untagged`): a
+ * level's tag patterns are resolved against that model's routes before the levels are layered.
  */
-export function layeredOver(snapshot: PreferenceSnapshot, keyDefault: string | null, workspaceId: string, preference: Preference): Layered {
-  const key = keyDefault === null ? null : Preference.parseDefault(keyDefault);
+export function layeredOver(snapshot: PreferenceSnapshot, keyDefault: string | null, workspaceId: string, preference: Preference, model: string | null = null, tag: string | null = null): Layered {
+  let key = keyDefault === null ? null : Preference.parseDefault(keyDefault);
   if (key === "routing_default_invalid") return { ok: false, code: key };
   const stored = snapshot.routingDefaults?.[workspaceId];
-  const workspace = stored === undefined ? null : Preference.parseDefault(stored);
+  let workspace = stored === undefined ? null : Preference.parseDefault(stored);
   if (workspace === "routing_default_invalid") return { ok: false, code: workspace };
+  // Tag patterns become references before anything below reads the lists; a request that states none, the
+  // usual one, pays for none of this.
+  if (tag !== null || [preference, key, workspace].some((level) => level !== null && level.statesPattern())) {
+    const tags: Tags = {
+      routes: snapshot.routes.flatMap((r) => (r.model === model && r.tag !== undefined ? [[providerRef(r.operator, r.endpointId), r.tag] as const] : [])),
+      handles: snapshot.handles ?? {},
+      supplierRef,
+    };
+    preference = preference.resolved(tag, tags);
+    key = key?.resolved(null, tags) ?? null;
+    workspace = workspace?.resolved(null, tags) ?? null;
+  }
   // Only an order needs the published routes, to tell which of its names the filters still leave something
   // to order; most requests state none.
   const statesOrder = [preference, key, workspace].some((level) => level !== null && level.order.length > 0);
@@ -100,7 +163,7 @@ export function retainAdmitted<R>(
   routes: readonly R[],
   refs: (route: R) => readonly [string, string],
 ): { readonly ok: true; readonly routes: readonly R[] } | { readonly ok: false; readonly code: "routing_unknown_provider" | "routing_filter_excluded_all" } {
-  if (preference.selected().some((named) => !registered.has(named))) return { ok: false, code: "routing_unknown_provider" };
+  if (preference.selected().some((named) => !registered.has(named) && !preference.knows(named))) return { ok: false, code: "routing_unknown_provider" };
   if (preference.isDefault() || routes.length === 0) return { ok: true, routes };
   const kept = routes.filter((route) => {
     const [provider, supplier] = refs(route);

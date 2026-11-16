@@ -38,6 +38,57 @@ export const SERVICE_REGIONS = [
   "South Africa",
 ] as const;
 
+/** `region_slug`: a service region as a route's tag writes it, lower case with spaces as `-` (`US East` is `us-east`). */
+export function regionSlug(region: string): string {
+  return region.toLowerCase().replaceAll(" ", "-");
+}
+
+/**
+ * The quantization levels an offer may state (`QUANTIZATION_LEVELS`), OpenRouter's documented ones
+ * (openrouter.ai/docs/guides/routing/provider-selection, "Quantization Levels", read 2026-11-16): customers filter
+ * and compare by them, so the list is fixed. `unknown` is theirs for "not stated": a draft that says it is saved
+ * without the term.
+ */
+export const QUANTIZATION_LEVELS = ["int4", "int8", "fp4", "mxfp4", "nvfp4", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] as const;
+
+/** `valid_tier`: `[a-z0-9][a-z0-9.-]{0,31}`, and neither a quantization level nor a service region's slug, which stand beside it in a tag. */
+export function validTier(tier: string): boolean {
+  return /^[a-z0-9][a-z0-9.-]{0,31}$/.test(tier) && !(QUANTIZATION_LEVELS as readonly string[]).includes(tier) && !SERVICE_REGIONS.some((r) => regionSlug(r) === tier);
+}
+
+/** `validate_terms`' rule for the two variant terms: unset, or a listed level and a valid tier name. */
+export function variantTermsValid(t: { readonly quantization?: string | null; readonly tier?: string | null }): boolean {
+  return (t.quantization == null || (QUANTIZATION_LEVELS as readonly string[]).includes(t.quantization)) && (t.tier == null || validTier(t.tier));
+}
+
+/** `RouteTag`: what names a public supplier's route beside its model, `handle[/quantization][/region][/tier]` (`lithos/fp8/turbo`). */
+export interface RouteTag {
+  readonly handle: string;
+  readonly quantization: string | null;
+  readonly region: string | null;
+  readonly tier: string | null;
+}
+
+/**
+ * `route_tag`: the tag of a route whose supplier workspace registered `handle`, from its active offer's terms; none
+ * for a workspace without a handle, which stays anonymous, and never one for a lane relay.
+ */
+export function routeTag(handle: string | null, laneRelay: boolean, terms: Pick<OfferTerms, "quantization" | "service_region" | "tier"> | null): RouteTag | null {
+  if (handle === null || laneRelay) return null;
+  const quantization = terms?.quantization ?? null;
+  return {
+    handle,
+    quantization: quantization === "unknown" ? null : quantization,
+    region: terms?.service_region == null ? null : regionSlug(terms.service_region),
+    tier: terms?.tier ?? null,
+  };
+}
+
+/** `RouteTag::text`: the tag as a customer writes it (`lithos/fp8/us-east/turbo`). */
+export function tagText(tag: RouteTag): string {
+  return [tag.handle, tag.quantization, tag.region, tag.tier].filter((part) => part !== null).join("/");
+}
+
 export interface ProviderLimits {
   readonly requests_per_minute: number | null;
   readonly tokens_per_minute: number | null;
@@ -70,6 +121,13 @@ export interface OfferTerms {
   readonly protocol: Protocol;
   readonly mapping_fingerprint: string | null;
   readonly service_region: string | null;
+  /**
+   * The quantization the provider states (`QUANTIZATION_LEVELS`) and its own name of this variant (`validTier`).
+   * Absent when not set, as serde leaves them out, so an offer saved before them is the same object, and the same
+   * snapshot bytes, as before.
+   */
+  readonly quantization?: string | null;
+  readonly tier?: string | null;
   readonly max_concurrency: number;
   readonly limits: ProviderLimits | null;
   readonly input_microusd_per_million: number;
@@ -203,6 +261,8 @@ const TERMS_FIELDS = [
   "protocol",
   "mapping_fingerprint",
   "service_region",
+  "quantization",
+  "tier",
   "max_concurrency",
   "limits",
   "input_microusd_per_million",
@@ -226,6 +286,8 @@ export function parseTerms(v: unknown): OfferTerms {
     protocol: o.protocol,
     mapping_fingerprint: optStr(o.mapping_fingerprint, "terms.mapping_fingerprint"),
     service_region: optStr(o.service_region, "terms.service_region"),
+    ...(o.quantization == null ? {} : { quantization: str(o.quantization, "terms.quantization") }),
+    ...(o.tier == null ? {} : { tier: str(o.tier, "terms.tier") }),
     max_concurrency: int(o.max_concurrency, "terms.max_concurrency", 0, U32),
     limits: parseLimits(o.limits),
     input_microusd_per_million: int(o.input_microusd_per_million, "terms.input", I64_MIN, I64_MAX),
@@ -333,6 +395,7 @@ export function validTerms(t: OfferTerms, at: number): boolean {
     t.credential_generation === 0 ||
     utf8Bytes(t.config_fingerprint) !== 64 ||
     (t.service_region !== null && !(SERVICE_REGIONS as readonly string[]).includes(t.service_region)) ||
+    !variantTermsValid(t) ||
     t.currency !== "USD" ||
     !(t.max_concurrency >= 1 && t.max_concurrency <= MAX_CONCURRENCY) ||
     (t.limits !== null && !limitsValid(t.limits)) ||

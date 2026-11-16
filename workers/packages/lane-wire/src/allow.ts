@@ -60,6 +60,8 @@ export const RELEASE_DETAIL_FIELDS: readonly Field[] = Object.freeze([
   { name: "model", kind: "text" },
   { name: "protocol", kind: "code" },
   { name: "client_key", kind: "true" },
+  // The hold was admitted degraded away from the client key's home shard: a second charge it causes is refunded (migration 0087).
+  { name: "admission_degraded", kind: "true" },
   { name: "requested_model", kind: "text" },
   { name: "fallback_models", kind: "text" },
   { name: "ms_read", kind: "uint" },
@@ -93,6 +95,8 @@ export const SETTLE_META_FIELDS: readonly Field[] = Object.freeze([
   { name: "output_cap", kind: "uint_nullable" },
   { name: "output_cap_source", kind: "cap_source" },
   { name: "client_key", kind: "true" },
+  // The hold was admitted degraded away from the client key's home shard: a second charge it causes is refunded (migration 0087).
+  { name: "admission_degraded", kind: "true" },
   { name: "requested_model", kind: "text" },
   { name: "fallback_models", kind: "text" },
   // The stack account whose answer was charged (S61): the relay's own id, already on the request's index row (S27).

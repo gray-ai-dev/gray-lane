@@ -1,5 +1,7 @@
 import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { z } from "zod";
+import { acmeChallengeAnswerSchema, acmeChallengeSchema } from "./acme-challenge.ts";
+import { entryRoleAnswerSchema, entryRoleRequestSchema } from "./entry-role.ts";
 import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
 import { attestCollateralAnswerSchema, attestCollateralRequestSchema, releaseListsAnswerSchema, releaseListsRequestSchema } from "./background.ts";
 import { acquireInputSchema, acquireResultSchema, emptyAnswerSchema, endpointReleaseInputSchema, endpointReleaseResultSchema, noteInputSchema, probeAnsweredInputSchema, retryReleaseInputSchema, retryReserveInputSchema, retryReserveResultSchema, warmInputSchema, warmResultSchema } from "./endpoint.ts";
@@ -134,6 +136,8 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "attest.collateral": attestCollateralRequestSchema,
   "lane.acme_failed": laneAcmeFailedSchema,
   "ticket.use": ticketUseInputSchema,
+  "acme.challenge": acmeChallengeSchema,
+  "entry.role": entryRoleRequestSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 export const BRIDGE_RESPONSE_SCHEMAS = {
@@ -169,6 +173,8 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "attest.collateral": attestCollateralAnswerSchema,
   "lane.acme_failed": laneAcmeFailedAnswerSchema,
   "ticket.use": ticketUseAnswerSchema,
+  "acme.challenge": acmeChallengeAnswerSchema,
+  "entry.role": entryRoleAnswerSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 /**

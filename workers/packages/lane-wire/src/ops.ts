@@ -49,6 +49,14 @@ import { BridgeWireError } from "./error.ts";
  * `ticket.use` (ticket.ts; docs/model-authenticity-workflow.md, "Probes are not billed", decided 2026-11-04) uses a
  * model-check ticket's one-time id in the lane VMs' one record of them, a `LaneNonceDO` of the bridge's own (decided
  * 2026-11-05): the last check before a lane serves a request as a model check. Its target is `model-check-tickets`.
+ *
+ * `acme.challenge` (acme-challenge.ts; docs/design/entry-replicas.md ER5) sets or clears one DNS-01 challenge value for
+ * an entry's certificate order: the bridge writes the `_acme-challenge` TXT record, since no DNS credential is inside
+ * the CVM (D45). Only an entry's key may call it, and its target is the record's name (`acme/<name>`).
+ *
+ * `entry.role` (entry-role.ts; docs/design/entry-replicas.md ER9 as revised) reads an entry replica's role, `serving` or
+ * `draining`, from the console: the release tool drains a replica before it updates that replica's VM. Only an entry's
+ * key may call it, and its target is the replica (`entry/<index>`).
  */
 export const BRIDGE_OPS = [
   "account.admit",
@@ -83,6 +91,8 @@ export const BRIDGE_OPS = [
   "attest.collateral",
   "lane.acme_failed",
   "ticket.use",
+  "acme.challenge",
+  "entry.role",
 ] as const;
 
 export type BridgeOp = (typeof BRIDGE_OPS)[number];
@@ -121,6 +131,8 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "attest.collateral": "POST",
   "lane.acme_failed": "POST",
   "ticket.use": "POST",
+  "acme.challenge": "POST",
+  "entry.role": "POST",
 });
 
 /** The base request target of each op; the snapshot read appends its two parameters (snapshot.ts). */
@@ -157,6 +169,8 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "attest.collateral": "/v1/lane-bridge/attest/collateral",
   "lane.acme_failed": "/v1/lane-bridge/lane/acme-failed",
   "ticket.use": "/v1/lane-bridge/ticket/use",
+  "acme.challenge": "/v1/lane-bridge/acme/challenge",
+  "entry.role": "/v1/lane-bridge/entry/role",
 });
 
 /**

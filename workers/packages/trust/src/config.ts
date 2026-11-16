@@ -6,10 +6,16 @@
  * `require_response_model` is not a field here: it made the gate refuse an answer for the model name
  * it reports, which the owner ruled out on 2026-10-16 (release 2 removes the field on the server).
  * A configuration that sets it is refused as naming an unknown field, as release 2 refuses it.
+ *
+ * Neither is `mode`: the gate observes only (owner, 2026-11-17). A document naming it is refused as
+ * any unknown field, and the policy it reads runs `audit`, which records every finding and refuses,
+ * holds or rewrites nothing. `enforce` and `off` remain for tests (`TrustPolicy.withTestMode`).
  */
 import { type Json, compareUtf8, isArray, isObject } from "@gray/json";
 
+/** What the gate does with its findings: production always runs `audit` (observe); `enforce` and `off` are test-only. */
 export type TrustMode = "off" | "audit" | "enforce";
+export const TRUST_MODES: readonly TrustMode[] = ["off", "audit", "enforce"];
 
 /** `PackageManager`, in its derived order (pip, npm, cargo), which decides which check fails first. */
 export type PackageManager = "pip" | "npm" | "cargo";
@@ -35,6 +41,7 @@ export interface ToolPolicy {
 }
 
 export interface TrustPolicyConfig {
+  /** Not part of the document: `audit`, unless a test set another (`TrustPolicy.withTestMode`). */
   readonly mode: TrustMode;
   /** Absent: tools are authorised by the request's declarations alone; present: intersected with these. */
   readonly allowedTools: ReadonlyMap<string, ToolPolicy> | undefined;
@@ -43,7 +50,7 @@ export interface TrustPolicyConfig {
 }
 
 export const DEFAULT_TRUST_POLICY: TrustPolicyConfig = Object.freeze({
-  mode: "enforce",
+  mode: "audit",
   allowedTools: undefined,
   secretDenyMarkers: Object.freeze([]) as readonly string[],
 });
@@ -131,15 +138,20 @@ function toolPolicy(value: Json | undefined, where: string): ToolPolicy {
   };
 }
 
-/** The configuration's serde form, read; throws `TrustConfigError` of kind `deserialize`. */
+/**
+ * The test-only mode a test names (`TrustPolicy.withTestMode`), read as serde reads Rust's `TrustMode`; throws
+ * `TrustConfigError` of kind `deserialize`.
+ */
+export function parseTestTrustMode(value: Json): TrustMode {
+  const m = string(value, "mode");
+  if (!(TRUST_MODES as readonly string[]).includes(m)) shape(`unknown variant \`${m}\``);
+  return m as TrustMode;
+}
+
+/** The policy document's serde form, read; throws `TrustConfigError` of kind `deserialize`. Its mode is `audit`. */
 export function parseTrustPolicyConfig(value: Json): TrustPolicyConfig {
-  const o = fields(value, "the trust policy", ["mode", "allowed_tools", "secret_deny_markers"]);
-  let mode: TrustMode = "enforce";
-  if (o.mode !== undefined) {
-    const m = string(o.mode, "mode");
-    if (m !== "off" && m !== "audit" && m !== "enforce") shape(`unknown variant \`${m}\``);
-    mode = m;
-  }
+  const o = fields(value, "the trust policy", ["allowed_tools", "secret_deny_markers"]);
+  const mode: TrustMode = "audit";
   let allowedTools: Map<string, ToolPolicy> | undefined;
   if (o.allowed_tools !== undefined && o.allowed_tools !== null) {
     if (!isObject(o.allowed_tools)) shape("allowed_tools must be an object");

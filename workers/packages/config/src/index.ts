@@ -775,17 +775,19 @@ export const SETTINGS: readonly SettingSpec[] = [
     workers: ["gateway"],
     type: "enum",
     values: TRANSLATION_FALLBACKS,
-    default: "open_ai_responses",
+    default: "off",
     refusal: TRANSLATION_FALLBACK_RULE,
     source:
-      "Release 4's GRAY_TRANSLATION_FALLBACK (crates/gray-gateway/src/translation/mod.rs `Fallback::from_env`), on by default: decision (b) " +
-      "of 2026-10-23, after the yylx relay answered buffered Responses requests of gpt-6.1-sol with HTTP 500 while its Chat route served " +
-      "(final-design.md B12). Unset and empty mean on, as on the server; any other value is refused at start.",
+      "Release 4's GRAY_TRANSLATION_FALLBACK (crates/gray-gateway/src/translation/mod.rs `Fallback::from_env`): decision (b) of 2026-10-23, " +
+      "after the yylx relay answered buffered Responses requests of gpt-6.1-sol with HTTP 500 while its Chat route served (final-design.md " +
+      "B12). Off by default since the owner's decision of 2026-11-17: a translated answer is not the provider's answer, and a translation's " +
+      "errors would be silent. Unset and empty mean off, as on the server; any other value is refused at start.",
     doc:
-      "The implied Responses fallback: `open_ai_responses` translates a Responses request of a model some endpoint maps on Responses, " +
-      "which no live native Responses route can take because of what its verification proved, to a live Chat, Messages or Gemini route " +
-      "of the same model (in that order, the first that serves it; an operator translation rule for the model replaces the list). `off` " +
-      "turns it off: such a request gets the answer it gets without a translation. A request admitted before a change keeps its plan.",
+      "The implied Responses fallback, off by default: `open_ai_responses` translates a Responses request of a model some endpoint maps on " +
+      "Responses, which no live native Responses route can take because of what its verification proved, to a live Chat, Messages or Gemini " +
+      "route of the same model (in that order, the first that serves it; an operator translation rule for the model replaces the list). " +
+      "`off` leaves it off: such a request gets the answer it gets without a translation. An operator translation rule applies either way. " +
+      "A request admitted before a change keeps its plan.",
   },
   {
     name: "IMAGE_USAGE_UNSPLIT",
@@ -949,6 +951,26 @@ export const SETTINGS: readonly SettingSpec[] = [
       "How often a relay-stack lane asks the bridge for its relay's configuration (stack.config with the version it has) and for pending " +
       "proxy checks (stack.proxy_checks), and how often it pushes an unchanged account table to egress again; also the timeout of one " +
       "push. At most once per interval, on the relay's polls, intake and client requests. Read by the lane in the relay-stack layout only.",
+  },
+  {
+    name: "LANE_ENTRY_ROLE_POLL_MS",
+    key: "laneEntryRolePollMs",
+    workers: ["gateway"],
+    type: "int",
+    default: "5000",
+    min: 1000,
+    max: 60000,
+    source:
+      "docs/design/entry-replicas.md ER9 as the entry replicas' operating spec of 2026-11-17 revised it: the release tool sets a " +
+      "replica draining, disables its load-balancer endpoint and waits at least 60 s (PROVISION_DRAIN_MIN_MS) before it reads " +
+      "the replica's in-flight count, so a role read every 5 s (LANE_STACK_POLL_MS's default, the stack VMs' role poll) is " +
+      "seen well inside that wait. The maximum is that wait itself; the minimum is one bridge call per second per replica at " +
+      "most [estimated].",
+    doc:
+      "How often an entry replica (a lane entry with a replica index, LANE_REPLICA) asks the bridge for its role (entry.role): " +
+      "serving, or draining while the release tool takes it out for an update. At most once per interval, behind the " +
+      "requests the replica serves (workerd runs nothing between requests); an answer it cannot read keeps the role it last " +
+      "read. Read by the lane in the entry layout with a replica index only.",
   },
   {
     name: "LANE_STACK_REPORT_MIN_MS",
@@ -1278,7 +1300,8 @@ export const SETTINGS: readonly SettingSpec[] = [
       "production's values.jsonc alertPaging names it, so a deploy takes it from a commit.",
     doc:
       "Whether the alert router pages. `on`: at least one destination secret outside DEPLOY_ENV local, as before. `off`: no destination " +
-      "secret may be set (ALERT_PAGERDUTY_ROUTING_KEY, ALERT_LARK_WEBHOOK_URL, ALERT_LARK_SECRET, ALERT_WEBHOOK_URL), and each page the " +
+      "secret may be set (ALERT_PAGERDUTY_ROUTING_KEY, ALERT_LARK_WEBHOOK_URL, ALERT_LARK_SECRET, ALERT_TELEGRAM_BOT_TOKEN, " +
+      "ALERT_TELEGRAM_CHAT_ID, ALERT_WEBHOOK_URL), and each page the " +
       "router would have sent is an error line `alert_page_not_sent` in its Workers Logs instead (workers/alerts/src/paging.ts).",
   },
   {
@@ -2073,13 +2096,15 @@ export const SETTINGS: readonly SettingSpec[] = [
     textCheck: jsonDocumentProblem,
     source:
       "The server's tool gate policy, the JSON document of GRAY_TRUST_POLICY_FILE read with serde_json (crates/gray-gateway/src/config/mod.rs:460); " +
-      "unset there it is the policy's Default, which `{}` reads as: enforce mode, tools authorised by the request's own declarations, no " +
-      "secret markers (docs/cloudflare-native/trust.md section 2). Kept as a deploy-time document, as the server keeps a file. Here only " +
-      "its JSON is checked; the gateway compiles it with @gray/trust at an isolate's first request, and a document the server would refuse " +
-      "fails every request rather than serving without the gate.",
+      "unset there it is the policy's Default, which `{}` reads as: tools authorised by the request's own declarations, no secret markers " +
+      "(docs/cloudflare-native/trust.md section 2). The gate observes only (the owner's decision of 2026-11-17): the document has no mode, " +
+      "one naming `mode` is refused as any unknown field, and the gate records what it finds without refusing, holding or rewriting " +
+      "anything. Kept as a deploy-time document, as the server keeps a file. Here only its JSON is checked; the gateway compiles it with " +
+      "@gray/trust at an isolate's first request, and a document the server would refuse fails every request rather than serving without the gate.",
     doc:
-      "The tool gate's policy (workers/gateway/src/trust.ts): mode (enforce, audit, off), allowed tools with their operator schemas, URL and " +
-      "command rules, secret markers.",
+      "The tool gate's policy (workers/gateway/src/trust.ts): allowed tools with their operator schemas, URL and command rules, and secret " +
+      "markers. The gate only observes (owner, 2026-11-17): every rule is checked and what it finds is recorded (security events, request " +
+      "evidence, the per-route tool-call and structured-output checks); nothing is refused, held or rewritten for it. No `mode`.",
   },
   {
     name: "CONTINUATION_BUCKETS",
@@ -3448,23 +3473,6 @@ export const SETTINGS: readonly SettingSpec[] = [
       "first, never within six minutes of the round. 0 turns the traffic trigger off: the floor alone",
   },
   {
-    name: "MODELTRACE_LANE_URL",
-    key: "modeltraceLaneUrl",
-    // The console sends a confidential-lane relay's probes to the lane entry, the only gateway that routes lane relays.
-    workers: ["console"],
-    type: "text",
-    default: "",
-    textCheck: (v) => (v === "" || originProblem(v) === null ? null : "must be empty or an http(s) origin"),
-    source:
-      "Decided with the user on 2026-11-03 (docs/model-authenticity-workflow.md, \"Probes are not billed\"): a confidential-lane (TEE) relay " +
-      "holds no credential Gray could probe it with, so its probes go through the lane entry (production https://lane.usefallback.com; " +
-      "@gray/snapshot routeInMode: the main gateway never routes a lane relay). Unset by default: lane relays have no rounds.",
-    doc:
-      "The lane entry's origin, to which the console sends the ModelTrace probes of confidential-lane relays (auth lane_relay) as the " +
-      "built-in model-check workspace's requests (@gray/modeltrace MODEL_CHECK_WORKSPACE_ID), each with the ticket the console signs for " +
-      "it. Empty (the default): lane relays have no rounds",
-  },
-  {
     name: "WORKSPACE_DELETION_WAIT_MS",
     key: "workspaceDeletionWaitMs",
     workers: ["console"],
@@ -4077,8 +4085,28 @@ export const SETTINGS: readonly SettingSpec[] = [
       "docs/design/relay-outbound-only.md sections 5 and 6: an outbound-only relay stack VM has no public name; its health is read through " +
       "the entry's public route GET <entry>/v1/peer/relays/<relay>/healthz (R4), which answers the VM's /healthz with x-gray-peer-keyset and " +
       "x-gray-peer-sessions. The entry is the environment's: lane.usefallback.com in production, lane-staging.usefallback.com on staging " +
-      "(section 4). Empty: the relay panel shows no session line.",
-    doc: "The environment's entry origin, whose health route the relay panel reads for an outbound-only relay's sessions. Empty: none is read.",
+      "(section 4). Empty: the relay panel shows no session line. With replicas (docs/design/entry-replicas.md ER2, ER11) it is the shared " +
+      "name customers use and every relay's tunnel lane origin names, and LANE_STACK_ENTRY_ORIGINS lists the replicas by their own names.",
+    doc:
+      "The environment's entry origin (with replicas, their shared name), whose health route the relay panel reads for an outbound-only relay's " +
+      "sessions and through which every tunnel lane origin goes. Empty: none is read.",
+  },
+  {
+    name: "LANE_STACK_ENTRY_ORIGINS",
+    key: "laneStackEntryOrigins",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || entryOriginsProblem(v) === null ? null : `is not 1 to ${ENTRY_ORIGINS_MAX} distinct https origins separated by commas (https://lane-1.usefallback.com,https://lane-2.usefallback.com)`),
+    source:
+      "docs/design/entry-replicas.md ER2 and ER11: the entry becomes replicas, each with its own name (lane-<n>.usefallback.com, staging " +
+      "lane-staging-<n>.usefallback.com) beside the shared name customers use (LANE_STACK_ENTRY_ORIGIN). A replica holds its own sessions to every " +
+      "stack VM, so a rollout's watch waits for the new boot at each one in service, and its drain sums the streams each holds; a read through the shared name " +
+      "reaches one replica, whichever the front door picks. 16 is the lane bridge's STACK_ENTRIES_MAX and gray-assistant's bound on lane origins. " +
+      "Empty: the one entry, LANE_STACK_ENTRY_ORIGIN, as before replicas.",
+    doc:
+      "The entries a stack VM rollout reads one by one, each replica by its own name, comma-separated; LANE_STACK_ENTRY_ORIGIN stays the shared " +
+      "name customers and every tunnel lane origin use. Empty: LANE_STACK_ENTRY_ORIGIN alone.",
   },
   {
     name: "LANE_STACK_ENTRY_TIMEOUT_MS",
@@ -4536,6 +4564,21 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc: "How long an open waits for room in its isolate's read budget (CONTENT_READ_MAX_BYTES in the content Worker, CONSOLE_CONTENT_READ_MAX_BYTES in the console) before it is refused.",
   },
   {
+    name: "CONTENT_OPEN_IDLE_MS",
+    key: "contentOpenIdleMs",
+    workers: ["content"],
+    type: "int",
+    default: "60000",
+    min: 1000,
+    max: 600000,
+    source:
+      "STREAM_CLIENT_STALL_MS (GRAY_STREAM_CLIENT_STALL_SECONDS, default 60, config/mod.rs:163-167; maximum 600 s, REQUEST_BODY_MS's maximum): " +
+      "the same client-stall bound the gateway applies once a response body has started to go out.",
+    doc:
+      "How long an opened content stream in the content Worker waits for a caller that takes nothing from a full frame buffer before cutting off " +
+      "the stream and reclaiming its read budget (CONTENT_READ_MAX_BYTES).",
+  },
+  {
     name: "CONSOLE_CONTENT_READ_MAX_BYTES",
     key: "consoleContentReadMaxBytes",
     workers: ["console"],
@@ -4609,6 +4652,36 @@ export function entryOriginProblem(value: string): string | null {
   } catch {
     return "not a URL";
   }
+}
+
+/** The most entries LANE_STACK_ENTRY_ORIGINS names: the lane bridge's STACK_ENTRIES_MAX (docs/design/entry-replicas.md ER2). */
+export const ENTRY_ORIGINS_MAX = 16;
+
+/** LANE_STACK_ENTRY_ORIGINS's entries as written: split at commas, trimmed; [] for "". */
+export function entryOriginList(value: string): string[] {
+  return value === "" ? [] : value.split(",").map((origin) => origin.trim());
+}
+
+/** Why `value` is not LANE_STACK_ENTRY_ORIGINS (1 to ENTRY_ORIGINS_MAX distinct `entryOriginProblem` origins), or null. */
+export function entryOriginsProblem(value: string): string | null {
+  const origins = entryOriginList(value);
+  if (origins.length === 0 || origins.length > ENTRY_ORIGINS_MAX) return "count";
+  if (new Set(origins).size !== origins.length) return "an origin twice";
+  for (const origin of origins) {
+    const problem = entryOriginProblem(origin);
+    if (problem !== null) return problem;
+  }
+  return null;
+}
+
+/**
+ * The entries a stack VM rollout reads one by one (docs/design/entry-replicas.md ER11): LANE_STACK_ENTRY_ORIGINS's,
+ * or, where it is empty, the one entry LANE_STACK_ENTRY_ORIGIN; [] where neither is set.
+ */
+export function entryOriginsOf(config: { readonly laneStackEntryOrigin: string; readonly laneStackEntryOrigins?: string }): string[] {
+  const list = entryOriginList(config.laneStackEntryOrigins ?? "");
+  if (list.length > 0) return list;
+  return config.laneStackEntryOrigin === "" ? [] : [config.laneStackEntryOrigin];
 }
 
 /**
@@ -5173,6 +5246,19 @@ export const TEXT_CROSS_CHECKS: readonly TextCrossCheck[] = [
     check: (a, b) => ((a === "") === (b === "") ? null : a === "" ? "is empty while RELAY_KIT_SHA256 is set; set both or neither" : "needs RELAY_KIT_SHA256: the agent instructions check the kit with it"),
     source: "The agent instructions download the kit only with the SHA-256 they check it against (RELAY_KIT_SHA256); a digest without a URL names nothing.",
   },
+  {
+    workers: ["console"],
+    names: ["LANE_STACK_ENTRY_ORIGINS", "LANE_STACK_ENTRY_ORIGIN"],
+    check: (a, b) => {
+      if (a === "") return null;
+      if (b === "") return "needs LANE_STACK_ENTRY_ORIGIN: the shared name customers and every tunnel lane origin use";
+      const origins = entryOriginList(a);
+      return origins.length > 1 && origins.includes(b) ? "names LANE_STACK_ENTRY_ORIGIN among several entries; list each replica by its own name" : null;
+    },
+    source:
+      "docs/design/entry-replicas.md ER2 and ER11: the shared name reaches whichever replica the front door picks, so a read through it is no " +
+      "one replica's, and a relay's tunnel lane origin stays at it, so it must be set whenever replicas are.",
+  },
 ];
 
 /**
@@ -5347,6 +5433,8 @@ export interface GatewayConfig {
   readonly laneBridgeAnswerMarginMs: number;
   /** LANE_STACK_POLL_MS (S28): a relay-stack lane's bridge poll and table re-push interval. */
   readonly laneStackPollMs: number;
+  /** LANE_ENTRY_ROLE_POLL_MS (entry replicas, ER9 as revised): how often an entry replica reads its role through the bridge. */
+  readonly laneEntryRolePollMs: number;
   /** LANE_STACK_REPORT_MIN_MS (S42): the shortest interval between two stack.report calls carrying a change. */
   readonly laneStackReportMinMs: number;
   /** LANE_STACK_REPORT_HEARTBEAT_MS (S42): stack.report's interval when nothing changed. */
@@ -5576,6 +5664,8 @@ export interface ConsoleConfig {
   readonly laneStackTunnelZone: string;
   /** LANE_STACK_ENTRY_ORIGIN: the entry whose health route shows an outbound-only relay's sessions (docs/design/relay-outbound-only.md 5); empty: none. */
   readonly laneStackEntryOrigin: string;
+  /** LANE_STACK_ENTRY_ORIGINS: the entries a rollout reads one by one, each replica by its own name (entry-replicas ER11); empty: the one entry. */
+  readonly laneStackEntryOrigins: string;
   /** LANE_STACK_ENTRY_TIMEOUT_MS: the relay panel's bound on one read of the entry's health route. */
   readonly laneStackEntryTimeoutMs: number;
   /** LANE_STACK_OUTBOUND_MIN_KIT: the lowest gray-relay kit an outbound-only release may boot for (R10). */
@@ -5696,8 +5786,6 @@ export interface ConsoleConfig {
    * basis points (@gray/modeltrace `recheckServed`); 0 turns the traffic trigger off, the floor alone.
    */
   readonly modeltraceTrafficShareBps: number;
-  /** MODELTRACE_LANE_URL: the lane entry's origin for confidential-lane relays' probes; "" when unset: they have no rounds. */
-  readonly modeltraceLaneUrl: string;
   /** WORKSPACE_DELETION_WAIT_MS: how long a workspace's closure waits for its data's deletion before it answers. */
   readonly workspaceDeletionWaitMs: number;
   /**
@@ -5751,6 +5839,7 @@ export interface ContentConfig {
   readonly contentKeyLeadDays: number;
   readonly contentReadMaxBytes: number;
   readonly contentOpenWaitMs: number;
+  readonly contentOpenIdleMs: number;
   readonly contentStatementTimeoutMs: number;
   readonly accessTeamDomain: string;
   readonly accessAud: string;

@@ -75,13 +75,20 @@ export const STACK_ID_RULE = "An id or a label is 1-128 characters of A-Z a-z 0-
 export const STACK_APP_ID_RULE = "A dstack app id is 40 lower-case hex digits.";
 export const STACK_TOKEN_URL_RULE = "The pull-token service's address is an https origin without a path, a query or a fragment: pre-launch appends /v1/pull-token/... to it.";
 export const STACK_REGISTRY_RULE = "A registry is a host name with an optional port, as docker login takes it, in lower case: no scheme, path or user.";
-export const STACK_IMAGE_RULE = "The relay's image is pinned by its digest: <repository>@sha256:<64 lower-case hex digits>.";
-export const STACK_SETTINGS_RULE = `The relay's settings are a JSON object of at most ${STACK_SETTINGS_MAX_BYTES} bytes.`;
+export const STACK_IMAGE_RULE = "The image is pinned by its digest: <repository>@sha256:<64 lower-case hex digits>.";
+export const STACK_SETTINGS_RULE = `The settings are a JSON object of at most ${STACK_SETTINGS_MAX_BYTES} bytes.`;
 export const STACK_MODELS_RULE = "An account's models are distinct model IDs (a letter or digit, then letters, digits and . _ : @ + / -, at most 256).";
 export const STACK_LABELS_RULE = "An account's labels are distinct, each 1-128 characters of A-Z a-z 0-9 . _ : -.";
 export const STACK_WINDOWS_RULE = `An account's limit windows have distinct lengths of 1 to ${LANE_STACK_WINDOW_MAX_SECONDS} seconds (7 days).`;
 export const STACK_PROXY_HOST_RULE = "A proxy host is a name or an IP address without a scheme, user, port, path or brackets.";
 export const STACK_APPEND_RULE = `An appended text is non-empty, well-formed text of at most ${STACK_APPEND_MAX_BYTES} UTF-8 bytes.`;
+
+/**
+ * An account's group (docs/design/relay-operator-page.md section 2): a name for people, 1 to 64 characters as trimmed,
+ * with no control character. Never served to the lane, unlike an account's `labels`.
+ */
+export const STACK_GROUP_MAX_CHARS = 64;
+export const STACK_GROUP_RULE = `A group's name is 1 to ${STACK_GROUP_MAX_CHARS} characters without control characters; spaces around it are dropped.`;
 
 /**
  * Who inserts the relay's registered appends (relay standard v1.7 §2): `relay`, its container as before, or `gray`, the
@@ -223,6 +230,31 @@ export const stackAccountsPatchSchema = z
   .strict();
 export type StackAccountsPatch = z.infer<typeof stackAccountsPatchSchema>;
 
+/** A batch's group (`PATCH .../accounts` body): every listed account is in `group` from now on (null: in none). */
+export const stackAccountsGroupSchema = z
+  .object({
+    account_ids: z.array(z.string()).min(1).max(STACK_ACCOUNTS_PATCH_MAX),
+    group: z.string().nullable(),
+  })
+  .strict();
+export type StackAccountsGroup = z.infer<typeof stackAccountsGroupSchema>;
+
+/**
+ * A batch's settings (`PATCH .../accounts` body): every listed account takes each of `models`, `weight` and
+ * `max_concurrency` the body names, at least one, in the account PUT's ranges; a member it does not name stays as each
+ * account has it.
+ */
+export const stackAccountsSettingsSchema = z
+  .object({
+    account_ids: z.array(z.string()).min(1).max(STACK_ACCOUNTS_PATCH_MAX),
+    models: z.array(z.string()).optional(),
+    weight: z.number().int().min(1).max(U32).optional(),
+    max_concurrency: z.number().int().min(1).max(U32).optional(),
+  })
+  .strict()
+  .refine((b) => b.models !== undefined || b.weight !== undefined || b.max_concurrency !== undefined, { message: "a settings batch names models, weight or max_concurrency" });
+export type StackAccountsSettings = z.infer<typeof stackAccountsSettingsSchema>;
+
 /** A proxy (`PUT .../proxies/{id}` body); its user name and password are sealed, never sent here. */
 export const stackProxyInputSchema = z
   .object({
@@ -282,6 +314,22 @@ export function checkStackAccount(input: StackAccountInput): void {
   if (input.proxy_id !== null && !validStackId(input.proxy_id)) refuse(STACK_ID_RULE);
 }
 
+/**
+ * A group's name as it is stored: `name` without the white space around it, refused when what is left is empty, over
+ * STACK_GROUP_MAX_CHARS characters (code points, as the table's check counts them), not well-formed or holds a control
+ * character.
+ */
+export function checkedStackGroup(name: string): string {
+  const group = name.trim();
+  if (group === "" || !group.isWellFormed() || [...group].length > STACK_GROUP_MAX_CHARS || /\p{Cc}/u.test(group)) refuse(STACK_GROUP_RULE);
+  return group;
+}
+
+/** A settings batch's own rules: its `models` as an account's. */
+export function checkStackAccountsSettings(input: StackAccountsSettings): void {
+  if (input.models !== undefined && (!input.models.every(validModelId) || !distinct(input.models))) refuse(STACK_MODELS_RULE);
+}
+
 /** A proxy's own rules: the egress sidecar's host rule (@gray/relay-connector `isValidEgressHost`). */
 export function checkStackProxy(input: StackProxyInput): void {
   if (!isValidEgressHost(input.host)) refuse(STACK_PROXY_HOST_RULE);
@@ -302,14 +350,24 @@ export function checkStackAppend(input: StackAppendInput): void {
 export const STACK_KMS_CA_PUBKEY_PATTERN = /^3059301306072a8648ce3d020106082a8648ce3d03010703420004[0-9a-f]{128}$/;
 
 export const STACK_LANE_ORIGIN_RULE =
-  "A relay stack's lane origin is Gray's entry tunnel route for the relay, spelled as itself: https://<entry>/v1/peer/tunnel/<relay_id>. " +
+  "A deployment's lane origin is Gray's entry tunnel route for it, spelled as itself: https://<entry>/v1/peer/tunnel/<relay_id>. " +
   "A stack VM takes no inbound connection, so it has no address of its own.";
-export const STACK_LANE_TUNNEL_RULE = "A tunnel lane origin names the relay it is published for: https://<entry>/v1/peer/tunnel/<this relay's id>, not another relay's.";
+export const STACK_LANE_TUNNEL_RULE = "A tunnel lane origin names the deployment it is published for: https://<entry>/v1/peer/tunnel/<this deployment's id>, not another deployment's.";
 export const STACK_LANE_TUNNEL_NO_ENTRY_RULE =
   "This deployment names no entry (LANE_STACK_ENTRY_ORIGIN is empty), so it publishes no tunnel lane origin: configure the entry an outbound-only VM is reached through first.";
 /** The refusal of a tunnel lane origin through another entry than this deployment's (LANE_STACK_ENTRY_ORIGIN). */
 export function stackLaneTunnelEntryRule(entryOrigin: string): string {
   return `A tunnel lane origin goes through this deployment's entry, ${entryOrigin}: ${entryOrigin}${PEER_TUNNEL_PATH}<relay_id>.`;
+}
+/**
+ * The refusal of a tunnel lane origin at one entry replica's own name (LANE_STACK_ENTRY_ORIGINS,
+ * docs/design/entry-replicas.md ER11): it stays at the replicas' shared name.
+ */
+export function stackLaneTunnelReplicaRule(entryOrigin: string, replica: string): string {
+  return (
+    `A tunnel lane origin goes through the entry's shared name, ${entryOrigin}, not the replica ${replica}: a replica's own name reaches ` +
+    `that replica only, which an entry release takes out, while every replica holds sessions to every VM: ${entryOrigin}${PEER_TUNNEL_PATH}<relay_id>.`
+  );
 }
 export const STACK_KMS_CA_PUBKEY_RULE = "A KMS CA public key is the node KMS's ca_pubkey: a P-256 SubjectPublicKeyInfo as 182 lower-case hex digits.";
 
@@ -374,13 +432,24 @@ export type StackInstanceInput = z.infer<typeof stackInstanceInputSchema>;
  * is outbound-only (docs/design/relay-outbound-only.md section 5). Each refusal has its own rule: not a tunnel route,
  * no entry configured, another entry (the rule names the expected one, so a typo is not a VM nobody reaches), or
  * another relay's tunnel (gray-relay would refuse to adopt it).
+ *
+ * With entry replicas (`replicas`, LANE_STACK_ENTRY_ORIGINS, docs/design/entry-replicas.md ER11) `entryOrigin` is their
+ * shared name, and it stays the only entry a tunnel lane origin names: the tunnel carries the VM's own TLS, and every
+ * replica holds sessions to every VM, so any replica the shared name reaches serves it. A replica's own name is refused
+ * with a rule of its own: gray-assistant would pin one replica, and lose the lane while an entry release updates it.
  */
-export function checkStackInstance(input: Pick<StackInstanceInput, "app_id" | "lane_origin" | "kms_ca_pubkey">, relayId: string, entryOrigin: string | null): void {
+export function checkStackInstance(
+  input: Pick<StackInstanceInput, "app_id" | "lane_origin" | "kms_ca_pubkey">,
+  relayId: string,
+  entryOrigin: string | null,
+  replicas: readonly string[] = [],
+): void {
   if (input.app_id !== null && !STACK_APP_ID_PATTERN.test(input.app_id)) refuse(STACK_APP_ID_RULE);
   if (input.lane_origin !== null) {
     const tunnel = tunnelOriginParts(input.lane_origin);
     if (tunnel === null) refuse(STACK_LANE_ORIGIN_RULE);
     if (entryOrigin === null || entryOrigin === "") refuse(STACK_LANE_TUNNEL_NO_ENTRY_RULE);
+    if (tunnel.entry !== entryOrigin && replicas.includes(tunnel.entry)) refuse(stackLaneTunnelReplicaRule(entryOrigin, tunnel.entry));
     if (tunnel.entry !== entryOrigin) refuse(stackLaneTunnelEntryRule(entryOrigin));
     if (tunnel.relayId !== relayId) refuse(STACK_LANE_TUNNEL_RULE);
   }
@@ -411,7 +480,7 @@ export function stackRoutesProblem(routes: readonly StackServedRoute[]): string 
       continue;
     }
     return (
-      `A relay stack serves one route per protocol and requested model: ${r.requested_model} (${r.protocol}) is mapped by its enabled ` +
+      `A deployment serves one route per protocol and requested model: ${r.requested_model} (${r.protocol}) is mapped by its enabled ` +
       `endpoints ${first} and ${r.endpoint_id}. Remove the mapping from one of them, or disable one, first.`
     );
   }
@@ -438,8 +507,8 @@ export function stackAppendsProblem(appends: readonly StackServedAppend[]): stri
     const bytes = at.reduce((sum, a) => sum + utf8Length(a.text), 0);
     if (at.length > DEFAULT_MAX_ITEMS || bytes > DEFAULT_MAX_TOTAL_BYTES) {
       return (
-        `One ${protocol} request carries at most ${DEFAULT_MAX_ITEMS} appended texts of ${DEFAULT_MAX_TOTAL_BYTES} bytes together, and a relay ` +
-        `stack's texts at ${positions.join(" and ")} would be ${at.length} of ${bytes} bytes. Remove or shorten one first.`
+        `One ${protocol} request carries at most ${DEFAULT_MAX_ITEMS} appended texts of ${DEFAULT_MAX_TOTAL_BYTES} bytes together, and the deployment's ` +
+        `texts at ${positions.join(" and ")} would be ${at.length} of ${bytes} bytes. Remove or shorten one first.`
       );
     }
   }
@@ -550,6 +619,67 @@ export function stackRestartRequestMessage(r: StackRestartRequest): Uint8Array {
   const lines = [STACK_RESTART_REQUEST_DOMAIN, r.relay_id, r.request_id, String(r.issued_ms), r.app_id, r.reason, r.image ?? ""];
   if (r.kit !== undefined || r.boot_version !== undefined) lines.push(r.kit ?? "", r.boot_version === undefined ? "" : String(r.boot_version));
   return new TextEncoder().encode(lines.join("\n"));
+}
+
+// ------------------------------------------------------------------------------------- the relay's panel view
+
+/**
+ * A relay's read of its own panel view (`POST /v1/lane-stack/panel-view`, docs/design/relay-operator-page.md section 5):
+ * gray-assistant's page lists each account with its state on Gray and its group. Signed by the relay key, as a restart
+ * request is; a read, so the nonce only keeps two requests of one millisecond apart and is not stored.
+ */
+export const STACK_PANEL_VIEW_NONCE_PATTERN = /^[0-9a-f]{32}$/;
+export const stackPanelViewRequestSchema = z
+  .object({ relay_id: z.string().regex(LANE_RELAY_ID_PATTERN), issued_ms: u64, nonce: z.string().regex(STACK_PANEL_VIEW_NONCE_PATTERN) })
+  .strict();
+export type StackPanelViewRequest = z.infer<typeof stackPanelViewRequestSchema>;
+
+/** The request and the relay's Ed25519 signature over `stackPanelViewMessage`, 128 lower-case hex digits. */
+export const stackPanelViewReportSchema = z.object({ request: stackPanelViewRequestSchema, signature: z.string().regex(/^[0-9a-f]{128}$/) }).strict();
+export type StackPanelViewReport = z.infer<typeof stackPanelViewReportSchema>;
+
+/** The first line of the signed panel-view request. */
+export const STACK_PANEL_VIEW_DOMAIN = "gray-relay-panel-view/v1";
+/** How far `issued_ms` may be from Gray's clock, either way. */
+export const STACK_PANEL_VIEW_MAX_SKEW_MS = 5 * 60_000;
+
+/** The bytes the relay signs: the domain and each member on its own line, in this order. */
+export function stackPanelViewMessage(r: StackPanelViewRequest): Uint8Array {
+  return new TextEncoder().encode([STACK_PANEL_VIEW_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce].join("\n"));
+}
+
+// ------------------------------------------------------------------------------------- the relay's own group change
+
+/**
+ * A relay's own change of its accounts' group (`POST /v1/lane-stack/account-group`, docs/design/relay-operator-page.md
+ * section 2): what the panel's Move to group does, signed by the relay key. gray-assistant's page uses it to put an
+ * account it just added in the group the operator chose, and `gray-assistant accounts group` does the same from a
+ * terminal. The name's own rule (`checkedStackGroup`) is the console's to apply; here it only has to sit on one line.
+ */
+export const stackAccountGroupRequestSchema = z
+  .object({
+    relay_id: z.string().regex(LANE_RELAY_ID_PATTERN),
+    issued_ms: u64,
+    nonce: z.string().regex(STACK_PANEL_VIEW_NONCE_PATTERN),
+    account_ids: z.array(z.string().regex(STACK_ID_PATTERN)).min(1).max(STACK_ACCOUNTS_PATCH_MAX),
+    group: z.string().max(256).regex(/^[^\r\n]*$/).nullable(),
+  })
+  .strict();
+export type StackAccountGroupRequest = z.infer<typeof stackAccountGroupRequestSchema>;
+
+/** The request and the relay's Ed25519 signature over `stackAccountGroupMessage`, 128 lower-case hex digits. */
+export const stackAccountGroupReportSchema = z.object({ request: stackAccountGroupRequestSchema, signature: z.string().regex(/^[0-9a-f]{128}$/) }).strict();
+export type StackAccountGroupReport = z.infer<typeof stackAccountGroupReportSchema>;
+
+/** The first line of the signed group change. */
+export const STACK_ACCOUNT_GROUP_DOMAIN = "gray-relay-account-group/v1";
+
+/**
+ * The bytes the relay signs: the domain, `relay_id`, `issued_ms`, `nonce`, the group (`-` for none, `=` and the name
+ * for a group, so a group named `-` is not none), then each account id on a line of its own, in the request's order.
+ */
+export function stackAccountGroupMessage(r: StackAccountGroupRequest): Uint8Array {
+  return new TextEncoder().encode([STACK_ACCOUNT_GROUP_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, r.group === null ? "-" : `=${r.group}`, ...r.account_ids].join("\n"));
 }
 
 /** Where a restart request stands: recorded and waiting, or settled by the provisioner or Gray's operator. */

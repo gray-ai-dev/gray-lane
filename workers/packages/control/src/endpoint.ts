@@ -106,9 +106,9 @@ export const LANE_BASE_URL_RULE =
 export const LANE_AUTH_RULE =
   'A confidential-lane endpoint has "auth": "lane_relay" and a "lane" record; every other endpoint has "protocol_native" or "bearer" and no "lane" record.';
 export const LANE_RELAY_RULE =
-  "A lane record names its relay (1-128 characters of A-Z a-z 0-9 . _ : -), the relay's Ed25519 public key and its scheduler's (64 lowercase hex digits each), and the scheduler's https origin without a path, a query or a fragment.";
+  "A lane record names its deployment (1-128 characters of A-Z a-z 0-9 . _ : -), the deployment's Ed25519 public key and its scheduler's (64 lowercase hex digits each), and the scheduler's https origin without a path, a query or a fragment.";
 export const LANE_CREDENTIAL_RULE =
-  "A confidential-lane endpoint's credential is the sentinel lane:<relay_id>, the same relay its lane record names; the relay's own accounts are sealed to the TEE, never stored as the endpoint's credential.";
+  "A confidential-lane endpoint's credential is the sentinel lane:<relay_id>, the same deployment its lane record names; the deployment's own accounts are sealed to the TEE, never stored as the endpoint's credential.";
 
 export interface ModelMapping {
   readonly requested_model: string;

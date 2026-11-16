@@ -6,14 +6,36 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/go-acme/lego/v5/acme"
 	"github.com/go-acme/lego/v5/certcrypto"
 	"github.com/go-acme/lego/v5/certificate"
+	"github.com/go-acme/lego/v5/challenge/dns01"
 	"github.com/go-acme/lego/v5/challenge/tlsalpn01"
 	"github.com/go-acme/lego/v5/lego"
 	legoLog "github.com/go-acme/lego/v5/log"
+	"github.com/go-acme/lego/v5/providers/dns/httpreq"
 	"github.com/go-acme/lego/v5/registration"
+)
+
+const (
+	// docs/design/entry-replicas.md ER5, §5 row 7: how long lego waits for the challenge TXT record to be visible
+	// before it asks the CA to validate, and how often it looks. lego's own defaults (challenge/dns01/
+	// dns_challenge.go:24,27 in v5.6.0: 60 s, every 2 s), until M8 measures the bridge's records on staging. A record
+	// not seen in time fails that CA's order (§5 row 6), and the entrypoint's hold and restart order again.
+	dns01PropagationTimeout = dns01.DefaultPropagationTimeout
+	dns01PollingInterval    = dns01.DefaultPollingInterval
+	// One present or cleanup call to the entrypoint: httpreq's own default (providers/dns/httpreq/httpreq.go:65,
+	// 30 s). It is above the entrypoint's bound on the bridge call it makes for it (LANE_BRIDGE_CALL_MS, 20 s, in
+	// @gray/lane-wire wire.ts), so the entrypoint answers with the bridge's code before this client gives up.
+	dns01CallTimeout = 30 * time.Second
+	// The endpoint URL httpreq joins `/present` and `/cleanup` to. Its host is never resolved: the transport
+	// dials ACME_DNS01_SOCKET whatever the URL names.
+	dns01Endpoint = "http://localhost"
 )
 
 // keptLines keeps lego's operational lines off the service log while a CA attempt runs: D45 wants the
@@ -88,10 +110,60 @@ func newLegoClient(ca caEndpoint, cfg config, accountKey crypto.Signer, accountU
 	if err != nil {
 		return nil, err
 	}
+	if cfg.DNS01Socket != "" {
+		if err := setDNS01(client, cfg); err != nil {
+			return nil, fmt.Errorf("configure dns-01: %w", err)
+		}
+		return &legoClient{client: client, user: user, details: details}, nil
+	}
 	if err := client.Challenge.SetTLSALPN01Provider(tlsalpn01.NewProviderServer(cfg.ChallengeHost, cfg.ChallengePort)); err != nil {
 		return nil, fmt.Errorf("configure tls-alpn-01: %w", err)
 	}
 	return &legoClient{client: client, user: user, details: details}, nil
+}
+
+// setDNS01 makes dns-01 the client's only challenge (docs/design/entry-replicas.md ER5): lego's `httpreq` provider,
+// unchanged, with an HTTP client whose transport dials the entrypoint's unix socket and nothing else (no proxy, no
+// name lookup). httpreq posts `{"fqdn", "value"}` to `/present` and `/cleanup` (providers/dns/httpreq/httpreq.go:
+// 37-40,134-145,165-176) and fails on any status but 2xx (:208-210), the entrypoint's answer body in its error. With
+// ACME_DNS01_RESOLVERS (the simulator's challenge DNS server) lego's propagation check asks those servers only and
+// skips the authoritative servers, which a test DNS server does not delegate to.
+func setDNS01(client *lego.Client, cfg config) error {
+	provider, err := dns01Provider(cfg.DNS01Socket)
+	if err != nil {
+		return err
+	}
+	var options []dns01.ChallengeOption
+	if len(cfg.DNS01Resolvers) > 0 {
+		resolverOptions := dns01.NewOptions()
+		resolverOptions.RecursiveNameservers = cfg.DNS01Resolvers
+		dns01.SetDefaultClient(dns01.NewClient(resolverOptions))
+		options = append(options, dns01.DisableAuthoritativeNssPropagationRequirement())
+	}
+	return client.Challenge.SetDNS01Provider(provider, options...)
+}
+
+// dns01Provider is lego's httpreq provider posting to the unix socket at socket.
+func dns01Provider(socket string) (*httpreq.DNSProvider, error) {
+	endpoint, err := url.Parse(dns01Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return httpreq.NewDNSProviderConfig(&httpreq.Config{
+		Endpoint:           endpoint,
+		PropagationTimeout: dns01PropagationTimeout,
+		PollingInterval:    dns01PollingInterval,
+		HTTPClient: &http.Client{
+			Timeout: dns01CallTimeout,
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var dialer net.Dialer
+					return dialer.DialContext(ctx, "unix", socket)
+				},
+				DisableKeepAlives: true,
+			},
+		},
+	})
 }
 
 // Details are what the CA's ACME objects and lego's own log said during this attempt (details.go).
@@ -138,12 +210,12 @@ func (l *legoClient) Register(eab *eabCredentials) (string, error) {
 	return account.Location, nil
 }
 
-// Obtain orders the certificate for key. KeyType names the EC P-256 key lego v4's client
+// Obtain orders the certificate for names (an entry replica's two, or TLS_DOMAIN alone) and key. KeyType names the EC P-256 key lego v4's client
 // configuration did (lego reads the type of a given key from the key itself); EnableCommonName keeps
 // the CSR's common name, which lego v4 set by default and v5 sets only when asked.
-func (l *legoClient) Obtain(domain string, key crypto.Signer) ([]byte, error) {
+func (l *legoClient) Obtain(names []string, key crypto.Signer) ([]byte, error) {
 	result, err := l.client.Certificate.Obtain(context.Background(), certificate.ObtainRequest{
-		Domains:          []string{domain},
+		Domains:          names,
 		PrivateKey:       key,
 		KeyType:          certcrypto.EC256,
 		Bundle:           true,

@@ -9,7 +9,7 @@ export { confirmedAtOf, currentFor, routeServes, type AgeJudgement };
 export type { GatewayRecipient };
 import { gatewayNow } from "./clock.ts";
 import type { GatewayEnv } from "./env.ts";
-import type { FeedAnswer, FeedHave, RankingConfig } from "@gray/routing";
+import type { FeedAnswer, FeedHave, RankingConfig, RouteTag } from "@gray/routing";
 import { endpointSettings, rankingConfigOf } from "@gray/endpoint";
 import { RankingBase } from "./ranking-base.ts";
 import { rankingCheckPoint } from "./ranking-points.ts";
@@ -120,6 +120,8 @@ export function chatFor(caps: RouteCapabilities, stream: boolean): ModeCapabilit
 
 /** One verified model mapping of one endpoint (the server's `Route`). */
 export interface RouteRecord {
+  /** The route's public tag (routing.rs `RouteTag`), when its supplier sells under its own name; absent: none. */
+  readonly tag?: RouteTag;
   readonly endpointId: string;
   /**
    * The endpoint's credential generation and configuration fingerprint: with the mapping's model and API, the
@@ -288,11 +290,16 @@ export interface GatewaySnapshot {
    */
   readonly registered?: ReadonlySet<string>;
   /**
-   * Every route of the snapshot as its (route, supplier) references, priced or not (@gray/snapshot
-   * `GatewayView.published`), which customer orders are settled against (preference.ts `layeredOver`).
-   * Absent (a test's own snapshot): the routes' own.
+   * Every route of the snapshot as its (route, supplier) references and whether it has a tier, priced or not
+   * (@gray/snapshot `GatewayView.published`), which customer orders are settled against (preference.ts
+   * `layeredOver`). Absent (a test's own snapshot): the routes' own.
    */
-  readonly published?: readonly (readonly [provider: string, supplier: string])[];
+  readonly published?: readonly (readonly [provider: string, supplier: string, tiered?: boolean])[];
+  /**
+   * Every registered public handle with its supplier's workspace id, with a live route or not (inference.rs
+   * `Snapshot.handles`): what a tag pattern's handle is looked up in (preference.ts `layeredOver`). Absent: none.
+   */
+  readonly handles?: Readonly<Record<string, string>>;
   /**
    * The public keys a model-check ticket verifies under, kid to 64 lower hex digits (@gray/snapshot
    * `Snapshot.modelCheckKeys`, model-check.ts; docs/model-authenticity-workflow.md, "Probes are not billed"). Absent:
@@ -490,6 +497,7 @@ export function gatewaySnapshotOf(snapshot: Snapshot, mode: GatewayMode = "main"
     // A set once per version (this mapping is cached by version): every request naming a reference asks it.
     registered: new Set(view.registered),
     published: view.published,
+    ...(view.handles === undefined ? {} : { handles: view.handles }),
     // The model-check tickets' keys, the main gateway's and the lane entry's alike (both map through here).
     ...(snapshot.modelCheckKeys === undefined || snapshot.modelCheckKeys.length === 0 ? {} : { modelCheckKeys: modelCheckKeysOf(snapshot.modelCheckKeys) }),
   };

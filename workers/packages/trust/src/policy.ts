@@ -9,8 +9,14 @@
  * a tool the request did not declare, and arguments the declared schema refuses or that are not an
  * object. A client runs only the tools it declared and checks their arguments against its own
  * declaration, as it does when it talks to the upstream directly. Every rule that reads a declared
- * call's arguments for Gray itself (an operator schema, URL or command rule) still refuses, and so do
- * the tool-selection, secret, payload, protocol and shape rules.
+ * call's arguments for Gray itself (an operator schema, URL or command rule) refuses in enforce mode,
+ * and so do the tool-selection, secret, payload, protocol and shape rules.
+ *
+ * The gate observes only (owner, 2026-11-17): the policy the gateway reads (`fromJson`) runs `audit`,
+ * which reports each of those refusals as a violation and lets the request or answer go on; it holds,
+ * buffers and rewrites nothing. A stream to a request that declared tools is inspected call by call as
+ * it passes (`streamCheck`), so its calls count in the per-route error rates. `enforce` and `off`
+ * remain for tests only (`withTestMode`).
  *
  * Requests travel as the canonical projection plus the parsed native body (`body`), which is what
  * Rust keeps as `raw_body`; `undefined` is Rust's `None`.
@@ -18,7 +24,7 @@
 import { type Json, get, isObject, pointer, serializedLength, utf8Length } from "@gray/json";
 import { type CanonicalEvent, type CanonicalRequest, type FinishReason, type Protocol, ProtocolError, type ToolCallCheck, parseResponse } from "@gray/protocol";
 import { AnswerCallCheck } from "./answer.ts";
-import { type TrustMode, type TrustPolicyConfig, TrustConfigError, parseTrustPolicyConfig } from "./config.ts";
+import { type TrustMode, type TrustPolicyConfig, TrustConfigError, parseTestTrustMode, parseTrustPolicyConfig } from "./config.ts";
 import { inspectToolDeclarations, inspectToolSelection } from "./declarations.ts";
 import { MARKER_MAX_BYTES, MARKER_MIN_BYTES, MAX_TOOLS, TOOL_NAME_MAX_BYTES } from "./limits.ts";
 import { domainProblem, inspectCommand, inspectUrl, safePackageSpec } from "./rules.ts";
@@ -160,9 +166,25 @@ export class TrustPolicy {
     return new TrustPolicy(config, operatorSchemas);
   }
 
-  /** `serde_json::from_*` and then `compile`, from the configuration's JSON. */
+  /**
+   * `serde_json::from_*` and then `compile`, from the policy document's JSON, as the gateway reads TRUST_POLICY: a
+   * document naming `mode` is refused, and the policy observes (`audit`).
+   */
   static fromJson(value: Json): TrustPolicy {
     return TrustPolicy.compile(parseTrustPolicyConfig(value));
+  }
+
+  /**
+   * Test-only constructor (owner, 2026-11-17: the gate observes only). `document` with a `mode` member taken out of it
+   * (absent: `enforce`, the default the tests and conformance fixtures written before that day were written for), and
+   * the policy of the rest in that mode. `enforce` and `off` exist for those tests alone: the gateway reads its document
+   * with `fromJson`, never with this. Rust: `TrustPolicyConfig::with_test_mode`.
+   */
+  static withTestMode(document: Json): TrustPolicy {
+    if (!isObject(document) || document.mode === undefined) return TrustPolicy.compile({ ...parseTrustPolicyConfig(document), mode: "enforce" });
+    const { mode, ...rest } = document;
+    const parsed = parseTestTrustMode(mode as Json);
+    return TrustPolicy.compile({ ...parseTrustPolicyConfig(rest), mode: parsed });
   }
 
   get mode(): TrustMode {
@@ -172,7 +194,8 @@ export class TrustPolicy {
   /**
    * Gate these streams with a `StreamToolInspector` (or `ToolGate`): frames before the first sign of
    * a tool call are released once inspected; from that frame, or from the first terminal event,
-   * every byte is held until the end-of-stream checks pass.
+   * every byte is held until the end-of-stream checks pass. Enforce (test-only) alone: the gate
+   * production runs holds nothing.
    */
   requiresBufferedStream(request: CanonicalRequest): boolean {
     return this.config.mode === "enforce" && request.stream && request.tools.length > 0;

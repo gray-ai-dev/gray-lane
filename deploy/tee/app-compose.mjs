@@ -251,6 +251,9 @@ export const SERVICE_KEYS = Object.freeze([
 export const FORBIDDEN_ENV_NAMES = Object.freeze([
   "LANE_RENDERED", "LANE_TEMPLATE", "LANE_RECEIPT_KEY_ID",
   "LANE_ACME", "LANE_TLS_CERT", "LANE_TLS_KEY", "ACME_CERT_DIR", "ACME_TLS_ALPN_ADDRESS",
+  // docs/design/entry-replicas.md ER5: the entrypoint gives gray-acme a replica's name and its dns-01 socket itself;
+  // ACME_DNS01_RESOLVERS is the simulator's DNS server for lego's propagation check, never a release's.
+  "TLS_REPLICA_DOMAIN", "ACME_DNS01_SOCKET", "ACME_DNS01_RESOLVERS",
 ]);
 
 /** What the committed compose allows each service to publish (D58). */
@@ -327,7 +330,23 @@ const RELEASE_KEY = /^[0-9a-f]{64}$/;
 export const PEERS_ENV = "LANE_PEERS";
 export const PEER_FLAG = "-peer";
 export const PEER_TUNABLES = PEER_TUNABLE_NAMES;
-/** Every lane setting only an entry may carry. */
+/**
+ * docs/design/entry-replicas.md ER2, default layout only: an entry replica's two settings on lane, both or neither.
+ * `TLS_REPLICA_DOMAIN_PATTERN` (`--tls-replica-domain-pattern`) is the measured name pattern, for example
+ * `lane-{n}.usefallback.com`: one `{n}`, in the first label, in the zone of the shared name (TLS_DOMAIN's parent).
+ * `LANE_REPLICA` is the replica's index, 1 to REPLICA_MAX, and is not measured: it comes from the instance's
+ * encrypted env, so the lane passes it through as REPLICA_EXPRESSION and it is one more name of `allowed_envs`. A
+ * measured index would give every instance of the app the same name. The entrypoint renders the replica's name from
+ * the two; an instance without an index is a single entry. A compose with neither measures what it did before.
+ */
+export const REPLICA_PATTERN_ENV = "TLS_REPLICA_DOMAIN_PATTERN";
+export const REPLICA_ENV = "LANE_REPLICA";
+export const REPLICA_EXPRESSION = "${LANE_REPLICA:-}";
+/** The index's upper bound: a stack VM's entry list and gray-assistant's lane origins each hold 16. */
+export const REPLICA_MAX = 16;
+const REPLICA_PLACEHOLDER = "{n}";
+const REPLICA_ENVS = Object.freeze([REPLICA_PATTERN_ENV, REPLICA_ENV]);
+/** Every lane setting of routing PR 9 only an entry may carry. */
 const ENTRY_ENVS = Object.freeze([PEERS_ENV, ...PEER_TUNABLES]);
 /** Go's flag package reads `-name`, `--name`, `-name=v` and `--name=v` alike; the gate reads every spelling. */
 function goFlag(name) {
@@ -1557,10 +1576,12 @@ export function checkCompose(composeText, options = {}) {
   const label = spec.label;
   const problems = [];
   const images = [];
+  // Whether the compose carries an entry replica's settings (checkEntryReplica); never in the stack layout.
+  let replicas = false;
   const parsed = parseCompose(composeText);
   if (parsed.error !== undefined) {
     problems.push(`${label} ${parsed.error}`);
-    return { problems, images };
+    return { problems, images, replicas };
   }
   const names = [...parsed.services.keys()].map(String).sort();
   if (names.join(",") !== [...spec.services].sort().join(",")) {
@@ -1601,6 +1622,7 @@ export function checkCompose(composeText, options = {}) {
     checkImages(parsed.services, images, options, problems);
     checkEntryPeers(parsed.services, label, problems);
     checkEntryPeerlink(parsed.services, label, problems);
+    replicas = checkEntryReplica(parsed.services, label, problems);
     // The stack settings are what makes the entrypoint render the relay listener (S28); the default
     // layout has no relay network, so none of them belongs there.
     for (const [name, service] of parsed.services) {
@@ -1614,7 +1636,7 @@ export function checkCompose(composeText, options = {}) {
   checkSchedulerPick(parsed.services, label, problems);
   checkReleaseKeys(parsed.services, options, label, problems);
   checkBodyCap(parsed.services, label, problems);
-  return { problems, images };
+  return { problems, images, replicas };
 }
 
 /** The measured pre-launch script's text: embedded verbatim, so its bytes are part of the hash. */
@@ -1927,6 +1949,63 @@ function checkEntryPeerlink(services, label, problems) {
   }
 }
 
+/**
+ * Why `pattern` is not a replica name pattern beside the shared name `domain`, or null: `{n}` once and in the first
+ * label, a lowercase DNS hostname for every index (1 and REPLICA_MAX cover both lengths of the number), in the
+ * shared name's parent zone, and never the shared name itself.
+ */
+function replicaPatternProblem(pattern, domain) {
+  if (typeof pattern !== "string") return "is not a string";
+  if (pattern.split(REPLICA_PLACEHOLDER).length !== 2) return `does not hold ${REPLICA_PLACEHOLDER} exactly once`;
+  const dot = pattern.indexOf(".");
+  if (dot < 0 || pattern.indexOf(REPLICA_PLACEHOLDER) > dot) return `does not hold ${REPLICA_PLACEHOLDER} in its first label, before a zone`;
+  const names = Array.from({ length: REPLICA_MAX }, (_unused, index) => pattern.replace(REPLICA_PLACEHOLDER, String(index + 1)));
+  if (!TLS_HOST.test(names[0]) || !TLS_HOST.test(names[REPLICA_MAX - 1])) return `is not a lowercase DNS hostname once ${REPLICA_PLACEHOLDER} is a replica's index`;
+  if (typeof domain !== "string" || !TLS_HOST.test(domain)) return null;
+  const zone = domain.slice(domain.indexOf(".") + 1);
+  if (pattern.slice(dot + 1) !== zone) return `is not in the shared name's zone ${zone} (TLS_DOMAIN ${domain})`;
+  if (names.includes(domain)) return `renders the shared name ${domain} for a replica`;
+  return null;
+}
+
+/** `--tls-replica-domain-pattern`: the pattern's own form; the gate holds it to the shared name once both are set. */
+function validateReplicaPattern(pattern) {
+  const problem = replicaPatternProblem(pattern, undefined);
+  if (problem !== null) throw new Error(`--tls-replica-domain-pattern '${pattern}' ${problem}`);
+  return pattern;
+}
+
+/**
+ * docs/design/entry-replicas.md ER2, default layout: the replica settings (REPLICA_PATTERN_ENV), on lane only and
+ * both or neither. Returns whether the compose carries them, which decides `allowed_envs`.
+ */
+function checkEntryReplica(services, label, problems) {
+  for (const [name, service] of services) {
+    if (name === "lane" || !isMap(service)) continue;
+    for (const key of REPLICA_ENVS) {
+      let referenced = false;
+      forEachScalar(service, (text) => {
+        if (new RegExp(`\\b${key}\\b`).test(text)) referenced = true;
+      });
+      if (referenced || environmentOf(service).has(key)) problems.push(`${label}: ${name} references ${key}; only the lane takes an entry replica's name (entry-replicas ER2)`);
+    }
+  }
+  const lane = services.get("lane");
+  if (!isMap(lane)) return false;
+  const environment = environmentOf(lane);
+  const pattern = environment.get(REPLICA_PATTERN_ENV);
+  if (pattern === undefined) {
+    if (environment.has(REPLICA_ENV)) problems.push(`${label}: lane sets ${REPLICA_ENV} without ${REPLICA_PATTERN_ENV}: a replica's index needs the measured name pattern it renders (entry-replicas ER2)`);
+    return false;
+  }
+  const problem = replicaPatternProblem(pattern, environment.get("TLS_DOMAIN"));
+  if (problem !== null) problems.push(`${label}: lane.${REPLICA_PATTERN_ENV} ${JSON.stringify(pattern)} ${problem}; it is the replicas' name pattern, like lane-${REPLICA_PLACEHOLDER}.<zone> (--tls-replica-domain-pattern, entry-replicas ER2)`);
+  if (environment.get(REPLICA_ENV) !== REPLICA_EXPRESSION) {
+    problems.push(`${label}: lane must set ${REPLICA_ENV}: "${REPLICA_EXPRESSION}" beside ${REPLICA_PATTERN_ENV}; a replica's index comes from the instance's encrypted env and is never a measured literal (entry-replicas ER2)`);
+  }
+  return true;
+}
+
 /** Routing PR 9, relay-stack layout: lane sets no entry setting: a relay stack VM is never an entry (section 4.6). */
 function checkStackNotEntry(services, label, problems) {
   const lane = services.get("lane");
@@ -1934,6 +2013,9 @@ function checkStackNotEntry(services, label, problems) {
   const environment = environmentOf(lane);
   for (const name of ENTRY_ENVS) {
     if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry's setting: a relay stack VM is never an entry (routing PR 9)`);
+  }
+  for (const name of REPLICA_ENVS) {
+    if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry replica's setting: a relay stack VM is never an entry and has no public name (entry-replicas ER2)`);
   }
 }
 
@@ -1995,6 +2077,13 @@ function applyComposeFlags(composeText, options) {
   }
   if (options.tlsDomain !== undefined) {
     measured = setEnvLines(measured, "TLS_DOMAIN", validateTlsDomain(options.tlsDomain), "--tls-domain", 1);
+  }
+  if (options.tlsReplicaDomainPattern !== undefined) {
+    if (layoutSpec(options).name === "stack") throw new Error("--tls-replica-domain-pattern is not a stack compose value: a relay stack VM is never an entry and has no public name (entry-replicas ER2)");
+    // Two new lines under lane's TLS_DOMAIN, with its indentation: the committed compose has neither, so an entry
+    // without replicas measures exactly what it did before. The index's line first, so the pattern follows the name.
+    measured = addEnvLineAfter(measured, "TLS_DOMAIN", REPLICA_ENV, REPLICA_EXPRESSION, "--tls-replica-domain-pattern");
+    measured = addEnvLineAfter(measured, "TLS_DOMAIN", REPLICA_PATTERN_ENV, validateReplicaPattern(options.tlsReplicaDomainPattern), "--tls-replica-domain-pattern");
   }
   if (options.bridgeUrl !== undefined) {
     measured = setEnvLines(measured, "LANE_BRIDGE_URL", validateBridgeUrl(options.bridgeUrl), "--bridge-url", 1);
@@ -2098,7 +2187,8 @@ export function appComposeFor(composeText, options = {}) {
     key_provider: "kms",
     gateway_enabled: gatewayEnabled,
     local_key_provider_enabled: false,
-    allowed_envs: [...spec.allowedEnvs],
+    // entry-replicas ER2: a compose with the replica settings also lets the host set the replica's index.
+    allowed_envs: checked.replicas ? [...spec.allowedEnvs, REPLICA_ENV] : [...spec.allowedEnvs],
     no_instance_id: false,
     secure_time: true,
     storage_discard: false,
@@ -2267,6 +2357,7 @@ export function renderAppCompose(composeText, options = {}) {
 const USAGE = `usage: app-compose.mjs [--check] [--out <file>] [--compose <file>] [--layout default|stack]
   [--target dstack|phala] [--kms-ca-pubkey <182 hex>] [--deploy-env testnet|production]
   [--tls-domain <host> (default layout only)] [--bridge-url <https origin>] [--keyset-not-after <unix seconds>]
+  [--tls-replica-domain-pattern <host with one {n}> (default layout only: the entry replicas' names, in --tls-domain's zone)]
   [--scheduler-pick-ms <ms>] [--release-public-key <64 hex>] [--release-freshness-public-key <64 hex>]
   [--lane-peers true|false (default layout only)] [--gateway-enabled true|false (default layout only; default true)]
   [--peer-entries <name>[,<name>...] (stack layout only: the entries the VM dials first)]
@@ -2278,6 +2369,7 @@ const VALUE_OPTIONS = new Set([
   "--out", "--compose", "--image", "--target", "--kms-ca-pubkey", "--deploy-env", "--tls-domain", "--bridge-url",
   "--keyset-not-after", "--scheduler-pick-ms", "--layout", "--pre-launch", "--release-public-key",
   "--release-freshness-public-key", "--lane-peers", "--gateway-enabled", "--peer-entries", "--kms-url",
+  "--tls-replica-domain-pattern",
 ]);
 const BOOLEAN_OPTIONS = new Set(["--check", "--allow-placeholders", "--help"]);
 
@@ -2329,6 +2421,7 @@ export function main(argv = process.argv.slice(2), log = console.log) {
     allowPlaceholders: flags.has("--allow-placeholders"),
     deployEnv: values["--deploy-env"],
     tlsDomain: values["--tls-domain"],
+    tlsReplicaDomainPattern: values["--tls-replica-domain-pattern"],
     bridgeUrl: values["--bridge-url"],
     keysetNotAfter: values["--keyset-not-after"],
     schedulerPickMs: values["--scheduler-pick-ms"],

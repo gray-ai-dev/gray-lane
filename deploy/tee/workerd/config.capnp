@@ -60,7 +60,7 @@ const config :Workerd.Config = (
     ),__STACK_SERVICES__
 __PEERLINK_SERVICES__
 __VAULT_DISK_SERVICES__
-    # Nothing is reachable through this service: `allow` defaults to ["public"], and the empty list
+__REPLICA_SERVICES__    # Nothing is reachable through this service: `allow` defaults to ["public"], and the empty list
     # permits no address family at all (workerd.capnp, `Network.allow`).
     ( name = "no-network",
       network = ( allow = [] )
@@ -91,7 +91,7 @@ __VAULT_DISK_SERVICES__
           ( name = "KEYSET_SUBJECT", text = "__KEYSET_SUBJECT__" ),
           ( name = "KEYSET_NOT_AFTER", text = "__KEYSET_NOT_AFTER__" ),
           ( name = "TLS_SPKI_SHA256", text = "__TLS_SPKI_SHA256__" ),
-          ( name = "TLS_DOMAIN", text = "__TLS_DOMAIN__" ),
+          ( name = "TLS_DOMAIN", text = "__TLS_DOMAIN__" ),__REPLICA_BINDINGS__
           ( name = "GUEST_AGENT_URL", text = "__GUEST_AGENT_URL__" ),
           ( name = "GUEST_AGENT_TIMEOUT_MS", text = "__GUEST_AGENT_TIMEOUT_MS__" ),
 

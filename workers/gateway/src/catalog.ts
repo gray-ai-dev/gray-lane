@@ -67,10 +67,13 @@ export interface Listed {
  * request carried, has the thinking OpenCode asks the model `id` for on that protocol, `reasoning` being whether
  * the routes OpenCode is configured from proved reasoning (@gray/control `thinkingSent`). A pass with thinking
  * turned off, found while the routes had not proved reasoning, would otherwise make the model OpenCode's default
- * once they proved it, when OpenCode asks a Claude 5.5 model for adaptive thinking with its binding beta.
+ * once they proved it, when OpenCode asks a Claude 5.5 model for adaptive thinking with its binding beta. A pass
+ * with adaptive thinking counts only where the routes proved reasoning: Gray sends a request with thinking only to a
+ * route that proved it (routes.ts `capable`), and OpenCode asks a model that refuses thinking turned off for adaptive
+ * thinking without it too.
  */
 export function servesOpencode(passes: readonly (readonly [Protocol, string])[], id: string, reasoning: boolean): boolean {
-  return passes.some(([protocol, thinking]) => thinking === thinkingSent(protocol, id, reasoning));
+  return passes.some(([protocol, thinking]) => thinking === thinkingSent(protocol, id, reasoning) && (reasoning || thinking !== "adaptive"));
 }
 
 /** `agent_tier`: 3 streaming, tools and reasoning; 2 streaming and tools; 1 streaming; else 0. */

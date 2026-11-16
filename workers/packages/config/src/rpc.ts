@@ -107,7 +107,7 @@ export const RPC_SURFACES = {
   setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog"] },
   publicSetup: { callee: "console", target: "PublicSetup", kind: "entrypoint", callers: ["gateway"], calls: ["fetch", "keyStatus"] },
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
-  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut", "vaultShareNonce", "vaultShare", "stackInstance"] },
+  laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut", "vaultShareNonce", "vaultShare", "stackInstance", "entryRole"] },
   laneStackSignals: { callee: "console", target: "LaneStackSignals", kind: "entrypoint", callers: ["lane-watch"], calls: ["releaseList"] },
   identity: { callee: "identity", target: "IdentityService", kind: "entrypoint", callers: ["console"], calls: ["challenge", "verify"] },
   content: { callee: "content", target: "ContentService", kind: "entrypoint", callers: ["console"], calls: ["open", "ensureWorkspace"] },
@@ -143,6 +143,9 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // A relay VM's role in a rollout (docs/design/relay-no-always-on-host.md 13.4, P7): a gray-console of a release before
   // `stackInstance` throws, the bridge answers unavailable, and the VM's role stays unknown (it writes nothing).
   "laneStackConfig.stackInstance": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before stackInstance answers that it has no such method: unavailable, and the VM writes nothing",
+  // An entry replica's role (docs/design/entry-replicas.md ER9 as revised): a gray-console of a release before `entryRole`
+  // throws, the bridge answers unavailable, and the replica keeps the role it last read (serving before any).
+  "laneStackConfig.entryRole": "lane-bridge/test/entry-role.test.ts > a console of a release before entryRole answers that it has no such method: unavailable, and the replica keeps its role",
 };
 
 /** Each call taken off a list since the previous release's lists, as `<surface>.<call>`: why no release that runs calls it. */

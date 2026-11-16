@@ -308,8 +308,13 @@ export const STACK_LAYOUT = deepFreeze({
   /**
    * Routing PR 9: an entry's settings (app-compose.mjs `PEERS_ENV` and `PEER_TUNABLES`), which no stack service sets: a
    * relay stack VM is never an entry (section 4.6), so its lane never routes to other relays' VMs.
+   * docs/design/entry-replicas.md ER2: nor an entry replica's (app-compose.mjs `REPLICA_PATTERN_ENV` and `REPLICA_ENV`):
+   * the replicas' name pattern and a replica's index name an entry, and a stack VM has no public name.
    */
-  entryEnvironment: ["LANE_PEERS", "PEER_PROBE_MS", "PEER_DOWN_MS", "PEER_DOWN_MAX_MS", "PEER_RECHECK_MS", "PEER_RENEW_MS", "PEER_CALL_MS", "PEER_FOLLOW_UP_MS"],
+  entryEnvironment: [
+    "LANE_PEERS", "PEER_PROBE_MS", "PEER_DOWN_MS", "PEER_DOWN_MAX_MS", "PEER_RECHECK_MS", "PEER_RENEW_MS", "PEER_CALL_MS", "PEER_FOLLOW_UP_MS",
+    "TLS_REPLICA_DOMAIN_PATTERN", "LANE_REPLICA",
+  ],
   /** S4: the relay's environment (also in `fixed.relay`). */
   relay: { environment: RELAY_ENVIRONMENT },
 

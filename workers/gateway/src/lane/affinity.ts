@@ -19,14 +19,45 @@ import { sha256 } from "@noble/hashes/sha2";
  * - `session_id` is the gateway's existing, already-bounded client session id (`clientFields`),
  *   read from headers only. No session id means no token: there is no body hash fallback.
  *
- * `K_boot` is 32 random bytes made with the other per-boot keys and held only in process memory.
- * It is never in the keyset, a receipt, a record or a log line; it rotates on every boot, which
- * bounds any linkage to one boot. The lane derives one token per (relay, request) and sends the
- * same value on every attempt, so a retry stays on the conversation while the token itself is
- * opaque to Gray's Cloudflare side and to the relay's software.
+ * `K_boot` is held only in process memory and is never in the keyset, a receipt, a record or a log line. The lane
+ * derives one token per (relay, request) and sends the same value on every attempt, so a retry stays on the
+ * conversation while the token itself is opaque to Gray's Cloudflare side and to the relay's software.
+ *
+ * Where `K_boot` comes from (docs/design/entry-replicas.md ER7):
+ * - **The entry layout with the guest agent** (every deployed entry: `GUEST_AGENT` is a required binding) derives it
+ *   from the app's KMS key: `HKDF-SHA256(GetKey(AFFINITY_KEY_PATH), salt = "", info = AFFINITY_KEY_INFO)` to 32 bytes
+ *   (`affinityKeyFromMaterial`), the way a stack VM's vault key is derived (`vault.ts`, `recordKey`). Every replica
+ *   and every boot of one app gets the same key, so a conversation whose connections land on different replicas keeps
+ *   one upstream session id and the vendor's prompt cache. A `GetKey` that fails leaves the boot on a random key and is
+ *   tried again on the vault's schedule (`LaneAffinityKey` in `state.ts`).
+ * - **Anything else** (local dev and tests without a guest agent, the relay-stack layout) keeps the E3 key: 32 random
+ *   bytes made with the other per-boot keys.
+ *
+ * What ER7 changes, for the owner to veto: the derived id no longer rotates at a reboot. E3's random key bounded any
+ * linkage of one conversation's requests to one boot; with the derived key that bound is the app (its KMS key): the
+ * same conversation at the same relay gets the same token on every boot of the app, and whatever boots under the app's
+ * key can derive it. No rotation is built. A period in the derivation path (`gray-lane/v1/affinity/<period>`) would
+ * restore a bound, at one prompt-cache miss per conversation per period.
  */
 
 export const AFFINITY_DOMAIN = "gray-affinity-v1";
+
+/** ER7: the guest agent `GetKey` path of the entry's affinity key, in the style of the vault's `gray-relay/v1/...`. */
+export const AFFINITY_KEY_PATH = "gray-lane/v1/affinity";
+
+/** ER7: the HKDF info that turns the `GetKey` answer into `K_boot`; a new version is a new key everywhere. */
+export const AFFINITY_KEY_INFO = "gray-lane-affinity-key-v1";
+
+/**
+ * ER7: `K_boot` from the guest agent's `GetKey` answer for `AFFINITY_KEY_PATH` (32 bytes): HKDF-SHA256 with an empty
+ * salt and `AFFINITY_KEY_INFO`, 32 bytes out. The caller zeroes `material`.
+ */
+export async function affinityKeyFromMaterial(material: Uint8Array): Promise<Uint8Array> {
+  if (material.length !== 32) throw new Error("the GetKey answer is 32 bytes");
+  const base = await crypto.subtle.importKey("raw", material, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode(AFFINITY_KEY_INFO) }, base, 256);
+  return new Uint8Array(bits);
+}
 
 /**
  * The domain of the conversation id a relay's container is sent (relay standard v1.7 `X-Gray-Conversation`, design

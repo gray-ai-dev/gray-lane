@@ -518,7 +518,7 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     if (attempt.forwarded_body_jcs_sha256 === null) continue;
     checks.push(pass(`${id}:relay_changes`, changesSummary(attempt.changed)));
     // Reported only when it differs from the egress's own handshake, like a change.
-    if (attempt.tls_hello !== null) checks.push(pass(`${id}:tls_hello`, "the TLS handshake with the vendor had the shape the relay's software showed the egress (a vendor tunnel), not the egress's own"));
+    if (attempt.tls_hello !== null) checks.push(pass(`${id}:tls_hello`, "the TLS handshake with the vendor had the shape the provider's software showed the egress (a vendor tunnel), not the egress's own"));
     const applied: AppliedAppend[] = [];
     const missing: string[] = [];
     let textsOk = true;
@@ -543,7 +543,7 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     }
     if (!textsOk) continue;
     if (missing.length > 0) {
-      checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not checked: no text supplied for the relay's template(s) ${missing.join(", ")} (--templates)`));
+      checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not checked: no text supplied for the provider's template(s) ${missing.join(", ")} (--templates)`));
       continue;
     }
     const expected = attempt.forwarded_body_jcs_sha256;
@@ -551,11 +551,11 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     // Only the body entries change the body: changed headers alone leave the declared replay as it is.
     if (changed !== null && (changed.omitted > 0n || (changed.values === "omitted" && changed.body.length > 0))) {
       const why = changed.omitted > 0n ? `leaves ${changed.omitted} change(s) out` : "names the changed paths but not their values";
-      checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not checked: the relay changed the request and the receipt ${why}, so the forwarded body cannot be recomputed`));
+      checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not checked: the deployment changed the request and the receipt ${why}, so the forwarded body cannot be recomputed`));
       continue;
     }
     const relayEntries = changed === null ? 0 : changed.body.length;
-    const what = `${attempt.modified.length} op(s) then ${applied.length} append(s)${changed === null ? "" : ` then the relay's ${relayEntries} change(s)`}`;
+    const what = `${attempt.modified.length} op(s) then ${applied.length} append(s)${changed === null ? "" : ` then the deployment's ${relayEntries} change(s)`}`;
     const declared = replayForwarded(options.receivedBody, protocol, attempt.modified, applied);
     const replay = declared === null || changed === null || relayEntries === 0 ? declared : applyRelayChanges(declared, changed.body);
     const actual = replay === null ? null : stackBodyDigest(replay);
@@ -658,8 +658,8 @@ type MutableAttempt = {
  * the relay's account: the receipt carries none.
  */
 const REFUSAL_MEANINGS: ReadonlyMap<string, string> = new Map([
-  ["stack_account_cooling", "the relay's account was resting after a vendor limit or error, so no vendor was called; the relay may retry on another account"],
-  ["stack_identity_mismatch", "the relay sent a client-identity header whose value is not the one registered for its account, so no vendor was called"],
+  ["stack_account_cooling", "the deployment's account was resting after a vendor limit or error, so no vendor was called; the deployment may retry on another account"],
+  ["stack_identity_mismatch", "the deployment sent a client-identity header whose value is not the one registered for its account, so no vendor was called"],
 ]);
 
 /** The relay changes one transcript line lists before it says how many more there are. */
@@ -671,7 +671,7 @@ const CHANGES_LISTED = 16;
  * paths and names are the relay's (signed, never trusted as text: the transcript escapes them).
  */
 function changesSummary(changed: RelayStackChanges | null): string {
-  if (changed === null) return "unchanged: the relay forwarded the request as Gray declared it";
+  if (changed === null) return "unchanged: the deployment forwarded the request as Gray declared it";
   const bytes = (entry: { readonly removed_bytes: bigint; readonly added_bytes: bigint }): string =>
     [entry.removed_bytes > 0n ? `-${entry.removed_bytes}` : "", entry.added_bytes > 0n ? `+${entry.added_bytes}` : ""].filter((part) => part !== "").join(" ") || "0";
   const listed = [
@@ -682,7 +682,7 @@ function changesSummary(changed: RelayStackChanges | null): string {
   const parts = listed.slice(0, CHANGES_LISTED);
   if (unlisted > 0) parts.push(`${unlisted} more listed`);
   if (changed.omitted > 0n) parts.push(`${changed.omitted} more not in the receipt`);
-  return `changed by the relay: ${parts.join("; ")}; body +${changed.added_bytes} -${changed.removed_bytes} bytes in all; values ${changed.values === "included" ? "included" : "not included"}`;
+  return `changed by the deployment: ${parts.join("; ")}; body +${changed.added_bytes} -${changed.removed_bytes} bytes in all; values ${changed.values === "included" ? "included" : "not included"}`;
 }
 
 function attemptSummary(attempt: StackAttemptRecord): string {
@@ -788,10 +788,10 @@ function isSealedKeyset(keyset: WorkloadKeyset | SealedKeyset): keyset is Sealed
 /** S52/S55: the receipt names the attested lane's relay image, or none for a default-layout lane. */
 function relayImageCheck(named: string | null, expected: string | null): ReceiptCheck {
   if (expected === null) {
-    return named === null ? pass("relay_image", "a default-layout lane's receipt names no relay image") : fail("relay_image", `the receipt names relay image ${named}, but the attested lane is not a relay-stack lane`);
+    return named === null ? pass("relay_image", "a default-layout lane's receipt names no provider image") : fail("relay_image", `the receipt names provider image ${named}, but the attested lane is not a deployment lane`);
   }
-  if (named === null) return fail("relay_image", `the receipt names no relay image; the attested lane runs ${expected}`);
-  return named === expected ? pass("relay_image", named) : fail("relay_image", `the receipt names relay image ${named}; the attested lane runs ${expected}`);
+  if (named === null) return fail("relay_image", `the receipt names no provider image; the attested lane runs ${expected}`);
+  return named === expected ? pass("relay_image", named) : fail("relay_image", `the receipt names provider image ${named}; the attested lane runs ${expected}`);
 }
 
 function bodyHashOf(document: ReceiptDocument, type: string): string | null {

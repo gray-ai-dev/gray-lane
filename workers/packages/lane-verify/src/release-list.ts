@@ -1099,7 +1099,7 @@ export async function signReleaseFreshness(listText: string, options: SignReleas
     return {
       ok: false,
       code: "list_regressed",
-      message: `the published list was issued at ${listIssuedAt}, before the list the published document names (${published.listIssuedAt}): a rollback, which no relay takes either`,
+      message: `the published list was issued at ${listIssuedAt}, before the list the published document names (${published.listIssuedAt}): a rollback, which no deployment takes either`,
     };
   }
   const listSha256 = releaseListSha256(listText);

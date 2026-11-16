@@ -2,6 +2,7 @@ import type { LaneEndpoint, UpstreamAuth } from "@gray/control";
 import type { Protocol } from "@gray/protocol";
 import { capabilityWords, type Capabilities } from "./capabilities.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
+import type { RouteTag } from "./offers.ts";
 import { snapshotRoutes, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
 
 /** A recipient record as the gateway reads it (@gray/content `RecipientRecord`). */
@@ -232,6 +233,8 @@ export interface GatewayRouteRecord {
   readonly lane: GatewayLaneRelay | null;
   /** A relay stack's route: until when (Unix ms) it takes traffic (`SnapshotRoute.trafficUntilMs`). Absent: no limit. */
   readonly trafficUntil?: number;
+  /** The tag of a route whose supplier workspace has a public handle (`SnapshotRoute.tag`). Absent: an anonymous supplier's route. */
+  readonly tag?: RouteTag;
 }
 
 /** A workspace row of the gateway's view (`GatewayView.workspaces`). */
@@ -301,12 +304,15 @@ export interface GatewayView {
   readonly routingDefaults: Readonly<Record<string, string>>;
   /** Every reference naming a registered endpoint, published or not (`Snapshot.registered`, routing::registered_refs). */
   readonly registered: readonly string[];
+  /** Every registered public handle with its supplier workspace id (`SnapshotContent.handles`). Absent: none registered. */
+  readonly handles?: Readonly<Record<string, string>>;
   /**
-   * Every route of the snapshot in this view's mode as its (route, supplier) references, priced or not and
-   * whatever its expiry (inference.rs `layered_over` reads `snapshot.routes` so): what tells a name in a
-   * customer's order that still orders something from one whose routes left (routing.rs `Preference::layered`).
+   * Every route of the snapshot in this view's mode as its (route, supplier) references, with `true` third when
+   * it has a tier, priced or not and whatever its expiry (inference.rs `layered_over` reads `snapshot.routes`
+   * so): what tells a name in a customer's order that still orders something from one whose routes left or
+   * whose routes are all opt-in tiers (routing.rs `Preference::layered`).
    */
-  readonly published: readonly (readonly [provider: string, supplier: string])[];
+  readonly published: readonly (readonly [provider: string, supplier: string, tiered?: true])[];
 }
 
 function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
@@ -373,6 +379,7 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
     ...(r.behavioralScore === null ? {} : { behavioralScore: r.behavioralScore }),
     lane: laneRelayOf(r.config.lane),
     ...(r.trafficUntilMs === undefined ? {} : { trafficUntil: r.trafficUntilMs }),
+    ...(r.tag === undefined ? {} : { tag: r.tag }),
   };
 }
 
@@ -419,11 +426,11 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     };
   }
   const routes: GatewayRouteRecord[] = [];
-  const published: (readonly [string, string])[] = [];
+  const published: (readonly [string, string, true?])[] = [];
   // The routes that serve streamed requests only too: this gateway serves them in that mode alone.
   for (const r of snapshotRoutes(snapshot)) {
     if (!routeInMode(r, mode)) continue;
-    published.push([r.providerRef, r.supplierRef]);
+    published.push((r.tag?.tier ?? null) === null ? [r.providerRef, r.supplierRef] : [r.providerRef, r.supplierRef, true]);
     const record = routeRecord(r);
     if (record !== null) routes.push(record);
   }
@@ -481,6 +488,7 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     routingDefaults,
     registered: snapshot.registered ?? [],
     published,
+    ...(snapshot.handles === undefined ? {} : { handles: snapshot.handles }),
   };
 }
 

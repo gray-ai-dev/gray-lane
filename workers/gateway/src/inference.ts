@@ -113,7 +113,7 @@ import { openCredential } from "./crypto.ts";
 import { Dispatcher, attemptCode, countedFailure, failureEnd, noAttemptError, noRouteRetryAfter, servedLater, skipLabel, type AttemptEnd, type BlockGates, type ColdPass, type DispatchEnv, type DispatchPlan, type HeldRefusal, type PassFacts } from "./dispatcher.ts";
 import { accountBlockGauges, accountBlockIsolate, blockGates } from "./account-blocks.ts";
 import { headReason, orderPlan, settleHead, steering } from "./plan-order.ts";
-import { isolateAffinity, layeredOver, modelCheckPinned, modelCheckUnpinned, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, unadmitted, unreadableDefault, unreadablePreference, type PreferenceFacts } from "./preference.ts";
+import { isolateAffinity, layeredOver, takeTags, tierAdmitted, modelCheckPinned, modelCheckUnpinned, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, unadmitted, unreadableDefault, unreadablePreference, type PreferenceFacts } from "./preference.ts";
 import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releasePermit, releaseRetry, reserveRetry, settledWithin, shardFor, type EndpointCounts, type EndpointLocator, type ReleaseFacts, type ShardChoice } from "./endpoints.ts";
 import { fileRest, rankKey, recoveryRefusal, REST_EGRESS_REGION, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView, type EndpointRootLocator, type ShardRests } from "./rests.ts";
 import { evidenceFor, generationMediaEvidence, judgeEvidence } from "./evidence.ts";
@@ -829,6 +829,11 @@ export class InferenceRun {
   private markResponded!: () => void;
   /** Admitted on the request's own region after the client key's home shard did not answer (sinks.ts). */
   private admissionDegraded = false;
+  /**
+   * The hold `token` names was admitted degraded (`admitOnce`'s `degraded`): its settlement says so to the
+   * projection, which refunds a second charge of the client's key only for such a hold (migration 0087).
+   */
+  private holdDegraded = false;
   private snapshot: GatewaySnapshot | null = null;
   private recorded = false;
   /** The record's emission (sinks.ts), which a spooled body waits for before it is deleted. */
@@ -1125,7 +1130,8 @@ export class InferenceRun {
 
   private readonly request: Request;
   private readonly protocol: GenerationProtocol;
-  private readonly pathModel: string | null;
+  /** The model a Gemini request's path names, without the tag pattern it carried (`takeTags`). */
+  private pathModel: string | null;
   private readonly deps: GatewayDeps;
   private readonly ctx: ExecutionContext;
 
@@ -1863,9 +1869,12 @@ export class InferenceRun {
    * so a repeat in a later gateway call is checked against it. The hold says so when the key's home
    * shard admitted it; an admission degraded to the request's own region (ACCOUNT_CLIENT_KEY_FALLBACK
    * local) admitted it as a key the gateway made up, and only this record says it (jobs.md 2.4).
+   * `admission_degraded`: this hold was such an admission, so a second charge of the key by it is Gray's
+   * and refunded; a record without it is a hold the key's home shard admitted (migration 0087).
    */
-  private clientKeyRecord(): { client_key?: true } {
-    return this.clientKey ? { client_key: true } : {};
+  private clientKeyRecord(): { client_key?: true; admission_degraded?: true } {
+    if (!this.clientKey) return {};
+    return this.holdDegraded ? { client_key: true, admission_degraded: true } : { client_key: true };
   }
 
   /**
@@ -2428,7 +2437,17 @@ export class InferenceRun {
       if (laneRefusal !== null) return this.refuse(laneRefusal, "parse");
     }
     // A Gemini request streams by its method, whatever its body says (forward_traced).
-    const canonical: CanonicalRequest = protocol === "gemini" ? { ...parsed.canonical, stream: geminiStream(this.path) } : parsed.canonical;
+    let canonical: CanonicalRequest = protocol === "gemini" ? { ...parsed.canonical, stream: geminiStream(this.path) } : parsed.canonical;
+    // Each model string gives up its tag (`model@pattern`, preference.ts `takeTags`): from here on the body, the
+    // path's model and the chain name the models alone; the request record keeps the list as the client sent it.
+    const tagged = takeTags(snapshot, canonical.model, parsed.models);
+    if (!tagged.ok) return this.refuse(unreadablePreference(tagged.code), "preference");
+    if (tagged.tags.length > 0) {
+      canonical = { ...canonical, model: tagged.model };
+      if (this.pathModel !== null) this.pathModel = tagged.model;
+      else if (isObject(parsed.value)) (parsed.value as JsonObject).model = tagged.model;
+    }
+    const chain = tagged.models.length === 0 ? [canonical.model] : tagged.models;
     this.model = canonical.model;
     this.stream = canonical.stream;
     this.toolCount = canonical.tools.length;
@@ -2437,7 +2456,7 @@ export class InferenceRun {
 
     // The key's model scope. A key restricted to some models must allow every model the request lists, not
     // only the one it is served by: which one serves is decided later, by supply the customer does not control.
-    for (const model of parsed.models.length === 0 ? [canonical.model] : parsed.models) {
+    for (const model of chain) {
       const scope = modelScopeRefusal(key, model);
       if (scope !== null) return this.refuse(scope, "model_scope");
     }
@@ -2452,10 +2471,21 @@ export class InferenceRun {
     // request (503), since an organization's constraint is never silently dropped.
     this.admission = "preference";
     const own = this.preference;
-    const layered = layeredOver(snapshot, key.routing ?? null, key.workspaceId, this.preference);
+    const layer = (index: number) => layeredOver(snapshot, key.routing ?? null, key.workspaceId, own, chain[index]!, tagged.tags[index] ?? null);
+    const layered = layer(0);
     if (!layered.ok) return this.refuse(unreadableDefault(layered.code), "preference");
     this.preference = layered.preference;
     this.preferenceRecord = preferenceFacts(layered.preference, layered.sources);
+    // Patterns are resolved against one model's routes: a request that states any is layered again for each
+    // later model it lists.
+    const preferences = [layered.preference];
+    if (tagged.tags.length > 0 || layered.preference.resolvedForModel()) {
+      for (let index = 1; index < chain.length; index++) {
+        const later = layer(index);
+        if (!later.ok) return this.refuse(unreadableDefault(later.code), "preference");
+        preferences.push(later.preference);
+      }
+    }
     // A ModelTrace probe is a model check only with the ticket the console signed for it (`takeModelCheck`). It checks one
     // route: its own preference names that endpoint alone, with fallbacks refused, for one model; the stored defaults
     // layered over it only narrow it. Anything else is refused before anything is held or sent.
@@ -2465,7 +2495,6 @@ export class InferenceRun {
     // Each model is tried only after the one before it had no eligible provider or failed every attempt it
     // was allowed, in the customer's order and never another (forward_traced). The last model's refusal is
     // the answer, and none is tried once the request's time has run out: a later model has what is left of it.
-    const chain = parsed.models.length === 0 ? [canonical.model] : parsed.models;
     const deadline = this.deadline(bodyRead);
     let refused: Response | null = null;
     let turn: { readonly parsed: ParsedRequest; readonly canonical: CanonicalRequest } = { parsed, canonical };
@@ -2474,6 +2503,7 @@ export class InferenceRun {
       const last = index === chain.length - 1;
       const model = chain[index]!;
       this.beginModel(index, model, last);
+      this.preference = preferences[index] ?? this.preference;
       if (index > 0) {
         const again = await this.forModel(body, model);
         if (again instanceof ApiError) {
@@ -2610,6 +2640,7 @@ export class InferenceRun {
     // routing again): a translated answer names what its translation dropped alone (`mark_response`).
     this.nativeDropped = [];
     this.token = null;
+    this.holdDegraded = false;
     this.holdDecided = false;
     this.heldMicrousd = null;
     this.boundMicrousd = null;
@@ -2682,7 +2713,8 @@ export class InferenceRun {
     const keyed = parsed.whole || (canonical.cache_hints !== null && canonical.cache_hints.key !== null);
     this.affinityKey = this.preference.affinityAllowed() && keyed ? affinityKey(key.workspaceId, canonical, parsed.value) : null;
     // S22: a lane routes only what its VM is laid out for (`laneRoutes`), before anything weighs the routes.
-    let records = nativeRoutes(snapshot, canonical, protocol, now, !parsed.whole).filter((r) => this.laneRoutes(r));
+    // A route with a tier is a candidate only for a request that opts in to it (`tierAdmitted`).
+    let records = nativeRoutes(snapshot, canonical, protocol, now, !parsed.whole).filter((r) => this.laneRoutes(r) && tierAdmitted(this.preference, r));
     // The release traffic window: a relay stack still on an older release past its window is left out, as a route that
     // is not available, and the record says why (`routing_skipped` `release_outdated`).
     records = records.filter((r) => {
@@ -2761,7 +2793,7 @@ export class InferenceRun {
       // protocol, or, for a Responses request of a model some endpoint maps on Responses, those of the implied rule
       // (decision (b) of 2026-10-23, `translationTargets`): fallback on proof only, so a native route that rests, is
       // out of region or unpriced keeps its own answer (translate.ts).
-      const live = (upstream: Protocol) => snapshot.routes.some((r) => routeServes(r.expiresAt, now) && r.model === canonical.model && r.protocol === upstream);
+      const live = (upstream: Protocol) => snapshot.routes.some((r) => routeServes(r.expiresAt, now) && r.model === canonical.model && r.protocol === upstream && tierAdmitted(this.preference, r));
       // A snapshot without the mapped pairs says it by its routes, as `unrouted` reads it.
       const responsesMapped =
         snapshot.mapped !== undefined ? snapshot.mapped.some((m) => m.model === canonical.model && m.protocol === "open_ai_responses") : snapshot.routes.some((r) => r.model === canonical.model && r.protocol === "open_ai_responses");
@@ -2803,7 +2835,7 @@ export class InferenceRun {
         stream: canonical.stream,
         upstreams,
         rule: targets.rule,
-        routes: (upstream) => snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === canonical.model && r.protocol === upstream),
+        routes: (upstream) => snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === canonical.model && r.protocol === upstream && tierAdmitted(this.preference, r)),
         judge: (t, candidates) => {
           const able = candidates.filter((r) => capable(r, t.contract, false));
           if (able.length === 0) return { kind: "skip" };
@@ -3127,6 +3159,7 @@ export class InferenceRun {
       if (admitted.result.ok || admitted.result.code === "key_rate_limit" || admitted.result.code === "unavailable") this.rateOpen = false;
       if (admitted.result.ok) {
         this.token = admitted.result.token;
+        this.holdDegraded = admitted.degraded;
         this.heldMicrousd = admitted.result.held;
         // The server's `request` event `accepted`, the route view's demand (sinks.ts `admissions`).
         this.admissions.push({ model: canonical.model, atMs: clock() });

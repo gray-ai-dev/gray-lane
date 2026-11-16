@@ -680,24 +680,41 @@ func (o *attemptObserver) finished(code string) {
 		if o.status >= http.StatusBadRequest && total <= stackErrorBodyMax {
 			records = append(records, feedErrorBody{T: "error_body", N: n, B64: base64.StdEncoding.EncodeToString(o.held)})
 		}
-	case code == errEgressLimit:
-		reason = endEgressLimit
-	case code == errClientWrite:
-		reason = endRelayClosed
-	case o.req.ctx.Err() != nil:
-		// The rid ended, and its end already wrote this attempt's `end` (timeout or entry_closed); this one
-		// is dropped with the closed feed.
-		reason = endTimeout
-	case o.relay.Err() != nil:
-		reason = endRelayClosed
 	default:
-		reason = endVendorReset
+		reason = attemptEndReason(code, o.req.ctx.Err() != nil, o.stopped != "", o.relay.Err() != nil)
 	}
 	// The held answer and the digester go now; the trailing records take their own bytes, and an `end` with
 	// egress_limit replaces them when the budget cannot hold them.
 	o.held, o.digester, o.pending = nil, nil, nil
 	o.hold.free()
 	o.req.finish(n, records, reason, streamFailed)
+}
+
+// attemptEndReason is the `end` reason of an attempt that did not end at a clean EOF, by code (forward's, or
+// response_read for a coded answer that did not decode), whether the rid had ended, whether the observer stopped the
+// answer for its coding, and whether the relay had closed its connection.
+//
+// A coding failure is the vendor's whatever the relay did after: an answer cut inside its coding still reaches the
+// relay whole by its own framing, and the relay may close before the decoder's end is read. Checking the relay first
+// made that end relay_closed or vendor_reset by which came first (TestStackUndecodableAnswers, "gzip cut at its end",
+// failed once in CI on 2026-11-17).
+func attemptEndReason(code string, ridEnded, codingFailed, relayClosed bool) string {
+	switch {
+	case code == errEgressLimit:
+		return endEgressLimit
+	case code == errClientWrite:
+		return endRelayClosed
+	case ridEnded:
+		// The rid ended, and its end already wrote this attempt's `end` (timeout or entry_closed); this one
+		// is dropped with the closed feed.
+		return endTimeout
+	case codingFailed:
+		return endVendorReset
+	case relayClosed:
+		return endRelayClosed
+	default:
+		return endVendorReset
+	}
 }
 
 func eventStream(h http.Header) bool {

@@ -798,9 +798,12 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 
 	target := &url.URL{Scheme: "https", Host: host, Opaque: vendorPath, RawQuery: query}
 	plan := requestPlan{route: route{name: routeSignInProxyCall, host: host}, target: target, spec: spec}
+	// The call's vendor connection is its account's own, as a relay call's is (mirror_dial.go accountOf): two accounts
+	// with one proxy, or with none, never share a connection to the vendor's sign-in host.
+	vendorCtx := context.WithValue(r.Context(), mirrorAccountKey{}, accountID)
 	if !tokenCall {
 		// Every other call: the vendor's answer streams back as it came, cookies and redirects included.
-		ctx, cancel := context.WithTimeout(r.Context(), loginCallCap)
+		ctx, cancel := context.WithTimeout(vendorCtx, loginCallCap)
 		defer cancel()
 		entry.Error = o.srv.forward(ctx, o.srv.relayClient, rec, r.Method, plan, header, body, call.observer(r.Method, host, decodedPath))
 		return
@@ -828,7 +831,7 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	// The answer is read whole (at most loginTokenAnswerMax), a token in it becomes the account's, and the answer
 	// passes back as it came, once the family is in the vault (persist first; at once in phase 1).
 	capture := &captureWriter{header: http.Header{}, limit: loginTokenAnswerMax}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), loginCallCap)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(vendorCtx), loginCallCap)
 	defer cancel()
 	forwardCode := o.srv.forward(ctx, o.srv.relayClient, &responseRecorder{ResponseWriter: capture}, r.Method, plan, header, body, nil)
 	outcome := ""

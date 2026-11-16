@@ -125,6 +125,7 @@ export {
   type TemplateText,
   type VerifyResponseReceiptOptions,
 } from "./receipt.ts";
+export { LANE_ORIGIN_HEADER, readLaneOrigin, type LaneOriginRead } from "./lane-origin.ts";
 export {
   PEER_REFUSED_BEFORE_FRAMES,
   outerPeerAttempts,

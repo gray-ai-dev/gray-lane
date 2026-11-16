@@ -134,6 +134,12 @@ export const STACK_PROXY_CHECK_URL = "http://egress/v1/stack/proxy-check";
  * the entry allows one poll interval more for the answer to come back.
  */
 export const PROXY_CHECK_EGRESS_CAP_MS = 60_000;
+/**
+ * How many sealed credentials of one proxy address a check runs with at once (the newest first). A panel proxy is an
+ * address; a provider's gateway serves many accounts at one address, each with a user name of its own that picks its
+ * exit. One check with the newest credential said "OK" for all of them.
+ */
+export const PROXY_CHECK_CREDENTIALS_MAX = 16;
 /** The header that names the config version a table belongs to (S15). */
 export const STACK_VERSION_HEADER = "x-gray-stack-version";
 /** The header that names a push's place in this boot's sequence (S15; egress refuses a lower (version, push), 409). */
@@ -435,9 +441,11 @@ export class StackConfigService implements StackRelayConfigProvider {
   /**
    * One check through egress, or null when egress gave no answer. The proxy's address is the panel's
    * (`proxies[]`); its credentials are the sealed ones: the account egress specs of this relay that name
-   * that address (type, host, port) at a sealed version at or past the check's `credential_version`,
-   * the newest first. With none, `credential_version` 0 checks the address without credentials (a proxy
-   * that asks for none); any other is `credential_missing`, as is a proxy the panel no longer lists.
+   * that address (type, host, port) at a sealed version at or past the check's `credential_version`:
+   * every distinct one (user name and password), the newest first, up to PROXY_CHECK_CREDENTIALS_MAX, each through
+   * egress. The check is OK only when every one is (its latency the slowest); the first that fails is the answer.
+   * With none, `credential_version` 0 checks the address without credentials (a proxy that asks for none); any
+   * other is `credential_missing`, as is a proxy the panel no longer lists.
    */
   async #runCheck(check: PendingProxyCheck): Promise<ProxyCheckResult | null> {
     const options = this.#options;
@@ -448,8 +456,22 @@ export class StackConfigService implements StackRelayConfigProvider {
       latency_ms: latency,
       checked_ms: options.now(),
     });
-    const spec = this.#proxySpec(check);
-    if (spec === null) return result("failed", "credential_missing", null);
+    const specs = this.#proxySpecs(check);
+    if (specs === null) return result("failed", "credential_missing", null);
+    if (options.egress === undefined) return null;
+    const answers = await Promise.all(specs.map((spec) => this.#checkThrough(check, spec)));
+    // An answer egress could not give is not invented, whatever the others said.
+    if (answers.some((answer) => answer === null)) return null;
+    const given = answers as readonly { readonly outcome: "ok" | "failed"; readonly code: ProxyCheckCode | null; readonly latency: number | null }[];
+    const failed = given.find((answer) => answer.outcome !== "ok");
+    if (failed !== undefined) return result(failed.outcome, failed.code, failed.latency);
+    const slowest = given.reduce<number | null>((most, answer) => (answer.latency === null ? most : most === null || answer.latency > most ? answer.latency : most), null);
+    return result("ok", null, slowest);
+  }
+
+  /** One sealed credential's check through egress: its answer, or null when egress gave none. */
+  async #checkThrough(check: PendingProxyCheck, spec: EgressSpec): Promise<{ readonly outcome: "ok" | "failed"; readonly code: ProxyCheckCode | null; readonly latency: number | null } | null> {
+    const options = this.#options;
     const egress = options.egress;
     if (egress === undefined) return null;
     const controller = new AbortController();
@@ -467,7 +489,7 @@ export class StackConfigService implements StackRelayConfigProvider {
         this.#log({ level: "warn", event: "lane_stack_proxy_check_failed", relay_id: options.relayId, check_id: check.check_id, status: response.status });
         return null;
       }
-      return result(answer.outcome, answer.code, answer.latency);
+      return answer;
     } catch (error) {
       this.#log({ level: "warn", event: "lane_stack_proxy_check_failed", relay_id: options.relayId, check_id: check.check_id, code: errorCode(error) });
       return null;
@@ -476,18 +498,28 @@ export class StackConfigService implements StackRelayConfigProvider {
     }
   }
 
-  #proxySpec(check: PendingProxyCheck): EgressSpec | null {
+  #proxySpecs(check: PendingProxyCheck): readonly EgressSpec[] | null {
     const panel = this.#metadata?.proxies.find((proxy) => proxy.id === check.proxy_id);
     if (panel === undefined) return null;
     const wanted = BigInt(check.credential_version);
-    let found: { readonly egress: EgressSpec; readonly version: bigint } | null = null;
+    const found: { readonly egress: EgressSpec; readonly version: bigint }[] = [];
     for (const account of this.#options.credentials.stackAccounts(this.#options.relayId, this.#options.now())) {
       const egress = account.egress;
       if (egress === undefined || egress.type !== panel.type || egress.host !== panel.host || egress.port !== panel.port || account.version < wanted) continue;
-      if (found === null || account.version > found.version) found = { egress, version: account.version };
+      found.push({ egress, version: account.version });
     }
-    if (found !== null) return found.egress;
-    return wanted === 0n ? { type: panel.type, host: panel.host, port: panel.port } : null;
+    found.sort((left, right) => (left.version > right.version ? -1 : left.version < right.version ? 1 : 0));
+    const specs: EgressSpec[] = [];
+    const seen = new Set<string>();
+    for (const { egress } of found) {
+      const credential = `${egress.username ?? ""}\u0000${egress.password ?? ""}`;
+      if (seen.has(credential)) continue;
+      seen.add(credential);
+      specs.push(egress);
+      if (specs.length === PROXY_CHECK_CREDENTIALS_MAX) break;
+    }
+    if (specs.length > 0) return specs;
+    return wanted === 0n ? [{ type: panel.type, host: panel.host, port: panel.port }] : null;
   }
 
   #pollDue(): boolean {

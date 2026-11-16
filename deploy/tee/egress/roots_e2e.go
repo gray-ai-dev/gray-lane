@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
 )
 
 // E2E ONLY. A build with `-tags e2e` accepts one additional root CA from a file, so the local
@@ -22,6 +21,7 @@ func addExtraRootCAFlag(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.directDialAddress, "e2e-direct", "", "E2E ONLY: dial this host:port for every official origin instead of resolving it (never set in production)")
 	e2ePeerDial = peerDialTarget{}
 	fs.Var(&e2ePeerDial, "e2e-peer-dial", "E2E ONLY: <peer host>=<ip>:<port>, dial that address for the peer host's port 443 instead of resolving it (never set in production)")
+	fs.BoolVar(&cfg.allowInternalDials, "e2e-allow-internal-dials", false, "E2E ONLY: dial loopback, private and other internal addresses for accounts, as the local harnesses' proxies and fake vendors need (never set in production)")
 }
 
 // e2ePeerDial is -e2e-peer-dial, kept here rather than in config so the production build's config is untouched; the
@@ -60,7 +60,9 @@ func directDial(cfg config) dialFunc {
 	if cfg.directDialAddress == "" && peerHost == "" {
 		return nil
 	}
-	dialer := &net.Dialer{Timeout: cfg.dialTimeout, KeepAlive: 30 * time.Second}
+	// The same dial rule as production's (dial_guard.go): the redirected addresses are internal, so the harness that
+	// sets -e2e-direct or -e2e-peer-dial sets -e2e-allow-internal-dials too.
+	dialer := accountDialer(cfg)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {

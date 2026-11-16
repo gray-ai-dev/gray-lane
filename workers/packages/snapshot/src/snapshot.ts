@@ -21,10 +21,12 @@ import {
   parseOfferVersion,
   quotaKey,
   recordBindingHolds,
+  routeTag,
   validTerms,
   type ActiveOffer,
   type DispatchLimits,
   type OfferVersion,
+  type RouteTag,
 } from "./offers.ts";
 import { restEndingChecks, routeRestChecks, type RouteRestChecks } from "./rests.ts";
 import { recoverSnapshot, type SnapshotPayload, type VerifyingKeys } from "./signed.ts";
@@ -102,6 +104,8 @@ export function laneRouteCapabilities(e: ProviderEndpoint, protocol: Protocol): 
   return { streaming: true, streamedOnly: false, chat, modes: { buffered: chat, streamed: chat }, cacheTtl: false };
 }
 
+export type { RouteTag } from "./offers.ts";
+
 export interface SnapshotRoute {
   /** The endpoint root's name for this route's permits (EndpointRootDO / EndpointShardDO, `capacityKey`). */
   readonly capacityKey: string;
@@ -146,6 +150,12 @@ export interface SnapshotRoute {
    * Gray proposed since (@gray/control release-traffic.ts, the release traffic window). Absent: no limit.
    */
   readonly trafficUntilMs?: number;
+  /**
+   * What names the route of a supplier workspace with a public handle beside its model (offers.ts `routeTag`): the
+   * handle and its active offer's quantization, region slug and tier. Absent: the workspace has no handle (it is
+   * anonymous, as every relay is), and always on a lane relay's route.
+   */
+  readonly tag?: RouteTag;
 }
 
 /** One capacity key with its agreed concurrency; `enabled` while a current pass covers its mapping (inference.rs refresh: CapacityState). */
@@ -283,6 +293,12 @@ export interface SnapshotContent {
    * stored before them): no request is a model check, on the main gateway and the lane entry alike.
    */
   readonly modelCheckKeys?: readonly SnapshotModelCheckKey[];
+  /**
+   * Every registered public handle with the supplier workspace that holds it (control_provider_handles), whether or
+   * not a route of it is published: a tag's first segment names a workspace through it. Absent while no workspace
+   * has a handle, and in a snapshot stored before handles: such a snapshot is the bytes it was.
+   */
+  readonly handles?: Readonly<Record<string, string>>;
 }
 
 /** A published snapshot: the content, its version and when the rebuild that first produced it ran. */
@@ -448,6 +464,8 @@ export interface SnapshotReader {
    * relay id; a reader without it reads none.
    */
   stackTraffic?(): Promise<ReadonlyMap<string, { readonly untilMs: number }>>;
+  /** Every registered public handle and its workspace (control_provider_handles); a reader without it reads none. */
+  handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string }[]>;
 }
 
 /** modeltrace.rs `PROFILE_ID`: the profile prefix of ModelTrace's records. */
@@ -609,33 +627,54 @@ export function registryOf(rows: readonly EndpointRowRaw[], verifications: reado
 }
 
 /**
- * The verification rows `registryOf` and `latestEvidence` need (`gateway_registry_read`; console `gatewayRegistry`):
- * of each (endpoint, model, protocol) as the stored record names them, only the row `latestEvidence` would keep from
- * every row, the newest `checked_at` and of a tie the later rowid, in the order the bindings first appear in rowid
- * order, which is the order `latestEvidence` meets them in. Reading every row instead sent the whole table on each
- * rebuild (2 MB of 4,636 rows for 24 bindings on staging, 2026-11-06, every CONFIG_REBUILD_MS).
+ * The newest verification row of each binding (endpoint, model, API) of the endpoints `endpoints` names (a FROM item
+ * `e` with a column `id`), read through the index control_verification_pair_latest and nothing else: `extra` adds
+ * columns of the binding (`b.m`, `b.p`) to the two the readers take, `endpoint_id` and `record`.
  *
- * Every row left out is older than the row kept for its binding, so it is neither the binding's latest nor could stand
- * in for a newer record. A record that does not parse is read when it is its binding's newest, and one without a
- * `checked_at` always is (NULLS FIRST), so its endpoint is left out as before (`verification_record_unparseable`); an
- * older record that does not parse, superseded by a newer one of its binding, no longer leaves the endpoint out.
- * Every stored record is JSON with an integer or missing `checked_at`: the index control_verification_pair_latest
- * casts both on insert. Each record's JSON is parsed once (OFFSET 0 keeps the cast in its own subquery).
+ * - The bindings: each endpoint's first (model, API) in the index's order, then the next one after it, until there is
+ *   none (a loose index scan: one probe a binding, however many rows a binding has).
+ * - Of each binding the newest `checked_at`, and of a tie the later rowid: the first rows of its range in the index. A
+ *   record without a `checked_at` is the newest (NULLS FIRST), so one that does not read still leaves its endpoint
+ *   out, as before. Nothing else filters that read: a condition the index does not hold (the record's generation, say)
+ *   makes the planner expect to walk far along the range before a row passes and read the binding's every row
+ *   instead (measured on production: 263 rows a binding, 99 ms for 64 bindings, against 3.6 ms).
+ * - In the order (endpoint, model, API).
+ *
+ * It read every row before (2026-11-06 to 2026-11-16: DISTINCT ON over the whole table, each record's JSON parsed):
+ * production's 16,810 rows for 45 bindings, 103 ms and a 9.5 MB sort on disk, in the route table's rebuild every
+ * CONFIG_REBUILD_MS (2 s), growing with every check ever recorded. Now 2 ms, by the number of bindings alone; the two
+ * gave the same 45 rows on production and the same 24 on staging (2026-11-16). What differs: the order (it was each
+ * binding's oldest row's; no reader depends on it); a row the writers never store, a record without a model or an
+ * API, is not read; and a binding is the column's endpoint with the record's model and API (a record that names
+ * another endpoint than its column, which the writers never store either, was a binding of its own).
  */
-export const LATEST_VERIFICATIONS_SQL =
-  "SELECT v.endpoint_id,v.record FROM (SELECT DISTINCT ON (k.endpoint_id,k.e,k.m,k.p) k.rowid,MIN(k.rowid) OVER (PARTITION BY k.endpoint_id,k.e,k.m,k.p) AS first_rowid " +
-  "FROM (SELECT endpoint_id,rowid,j->>'endpoint_id' AS e,j->>'model' AS m,j->>'protocol' AS p,(j->>'checked_at')::BIGINT AS t FROM (SELECT endpoint_id,rowid,record::jsonb AS j FROM control_verifications OFFSET 0) r) k " +
-  "ORDER BY k.endpoint_id,k.e,k.m,k.p,k.t DESC,k.rowid DESC) latest JOIN control_verifications v ON v.rowid=latest.rowid ORDER BY latest.first_rowid";
+function latestVerificationsSql(endpoints: string, extra = ""): string {
+  const [model, protocol] = ["((v.record::jsonb #>> '{model}'))", "((v.record::jsonb #>> '{protocol}'))"];
+  const next = (after: string) => `SELECT ${model} AS m,${protocol} AS p FROM control_verifications v WHERE v.endpoint_id=${after} ORDER BY ${model},${protocol} LIMIT 1`;
+  return (
+    `WITH RECURSIVE b(endpoint_id,m,p) AS (SELECT e.id,s.m,s.p FROM ${endpoints} CROSS JOIN LATERAL (${next("e.id")}) s ` +
+    `UNION ALL SELECT b.endpoint_id,n.m,n.p FROM b CROSS JOIN LATERAL (${next(`b.endpoint_id AND (${model},${protocol})>(b.m,b.p)`)}) n) ` +
+    `SELECT b.endpoint_id,r.record${extra} FROM b CROSS JOIN LATERAL (SELECT v.record FROM control_verifications v WHERE v.endpoint_id=b.endpoint_id AND ${model}=b.m AND ${protocol}=b.p ` +
+    "ORDER BY ((v.record::jsonb #>> '{checked_at}')::BIGINT) DESC,v.rowid DESC LIMIT 1) r ORDER BY b.endpoint_id,b.m,b.p"
+  );
+}
+
+/**
+ * The verification rows `registryOf` and `latestEvidence` need (`gateway_registry_read`; console `gatewayRegistry`):
+ * the newest row of each binding of every endpoint (`latestVerificationsSql`). The same text as crates/gray-control
+ * `LATEST_VERIFICATIONS_SQL`.
+ */
+export const LATEST_VERIFICATIONS_SQL = latestVerificationsSql("control_endpoints e");
 
 /**
  * `LATEST_VERIFICATIONS_SQL` of one workspace's endpoints only (`$1`, the workspace ID): the console's onboarding status
- * reads its own workspace's latest record of each binding, never every workspace's (crates/gray-control
- * `LATEST_WORKSPACE_VERIFICATIONS_SQL`, the same text).
+ * and a member's checks page read their own workspace's latest record of each binding, never every workspace's
+ * (crates/gray-control `LATEST_WORKSPACE_VERIFICATIONS_SQL`, the same text).
  */
-export const LATEST_WORKSPACE_VERIFICATIONS_SQL = LATEST_VERIFICATIONS_SQL.replace(
-  "FROM control_verifications OFFSET 0",
-  "FROM control_verifications WHERE endpoint_id IN (SELECT id FROM control_endpoints WHERE workspace_id=$1) OFFSET 0",
-);
+export const LATEST_WORKSPACE_VERIFICATIONS_SQL = latestVerificationsSql("(SELECT id FROM control_endpoints WHERE workspace_id=$1) e");
+
+/** `LATEST_VERIFICATIONS_SQL` of the endpoints `$1` lists (a text array), each row with its binding's `model` and `protocol`. */
+export const LATEST_ENDPOINT_VERIFICATIONS_SQL = latestVerificationsSql("unnest($1::text[]) AS e(id)", ",b.m AS model,b.p AS protocol");
 
 /** `gateway_registry`'s evidence: the newest record per (endpoint, model, protocol), of the endpoint as it is now. */
 export function latestEvidence(records: readonly VerificationRecord[], endpoints: readonly ProviderEndpoint[]): VerificationRecord[] {
@@ -740,6 +779,38 @@ export function routePass(e: ProviderEndpoint, m: ModelMapping, records: readonl
   return records.find(fresh(e, m, at));
 }
 
+/** What a direct route stands on (`routeEvidence`): the signed pass, and when the route ends. */
+export interface RouteEvidence {
+  readonly pass: VerificationRecord;
+  readonly expires: number;
+}
+
+/**
+ * What a route of `m` on `e` stands on at `at` (inference.rs `route_evidence`), or none. `records` are the registry's
+ * (`latestEvidence`), `listed` the verifications of the workspace's signed snapshot, which ends at `snapshotExpiresAt`.
+ *
+ * - The registry's latest record of the mapping must be a current pass (`routePass`): a newer record that is not a
+ *   pass (a failure, a withdrawal) ends the route at once, signed or not.
+ * - The route stands on the record of the mapping the signed snapshot lists, when that is itself a current pass of the
+ *   binding: the latest record once the snapshot lists it, and until then the earlier pass it still lists. Its id, what
+ *   it proved and its recovering words are the route's. So while a newer pass is not listed yet the route is what it
+ *   was: a capability that newer pass withdrew is still served until the snapshot lists it, at most one maintenance
+ *   scan later.
+ * - It ends at the earliest of the snapshot's end, that record's and the latest record's (a deferral copies a pass
+ *   under a new id with an earlier end).
+ *
+ * A re-check that passes writes a new record at once, and the workspace's snapshot is republished after it (by the
+ * job's end or the next maintenance scan). The route used to need the newest record listed, so every passing re-check
+ * took its model out of the routes until then, and copies of the route table built in that window went on being served
+ * after it (production, 2026-11-16: a model that passed at 03:28:47Z came and went four times in the next 30 s).
+ */
+export function routeEvidence(e: ProviderEndpoint, m: ModelMapping, records: readonly VerificationRecord[], listed: readonly VerificationRecord[], snapshotExpiresAt: number, at: number): RouteEvidence | undefined {
+  const latest = routePass(e, m, records, at);
+  if (latest === undefined) return undefined;
+  const pass = listed.find(fresh(e, m, at));
+  return pass === undefined ? undefined : { pass, expires: Math.min(routeExpires(snapshotExpiresAt, pass.expires_at), latest.expires_at) };
+}
+
 function fresh(e: ProviderEndpoint, m: ModelMapping, at: number) {
   return (v: VerificationRecord) =>
     v.endpoint_id === e.id &&
@@ -838,8 +909,10 @@ export function routeRecovering(e: ProviderEndpoint, protocol: Protocol, record:
 }
 
 /**
- * catalog.rs `projection`: the words the catalog lists each of `routes` with at `nowMs`, from the pass its binding
- * has then (`routePass`, the record `buildSnapshot` builds the route on) and that pass's report in `proofs`: what the
+ * catalog.rs `projection`: the words the catalog lists each of `routes` with at `nowMs`, from the pass of its binding
+ * among `records` then (`routePass`; the server hands it the records its routes stand on, `routeEvidence`, and the
+ * gateway lists the words its routes carry, which `buildSnapshot` takes from the same record) and that pass's report
+ * in `proofs`: what the
  * report verified of the endpoint's claims (`routeCapabilities`' chat capabilities, a gateway route's `proved`) and
  * what it withdrew that clients' configs keep (`recoveringCapabilitiesAt`). A route without such a pass has neither.
  */
@@ -929,13 +1002,19 @@ export function recipientDays(nowMs: number): number[] {
  */
 export async function buildSnapshot(
   reader: SnapshotReader,
-  nowMs: number,
+  now: number | (() => number),
   trusted: VerifyingKeys,
   reference?: ModelReference,
   onSkip: (skip: RebuildSkip) => void = () => {},
 ): Promise<SnapshotContent> {
-  const at = Math.floor(nowMs / 1000);
   const auth = await reader.auth();
+  // The build's time, read once its first read has answered when `now` is a clock (the server's refresh reads its own
+  // after the registry, inference.rs `judged_at`): the reads are one transaction's, whose view is taken at that first
+  // read, so every record it sees was stored by then. A time read before the transaction began could be a second
+  // behind a pass stored in between, which then counted as checked in the future: no pass, and its route was dropped
+  // for one rebuild (review of #720, 2026-11-16).
+  const nowMs = typeof now === "function" ? now() : now;
+  const at = Math.floor(nowMs / 1000);
   const keys: SnapshotKey[] = [];
   for (const row of auth.rows) {
     const read = authRecord(row);
@@ -1047,6 +1126,27 @@ export async function buildSnapshot(
   const covers = reader.modelTraceCovers?.bind(reader) ?? (() => true);
   const weights = published.length > 0 && reader.modelTraceRecords ? standingWeights(await reader.modelTraceRecords(published.map(({ e }) => e.id)), covers) : new Map<string, number>();
 
+  // What each direct route stands on (`routeEvidence`). A pass that is not the registry's latest (a newer one is not
+  // listed yet) has its report read too: the route keeps what that pass proved.
+  const standing = new Map<string, RouteEvidence>();
+  for (const { e, snapshot } of published) {
+    if (e.config.auth === "lane_relay") continue;
+    for (const m of e.config.mappings) {
+      const found = routeEvidence(e, m, evidence, snapshot.verifications, snapshot.expires_at, at);
+      if (found !== undefined) standing.set(offerKey(e.id, m.requested_model, m.protocol), found);
+    }
+  }
+  const earlier = [...new Set([...standing.values()].map((found) => found.pass.id))].filter((id) => !provenIds.includes(id));
+  if (earlier.length > 0) {
+    for (const row of await reader.probeReports(earlier)) {
+      const p = probeEvidence(row);
+      if (p) proofs.set(row.verification_id, p);
+    }
+  }
+
+  // The public handles: a route of a workspace that holds one is tagged, and the snapshot carries them all.
+  const handleRows = reader.handles === undefined ? [] : [...(await reader.handles())].sort((a, b) => byText(a.handle, b.handle));
+  const handleOf = new Map(handleRows.map((r) => [r.workspace_id, r.handle]));
   const traffic = published.some(({ e }) => e.config.lane?.mode === "stack") && reader.stackTraffic ? await reader.stackTraffic() : new Map<string, { readonly untilMs: number }>();
   const routes: SnapshotRoute[] = [];
   for (const { e, snapshot } of published) {
@@ -1059,12 +1159,13 @@ export async function buildSnapshot(
     // snapshot listing it and an approved offer, and nothing else (design v2 section B, module L3).
     const lane = e.config.auth === "lane_relay";
     for (const m of e.config.mappings) {
-      const v = lane ? undefined : routePass(e, m, evidence, at);
-      if (!lane && v === undefined) continue;
-      if (v !== undefined && !snapshot.verifications.some((x) => x.id === v.id && x.outcome === "pass")) continue;
+      const key = offerKey(e.id, m.requested_model, m.protocol);
+      // A direct route stands on the pass the signed snapshot lists (`routeEvidence`).
+      const found = lane ? undefined : standing.get(key);
+      if (!lane && found === undefined) continue;
+      const v = found?.pass;
       const url = routeUrl(e.config.base_url, m.native_path);
       if (url === null) continue;
-      const key = offerKey(e.id, m.requested_model, m.protocol);
       const quote = quoteOf.get(key) ?? null;
       // A lane relay earns its route by an approved offer alone; a direct route also by its current pass.
       if (lane && quote === null) continue;
@@ -1082,7 +1183,7 @@ export async function buildSnapshot(
         // A lane relay's route stands on its approved offer's eligibility (there is no verification to
         // expire), but never outlives the signed snapshot that lists it: a rebuild that stops must age the
         // lane's routes out like a direct route's. A direct route also ends with its current pass.
-        expires: lane ? (quote === null ? 0 : Math.min(snapshot.expires_at, quote.eligible_until)) : routeExpires(snapshot.expires_at, v!.expires_at),
+        expires: lane ? (quote === null ? 0 : Math.min(snapshot.expires_at, quote.eligible_until)) : found!.expires,
         offer: quote,
         maxConcurrency: quote ? quote.terms.max_concurrency : UNQUOTED_CONCURRENCY,
         capabilities: lane ? laneRouteCapabilities(e, m.protocol) : routeCapabilities(e, m.protocol, v!, proofs.get(v!.id)),
@@ -1093,6 +1194,7 @@ export async function buildSnapshot(
         // A lane relay has no verification, so nothing it proved is being checked again.
         ...((recovering) => (recovering === null ? {} : { recovering }))(lane ? null : routeRecovering(e, m.protocol, v!, proofs.get(v!.id), nowMs)),
         ...(trafficUntilMs === undefined ? {} : { trafficUntilMs }),
+        ...((tag) => (tag === null ? {} : { tag }))(routeTag(handleOf.get(e.workspace_id) ?? null, lane, quote?.terms ?? null)),
       });
     }
   }
@@ -1145,6 +1247,7 @@ export async function buildSnapshot(
     contentRecipients: recipients,
     ...(models === undefined ? {} : { modelFacts: models.facts, modelLimits: models.limits }),
     ...(reference === undefined || reference.largestWindow === null ? {} : { largestWindow: reference.largestWindow }),
+    ...(handleRows.length === 0 ? {} : { handles: Object.fromEntries(handleRows.map((r) => [r.handle, r.workspace_id])) }),
   };
 }
 

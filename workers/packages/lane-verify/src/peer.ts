@@ -75,11 +75,11 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
   const checks: VerifyCheck[] = [];
   const refused = (): PeerAttestationVerification => ({ ok: false, checks, verification: null, listCurrentUntil: null });
   if (options.layout === "default" && (options.expectedRelayId !== undefined || options.expectedRelayPublicKey !== undefined)) {
-    checks.push(fail("layout", "a default-layout peer serves no relay; a relay pin needs layout stack"));
+    checks.push(fail("layout", "a default-layout peer serves no deployment; a deployment pin needs layout stack"));
     return refused();
   }
   if (options.layout === "stack" && options.expectedRelayId === undefined) {
-    checks.push(fail("relay_pin", "a stack peer is verified for the relay its route names; none was given"));
+    checks.push(fail("relay_pin", "a stack peer is verified for the deployment its route names; none was given"));
     return refused();
   }
   const read = await readReleaseListText(options.releaseList.text, {
@@ -121,22 +121,22 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
     checks.push(fail("layout", "not checked: the measured compose hash is not a release of this list"));
   } else if (options.layout === "stack") {
     if (release.stack === null) checks.push(fail("layout", `release ${release.compose_hash} is not a stack release (no stack member)`));
-    else if (facts !== null && facts.phase === "empty_slot" && options.allowEmptySlot === true) checks.push(pass("layout", `stack release ${release.compose_hash}, empty slot of relay ${facts.identity.relayId}`));
-    else if (facts === null || facts.phase !== "sealed") checks.push(fail("layout", "the boot measured no sealed relay identity"));
-    else checks.push(pass("layout", `stack release ${release.compose_hash}, sealed boot of relay ${facts.identity.relayId}`));
+    else if (facts !== null && facts.phase === "empty_slot" && options.allowEmptySlot === true) checks.push(pass("layout", `stack release ${release.compose_hash}, empty slot of deployment ${facts.identity.relayId}`));
+    else if (facts === null || facts.phase !== "sealed") checks.push(fail("layout", "the boot measured no sealed deployment identity"));
+    else checks.push(pass("layout", `stack release ${release.compose_hash}, sealed boot of deployment ${facts.identity.relayId}`));
   } else if (release.stack !== null) {
     checks.push(fail("layout", `release ${release.compose_hash} is a stack release, not a default-layout one`));
   } else if (verification.stackBoot === null || !verification.stackBoot.ok || facts !== null) {
-    checks.push(fail("layout", "the boot is not a default-layout boot: it measured relay-stack events"));
+    checks.push(fail("layout", "the boot is not a default-layout boot: it measured deployment events"));
   } else {
     checks.push(pass("layout", `default release ${release.compose_hash}`));
   }
 
   if (options.expectedRelayPublicKey !== undefined) {
     const wanted = options.expectedRelayPublicKey.toLowerCase();
-    if (lowerHexBytes(wanted)?.length !== 32) checks.push(fail("relay_key_pin", "the expected relay key is not 32 bytes as hex"));
-    else if (facts === null) checks.push(fail("relay_key_pin", "the boot measured no relay identity"));
-    else if (facts.identity.publicKey !== wanted) checks.push(fail("relay_key_pin", `the identity names relay key ${facts.identity.publicKey}, not ${wanted}`));
+    if (lowerHexBytes(wanted)?.length !== 32) checks.push(fail("relay_key_pin", "the expected deployment key is not 32 bytes as hex"));
+    else if (facts === null) checks.push(fail("relay_key_pin", "the boot measured no deployment identity"));
+    else if (facts.identity.publicKey !== wanted) checks.push(fail("relay_key_pin", `the identity names deployment key ${facts.identity.publicKey}, not ${wanted}`));
     else checks.push(pass("relay_key_pin", wanted));
   }
 

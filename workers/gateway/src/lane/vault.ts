@@ -385,6 +385,15 @@ export class LaneVault implements LoginPins {
     return this.#key !== null;
   }
 
+  /**
+   * Whether a refusal of the KMS lease dropped the key (`drop`) and no open has succeeded since. Closed without it (the
+   * boot before its first open, a failed open waiting for its retry, a close waiting for its reopen), the vault is still
+   * to open, and the lane keeps egress's own-call set as it is meanwhile (review 11-16, `StackOpsKeep`).
+   */
+  get dropped(): boolean {
+    return this.#dropped;
+  }
+
   report(): LaneVaultReport {
     return { version: this.#version, persisted_ms: this.#persistedMs, copy_version: this.#copyVersion, copy_ok: this.#copyOk };
   }
@@ -1618,19 +1627,27 @@ export interface VaultBridge {
 }
 
 /**
- * `K_vault`'s inputs: the guest agent's v0 `GetKey` (`POST /GetKey {path, purpose: ""}`: dstack derives from the app key
- * and the path, C3) and Gray's share (H5: a nonce from Gray, a quote of `vaultShareRequest`'s report data from the guest
- * agent's v0 `GetQuote`, `stack.vault.share`, opened with the request's X25519 key).
+ * The guest agent's v0 `GetKey` (`POST /GetKey {path, purpose: ""}`): dstack derives 32 bytes from the app key and the
+ * path (C3), so every instance of one app gets the same bytes for one path. One call, bounded by `timeoutMs`; the caller
+ * zeroes the answer once it has derived its key. Throws a `VaultClientError` on any other answer.
+ */
+export async function guestGetKey(options: { readonly guest: FetchLike; readonly guestUrl: string; readonly timeoutMs: number }, path: string): Promise<Uint8Array> {
+  const base = options.guestUrl.replace(/\/+$/, "");
+  const value = await guestJson(options.guest, `${base}/GetKey`, { method: "POST", headers: { "content-type": "application/json" }, body: toJsonString({ path, purpose: "" }) }, options.timeoutMs);
+  const parsed = getKeyAnswerSchema.safeParse(value);
+  if (!parsed.success) throw new VaultClientError("guest_agent_invalid_answer");
+  return hexToBytes(parsed.data.key);
+}
+
+/**
+ * `K_vault`'s inputs: the guest agent's v0 `GetKey` (`guestGetKey`) and Gray's share (H5: a nonce from Gray, a quote of
+ * `vaultShareRequest`'s report data from the guest agent's v0 `GetQuote`, `stack.vault.share`, opened with the request's
+ * X25519 key).
  */
 export function vaultKeys(options: { readonly guest: FetchLike; readonly guestUrl: string; readonly timeoutMs: number; readonly bridge: VaultBridge; readonly relayId: string; readonly appId: string }): LaneVaultKeys {
   const base = options.guestUrl.replace(/\/+$/, "");
   return {
-    async getKey(path) {
-      const value = await guestJson(options.guest, `${base}/GetKey`, { method: "POST", headers: { "content-type": "application/json" }, body: toJsonString({ path, purpose: "" }) }, options.timeoutMs);
-      const parsed = getKeyAnswerSchema.safeParse(value);
-      if (!parsed.success) throw new VaultClientError("guest_agent_invalid_answer");
-      return hexToBytes(parsed.data.key);
-    },
+    getKey: (path) => guestGetKey(options, path),
     async share() {
       const { bridge, relayId, appId } = options;
       const nonce = await bridge.vaultShareNonce(relayId, appId);
