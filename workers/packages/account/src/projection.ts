@@ -1,4 +1,4 @@
-import type { BatchItem, ProjectionBatch, ProjectionMessage } from "./protocol.ts";
+import type { BatchItem, ProjectionBatch, ProjectionHandover, ProjectionMessage } from "./protocol.ts";
 import { utf8Length } from "./validate.ts";
 
 /**
@@ -41,8 +41,9 @@ const size = (m: ProjectionMessage) => utf8Length(JSON.stringify(m));
  * message is split into parts. Sizes are added up from each item's JSON once: an array's JSON is
  * its items' JSON joined by commas inside brackets.
  */
-export function projectionMessages(shard: string, batches: readonly StoredBatch[]): ProjectionMessage[] {
-  const messageBase = size({ format: 1, shard, batches: [] });
+export function projectionMessages(shard: string, batches: readonly StoredBatch[], handover?: ProjectionHandover): ProjectionMessage[] {
+  const envelope = handover ? { handover } : {};
+  const messageBase = size({ format: 1, shard, batches: [], ...envelope });
   const joined = (sizes: readonly number[]) => sizes.reduce((a, b) => a + b, 0) + Math.max(0, sizes.length - 1);
   const batchSize = (b: ProjectionBatch, itemSizes: readonly number[]) => utf8Length(JSON.stringify({ ...b, items: [] })) + joined(itemSizes);
 
@@ -50,7 +51,7 @@ export function projectionMessages(shard: string, batches: readonly StoredBatch[
   let current: ProjectionBatch[] = [];
   let currentSizes: number[] = [];
   const flush = () => {
-    if (current.length) out.push({ format: 1, shard, batches: current });
+    if (current.length) out.push({ format: 1, shard, batches: current, ...envelope });
     current = [];
     currentSizes = [];
   };
@@ -85,7 +86,7 @@ export function projectionMessages(shard: string, batches: readonly StoredBatch[
       partSizes.push(itemSizes[i]!);
     });
     if (part.length) parts.push(part);
-    parts.forEach((items, i) => out.push({ format: 1, shard, batches: [{ seq: b.seq, part: i, parts: parts.length, at: b.at, items }] }));
+    parts.forEach((items, i) => out.push({ format: 1, shard, batches: [{ seq: b.seq, part: i, parts: parts.length, at: b.at, items }], ...envelope }));
   }
   flush();
   return out;

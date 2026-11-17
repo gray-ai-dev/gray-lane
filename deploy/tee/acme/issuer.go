@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -29,6 +30,12 @@ const (
 	// not seen in time fails that CA's order (§5 row 6), and the entrypoint's hold and restart order again.
 	dns01PropagationTimeout = dns01.DefaultPropagationTimeout
 	dns01PollingInterval    = dns01.DefaultPollingInterval
+	// dns01PropagationWait is how long a replica's order waits after it presented its records before the CA validates
+	// them, in place of lego's active check (setDNS01). Measured on staging 2026-11-17, from the bridge's write through
+	// Cloudflare's API to the TXT value at both of usefallback.com's nameservers (jake and jule.ns.cloudflare.com), from
+	// one client, 15 trials: 5 to 58 s, median 52 s, 9 of 15 over 45 s. The CA validates from several places, each at its
+	// own Cloudflare location, so the wait is about twice the slowest seen. It adds to a replica's boot.
+	dns01PropagationWait = 120 * time.Second
 	// One present or cleanup call to the entrypoint: httpreq's own default (providers/dns/httpreq/httpreq.go:65,
 	// 30 s). It is above the entrypoint's bound on the bridge call it makes for it (LANE_BRIDGE_CALL_MS, 20 s, in
 	// @gray/lane-wire wire.ts), so the entrypoint answers with the bridge's code before this client gives up.
@@ -128,6 +135,13 @@ func newLegoClient(ca caEndpoint, cfg config, accountKey crypto.Signer, accountU
 // 37-40,134-145,165-176) and fails on any status but 2xx (:208-210), the entrypoint's answer body in its error. With
 // ACME_DNS01_RESOLVERS (the simulator's challenge DNS server) lego's propagation check asks those servers only and
 // skips the authoritative servers, which a test DNS server does not delegate to.
+//
+// In a CVM lego's active check cannot work (staging, 2026-11-17: both names failed with "recursive nameservers: NS
+// 127.0.0.11:53 returned NXDOMAIN" for 2 min while the bridge had created both records): before presenting, lego asks
+// the CVM's resolver whether the challenge name is a CNAME (challenge/dns01/dns_challenge.go GetChallengeInfo), the
+// resolver caches that NXDOMAIN for the zone's negative TTL, and the recursive check then reads the cached answer. So the
+// order waits dns01PropagationWait from its first check instead (lego's WrapPreCheck, as its PropagationWait does,
+// once for all of the order's names) and the CA validates at Cloudflare's authoritative servers itself.
 func setDNS01(client *lego.Client, cfg config) error {
 	provider, err := dns01Provider(cfg.DNS01Socket)
 	if err != nil {
@@ -139,8 +153,45 @@ func setDNS01(client *lego.Client, cfg config) error {
 		resolverOptions.RecursiveNameservers = cfg.DNS01Resolvers
 		dns01.SetDefaultClient(dns01.NewClient(resolverOptions))
 		options = append(options, dns01.DisableAuthoritativeNssPropagationRequirement())
+	} else {
+		options = append(options, dns01.WrapPreCheck(waitFromFirstCheck(dns01PropagationWait, time.Now, sleepCtx)))
 	}
 	return client.Challenge.SetDNS01Provider(provider, options...)
+}
+
+// waitFromFirstCheck is a pre-check that lets the CA validate once `wait` has passed since the order's first check,
+// without looking up the record: lego presents every name of the order before it checks the first
+// (challenge/resolver/prober.go parallelSolve; httpreq is no sequential provider), so one wait covers them all, and a
+// later name waits only what is left of it.
+func waitFromFirstCheck(wait time.Duration, now func() time.Time, sleep func(context.Context, time.Duration) error) dns01.WrapPreCheckFunc {
+	var mu sync.Mutex
+	var start time.Time
+	return func(ctx context.Context, _, _, _ string, _ dns01.PreCheckFunc) (bool, error) {
+		mu.Lock()
+		if start.IsZero() {
+			start = now()
+		}
+		left := wait - now().Sub(start)
+		mu.Unlock()
+		if left > 0 {
+			if err := sleep(ctx, left); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+}
+
+// sleepCtx sleeps d, or less when ctx ends first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // dns01Provider is lego's httpreq provider posting to the unix socket at socket.

@@ -196,6 +196,8 @@ interface LeaseBody {
   projected: number;
   /** The next batch's sequence number. */
   nextBatch: number;
+  /** Handover watermark from an earlier replaced storage, sent with projection messages of this incarnation. */
+  handover?: { readonly batch: number; readonly chargeSeq: number };
   /** The `at` of the last batch: batch times never go backwards, so batches can be searched by time. */
   lastBatchAt: number;
   /** When the root last confirmed the snapshot's version: the lease runs ACCOUNT_LEASE_MS from here. */
@@ -2654,6 +2656,8 @@ export class AccountShard {
       rate: this.admits.perSecond(now),
       ...(this.durable.incarnation ? { incarnation: this.durable.incarnation } : {}),
       ...(this.durable.took ? { took: this.durable.took } : {}),
+      ...(this.durable.nextBatch > 1 ? { lastBatch: this.durable.nextBatch - 1 } : {}),
+      ...(this.durable.chargeSeq > 0 ? { lastChargeSeq: this.durable.chargeSeq } : {}),
     };
   }
 
@@ -2726,7 +2730,8 @@ export class AccountShard {
     const epoch = Math.max(this.durable.epoch, h.epoch + 1);
     if (epoch !== this.durable.epoch) this.nextSeq = 0;
     const base = this.durable.incarnation?.at ?? now;
-    const nextBatch = Math.max(this.durable.nextBatch, base);
+    const nextBatch = Math.max(this.durable.nextBatch, base, (h.lastBatch ?? 0) + 1);
+    const chargeSeq = Math.max(h.charges?.seq ?? 0, h.lastChargeSeq ?? 0, this.durable.chargeSeq);
     this.durable = {
       ...this.durable,
       epoch,
@@ -2736,11 +2741,12 @@ export class AccountShard {
       pools: this.pools.durableRecord(),
       settled: h.settled,
       reported: Math.max(this.durable.reported, h.settled),
-      chargeSeq: h.charges?.seq ?? this.durable.chargeSeq,
+      chargeSeq,
       ...(h.charges && this.keccak !== null ? { chain: h.charges.chain } : {}),
       nextBatch,
       projected: Math.max(this.durable.projected, nextBatch - 1),
       took: h.from,
+      handover: { batch: nextBatch, chargeSeq },
     };
     this.writeLease();
     this.log({ level: "warn", event: "shard_took_handover", shard: this.name, from: h.from, epoch, inDoubtUntil: this.durable.inDoubtUntil, settled: h.settled });
@@ -2846,7 +2852,16 @@ export class AccountShard {
   books(): ShardBooks {
     const pools: Record<PoolId, { granted: number; returned: number; used: number }> = {};
     for (const [pool, d] of this.pools.durable) if (d.granted + d.returned + d.used > 0) pools[pool] = { granted: d.granted, returned: d.returned, used: d.used };
-    return { incarnation: this.durable.incarnation ?? null, epoch: this.durable.epoch, version: this.snapshot?.version ?? 0, settled: this.durable.settled, charges: this.chargePoint(), pools };
+    return {
+      incarnation: this.durable.incarnation ?? null,
+      epoch: this.durable.epoch,
+      version: this.snapshot?.version ?? 0,
+      settled: this.durable.settled,
+      charges: this.chargePoint(),
+      ...(this.durable.nextBatch > 1 ? { lastBatch: this.durable.nextBatch - 1 } : {}),
+      ...(this.durable.chargeSeq > 0 ? { lastChargeSeq: this.durable.chargeSeq } : {}),
+      pools,
+    };
   }
 
   /** Hands every unused allowance back to the root (idle, K shrank, admission closed, or an operator). */
@@ -3060,7 +3075,7 @@ export class AccountShard {
         const batches: StoredBatch[] = rows.map((r) => ({ seq: r.seq, at: r.at, items: JSON.parse(r.body) as BatchItem[] }));
         this.lastProjectAt = this.deps.clock();
         try {
-          for (const group of sendGroups(projectionMessages(this.name, batches))) {
+          for (const group of sendGroups(projectionMessages(this.name, batches, this.durable.handover))) {
             await this.deps.projection.sendBatch(group.map((body) => ({ body, contentType: "json" as const })));
           }
         } catch (err) {

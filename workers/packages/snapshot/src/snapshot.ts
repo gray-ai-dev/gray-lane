@@ -1124,7 +1124,8 @@ export async function buildSnapshot(
   }
 
   const covers = reader.modelTraceCovers?.bind(reader) ?? (() => true);
-  const weights = published.length > 0 && reader.modelTraceRecords ? standingWeights(await reader.modelTraceRecords(published.map(({ e }) => e.id)), covers) : new Map<string, number>();
+  const directEndpointIds = published.filter(({ e }) => e.config.auth !== "lane_relay").map(({ e }) => e.id);
+  const weights = directEndpointIds.length > 0 && reader.modelTraceRecords ? standingWeights(await reader.modelTraceRecords(directEndpointIds), covers) : new Map<string, number>();
 
   // What each direct route stands on (`routeEvidence`). A pass that is not the registry's latest (a newer one is not
   // listed yet) has its report read too: the route keeps what that pass proved.

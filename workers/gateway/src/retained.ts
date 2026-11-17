@@ -152,6 +152,17 @@ export class AnswerShare {
     return true;
   }
 
+  /**
+   * Records `bytes` already allocated in memory (a whole answer whose upstream body has finished): counted
+   * in the pool until `release()` so concurrent mid-read requests see the weight, without refusing a
+   * completed answer.
+   */
+  record(bytes: number): void {
+    if (this.released) return;
+    this.pool.move(bytes - this.mine);
+    this.mine = bytes;
+  }
+
   /** The request ended: what it held leaves the pool. Idempotent. */
   release(): void {
     if (this.released) return;

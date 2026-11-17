@@ -319,9 +319,10 @@ export async function reserveRetry(o: {
   /** The repeat's rank key (rests.ts `rankKey`), whose circuit judges it; absent: the route's mode-less circuit (`ROUTE_CIRCUIT`). */
   readonly restKey?: string;
 }): Promise<Reserved> {
-  const call = o.locate(o.shard.name, o.region).reserveRetry({
+  const region = o.shard.region ?? o.region;
+  const call = o.locate(o.shard.name, region).reserveRetry({
     endpointId: o.endpointId,
-    region: o.region,
+    region,
     index: o.shard.index,
     requestKey: o.requestKey,
     attempt: o.attempt,
@@ -333,8 +334,26 @@ export async function reserveRetry(o: {
   });
   const result = await within(call, o.waitMs, o.timers);
   if (result === "timeout" || "failed" in result) return { ok: false, reason: "unanswered" };
-  o.counts.learn(o.endpointId, o.region, result.shardsPerRegion);
+  o.counts.learn(o.endpointId, region, result.shardsPerRegion);
   return result.ok ? { ok: true, ticket: result.ticket } : { ok: false, reason: result.reason };
+}
+
+/** Upper bound on best-effort background shard notifications so a wedged shard never pins `waitUntil` indefinitely. */
+const BACKGROUND_SHARD_CALL_MS = 10_000;
+
+async function bounded<T>(call: Promise<T>): Promise<T> {
+  const result = await within(call, BACKGROUND_SHARD_CALL_MS, undefined);
+  if (result === "timeout") throw new Error("endpoint shard call timed out");
+  if (typeof result === "object" && result !== null && "failed" in result) throw result.failed;
+  return result;
+}
+
+function permitRegion(permit: PermitToken, fallback: LocationHint): LocationHint {
+  try {
+    return (shardRegion(permit.shard) as LocationHint | undefined) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 /**
@@ -343,8 +362,9 @@ export async function reserveRetry(o: {
  * hold.
  */
 export async function releaseRetry(locate: EndpointLocator, region: LocationHint, endpointId: string, shard: ShardChoice, requestKey: string, attempt: number, ticket: number): Promise<void> {
+  const targetRegion = shard.region ?? region;
   try {
-    await locate(shard.name, region).releaseRetry({ endpointId, region, index: shard.index, requestKey, attempt, ticket });
+    await bounded(locate(shard.name, targetRegion).releaseRetry({ endpointId, region: targetRegion, index: shard.index, requestKey, attempt, ticket }));
   } catch {
     // The ticket ends with its hold.
   }
@@ -375,12 +395,13 @@ export interface ReleaseFacts {
  */
 export async function releasePermit(locate: EndpointLocator, region: LocationHint, permit: PermitToken, outcome: Outcome, upstreamMayStillWork: boolean, facts: ReleaseFacts = {}): Promise<void> {
   const input = { permit, outcome, upstreamMayStillWork, ...facts };
+  const targetRegion = permitRegion(permit, region);
   try {
-    await locate(permit.shard, region).release({ ...input, retry: false });
+    await bounded(locate(permit.shard, targetRegion).release({ ...input, retry: false }));
   } catch (error) {
     try {
       // A first try lost in a reset of the shard is counted by the restarted shard (@gray/endpoint `ReleaseInput.afterReset`).
-      await locate(permit.shard, region).release({ ...input, retry: true, ...(objectReset(error) ? { afterReset: true } : {}) });
+      await bounded(locate(permit.shard, targetRegion).release({ ...input, retry: true, ...(objectReset(error) ? { afterReset: true } : {}) }));
     } catch {
       // The permit's deadline and the shard's in-doubt pool bound what it holds (endpoint.md 2.3).
     }
@@ -405,7 +426,7 @@ export function objectReset(error: unknown): boolean {
  */
 export async function notePermit(locate: EndpointLocator, region: LocationHint, permit: PermitToken, outcome: Outcome, repeat: boolean, measure?: OutcomeMeasure): Promise<void> {
   try {
-    await locate(permit.shard, region).note({ permit, outcome, repeat, ...(measure === undefined ? {} : { measure }) });
+    await bounded(locate(permit.shard, permitRegion(permit, region)).note({ permit, outcome, repeat, ...(measure === undefined ? {} : { measure }) }));
   } catch {
     // The refusal stays uncounted.
   }
@@ -415,7 +436,7 @@ export async function notePermit(locate: EndpointLocator, region: LocationHint, 
 export async function probeAnswered(locate: EndpointLocator, region: LocationHint, permit: PermitToken): Promise<void> {
   if (permit.probeId === null || permit.trial === true) return;
   try {
-    await locate(permit.shard, region).probeAnswered(permit);
+    await bounded(locate(permit.shard, permitRegion(permit, region)).probeAnswered(permit));
   } catch {
     // The probe's own result decides the spell anyway.
   }
@@ -429,7 +450,7 @@ export async function probeAnswered(locate: EndpointLocator, region: LocationHin
 export async function probeSent(locate: EndpointLocator, region: LocationHint, permit: PermitToken): Promise<void> {
   if (permit.probeId === null || permit.trial === true) return;
   try {
-    await locate(permit.shard, region).probeSent(permit);
+    await bounded(locate(permit.shard, permitRegion(permit, region)).probeSent(permit));
   } catch {
     // The probe's result says it went out.
   }

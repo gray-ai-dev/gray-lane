@@ -97,6 +97,16 @@ function mod(n: number, m: number): number {
 export class LaneNonceSpread {
   readonly #rows = new ObjectWindow(ROW_BUCKET_MS, ROW_BUCKETS);
   readonly #calls = new ObjectWindow(RATE_BUCKET_MS, RATE_BUCKETS);
+  #offset: number;
+
+  constructor(offset = 0) {
+    this.#offset = mod(Math.trunc(offset), LANE_NONCE_SHARDS_PER_KEY);
+  }
+
+  /** Updates the starting shard offset (e.g. from an entry replica's `TLS_REPLICA_DOMAIN`). */
+  setOffset(offset: number): void {
+    this.#offset = mod(Math.trunc(offset), LANE_NONCE_SHARDS_PER_KEY);
+  }
 
   /** k: how many objects a call at `now` may use. */
   objects(now: number): number {
@@ -110,9 +120,10 @@ export class LaneNonceSpread {
   /** The object a call at `now` goes to, counted as that call's. */
   pick(now: number): number {
     const k = this.objects(now);
-    let chosen = 0;
+    let chosen = this.#offset;
     let least = Number.POSITIVE_INFINITY;
-    for (let object = 0; object < k; object++) {
+    for (let step = 0; step < k; step++) {
+      const object = mod(this.#offset + step, LANE_NONCE_SHARDS_PER_KEY);
       const load = this.#rows.of(object) / NONCE_OBJECT_ROWS + this.#calls.of(object) / NONCE_OBJECT_CALLS_PER_SECOND;
       if (load < least) {
         least = load;
@@ -140,13 +151,38 @@ export class LaneNonceSpread {
 /** The isolate's tables, by key id: a lane signs with one key (two across a key change), so a handful at most. */
 const SPREADS = new Map<string, LaneNonceSpread>();
 const MAX_KEYS = 8;
+let replicaShardOffset = 0;
+
+/**
+ * Offsets the isolate's starting `LaneNonceDO` shard by its entry replica (`lane-1..16.<zone>` -> `0, 2, ..., 30`) so
+ * multiple entry replicas sharing one `LANE_BRIDGE_KEY_SEED` (`lane-1`) do not all pack shard 0.
+ */
+export function setLaneNonceReplica(replica: number | string | null): void {
+  let next = 0;
+  if (typeof replica === "number" && Number.isInteger(replica) && replica >= 1) {
+    next = mod((replica - 1) * 2, LANE_NONCE_SHARDS_PER_KEY);
+  } else if (typeof replica === "string" && replica.length > 0) {
+    const label = replica.split(".", 1)[0] ?? "";
+    const match = /([1-9][0-9]*)$/.exec(label);
+    if (match !== null) {
+      next = mod((Number(match[1]) - 1) * 2, LANE_NONCE_SHARDS_PER_KEY);
+    } else {
+      let h = 0;
+      for (let i = 0; i < replica.length; i++) h = (h * 31 + replica.charCodeAt(i)) | 0;
+      next = mod(h, LANE_NONCE_SHARDS_PER_KEY);
+    }
+  }
+  if (next === replicaShardOffset) return;
+  replicaShardOffset = next;
+  for (const spread of SPREADS.values()) spread.setOffset(next);
+}
 
 /** The isolate's `LaneNonceSpread` for `keyId`, shared by every bridge client that signs with it. */
 export function laneNonceSpread(keyId: string): LaneNonceSpread {
   let spread = SPREADS.get(keyId);
   if (spread === undefined) {
     if (SPREADS.size >= MAX_KEYS) SPREADS.delete(SPREADS.keys().next().value!);
-    spread = new LaneNonceSpread();
+    spread = new LaneNonceSpread(replicaShardOffset);
     SPREADS.set(keyId, spread);
   }
   return spread;

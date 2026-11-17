@@ -2149,6 +2149,12 @@ export class InferenceRun {
       response = await serving;
     } catch (error) {
       // A failure of Gray's own (a bug) before the response: free, recorded, and Gray's error.
+      if (this.billing === "charged") {
+        this.billing = "unsettled";
+        this.charged = null;
+        this.chargedSides = null;
+        this.chargeSeq = null;
+      }
       this.abandon(error, "request_failed");
       response = await this.closeRate(this.refuse(new ApiError(500, "internal_error"), this.admission));
     }
@@ -5643,7 +5649,7 @@ export class InferenceRun {
 
   /** The permit key of a deferred release. */
   private static permitKey(permit: PermitToken): string {
-    return `${permit.shard}/${permit.epoch}/${permit.id}`;
+    return `${permit.shard}/${permit.incarnation ?? ""}/${permit.epoch}/${permit.id}`;
   }
 
   /**
@@ -7449,8 +7455,12 @@ export class InferenceRun {
     client.readable.pipeTo(fixed.writable).catch(() => {});
     this.ttfbMs = clock() - this.started;
     this.relayed = (async () => {
-      // The sealed content takes the client's bytes as they go (content.md 3.5).
-      this.content?.push(out);
+      // The sealed content takes the client's bytes as they go (content.md 3.5); never let a sealing fault cut a paid answer.
+      try {
+        this.content?.push(out);
+      } catch (err) {
+        this.abandon(err, "content_push_failed");
+      }
       let delivered = true;
       for (let at = 0; at < out.length && delivered; at += UPSTREAM_BODY_CHUNK_BYTES) delivered = await client.write(out.subarray(at, at + UPSTREAM_BODY_CHUNK_BYTES));
       client.end();
@@ -7604,7 +7614,11 @@ export class InferenceRun {
     client.readable.pipeTo(fixed.writable).catch(() => {});
     this.ttfbMs = clock() - this.started;
     this.relayed = (async () => {
-      this.content?.push(bytes);
+      try {
+        this.content?.push(bytes);
+      } catch (err) {
+        this.abandon(err, "content_push_failed");
+      }
       let delivered = true;
       for (let at = 0; at < bytes.length && delivered; at += UPSTREAM_BODY_CHUNK_BYTES) delivered = await client.write(bytes.subarray(at, at + UPSTREAM_BODY_CHUNK_BYTES));
       client.end();

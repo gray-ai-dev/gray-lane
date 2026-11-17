@@ -1713,6 +1713,22 @@ export const SETTINGS: readonly SettingSpec[] = [
       "rests, and a probe's answer or departure: a root that does not answer holds no release (docs/request-path-availability.md M3).",
   },
   {
+    name: "ENDPOINT_ROOT_DELIVERY_TIMEOUT_MS",
+    key: "endpointRootDeliveryTimeoutMs",
+    workers: ["gateway"],
+    type: "int",
+    default: "3000",
+    min: 250,
+    max: 30000,
+    source:
+      "A Durable Object call to an object idle for 15 min or never called took 221 ms at the median and 727-2,278 ms at the 99th percentile " +
+      "(1,767 calls over two days, workers/gateway/src/lane/remote/nonces.ts:10); 3 s covers cold shard and sibling-root calls while keeping " +
+      "fan-out bounded so a wedged target cannot hold EndpointRoot's delivery loop forever.",
+    doc:
+      "How long EndpointRoot waits on each shard `apply` delivery or sibling-root `endRests` call during fan-out. A delivery that times out " +
+      "stays pending in EndpointRootCore and is resent on the next alarm (`apply` is versioned and idempotent).",
+  },
+  {
     name: "ENDPOINT_ACQUIRE_WAIT_MS",
     key: "endpointAcquireWaitMs",
     workers: ["gateway"],
@@ -5486,6 +5502,7 @@ export interface GatewayConfig {
   readonly endpointShardTargetRps: number;
   readonly endpointShardMax: number;
   readonly endpointRootCallTimeoutMs: number;
+  readonly endpointRootDeliveryTimeoutMs: number;
   readonly endpointAcquireWaitMs: number;
   readonly retryMaxAttempts: number;
   readonly retrySameOperator: number;

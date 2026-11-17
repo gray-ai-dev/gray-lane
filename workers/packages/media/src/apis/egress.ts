@@ -23,15 +23,14 @@ function ipLiteral(hostname: string): boolean {
   return hostname.startsWith("[") || /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/.test(hostname);
 }
 
-/** A host name as it is compared: lower-case, without the one trailing root dot DNS reads as the same name. */
+/** A host name as it is compared: lower-case, without any trailing root dots. */
 function hostKey(hostname: string): string {
-  const host = hostname.toLowerCase();
-  return host.endsWith(".") ? host.slice(0, -1) : host;
+  return hostname.toLowerCase().replace(/\.+$/, "");
 }
 
 /**
  * `upstream_url` for a fetched URL: https (http only with `allowPrivate`), no user name or password,
- * no IP literal (unless `allowPrivate`), no host on Gray's own zones. Undefined when refused.
+ * no IP literal or localhost (unless `allowPrivate`), no host on Gray's own zones. Undefined when refused.
  */
 export function vetUrl(raw: string, policy: EgressPolicy): URL | undefined {
   let url: URL;
@@ -43,8 +42,9 @@ export function vetUrl(raw: string, policy: EgressPolicy): URL | undefined {
   if (url.username !== "" || url.password !== "") return undefined;
   if (url.protocol !== "https:" && !(policy.allowPrivate && url.protocol === "http:")) return undefined;
   const host = hostKey(url.hostname);
-  if (!policy.allowPrivate && ipLiteral(host)) return undefined;
-  if (policy.ownZones.map(hostKey).some((zone) => host === zone || host.endsWith(`.${zone}`))) return undefined;
+  if (host === "") return undefined;
+  if (!policy.allowPrivate && (host === "localhost" || host.endsWith(".localhost") || ipLiteral(host))) return undefined;
+  if (policy.ownZones.map(hostKey).some((zone) => zone !== "" && (host === zone || host.endsWith(`.${zone}`)))) return undefined;
   return url;
 }
 

@@ -525,6 +525,10 @@ export interface ExchangeRequest {
   readonly incarnation?: Incarnation;
   /** The earlier storage whose books this shard took (`ExchangeResponse.handover`), once it took them. */
   readonly took?: string;
+  /** The last batch sequence number this storage wrote, when at least 1. */
+  readonly lastBatch?: number;
+  /** The last charge sequence number this storage wrote, when at least 1 (including shards without a hash chain). */
+  readonly lastChargeSeq?: number;
 }
 
 /** One storage of a shard: an id made with it, and when (the shard's clock). */
@@ -545,6 +549,10 @@ export interface Handover {
   readonly pools: Readonly<Record<PoolId, PoolGrant>>;
   readonly settled: number;
   readonly charges: ChargePoint | null;
+  /** The last batch sequence number the earlier storage reported, when known. */
+  readonly lastBatch?: number;
+  /** The last charge sequence number the earlier storage reported, when known. */
+  readonly lastChargeSeq?: number;
   /** When the earlier storage's tokens have all ended (the ordinary lifetime and its margin, from the new storage's start). */
   readonly inDoubtUntil: number;
 }
@@ -590,6 +598,8 @@ export interface ShardBooks {
   readonly version: number;
   readonly settled: number;
   readonly charges: ChargePoint | null;
+  readonly lastBatch?: number;
+  readonly lastChargeSeq?: number;
   readonly pools: Readonly<Record<PoolId, PoolGrant>>;
 }
 
@@ -617,6 +627,8 @@ export function parseBooks(v: unknown): ShardBooks {
     version: uint(o.version, "version"),
     settled: amount(o.settled, "settled"),
     charges: chargePoint(o.charges, "charges"),
+    ...(o.lastBatch === undefined || o.lastBatch === null ? {} : { lastBatch: uint(o.lastBatch, "lastBatch") }),
+    ...(o.lastChargeSeq === undefined || o.lastChargeSeq === null ? {} : { lastChargeSeq: uint(o.lastChargeSeq, "lastChargeSeq") }),
     pools: grants(o.pools, "pools"),
   };
 }
@@ -654,6 +666,8 @@ export function parseExchange(v: unknown): ExchangeRequest {
     rate,
     ...(o.incarnation === undefined || o.incarnation === null ? {} : { incarnation: incarnation(o.incarnation, "incarnation")! }),
     ...(o.took === undefined || o.took === null ? {} : { took: id(o.took, "took") }),
+    ...(o.lastBatch === undefined || o.lastBatch === null ? {} : { lastBatch: uint(o.lastBatch, "lastBatch") }),
+    ...(o.lastChargeSeq === undefined || o.lastChargeSeq === null ? {} : { lastChargeSeq: uint(o.lastChargeSeq, "lastChargeSeq") }),
   };
 }
 
@@ -1018,11 +1032,19 @@ export interface ProjectionBatch {
   readonly items: readonly BatchItem[];
 }
 
+export interface ProjectionHandover {
+  /** First batch sequence number written by this replacement storage. */
+  readonly batch: number;
+  /** Last charge sequence number acknowledged by the root for the replaced storage. */
+  readonly chargeSeq: number;
+}
+
 /** One queue message: one or more batches (or parts of one) of one shard. */
 export interface ProjectionMessage {
   readonly format: 1;
   readonly shard: string;
   readonly batches: readonly ProjectionBatch[];
+  readonly handover?: ProjectionHandover;
 }
 
 export function isBatchItem(v: unknown): v is BatchItem {

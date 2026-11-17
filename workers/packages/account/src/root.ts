@@ -1,6 +1,6 @@
 import { SETTINGS } from "@gray/config";
 import { isId } from "./validate.ts";
-import { parseShardName, REGIONS, retiredShard, shardName, type Region, type ShardAddress } from "./address.ts";
+import { MAX_SHARD_COUNT, parseShardName, REGIONS, retiredShard, shardName, type Region, type ShardAddress } from "./address.ts";
 import { isPeriodStart, periodEnd } from "./periods.ts";
 import {
   DISCOUNT,
@@ -180,6 +180,10 @@ interface LeaseRow {
    * it has. Absent: none.
    */
   handover?: Handover | null;
+  /** The largest batch sequence number the shard reported (`ExchangeRequest.lastBatch`). */
+  lastBatch?: number;
+  /** The largest charge sequence number the shard reported (`ExchangeRequest.lastChargeSeq` or `charges.seq`). */
+  lastChargeSeq?: number;
   /** The snapshot version the shard last said it holds: past it, a rebuilt root's version goes (`endRebuild`). */
   version?: number;
 }
@@ -405,6 +409,10 @@ export class AccountRoot {
         pools,
         settled: row.settled,
         charges: row.charges ? { seq: row.charges.seq, chain: row.charges.chain } : null,
+        ...(prior.lastBatch !== undefined ? { lastBatch: prior.lastBatch } : {}),
+        ...(prior.lastChargeSeq !== undefined || row.charges !== undefined
+          ? { lastChargeSeq: Math.max(prior.lastChargeSeq ?? 0, row.charges?.seq ?? 0) }
+          : {}),
         inDoubtUntil: Math.min(now, inc.at) + this.settings.holdTtlMs + this.settings.holdMarginMs,
       };
       row.incarnation = inc;
@@ -446,6 +454,8 @@ export class AccountRoot {
       this.mergePool(row, pool, rep);
     }
     row.settled = Math.max(row.settled, req.settled);
+    if (req.lastBatch !== undefined) row.lastBatch = Math.max(row.lastBatch ?? 0, req.lastBatch);
+    if (req.lastChargeSeq !== undefined || req.charges) row.lastChargeSeq = Math.max(row.lastChargeSeq ?? 0, req.lastChargeSeq ?? 0, req.charges?.seq ?? 0);
     if (req.charges) this.mergeCharges(row, { seq: req.charges.seq, chain: req.charges.chain, settled: req.settled });
     if (!stale) {
       row.epoch = req.epoch;
@@ -526,10 +536,10 @@ export class AccountRoot {
     });
   }
 
-  /** Every shard address of the workspace: each region, each index up to ACCOUNT_SHARD_COUNT's bound. */
+  /** Every shard address of the workspace: each region, each index up to ACCOUNT_SHARD_COUNT's bound (MAX_SHARD_COUNT). */
   private addresses(): string[] {
     const out: string[] = [];
-    for (const region of REGIONS) for (let index = 0; index < this.settings.shardCountMax; index++) out.push(shardName({ workspace: this.meta.workspace, region, index }));
+    for (const region of REGIONS) for (let index = 0; index < MAX_SHARD_COUNT; index++) out.push(shardName({ workspace: this.meta.workspace, region, index }));
     return out;
   }
 
@@ -550,6 +560,8 @@ export class AccountRoot {
       rate: req.rate,
       settled: req.settled,
       ...(req.charges ? { charges: { seq: req.charges.seq, chain: req.charges.chain, settled: req.settled } } : {}),
+      ...(req.lastBatch !== undefined ? { lastBatch: req.lastBatch } : {}),
+      ...(req.lastChargeSeq !== undefined || req.charges ? { lastChargeSeq: Math.max(req.lastChargeSeq ?? 0, req.charges?.seq ?? 0) } : {}),
       covered: pools[DISCOUNT]?.used ?? 0,
       suspect: false,
       pools,
@@ -569,9 +581,14 @@ export class AccountRoot {
   private async probe(): Promise<void> {
     const missing = this.meta.rebuilding?.missing ?? [];
     if (missing.length === 0) return;
-    const answers = await Promise.allSettled(
-      missing.map((n) => withTimeout(Promise.resolve().then(() => this.deps.shard(parseShardName(n)!).books()), this.settings.rootCallTimeoutMs, this.deps.recallTimers)),
-    );
+    const answers: PromiseSettledResult<unknown>[] = [];
+    for (let start = 0; start < missing.length; start += 64) {
+      const slice = missing.slice(start, start + 64);
+      const batch = await Promise.allSettled(
+        slice.map((n) => withTimeout(Promise.resolve().then(() => this.deps.shard(parseShardName(n)!).books()), this.settings.rootCallTimeoutMs, this.deps.recallTimers)),
+      );
+      answers.push(...batch);
+    }
     const leases = new Map(this.leases);
     const changed = new Set<string>();
     const answered = new Set<string>();
@@ -612,6 +629,8 @@ export class AccountRoot {
         rate: 0,
         settled: books.settled,
         ...(books.charges ? { charges: { seq: books.charges.seq, chain: books.charges.chain, settled: books.settled } } : {}),
+        ...(books.lastBatch !== undefined ? { lastBatch: books.lastBatch } : {}),
+        ...(books.lastChargeSeq !== undefined || books.charges ? { lastChargeSeq: Math.max(books.lastChargeSeq ?? 0, books.charges?.seq ?? 0) } : {}),
         covered: pools[DISCOUNT]?.used ?? 0,
         suspect: false,
         pools,
@@ -628,6 +647,8 @@ export class AccountRoot {
       r.used = Math.max(r.used, p.used);
     }
     row.settled = Math.max(row.settled, books.settled);
+    if (books.lastBatch !== undefined) row.lastBatch = Math.max(row.lastBatch ?? 0, books.lastBatch);
+    if (books.lastChargeSeq !== undefined || books.charges) row.lastChargeSeq = Math.max(row.lastChargeSeq ?? 0, books.lastChargeSeq ?? 0, books.charges?.seq ?? 0);
     row.version = Math.max(row.version ?? 0, books.version);
     if (books.charges) this.mergeCharges(row, { seq: books.charges.seq, chain: books.charges.chain, settled: books.settled });
     leases.set(name, row);

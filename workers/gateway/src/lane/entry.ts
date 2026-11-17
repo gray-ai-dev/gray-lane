@@ -40,6 +40,7 @@ import { PeerCall, PeerRegistry, peerTimingOf, stackRelayKeysOf } from "./peer-c
 import { PeerLink } from "./peer-link.ts";
 import { EntryLink } from "./entry-link.ts";
 import { BackgroundClient } from "./remote/background.ts";
+import { setLaneNonceReplica } from "./remote/nonces.ts";
 import { platformTimers } from "../client.ts";
 import { EntryRoleClient, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
 import type { LanePeers } from "./types.ts";
@@ -962,6 +963,7 @@ export default {
       const replica = laneReplicaIndex(env, identity.tls.replicaDomain);
       if (replica.problem !== null) throw new LaneBootError([replica.problem]);
       replicaIndex = replica.index;
+      setLaneNonceReplica(replicaIndex ?? identity.tls.replicaDomain);
     } catch (thrown) {
       return bootFailure(thrown);
     }

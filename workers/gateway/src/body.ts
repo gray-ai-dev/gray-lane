@@ -75,8 +75,10 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
   if (declared !== null && declared > limits.rawMax && spool === undefined) return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax) };
   const reader = request.body.getReader();
   const newSpool = (): Promise<Spool> => Spool.open(spool!, `${SPOOL_PREFIX}${crypto.randomUUID()}`, spoolPartBytes(declared));
-  // A stated length: one buffer of it (tiers A and B), or the spool from the first byte (tier C).
-  let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(declared) : null;
+  // A stated length (tiers A and B): start with a modest buffer (at most 64 KiB) and grow as bytes arrive so an
+  // unauthenticated request naming a 64 MiB Content-Length cannot pre-allocate 64 MiB before sending a byte.
+  const INITIAL_DECLARED_BUFFER = 65_536;
+  let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
   let spooled: Spool | null = declared !== null && declared > limits.rawMax ? await newSpool() : null;
   const chunks: Uint8Array[] = [];
   let chunked = 0;
@@ -129,7 +131,14 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
       }
       if (buffer !== null) {
         // More than the client stated: the body is not what its header says.
-        if (length > buffer.length) return await fail(new ApiError(400, "request_body_incomplete"));
+        if (declared !== null && length > declared) return await fail(new ApiError(400, "request_body_incomplete"));
+        if (length > buffer.length) {
+          const nextSize = Math.min(declared ?? limits.rawMax, Math.max(buffer.length * 2, length));
+          const grown = new Uint8Array(nextSize);
+          grown.set(buffer.subarray(0, length - chunk.length), 0);
+          buffer = grown;
+          report();
+        }
         buffer.set(chunk, length - chunk.length);
         continue;
       }
