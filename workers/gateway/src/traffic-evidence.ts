@@ -196,7 +196,11 @@ export function codeFailure(code: string): AttemptFailure {
   return "protocol";
 }
 
-/** Defect codes an answer of the provider's fails with (`implicates_provider`'s protocol failures). */
+/**
+ * Defect codes an answer of the provider's fails with (`implicates_provider`'s protocol failures). A text answer past
+ * its answer limit is Gray's own limit (relay.ts `LimitSource`), not counted, so it never comes here; the limit codes
+ * stand for a model API's answer past its media limit, which stays the provider's.
+ */
 const PROVIDER_DEFECTS: ReadonlySet<string> = new Set([
   "upstream_attempt_failed",
   "upstream_stream_interrupted",

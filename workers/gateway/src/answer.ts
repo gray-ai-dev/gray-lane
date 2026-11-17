@@ -5,7 +5,7 @@ import { asksForStructuredOutput } from "@gray/trust";
 import { type ClientPresence, ClientStream, type StreamTimers } from "./client.ts";
 import type { AnswerInspector, GateRequest } from "./gate.ts";
 import { NullUsageWatch, TeeListener, watchesNulls } from "./nulls.ts";
-import { UpstreamReader } from "./relay.ts";
+import { type LimitSource, UpstreamReader } from "./relay.ts";
 import type { AnswerShare, Retained } from "./retained.ts";
 import type { AnswerSink } from "./sinks.ts";
 
@@ -199,10 +199,14 @@ export type AnswerRead =
       readonly why: string;
       /** The tool gate's refusal, when it refused a call on the way (`upstream_trust_policy_rejected`). */
       readonly violation?: string;
-      /** Null for a limit of Gray's own (`gateway_capacity`, ANSWER_HELD_MAX_BYTES): the endpoint is not blamed. */
+      /** Null for a limit of Gray's own (`gateway_capacity`, ANSWER_HELD_MAX_BYTES, the answer limit): the endpoint is not blamed. */
       readonly supplierFailure: "timeout" | "upstream_error" | "invalid_response" | null;
-      /** One answer kept more than ANSWER_HELD_MAX_BYTES, weighed: Gray's memory bound ended it, as a held stream's does (relay.ts `limitSource`). */
-      readonly limitSource?: "gateway_memory";
+      /**
+       * Gray's own bound ended it, as a held stream's does (relay.ts `LimitSource`): one answer kept more than
+       * ANSWER_HELD_MAX_BYTES, weighed (`gateway_memory`), or grew past what its request's output limit allows
+       * (`request_output_limit`).
+       */
+      readonly limitSource?: LimitSource;
       /** Gray stopped reading while the upstream may still be working. */
       readonly upstreamMayStillWork: boolean;
       readonly received: number;
@@ -310,7 +314,8 @@ export class AnswerRelay {
     this.received += bytes.length;
     if (this.received > this.input.answerLimit) {
       this.upstream.cancel();
-      return this.failed("upstream_body_limit", `the answer passed its limit of ${this.input.answerLimit} bytes`, "invalid_response", true);
+      // The bytes its request's output limit allows (@gray/limits `answerLimit`): Gray's own bound, not the supplier's failure.
+      return this.failed("upstream_body_limit", `the answer passed its limit of ${this.input.answerLimit} bytes`, null, true, { limitSource: "request_output_limit" });
     }
     try {
       this.scan.write(bytes);
@@ -577,7 +582,7 @@ export class AnswerRelay {
     why: string,
     supplierFailure: Extract<AnswerRead, { kind: "failed" }>["supplierFailure"],
     stillWorking: boolean,
-    extra: { readonly violation?: string; readonly limitSource?: "gateway_memory"; readonly cutByDeadline?: boolean } = {},
+    extra: { readonly violation?: string; readonly limitSource?: LimitSource; readonly cutByDeadline?: boolean } = {},
   ): AnswerRead {
     this.forget();
     return {

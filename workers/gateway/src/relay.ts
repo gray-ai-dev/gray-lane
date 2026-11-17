@@ -267,6 +267,16 @@ export interface StreamRelayInput {
  */
 export type StreamEnd = RelayEnd & { readonly checks: AnswerChecks };
 
+/**
+ * Which of Gray's own limits ended an answer, as the record and the client's error name it
+ * (`limit_source`): the memory the gateway holds of one answer (ANSWER_HELD_MAX_BYTES,
+ * `gateway_memory`), or the bytes the request's own output limit allows (@gray/limits `answerLimit`,
+ * `request_output_limit`). Either is Gray's, never the supplier's failure: a bound derived from the
+ * customer's `max_output_tokens` that a real answer passes would otherwise rest an honest route for
+ * every customer of its model (staging 2026-11-17, docs/limits.md section 4).
+ */
+export type LimitSource = "gateway_memory" | "request_output_limit";
+
 type RelayEnd =
   /**
    * Charged; `delivered`: the client was still there and took every held frame. A client that left has
@@ -293,8 +303,8 @@ type RelayEnd =
       /** Gray stopped reading while the upstream may still be working. */
       readonly upstreamMayStillWork: boolean;
       readonly received: number;
-      /** Set when a limit of Gray's own ended the answer, not the request's (the held answer's ANSWER_HELD_MAX_BYTES). */
-      readonly limitSource?: "gateway_memory";
+      /** Set when a limit of Gray's own ended the answer (`LimitSource`): never the supplier's failure. */
+      readonly limitSource?: LimitSource;
       /**
        * Set when a read ended the stream (the silence limit, the request deadline, or a connection
        * that broke): how long the upstream had sent nothing by then, since its last byte or, before
@@ -511,9 +521,11 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
   // answer limit is checked before), so the supplier did nothing wrong. The stream ends as an
   // upstream failure would for the client (upstream_stream_limit: "not charged"), free, and the
   // endpoint's breaker does not count it.
-  const heldTooMuch = (stillWorking: boolean): RelayEnd => ({
-    ...(fail("upstream_stream_limit", "upstream_stream_limit", `what the stream holds passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds`, null, stillWorking) as Extract<RelayEnd, { kind: "failed" }>),
-    limitSource: "gateway_memory",
+  const heldTooMuch = (stillWorking: boolean): RelayEnd => overLimit("upstream_stream_limit", `what the stream holds passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds`, stillWorking, "gateway_memory");
+  /** A limit of Gray's own ended the answer (`LimitSource`): free, and not the supplier's failure. */
+  const overLimit = (code: string, why: string, stillWorking: boolean, source: LimitSource): RelayEnd => ({
+    ...(fail(code, code, why, null, stillWorking) as Extract<RelayEnd, { kind: "failed" }>),
+    limitSource: source,
   });
   /**
    * Weighs what the stream keeps (`streamWeight`: the held frames, the frames a priming handed back,
@@ -600,7 +612,7 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
       const ka = keepAlive(events);
       if (!ka) {
         total += frame.length;
-        if (total > input.answerLimit) return fail("upstream_stream_limit", "upstream_stream_limit", `the answer passed its limit of ${input.answerLimit} bytes`, "invalid_response", true);
+        if (total > input.answerLimit) return overLimit("upstream_stream_limit", `the answer passed its limit of ${input.answerLimit} bytes`, true, "request_output_limit");
       }
       if (gated) observeContent(events);
       const verdict = inspector.observe(events);
@@ -634,7 +646,7 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
       if (ids?.releases(bytes) === true) return idFailure(new ToolIdFailure(TOOL_ID_CODES.rewriteIncomplete, "a frame still held a replaced tool-call id"), true);
       await release(bytes, carriesContent(events));
     }
-    if (frames.length > frameLimit) return fail("upstream_frame_limit", "upstream_frame_limit", `a frame passed its limit of ${frameLimit} bytes`, "invalid_response", true);
+    if (frames.length > frameLimit) return overLimit("upstream_frame_limit", `a frame passed its limit of ${frameLimit} bytes`, true, frameLimitSource(frameLimit, input.answerLimit));
     return weighed(true);
   };
 
@@ -809,8 +821,8 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
 
 /**
  * The class of a failure before an answer committed, as @gray/errors `Class` names it (the server's
- * `Outcome::bare`): the upstream sent no event stream (`route_fault`), a frame the decoder, the trust
- * gate or a limit refused (`answer_defect`), the stream ended or broke (`transport`), or went silent
+ * `Outcome::bare`): the upstream sent no event stream (`route_fault`), a frame the decoder or the
+ * trust gate refused (`answer_defect`), the stream ended or broke (`transport`), or went silent
  * past its limit or the request's deadline (`timeout`).
  */
 export type UncommittedClass = "route_fault" | "answer_defect" | "transport" | "timeout";
@@ -862,14 +874,25 @@ export interface Primed {
 /**
  * A limit of Gray's own ended priming, which no other route lifts (the dispatch line's `final`): the
  * frames held alone passed ANSWER_HELD_MAX_BYTES (`upstream_stream_limit`, as the relay's held answer
- * does: the client is told 502 with `limit_source: gateway_memory`), or the isolate's answers could not
- * hold them besides the others in flight (`gateway_capacity`, 429).
+ * does: the client is told 502 with `limit_source: gateway_memory`), the answer passed the bytes its
+ * request's output limit allows (`upstream_stream_limit` or, for a frame, `upstream_frame_limit`, with
+ * `limit_source: request_output_limit`), or the isolate's answers could not hold them besides the
+ * others in flight (`gateway_capacity`, 429).
  */
 export interface PrimeGray {
   readonly kind: "gray";
-  readonly code: "upstream_stream_limit" | "gateway_capacity";
+  readonly code: "upstream_stream_limit" | "upstream_frame_limit" | "gateway_capacity";
+  /** Which limit: `gateway_memory` for `gateway_capacity`. */
+  readonly limitSource: LimitSource;
+  /** The limit's bytes, for the client's `limit_bytes`. */
+  readonly limitBytes: number;
   readonly received: number;
   readonly why: string;
+}
+
+/** Which bound a frame passed: `min(frameLimit, answerLimit)` is the answer's own when that is the smaller. */
+export function frameLimitSource(frameLimit: number, answerLimit: number): LimitSource {
+  return frameLimit < answerLimit ? "gateway_memory" : "request_output_limit";
 }
 
 /** The client left before the stream committed: the attempt ends, free (docs/cloudflare-native.md 5.6 rule 1). */
@@ -928,8 +951,9 @@ export interface PrimeInput {
  * client and nothing was charged, so the attempt may still fail and another one go (the client has
  * Gray's own keep-alives meanwhile, once its headers went): an error event (Anthropic's
  * `message_start` then `overloaded_error`, say) hands its payload on; the end of the stream or a cut
- * is a transport failure, silence or the deadline a timeout, and a frame that cannot be decoded, that
- * the trust gate refuses or that passes the answer limit an answer defect.
+ * is a transport failure, silence or the deadline a timeout, and a frame that cannot be decoded or
+ * that the trust gate refuses an answer defect. A frame past the answer limit is Gray's own limit
+ * (`PrimeGray`, `request_output_limit`), never the supplier's failure.
  *
  * What is held: the frames that carry the answer, within the answer limit, and the keep-alives among
  * them while all that is held stays within it. A keep-alive carries none of the answer and any
@@ -992,8 +1016,14 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
     upstream.cancel();
     forget();
     return bytes > heldLimit
-      ? { kind: "gray", code: "upstream_stream_limit", received, why: `what the stream held before it committed passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds` }
-      : { kind: "gray", code: "gateway_capacity", received, why: `the answers in flight in this isolate would hold more than the ${heldLimit} bytes the gateway holds of them together` };
+      ? { kind: "gray", code: "upstream_stream_limit", limitSource: "gateway_memory", limitBytes: heldLimit, received, why: `what the stream held before it committed passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds` }
+      : { kind: "gray", code: "gateway_capacity", limitSource: "gateway_memory", limitBytes: heldLimit, received, why: `the answers in flight in this isolate would hold more than the ${heldLimit} bytes the gateway holds of them together` };
+  };
+  /** The answer passed a bound of Gray's own before it committed (`PrimeGray`): free, no other route, not the supplier's failure. */
+  const overLimit = (code: "upstream_stream_limit" | "upstream_frame_limit", bound: number, why: string): PrimeGray => {
+    upstream.cancel();
+    forget();
+    return { kind: "gray", code, limitSource: code === "upstream_frame_limit" ? frameLimitSource(bound, limit) : "request_output_limit", limitBytes: bound, received, why };
   };
   /** Weighs what priming holds, reports it, and ends priming when it no longer fits (`gray`). */
   const weighed = (): PrimeGray | null => {
@@ -1022,7 +1052,7 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
       return failed("answer_defect", "upstream_trust_policy_rejected", verdict.violation, true, verdict.violation);
     }
     heldAnswer += frame.length;
-    if (heldAnswer > limit) return failed("answer_defect", "upstream_stream_limit", `the answer passed its limit of ${limit} bytes before it committed`, true);
+    if (heldAnswer > limit) return overLimit("upstream_stream_limit", limit, `the answer passed its limit of ${limit} bytes before it committed`);
     // The keep-alives held give up their room to the answer.
     if (heldPings + heldAnswer > room) {
       held = held.filter((h) => !h.ping);
@@ -1065,7 +1095,7 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
       if (ended !== null) return ended;
     }
     // A frame still arriving is part of the answer, and no larger.
-    if (frames.length > frameLimit) return failed("answer_defect", "upstream_frame_limit", `a frame passed its limit of ${frameLimit} bytes`, true);
+    if (frames.length > frameLimit) return overLimit("upstream_frame_limit", frameLimit, `a frame passed its limit of ${frameLimit} bytes`);
     const over = weighed();
     if (over !== null) return over;
     const code = received === 0 ? "upstream_stream_empty" : "upstream_stream_incomplete";

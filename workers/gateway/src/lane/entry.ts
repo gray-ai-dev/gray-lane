@@ -739,6 +739,25 @@ function entryRoleOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayC
   return role;
 }
 
+/**
+ * `ctx` as a counted request's handler gets it (`entry-role.ts`): each `waitUntil` also holds the request's count, so a
+ * stopping replica closes its stack VMs' sessions, the last thing that holds workerd's SIGTERM drain, only once the
+ * request's own end (its record, receipt and the relay's outcome report) has left.
+ */
+function heldContext(ctx: ExecutionContext, hold: (work: PromiseLike<unknown>) => void): ExecutionContext {
+  const held: Pick<ExecutionContext, "waitUntil" | "passThroughOnException" | "props"> = {
+    waitUntil: (work: Promise<unknown>) => {
+      hold(work);
+      ctx.waitUntil(work);
+    },
+    passThroughOnException: () => ctx.passThroughOnException(),
+    get props() {
+      return ctx.props;
+    },
+  };
+  return held as ExecutionContext;
+}
+
 /** A service binding as the lane calls it (`PEERLINK`, an `external` service on peerlink's unix socket). */
 interface FetchBinding {
   fetch(request: Request): Promise<Response>;
@@ -1001,11 +1020,19 @@ export default {
       const link = peerLinkOf(state, env, peers, identity);
       if (link !== null && PeerLink.handles(url.pathname)) return link.route(request, url);
     }
-    // ER9 as revised: a replica counts every request but its health route's from here to its answer's end.
+    // ER9 as revised: a replica counts every request but its health route's from here to its answer's end, and until the
+    // work it leaves behind settled: the handler's run and its `ctx.waitUntil` (its record, receipt and the relay's
+    // outcome report, which frees the pick's lease), which workerd's SIGTERM drain does not wait for (`entry-role.ts`).
     const end = replica === null || (declaredPath(url.pathname)?.path ?? url.pathname) === HEALTH_PATH ? null : replica.begin(request.signal);
     let answer: Response;
     try {
-      answer = missing.length > 0 ? misconfigured(request, url, state, missing) : await route(request, env, cfg, state, identity, url, ctx, origin, peers, replica);
+      if (missing.length > 0) {
+        answer = misconfigured(request, url, state, missing);
+      } else {
+        const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica);
+        end?.hold(routed);
+        answer = await routed;
+      }
     } catch (thrown) {
       end?.();
       throw thrown;

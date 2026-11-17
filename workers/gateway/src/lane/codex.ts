@@ -3,7 +3,7 @@ import { type CanonicalEvent, ProtocolError, ProtocolStreamDecoder, SseFrames, j
 import { wholeAnswerWeight } from "../answer.ts";
 import type { ClientPresence } from "../client.ts";
 import type { StreamInspector } from "../gate.ts";
-import { type PrimeGray, type PrimeLeft, type Retaining, type Uncommitted, type UncommittedClass, UpstreamReader, eventStream, streamWeight } from "../relay.ts";
+import { type PrimeGray, type PrimeLeft, type Retaining, type Uncommitted, type UncommittedClass, UpstreamReader, eventStream, frameLimitSource, streamWeight } from "../relay.ts";
 import type { AnswerShare, Retained } from "../retained.ts";
 
 /**
@@ -20,7 +20,8 @@ import type { AnswerShare, Retained } from "../retained.ts";
  * `response.failed`) into the provider's error for the dispatch rules to classify; each wait bounded
  * by the deadline and UPSTREAM_SILENCE_MS; the answer's frames bounded by its answer limit, a frame
  * being assembled by `frameLimit`, and what the read holds weighed against ANSWER_HELD_MAX_BYTES and
- * the isolate's answers (`streamWeight`). Only the terminal event is kept: its data's `response`
+ * the isolate's answers (`streamWeight`); each a limit of Gray's own (`PrimeGray`), never the
+ * supplier's failure. Only the terminal event is kept: its data's `response`
  * bytes, exactly as the vendor wrote them, and their parse (weighed by `keptWeight`). After it the
  * stream is read to its end, as the decoder requires (a keep-alive may follow; any other event fails
  * the stream), and a client that leaves then no longer ends the read: the upstream's final event is
@@ -144,8 +145,14 @@ async function readCompleted(input: CompletedInput, fed: { failed: boolean }): P
     upstream.cancel();
     forget();
     return bytes > heldLimit
-      ? { kind: "gray", code: "upstream_stream_limit", received, why: `what the stream held passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds` }
-      : { kind: "gray", code: "gateway_capacity", received, why: `the answers in flight in this isolate would hold more than the ${heldLimit} bytes the gateway holds of them together` };
+      ? { kind: "gray", code: "upstream_stream_limit", limitSource: "gateway_memory", limitBytes: heldLimit, received, why: `what the stream held passed ${heldLimit} bytes (ANSWER_HELD_MAX_BYTES), the most of one answer the gateway holds` }
+      : { kind: "gray", code: "gateway_capacity", limitSource: "gateway_memory", limitBytes: heldLimit, received, why: `the answers in flight in this isolate would hold more than the ${heldLimit} bytes the gateway holds of them together` };
+  };
+  /** The answer passed a bound of Gray's own (relay.ts `PrimeGray`): free, no other route, not the supplier's failure. */
+  const overLimit = (code: "upstream_stream_limit" | "upstream_frame_limit", bound: number, why: string): PrimeGray => {
+    upstream.cancel();
+    forget();
+    return { kind: "gray", code, limitSource: code === "upstream_frame_limit" ? frameLimitSource(bound, limit) : "request_output_limit", limitBytes: bound, received, why };
   };
   /** One frame's events: null to read on, or how the read ends. */
   const take = (events: readonly CanonicalEvent[], frame: Uint8Array): CompletedEnd | null => {
@@ -160,7 +167,7 @@ async function readCompleted(input: CompletedInput, fed: { failed: boolean }): P
       }
     }
     answer += frame.length;
-    if (answer > limit) return failed("answer_defect", "upstream_stream_limit", `the answer passed its limit of ${limit} bytes`, true);
+    if (answer > limit) return overLimit("upstream_stream_limit", limit, `the answer passed its limit of ${limit} bytes`);
     for (const event of events) {
       if (event.type !== "native" || !TERMINAL.has(asStr(get(event.payload, "type")) ?? "")) continue;
       const response = get(event.payload, "response");
@@ -189,7 +196,7 @@ async function readCompleted(input: CompletedInput, fed: { failed: boolean }): P
       const ended = take(events, frame);
       if (ended !== null) return ended;
     }
-    if (frames.length > frameLimit) return failed("answer_defect", "upstream_frame_limit", `a frame passed its limit of ${frameLimit} bytes`, true);
+    if (frames.length > frameLimit) return overLimit("upstream_frame_limit", frameLimit, `a frame passed its limit of ${frameLimit} bytes`);
     const over = weighed();
     if (over !== null) return over;
     const code = received === 0 ? "upstream_stream_empty" : "upstream_stream_incomplete";

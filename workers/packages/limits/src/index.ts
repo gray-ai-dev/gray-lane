@@ -115,8 +115,14 @@ export const TEXT_BYTES_PER_TOKEN_HUNDREDTHS = 459n;
  *   138 B (https://platform.claude.com/docs/en/build-with-claude/streaming).
  * - Chat: a `chat.completion.chunk` with one tool-call argument delta, `usage: null` and
  *   `obfuscation`: 376 B (OpenAI API reference, chat streaming).
- * - Responses: a `response.output_text.delta` with its item id, indexes, sequence number,
- *   `logprobs` and `obfuscation`: 269 B (OpenAI API reference, Responses streaming events).
+ * - Responses: a `response.output_text.delta` as ChatGPT's Codex backend sends it: 293 B. Measured
+ *   on staging 2026-11-17 (three gpt-6.1-sol answers through the confidential lane): every delta
+ *   event is 284 B at a 1-digit `sequence_number`, because `obfuscation` pads `delta` and itself to
+ *   16 characters and the backend adds `safety_buffering` and a 54-character item id; plus 6 B for a
+ *   7-digit sequence number, 2 for a 3-digit `output_index` and 1 for a 2-digit `content_index`. A
+ *   delta longer than 16 characters drops the padding, so the event is at most this plus its text,
+ *   which `textRepeats` counts. The documented event (OpenAI API reference) is smaller: 269 B, the
+ *   value before, which cut real answers (docs/limits.md, section 4).
  * - Gemini: a `GenerateContentResponse` chunk with one part, its candidate fields, `usageMetadata`
  *   and `modelVersion`: 349 B (https://ai.google.dev/api/generate-content).
  */
@@ -127,7 +133,7 @@ export function tokenEventBytes(protocol: Protocol): bigint {
     case "open_ai_chat":
       return 376n;
     case "open_ai_responses":
-      return 269n;
+      return 293n;
     case "gemini":
       return 349n;
     default:
@@ -148,7 +154,7 @@ export function textRepeats(protocol: Protocol): bigint {
 /**
  * The most wire bytes one output token of `protocol` can take: `tokenEventBytes` plus
  * `TEXT_BYTES_PER_TOKEN_HUNDREDTHS` for each time the text is sent, rounded up. Anthropic 143,
- * Chat 381, Responses 292, Gemini 354.
+ * Chat 381, Responses 316, Gemini 354.
  */
 export function bytesPerToken(protocol: Protocol): bigint {
   return tokenEventBytes(protocol) + divCeil(TEXT_BYTES_PER_TOKEN_HUNDREDTHS * textRepeats(protocol), 100n);
@@ -176,10 +182,17 @@ export function fixedAnswerBytes(protocol: Protocol): bigint {
 }
 
 /**
- * Responses: what its answers sent beyond 292 B per output token and three copies of the whole
- * request body, at most (n=25, the same query). The rest of its fixed part is the request echo.
+ * Responses: what an answer sends besides its tokens and the request echo (`answerEchoBytes`): twice
+ * the largest measured, 2 x 7,188 B. Measured on staging 2026-11-17 in three ChatGPT Codex backend
+ * answers (gpt-6.1-sol through the confidential lane) as the response bytes less the delta events,
+ * less four more copies of the text (the done events and `response.completed`) and less the echo:
+ * 6,560, 7,188 and 6,560 B (`response.metadata` alone varied from 268 to 896 B). The margin holds
+ * what varies between answers: moderation metadata, usage attribution entries and response-object
+ * fields. A 16-token answer is all framing and no slack in its tokens, so this part must hold the
+ * framing whole. The value before, 5,227 B, was measured on OpenAI API answers at 292 B per token
+ * and cut every short Codex answer (docs/limits.md, section 4).
  */
-export const RESPONSES_FIXED_BYTES = 5_227n;
+export const RESPONSES_FIXED_BYTES = 14_376n;
 
 /**
  * How many times a Responses stream repeats the request's own fields: `response.created`,
@@ -308,8 +321,10 @@ export class AnswerBytes {
 /**
  * The most bytes the answer to one request may take on the wire, from the most tokens it may
  * produce (`outputBound`: the output its credit hold covers, plus the serving endpoints' declared
- * allowance, times its candidate count). A stream or body past it is the upstream's failure
- * (`upstream_stream_limit`, `upstream_body_limit`), never a valid answer.
+ * allowance, times its candidate count). A stream or body past it ends with `upstream_stream_limit`
+ * or `upstream_body_limit`, free: a limit of Gray's own (`limit_source: request_output_limit`), which
+ * never counts against the route, since a bound too small for a real answer would otherwise rest
+ * an honest supplier for every customer (staging 2026-11-17).
  */
 export function answerLimit(protocol: Protocol, outputBound: bigint, body: Json, images: boolean): bigint {
   return AnswerBytes.of(protocol, body, images).limit(outputBound);

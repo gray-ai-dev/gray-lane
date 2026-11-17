@@ -135,7 +135,7 @@ import { chargeSidesMismatch, customerTextRates, generationPriceOf, pricesModali
 import { type ContentBucket, MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
 import { parseHeld, parseStored, type ParsedRequest } from "./parse.ts";
 import { redactedHeaders, redactedQuery } from "./redact.ts";
-import { type ChunkTap, type Primed as PrimedStream, type Uncommitted as StreamUncommitted, primeStream, readAnswer, relayStream, type SettleOutcome, type StreamEnd } from "./relay.ts";
+import { type ChunkTap, type LimitSource, type Primed as PrimedStream, type Uncommitted as StreamUncommitted, primeStream, readAnswer, relayStream, type SettleOutcome, type StreamEnd } from "./relay.ts";
 import { unrouted } from "./resolution.ts";
 import { type AnswerShare, Retained } from "./retained.ts";
 import { capable, dispatchExploratory, nativeRoutes, outputOverhead, RELEASE_OUTDATED, releaseOutdated, pinHolds, priceRoutes, probeLeases, promptOverhead, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, routeProbeLeases, withinBound, type Route } from "./routes.ts";
@@ -3881,6 +3881,14 @@ export class InferenceRun {
    * tool call comes near the bound, so this is a bug or a client asking for it (text passed on, then a
    * tool call grown past it): an alert, with the key and workspace, so a key that repeats it is seen.
    */
+  private answerLimitCut(route: Route, code: string, limitBytes: number | null, received: number): void {
+    // The bound from the request's output limit (@gray/limits `answerLimit`) ended an answer: Gray's limit, free, and not
+    // the supplier's failure. A real answer that passes it means the bound is too small for that API's answers
+    // (docs/limits.md section 6): a warning with what it read, so a bound to raise is seen.
+    const line = { level: "warn", event: "answer_limit_cut", request_id: this.requestId, code, limit_bytes: limitBytes, bytes_received: received, endpoint: route.record.endpointId };
+    console.warn(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
+  }
+
   private heldLimitAlert(route: Route): void {
     console.error(
       JSON.stringify({ level: "alert", event: "answer_held_limit", request_id: this.requestId, workspace: this.key?.workspaceId ?? null, key: this.key?.keyId ?? null, held_bytes: this.heldBytes, limit_bytes: this.deps.cfg.answerHeldMaxBytes, endpoint: route.record.endpointId }),
@@ -6221,7 +6229,8 @@ export class InferenceRun {
       case "left":
         return { kind: "left" };
       case "gray":
-        return { kind: "final", code: primed.code, error: primed.code === "gateway_capacity" ? capacityError() : new ApiError(502, primed.code).withMeta("limit_source", "gateway_memory") };
+        if (primed.limitSource === "request_output_limit") this.answerLimitCut(attempt.route, primed.code, primed.limitBytes, primed.received);
+        return { kind: "final", code: primed.code, error: primed.code === "gateway_capacity" ? capacityError() : ownLimitError(primed.code, primed.limitSource, primed.limitBytes) };
       case "uncommitted":
         // It failed before its commit, so before its finish: its checks are its priming's inspector's, the only one
         // that read it (the relay's reads a committed stream again from its start).
@@ -6902,7 +6911,8 @@ export class InferenceRun {
       console.warn(JSON.stringify(this.lane === null ? { level: "warn", event: "upstream_stream_cut", request_id: this.requestId, code: end.code, why: end.why.slice(0, 200), silence_ms: end.silenceMs, bytes_received: end.received, endpoint: route.record.endpointId } : laneSafeLog({ level: "warn", event: "upstream_stream_cut", request_id: this.requestId, code: end.code, silence_ms: end.silenceMs, bytes_received: end.received, endpoint: route.record.endpointId })));
     }
     this.releaseHold({ reason: end.reason, detail });
-    if (end.limitSource !== undefined) this.heldLimitAlert(route);
+    if (end.limitSource === "gateway_memory") this.heldLimitAlert(route);
+    if (end.limitSource === "request_output_limit") this.answerLimitCut(route, end.code, null, end.received);
     // An answer that followed a held refusal and failed before its first bytes: the client, still without
     // headers, gets that refusal (`openStream`).
     if (this.failedBeforeBytes(client)) return;
@@ -6957,7 +6967,7 @@ export class InferenceRun {
     readonly upstreamMayStillWork?: boolean;
     readonly error?: ApiError;
     /** Gray's own bound ended the answer: the release's detail says so, as a held stream's does. */
-    readonly limitSource?: "gateway_memory";
+    readonly limitSource?: LimitSource;
   }): void {
     const { attempt, relay, code } = o;
     const route = attempt.route;
@@ -7089,7 +7099,7 @@ export class InferenceRun {
         reason: string,
         why: string,
         supplier: "timeout" | "upstream_error" | "invalid_response" | null,
-        extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: "gateway_memory" } = {},
+        extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: LimitSource } = {},
       ) => this.answerFailed({ attempt, relay: current, handOver, code, reason, why, supplier, ...extra });
       if (read.kind === "client_left") {
         attempt.controller.abort(read.why);
@@ -7116,19 +7126,21 @@ export class InferenceRun {
           attempt.checks = refusedAnswerChecks(answerInspector);
         }
         // The isolate's answers hold too much together: Gray's limit, a 429 the client may retry. One
-        // answer kept more than ANSWER_HELD_MAX_BYTES: Gray's limit too, said as a held stream's is. Neither
-        // is the supplier's, and no other attempt would hold more (a stream's `final`): the request ends here.
+        // answer kept more than ANSWER_HELD_MAX_BYTES, or grew past the bytes its request's output limit
+        // allows: Gray's limit too, said as a held stream's is. None is the supplier's, and no other attempt
+        // would hold more (a stream's `final`): the request ends here.
         if (read.code === "gateway_capacity" || read.limitSource !== undefined) {
           const error =
             read.code === "gateway_capacity"
               ? new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory")
-              : new ApiError(502, read.code).withMeta("limit_bytes", BigInt(cfg.answerHeldMaxBytes)).withMeta("limit_source", read.limitSource!);
+              : new ApiError(502, read.code).withMeta("limit_bytes", BigInt(read.limitSource === "request_output_limit" ? a.answerLimit : cfg.answerHeldMaxBytes)).withMeta("limit_source", read.limitSource!);
           failed(read.code, read.code, read.why, read.supplierFailure, {
             upstreamMayStillWork: read.upstreamMayStillWork,
             error,
             ...(read.limitSource === undefined ? {} : { limitSource: read.limitSource }),
           });
-          if (read.limitSource !== undefined) this.heldLimitAlert(route);
+          if (read.limitSource === "gateway_memory") this.heldLimitAlert(route);
+          if (read.limitSource === "request_output_limit") this.answerLimitCut(route, read.code, a.answerLimit, read.received);
           return;
         }
         if (uncommitted(this.defect(attempt, read.code, read.upstreamMayStillWork))) return;
@@ -7501,7 +7513,7 @@ export class InferenceRun {
     const route = attempt.route;
     let handed: Response | null = null;
     const handOver = (r: Response) => (handed = r);
-    const failed = (code: string, reason: string, why: string, supplier: "timeout" | "upstream_error" | "invalid_response" | null, extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: "gateway_memory" } = {}): BufferedResult => {
+    const failed = (code: string, reason: string, why: string, supplier: "timeout" | "upstream_error" | "invalid_response" | null, extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: LimitSource } = {}): BufferedResult => {
       this.answerFailed({ attempt, relay: null, handOver, code, reason, why, supplier, ...extra });
       return { kind: "response", response: handed! };
     };
@@ -7547,10 +7559,11 @@ export class InferenceRun {
       }
       case "gray":
         // Gray's own limit, which no other attempt lifts: the request ends with it, free.
+        if (read.limitSource === "request_output_limit") this.answerLimitCut(route, read.code, read.limitBytes, read.received);
         return failed(read.code, read.code, read.why, null, {
           upstreamMayStillWork: true,
-          error: read.code === "gateway_capacity" ? capacityError() : new ApiError(502, read.code).withMeta("limit_bytes", BigInt(heldLimit)).withMeta("limit_source", "gateway_memory"),
-          ...(read.code === "gateway_capacity" ? {} : { limitSource: "gateway_memory" as const }),
+          error: read.code === "gateway_capacity" ? capacityError() : new ApiError(502, read.code).withMeta("limit_bytes", BigInt(read.limitBytes)).withMeta("limit_source", read.limitSource),
+          ...(read.code === "gateway_capacity" ? {} : { limitSource: read.limitSource }),
         });
       case "uncommitted":
         // It ended before its terminal event: its checks are its stream's inspector's, not finished; none when the
@@ -7668,6 +7681,15 @@ function grayAfterCheck(settled: Extract<SettleOutcome, { ok: false }>): boolean
 }
 
 /** Gray's own limit of what the isolate's answers hold together: a 429 the client may retry. */
+/**
+ * The client's error for an answer one of Gray's own limits ended (relay.ts `LimitSource`): 502 with its code, free.
+ * The memory's, as it was (`limit_source: gateway_memory`); the request's output limit's with the bound it passed.
+ */
+function ownLimitError(code: string, source: LimitSource, limitBytes: number): ApiError {
+  const error = new ApiError(502, code);
+  return source === "request_output_limit" ? error.withMeta("limit_bytes", BigInt(limitBytes)).withMeta("limit_source", source) : error.withMeta("limit_source", source);
+}
+
 function capacityError(): ApiError {
   return new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory");
 }
