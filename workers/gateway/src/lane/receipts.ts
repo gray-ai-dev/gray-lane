@@ -10,8 +10,12 @@ import type { StoredReceipt } from "./state.ts";
  * A receipt exists for an authenticated request whose body was read (M21). A refusal before the
  * body (401, a malformed header, the 413 of a body past the cap, 404) has no `request.received`, so
  * it carries no receipt and no `X-Receipt-Id`. A request that committed an attempt but failed
- * before its response closed keeps its id, and the GET answers 404 until the receipt is finalized
- * (m11). `X-Receipt` (the whole document in a header) is not served: one document, one encoding.
+ * before its response closed keeps its id (m11). The receipt is signed and stored as soon as the
+ * answer has ended; until then (the answer still streaming, or ended a moment ago) the GET of an id
+ * this boot named answers 503 `receipt_pending` with `Retry-After`, never the 404 of an unknown id,
+ * and a request that ends with no receipt to sign (`checkEventLog` refuses its log) withdraws its id,
+ * which then answers 404. `X-Receipt` (the whole document in a header) is not served: one document,
+ * one encoding.
  */
 
 export const ACI_VERSION_HEADER = "x-aci-version";
@@ -152,6 +156,22 @@ export function receiptResponse(entry: StoredReceipt, keysetDigest: string): Res
 /** The one 404 body the receipt route answers (an unknown id, an expired one, or another key's). */
 export function receiptNotFound(keysetDigest: string): Response {
   return aciJson(404, { error: { type: "not_found", code: "receipt_not_found", message: "No receipt with this id, or it was made with another key." } }, keysetDigest);
+}
+
+/** The seconds `receiptPending` tells the client to wait: signing takes milliseconds once the answer has ended. */
+export const RECEIPT_PENDING_RETRY_AFTER_S = 1;
+
+/**
+ * The answer for an id this boot named whose receipt is not stored yet (`LaneReceiptStore.pending`): the answer it
+ * covers is still being sent, or ended a moment ago. Retryable, and never the 404 of an unknown id.
+ */
+export function receiptPending(keysetDigest: string): Response {
+  return aciJson(
+    503,
+    { error: { type: "not_ready", code: "receipt_pending", message: "This receipt is not stored yet: the answer it covers is still being sent, or ended a moment ago. Ask again after Retry-After seconds." } },
+    keysetDigest,
+    { "retry-after": String(RECEIPT_PENDING_RETRY_AFTER_S) },
+  );
 }
 
 /** The 401 body when no credential was presented at all (ACI §7.6: `unauthorized`). */

@@ -29,7 +29,8 @@ import { LaneFetchRefusal } from "./fetch-refusal.ts";
  * - **The keys.** The provider's API key of each endpoint at its credential generation, from the bridge's
  *   `endpoint.credential` (`remote/endpoint-credential.ts`): prefetched for the view's endpoint routes after each change,
  *   a few at a time, and dropped when the generation changes or the route leaves. An attempt whose key is not here
- *   fetches it once within its own budget (`credential`). A key is never written to a log, a disk or a record.
+ *   fetches it once (or joins the fetch out) and waits for it within its own budget (`credential`); the fetch itself
+ *   has the background bound. A key is never written to a log, a disk or a record.
  * - **The fetch.** An attempt's own fetch (`fetchFor`): its route's URL, `https://<host><path>`, goes to egress as
  *   `http://route.gray.invalid/route/<key><path>` only when the host and the path prefix are the endpoint's row, and
  *   only once egress has taken a table holding that row (the attempt pushes it within its own bound if not).
@@ -189,9 +190,14 @@ export class EntryEndpointRoutes {
 
   /**
    * The key of `endpointId` at `generation` for an attempt: the one in memory, else one fetch (or the one already out)
-   * within `budgetMs`. Null when none could be had in that time, the endpoint has no row at that generation (the
-   * table's snapshot is another), or its last fetch failed within its rest (the console refused it, or the bridge did
-   * not answer): the attempt passes its route over as `route_inactive`.
+   * waited for within `budgetMs`. Null when none could be had in that time, the endpoint has no row at that generation
+   * (the table's snapshot is another), or its last fetch failed within its rest (the console refused it, or the bridge
+   * did not answer): the attempt passes its route over as `route_inactive`.
+   *
+   * A fetch the attempt starts has the background bound (CALL_MS), as a prefetch has, whatever the attempt waits: an
+   * attempt that stops waiting lets it go on, so the key is in memory for the next attempt. Cut at the attempt's own
+   * wait, a cold `endpoint.credential` slower than that wait never landed, and its failure rested the key five seconds
+   * (staging 2026-11-18, lane release V: a replica's first request to a quick route was 503 with no attempt).
    */
   async credential(endpointId: string, generation: number, budgetMs: number): Promise<string | null> {
     const held = this.#keys.get(endpointId);
@@ -201,7 +207,7 @@ export class EntryEndpointRoutes {
     if (row === undefined || row.generation !== generation) return null;
     // A key the console just refused, or whose fetch just failed, is not asked again by every attempt meanwhile.
     if (this.#deps.clock() < (this.#keyBackoff.get(keyOf(endpointId, generation)) ?? 0)) return null;
-    const running = this.#fetchKey(row, Math.min(budgetMs, this.#callMs));
+    const running = this.#fetchKey(row, this.#callMs);
     let timer: ReturnType<typeof setTimeout> | null = null;
     const late = new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), budgetMs);

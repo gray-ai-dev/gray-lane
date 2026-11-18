@@ -1067,6 +1067,8 @@ export class InferenceRun {
    * the attempt found, so a request that reached no vendor names no id.
    */
   private laneReceiptId: string | null = null;
+  /** The receipt id the response handed over named (`X-Receipt-Id`), announced to the store as pending; null for none. */
+  private laneAnnounced: string | null = null;
   /** The adopted attempt's draft; null until an attempt commits or a policy refuses. */
   private laneDraft: LaneReceiptDraft | null = null;
   /**
@@ -1515,6 +1517,11 @@ export class InferenceRun {
     this.emitted = (async () => {
       // The response's headers are the details' too: they are known once `serve` handed the response over.
       await this.responded;
+      // The lane's receipt is signed and stored now, as the answer has ended (its bytes are hashed as they are queued to
+      // the client, so the hash is final), beside the record's own work rather than after it: a client that verifies at
+      // once finds it, where after the record's sends (two bridge calls, LANE_BRIDGE_CALL_MS each) it was 404 for
+      // seconds (staging 2026-11-18, lane release V).
+      const receipt = this.laneReceipt();
       // A withheld answer's record says how its hold's resolution ended (`withhold`), when that ends before the content's
       // deadline (at most two settle budgets after the answer); past it the record says unsettled.
       let ended = record;
@@ -1544,10 +1551,10 @@ export class InferenceRun {
       const gauge = this.deps.accountBlocks === undefined ? accountBlockGauges.next(now, () => accountBlockIsolate.paused(now)) : null;
       const delivery = recordDelivery(this.deps.cfg, deadline + this.deps.cfg.contentTailReserveMs, this.deps.clock, this.deps.waitTimers ?? this.deps.timers ?? platformTimers);
       await emitRecord({ record: emitted, sinks: this.io.sinks, content: result, service: this.deps.service, gauge, evidence: this.traffic?.buffer.wire() ?? null, delivery });
-      // The lane's receipt and the relay's outcome report close the request here, in the same
-      // `waitUntil` (design v2 §C.10): the response body is written (or cut), so its hash is final,
-      // and both are metadata that may fail without changing what the client already got.
-      await this.finishLane(emitted, finishedAt);
+      // The relay's outcome report closes the request here, in the same `waitUntil` (design v2 §C.10), after the
+      // receipt (F2 D31): both are metadata that may fail without changing what the client already got.
+      await receipt;
+      this.finishLane(emitted, finishedAt);
       // The lane's sinks buffer (remote/sinks.ts): the point and the service events of this request
       // exist from here on and never before, so the flush belongs after the record (F2 bridge-1).
       // `deps.sinks` is the request's `RemoteSinks`; `io.sinks` (Outbound) has no `flush`.
@@ -1585,6 +1592,14 @@ export class InferenceRun {
     }
   }
 
+  /** Each peer hop's answer (`ended`), waited for as a stack call's close is: ERROR_BODY_WAIT_MS at most. */
+  private async peersEnded(): Promise<void> {
+    const timers = this.deps.timers ?? platformTimers;
+    let timer: unknown = null;
+    await Promise.race([Promise.all(this.peerCalls.map((call) => call.ended)), new Promise<void>((resolve) => (timer = timers.setTimeout(resolve, ERROR_BODY_WAIT_MS)))]);
+    timers.clearTimeout(timer);
+  }
+
   /**
    * An entry's `record` with the trace its peer attempts' `end` frames carried (docs/confidential-lane-stack-routing.md
    * section 4.10, `peerTraceOf`): the stack VM in backend mode makes no record, so the relay's attempts reach its panel
@@ -1598,10 +1613,7 @@ export class InferenceRun {
    */
   private async withPeerTrace(record: RequestRecord): Promise<RequestRecord> {
     try {
-      const timers = this.deps.timers ?? platformTimers;
-      let timer: unknown = null;
-      await Promise.race([Promise.all(this.peerCalls.map((call) => call.ended)), new Promise<void>((resolve) => (timer = timers.setTimeout(resolve, ERROR_BODY_WAIT_MS)))]);
-      timers.clearTimeout(timer);
+      await this.peersEnded();
       const attempts = record.attempts.map((attempt, at) => {
         const closed = this.peerEnded.get(at);
         if (closed === undefined) return attempt;
@@ -1618,8 +1630,8 @@ export class InferenceRun {
   }
 
   /**
-   * The end of a lane request (design v2 §C.10, §C.9): the receipt is signed and stored, and the
-   * relay's scheduler hears how the attempt went. Both are metadata: a failure is logged as a
+   * The lane's receipt (design v2 §C.9), signed and stored as soon as the answer has ended: from the request's
+   * `waitUntil` (`record`), beside the record's own work and never after its sends. Metadata: a failure is logged as a
    * content-free event and never changes the response.
    *
    * A receipt exists exactly when the ACI event log can be honest (`@gray/attest` `checkEventLog`):
@@ -1629,20 +1641,35 @@ export class InferenceRun {
    * attested egress"). A request that forwarded nothing and was not refused (no route, an opening
    * failure, a pre-connect egress failure before any headers, a client that left first) has no
    * honest receipt shape, so none is signed and the id the headers named answers 404 — the documented
-   * behaviour of a receipt that was promised and not produced.
+   * behaviour of a receipt that was promised and not produced. Until then the id reads as pending
+   * (`LaneReceiptStore.announce`), and it is withdrawn here when no receipt was stored under it.
    */
-  private async finishLane(record: RequestRecord, finishedAt: number): Promise<void> {
+  private async laneReceipt(): Promise<void> {
     const lane = this.lane;
-    const receiptId = this.laneReceiptId;
     if (lane === null) return;
-    if (this.stackCalls.length > 0) {
-      await this.finishStack(lane, receiptId);
-      return;
+    const receiptId = this.laneReceiptId;
+    try {
+      if (this.stackCalls.length > 0) await this.finishStack(lane, receiptId);
+      else if (this.lastAttemptPeer) await this.finishPeer(lane, receiptId);
+      else await this.signLaneReceipt(lane, receiptId);
+    } finally {
+      // A stored receipt is no longer pending (`put`); an id the response named with no receipt under it reads as unknown.
+      if (this.laneAnnounced !== null) lane.state.receipts.withdraw(this.laneAnnounced);
     }
-    if (this.lastAttemptPeer) {
-      await this.finishPeer(lane, receiptId);
-      return;
-    }
+  }
+
+  /**
+   * The end of a lane request after its record (design v2 §C.10): the relay's scheduler hears how the attempt went, after
+   * the receipt (F2 D31). A stack relay's request and an entry's request over the peer hop report nothing here (S27).
+   */
+  private finishLane(record: RequestRecord, finishedAt: number): void {
+    const lane = this.lane;
+    if (lane === null || this.stackCalls.length > 0 || this.lastAttemptPeer) return;
+    this.reportLaneOutcome(lane, record, finishedAt);
+  }
+
+  /** The receipt of a lane relay's or an endpoint route's request, under the id the response named. */
+  private async signLaneReceipt(lane: LaneDeps, receiptId: string | null): Promise<void> {
     try {
       // F2 D31: the receipt is signed before the report. A scheduler lookup or a report is metadata;
       // neither may cancel the receipt the response already named (GW-03).
@@ -1672,7 +1699,6 @@ export class InferenceRun {
       // Content-free by construction: the event, the id, and whether it was a receipt or a report.
       console.error(JSON.stringify({ level: "error", event: "lane_finish_failed", request_id: this.requestId, receipt_id: receiptId, ...failureNames(error) }));
     }
-    this.reportLaneOutcome(lane, record, finishedAt);
   }
 
   /**
@@ -1726,7 +1752,9 @@ export class InferenceRun {
   private async finishPeer(lane: LaneDeps, receiptId: string | null): Promise<void> {
     let builder: ReceiptBuilder | null = null;
     try {
-      // The answer is over (the record is out): whatever `end` came is in, and a hop still open is closed.
+      // The answer is over: each hop's `end` is waited for as the record's trace waits for it (`peersEnded`), so the
+      // receipt holds every `end` the trace does; then a hop still open is closed.
+      await this.peersEnded();
       for (const call of this.peerCalls) call.close();
       await Promise.all(this.peerCalls.map((call) => call.ended));
       const received = this.laneReceived;
@@ -2191,6 +2219,13 @@ export class InferenceRun {
       const headers = new Headers(response.headers);
       this.laneReceiptHeader(headers);
       response = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    }
+    // The id the client is given reads as pending, not unknown, until its receipt is stored or the request ends without
+    // one (`laneReceipt`): a client that asks while the answer streams, or the moment it ended, is told to ask again.
+    const named = this.lane === null ? null : response.headers.get("x-receipt-id");
+    if (named !== null && this.laneOwner !== null) {
+      this.lane!.state.receipts.announce(named, this.laneOwner);
+      this.laneAnnounced = named;
     }
     this.responseHead ??= { status: response.status, headers: response.headers };
     this.markResponded();
@@ -3531,6 +3566,14 @@ export class InferenceRun {
    * asks for carries a number of its own: a probe lease is keyed by (request key, attempt), so a
    * number used twice at one endpoint (a refit's head after a head that timed out, whose release
    * goes back in the background) could get the earlier lease back and have that late release free it.
+   *
+   * In the lane (a CVM, where admission and the permit are each a bridge round trip) the wait is its own bound, not what
+   * the request's pre phase left, as the lane's other steps before a send have theirs (the relay's pick, an endpoint
+   * route's key). A cold replica's admission (staging 2026-11-18, lane release V: `account.admit` 0.7-1.2 s at the
+   * bridge, twice on one request) spent the 3 s pre phase before the permit was asked; its acquire (0.45-0.9 s at the
+   * bridge, 0.18 s warm) then waited what was left, tens of milliseconds, was passed over as `capacity`, and D131's one
+   * repeat was refused for the spent pre phase: 503 `provider_capacity_or_quote_unavailable` with no attempt, and the
+   * request seconds later was served. The main lane keeps the pre phase's bound: its objects are a call away.
    */
   private async acquire(route: Route, requestKey: string, bodyRead: number, answerBudgetMs: number, options: { readonly first?: boolean; readonly retryTicket?: number; readonly shard?: ShardChoice; readonly attempt?: number; readonly awaitLease?: true } = {}): Promise<HeadPermit> {
     // A repeat acquires with the number and at the shard its ticket was reserved under (`sameOperator`).
@@ -3550,8 +3593,10 @@ export class InferenceRun {
     }
     const attemptMs = Math.max(1, Math.min(this.deadline(bodyRead) - clock(), cfg.streamTotalSeconds * 1000));
     // Within the pre phase too; once it is spent no permit is asked for, and the route is passed over as one whose
-    // shard did not answer (not a cold pass: no repeat).
-    const waitMs = this.budget.preWait(Math.max(1, Math.min(cfg.endpointAcquireWaitMs, budgetMs)));
+    // shard did not answer (not a cold pass: no repeat). In the lane the wait is its own bound, ENDPOINT_ACQUIRE_WAIT_MS
+    // within the time for an answer, never what the pre phase left (see above).
+    const capMs = Math.max(1, Math.min(cfg.endpointAcquireWaitMs, budgetMs));
+    const waitMs = this.lane !== null ? capMs : this.budget.preWait(capMs);
     if (waitMs === 0) return { ok: false, reason: "unanswered", retryAfterMs: null, borrowing: false, shardChoice: options.shard ?? (await shardFor(this.deps.endpointCounts, route.record.capacityKey, this.deps.region, requestKey, index)) };
     // The attempt's rank key (`rank_key`, of the request's stream): a failure rest covering it refuses a first call
     // to it at the shard, an answer at it ends the rests on it, and a failure of it rests it (`restRoute`).
@@ -4399,8 +4444,9 @@ export class InferenceRun {
     const { cfg, clock } = this.deps;
     const needMs = cfg.endpointAcquireWaitMs + (d.plan.accountPool(cold.route) !== null ? cfg.laneSchedulerPickMs : 0);
     if (!coldRepeatAllowed({ sent: this.attempts.length, repeated: this.coldRepeated, clientGone: this.presence.gone, roomMs: answerDeadline - clock(), needMs })) return false;
-    // Its permit waits what the pre phase has left (`acquire`): none left, no repeat.
-    if (this.budget.preLeft() === 0) return false;
+    // Its permit waits what the pre phase has left (`acquire`): none left, no repeat. In the lane the permit has its own
+    // bound, and the room rule above is the repeat's bound (`acquire`).
+    if (this.lane === null && this.budget.preLeft() === 0) return false;
     this.coldRepeated = true;
     this.coldRepeatAt = cold;
     d.repeatPass(cold);
@@ -4911,13 +4957,22 @@ export class InferenceRun {
 
   /**
    * The provider's key of an entry's endpoint route at its credential generation (section 3.2): the one in the entry's
-   * memory, else one `endpoint.credential` call within what the request's pre phase leaves (a call of Gray's own before
-   * the first upstream byte), at most a bridge call's bound and the time to the answer's deadline. Null when none came.
+   * memory, else one `endpoint.credential` call (or the one out) waited for within a bridge call's bound and the time to
+   * the answer's deadline. Null when none came.
+   *
+   * The wait is its own bound, not what the request's pre phase left: it is a step of the attempt (`openAttempt` runs
+   * with the pre clock stopped), as the lane relay's pick is (LANE_SCHEDULER_PICK_MS), and the attempt cannot be sent
+   * without it. A replica's first request to a route, after a restart or once the route or its key generation is new to
+   * it, has no key in memory, and the snapshot, admission and permit before it may have spent the whole pre phase:
+   * bounded by what they left, the wait was 0 (or shorter than one cold `endpoint.credential`) and the route was passed
+   * over as `route_inactive`, the request 503 `provider_capacity_or_quote_unavailable` with no attempt (staging
+   * 2026-11-18, lane release V). A fetch that failed rests (`EntryEndpointRoutes`), so a console that is down costs one
+   * wait per rest, not one per request.
    */
   private async laneEndpointKey(route: RouteRecord, answerDeadline: number): Promise<string | null> {
     const keys = this.lane?.endpointCredentials;
     if (keys === undefined) return null;
-    const budgetMs = this.budget.preWait(Math.max(1, Math.min(LANE_BRIDGE_CALL_MS, answerDeadline - this.deps.clock())));
+    const budgetMs = Math.max(0, Math.min(LANE_BRIDGE_CALL_MS, answerDeadline - this.deps.clock()));
     try {
       return await keys.credential(route.endpointId, route.credentialGeneration, budgetMs);
     } catch {

@@ -471,6 +471,14 @@ export interface SnapshotReader {
    * relay id; a reader without it reads none.
    */
   stackTraffic?(): Promise<ReadonlyMap<string, { readonly untilMs: number }>>;
+  /**
+   * Which routes of the relay stacks `relayIds` an account of their relay can serve at `nowMs`: a predicate of a
+   * stack endpoint's relay, base URL and a mapping's upstream model (gray-jobs src/snapshot-reader.ts `stackCoverage`,
+   * @gray/lane-wire `stackRouteCovered`: an account of the endpoint's vendor with the model in its models that the VM's
+   * latest report does not hold, pause or leave out for it). A stack route it answers false for is not published; a
+   * reader without it publishes every stack route by its offer alone.
+   */
+  stackCoverage?(relayIds: readonly string[], nowMs: number): Promise<(relayId: string, baseUrl: string, upstreamModel: string) => boolean>;
   /** Every registered public handle and its workspace (control_provider_handles); a reader without it reads none. */
   handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string; readonly show_name?: boolean }[]>;
 }
@@ -1156,6 +1164,10 @@ export async function buildSnapshot(
   const handleRows = reader.handles === undefined ? [] : [...(await reader.handles())].sort((a, b) => byText(a.handle, b.handle));
   const handleOf = new Map(handleRows.map((r) => [r.workspace_id, r.handle]));
   const traffic = published.some(({ e }) => e.config.lane?.mode === "stack") && reader.stackTraffic ? await reader.stackTraffic() : new Map<string, { readonly untilMs: number }>();
+  // A relay stack's route is published only while an account of its relay can serve its upstream model (`stackCoverage`):
+  // the lane's entry, the main view's `laneServed` and `laneOffers` and the catalog all read these routes.
+  const stackRelays = [...new Set(published.flatMap(({ e }) => (e.config.lane?.mode === "stack" ? [e.config.lane.relay_id] : [])))].sort(byText);
+  const covered = stackRelays.length > 0 && reader.stackCoverage ? await reader.stackCoverage(stackRelays, nowMs) : null;
   const routes: SnapshotRoute[] = [];
   for (const { e, snapshot } of published) {
     const trafficUntilMs = e.config.lane?.mode === "stack" ? traffic.get(e.config.lane.relay_id)?.untilMs : undefined;
@@ -1177,6 +1189,8 @@ export async function buildSnapshot(
       const quote = quoteOf.get(key) ?? null;
       // A lane relay earns its route by an approved offer alone; a direct route also by its current pass.
       if (lane && quote === null) continue;
+      // A relay stack's route also by an account that can serve it.
+      if (covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model)) continue;
       routes.push({
         capacityKey: capacityKey(e.id, m.requested_model, m.protocol),
         endpointId: e.id,

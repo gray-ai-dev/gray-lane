@@ -2,7 +2,7 @@ import { EVENT_PEER_ENTRY, eventType, jcsBytes, sha256BareHex, verifyReceipt } f
 import { get, toJsonString, type Json } from "@gray/json";
 import { keyHash } from "../auth.ts";
 import type { StoredPeerAttempt } from "./peer-model.ts";
-import { aciHeaders, aciJson, receiptNotFound, receiptResponse, receiptUnauthorized } from "./receipts.ts";
+import { aciHeaders, aciJson, receiptNotFound, receiptPending, receiptResponse, receiptUnauthorized } from "./receipts.ts";
 import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
 
 /**
@@ -18,7 +18,8 @@ import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
  *   attempt never reached it). A number that repeats answers for its last attempt.
  *
  * Both have the outer receipt's owner check: no credential is 401; a wrong one, an unknown id and an expired id are
- * all 404 `receipt_not_found`, checked before anything of the attempts is read. Then an attempt the receipt does not
+ * all 404 `receipt_not_found`, checked before anything of the attempts is read; an id this boot named for the same key
+ * whose receipt is not stored yet is 503 `receipt_pending` with `Retry-After`. Then an attempt the receipt does not
  * have is 404 `peer_attempt_not_found`; a late fetch that got no answer, or a stack VM that no longer holds a receipt
  * the outer one names, 502 `peer_receipt_unavailable`; a late receipt that is not the one the outer receipt names (its
  * JCS SHA-256 or id), does not verify under the stack VM's attested keyset, or whose `peer.entry` names another
@@ -44,8 +45,10 @@ export async function serveReceipt(request: Request, deps: ReceiptRouteDeps, res
   if (presented === null) return receiptUnauthorized(deps.keysetDigest);
   const split = rest.indexOf(PEERS_SEGMENT);
   const id = split < 0 ? rest : rest.slice(0, split);
-  const entry = deps.receipts.get(id, await keyHash(presented));
-  if (entry === null) return receiptNotFound(deps.keysetDigest);
+  const owner = await keyHash(presented);
+  const entry = deps.receipts.get(id, owner);
+  // An id this boot named for this key whose receipt is not stored yet is retryable, not unknown.
+  if (entry === null) return deps.receipts.pending(id, owner) ? receiptPending(deps.keysetDigest) : receiptNotFound(deps.keysetDigest);
   if (split < 0) return receiptResponse(entry, deps.keysetDigest);
   const n = attemptNumber(rest.slice(split + PEERS_SEGMENT.length));
   const peer = n === null ? undefined : entry.peers.get(n);

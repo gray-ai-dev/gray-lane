@@ -286,6 +286,15 @@ export function createReceiptStore(
   const entries = new Map<string, StoredReceipt>();
   // An entry's outer receipts by the customer's request id (docs/design/relay-debug-sharing.md §3): dropped with them.
   const byRequest = new Map<string, string>();
+  // Ids a response named whose receipt is not put yet (`announce`), insertion-ordered as `entries`: the owner, and when
+  // the announcement lapses should the request never put or withdraw it (a process that lost the request's end).
+  const announced = new Map<string, { readonly owner: string; readonly until: number }>();
+  const sweepAnnounced = (at: number): void => {
+    for (const [id, pending] of announced) {
+      if (pending.until > at) break;
+      announced.delete(id);
+    }
+  };
   let peerBytes = 0;
   const heldBytes = (entry: StoredReceipt): number => {
     let total = 0;
@@ -311,6 +320,7 @@ export function createReceiptStore(
       const at = now();
       sweep(at);
       drop(receipt.receiptId);
+      announced.delete(receipt.receiptId);
       // Copies: the store decides which bytes it holds, and a caller's records stay as they were.
       const kept = new Map<number, StoredPeerAttempt>();
       for (const peer of peers) {
@@ -343,6 +353,26 @@ export function createReceiptStore(
       const entry = entries.get(id);
       if (entry === undefined) return null;
       return entry.owner === owner ? entry : null;
+    },
+    announce(id, owner) {
+      const at = now();
+      sweepAnnounced(at);
+      if (entries.has(id)) return;
+      announced.delete(id);
+      announced.set(id, { owner, until: at + ttlMs });
+      // Bounded as the receipts are: a replica's announcements are its requests in flight.
+      while (announced.size > maxEntries) {
+        const oldest = announced.keys().next();
+        if (oldest.done === true) break;
+        announced.delete(oldest.value);
+      }
+    },
+    pending(id, owner) {
+      sweepAnnounced(now());
+      return announced.get(id)?.owner === owner;
+    },
+    withdraw(id) {
+      announced.delete(id);
     },
     byRequest(requestId, owner) {
       const at = now();
