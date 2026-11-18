@@ -18,9 +18,15 @@ const NO_PROVIDER_RETRY_SECONDS = 60n;
 /** The generation APIs, in the order their paths are listed (model_resolution.rs `GENERATION`). */
 const GENERATION: readonly Protocol[] = ["open_ai_chat", "open_ai_responses", "anthropic_messages", "gemini"];
 
-function noProvider(model: string): ApiError {
+/**
+ * 503 `no_available_provider` for a model Gray lists (model_resolution.rs `no_provider`). When Gray's confidential VM
+ * serves it on the API called (`atLane`, preference.ts `laneModel`), the message says so too; the answer is otherwise the
+ * same, `retry-after` and all: this address may serve it again soon.
+ */
+export function noProvider(model: string, atLane: boolean): ApiError {
+  const lane = atLane ? " This model is also served at Gray's confidential VM address; the console shows it." : "";
   return new ApiError(503, "no_available_provider")
-    .withMessage(`No verified provider can serve \`${model}\` right now. Gray re-checks providers continuously; retry in a minute, or choose another model.`)
+    .withMessage(`No verified provider can serve \`${model}\` right now. Gray re-checks providers continuously; retry in a minute, or choose another model.${lane}`)
     .withMeta("limit_source", "provider_availability")
     .withRetryAfter(NO_PROVIDER_RETRY_SECONDS);
 }
@@ -108,6 +114,9 @@ export function missingCapability(model: string, protocol: Protocol, routes: rea
  */
 export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, protocol: Protocol, nowMs: number, mediaUnknown: boolean, policy?: TranslationPolicy): ApiError {
   const model = request.model;
+  // Whether Gray's confidential VM serves the model on this API there (`laneModel`): a pause here says so, and a model
+  // this gateway does not know is served there. The lane's own snapshot carries no lane pairs, so in lane mode never.
+  const atLane = laneModel(snapshot, model, protocol, true, nowMs);
   const routes = snapshot.routes.filter((r) => r.model === model);
   const live = routes.filter((r) => routeServes(r.expiresAt, nowMs));
   // The upstream protocols that could serve a request through `protocol`: itself, and the translation
@@ -124,14 +133,14 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
           .map((r) => `POST ${endpointPath(r.protocol, model, false)}`),
       ),
     ].sort(compareUtf8);
-    return missingCapability(model, protocol, here, request, mediaUnknown, elsewhere) ?? noProvider(model);
+    return missingCapability(model, protocol, here, request, mediaUnknown, elsewhere) ?? noProvider(model, atLane);
   }
   // A provider maps the model on this API (or on a translation target), but its route is not verified
   // now: a pause, not a wrong API. An image generation mapping through the Gemini adapter maps its model
   // on the Gemini API too (`GatewaySnapshot.mapped`). A snapshot without the pairs says it by its routes.
   const mapped = snapshot.mapped;
   const mappedHere = mapped !== undefined ? mapped.some((m) => m.model === model && targets.includes(m.protocol)) : routes.some((r) => r.protocol === protocol);
-  if (mappedHere) return noProvider(model);
+  if (mappedHere) return noProvider(model, atLane);
   const served = new Set(live.map((r) => r.protocol));
   const paths: string[] = [];
   for (const client of [...GENERATION, ...[...served].filter((p) => !GENERATION.includes(p))]) {
@@ -144,9 +153,9 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
       .withMeta("paths", paths)
       .withHelp(null);
   }
-  if (routes.length > 0 || (mapped?.some((m) => m.model === model) ?? false)) return noProvider(model);
-  // A model only Gray's confidential VM serves, on this API there (`laneModel`): not one it serves only on another API,
-  // which it does not translate. The lane's own snapshot carries no lane pairs, so in lane mode this is never so.
-  if (laneModel(snapshot, model, protocol, true, nowMs)) return new ApiError(404, "model_at_lane");
+  if (routes.length > 0 || (mapped?.some((m) => m.model === model) ?? false)) return noProvider(model, atLane);
+  // A model only Gray's confidential VM serves, on this API there: not one it serves only on another API, which it does
+  // not translate.
+  if (atLane) return new ApiError(404, "model_at_lane");
   return new ApiError(404, "model_not_found").withMessage(`The model \`${model}\` does not exist on Gray.`).withMeta("suggestions", []);
 }

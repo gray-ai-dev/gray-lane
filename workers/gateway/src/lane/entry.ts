@@ -743,6 +743,8 @@ const entryRoles = new WeakMap<LaneProcessState, LaneEntryRole | null>();
 
 /** The entrypoint's stop route on its socket (deploy/tee/bin/entrypoint.mjs `serveEntryStop`). */
 const ENTRY_STOP_URL = "http://entry-stop/stop";
+/** The entrypoint's stop socket is local and answers at once (`serveEntryStop`); a call past this is a failed one. */
+const ENTRY_STOP_CALL_MS = 5_000;
 
 /** The generation path's answers, which may still be streaming when `route` returns them (`LaneEntryRole.answer`'s `live`). */
 const generationAnswers = new WeakSet<Response>();
@@ -766,7 +768,8 @@ function entryRoleOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayC
             return link === undefined || link === null ? 0 : link.closeAll(idle);
           },
           // "Review fixes, 2026-11-17 night": the entrypoint's stop socket (ENTRY_STOP, rendered with the replica index).
-          ...(stopBinding === null ? {} : { requestStop: async () => (await stopBinding.fetch(new Request(ENTRY_STOP_URL, { method: "POST" }))).status === 200 }),
+          // Bounded (ENTRY_STOP_CALL_MS): a call that never answers would otherwise hold the watch's step to its own bound.
+          ...(stopBinding === null ? {} : { requestStop: async () => (await stopBinding.fetch(new Request(ENTRY_STOP_URL, { method: "POST", signal: AbortSignal.timeout(ENTRY_STOP_CALL_MS) }))).status }),
         });
   entryRoles.set(state, role);
   return role;

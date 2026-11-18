@@ -26,6 +26,9 @@ export type { EntryRole };
  *   the channel refuses new attaches and tunnels. The watch that does it runs in the background of a request
  *   (`ctx.waitUntil`) from the first read of a role other than `serving` written during this boot, and reads the role
  *   every poll on its own: after SIGTERM no new request is answered, and background work keeps running (measured).
+ *   Every request also advances it by a step when one is due, and a watch whose loop has not polled for more than
+ *   WATCH_GONE_POLLS poll intervals counts as gone, so the next request starts another; a step and the stop call are
+ *   bounded. `/healthz` reports where the stop is (`EntryReplicaSummary`), which release.mjs prints while it waits.
  * - **A role written before this boot** (`updated_ms` older than the holder) is reported and its header sent, but it
  *   stops nothing and starts no watch: a replica updated or restarted while its row still says `stopping` must pass its
  *   gate. A workerd the supervisor restarted after `stopping` was written is such a boot: it does not stop, and the
@@ -58,6 +61,13 @@ export type { EntryRole };
  * receipt into, which the scheduler's report (3 s, `@gray/relay-connector`) and the sinks' flush follow.
  */
 export const REQUEST_TAIL_MAX_MS = 60_000;
+
+/**
+ * A watch whose loop has not polled for more than this many poll intervals counts as gone, and the next request starts
+ * another (release T's roll of staging's replica 1, 2026-11-18: role `stopping` read, no stop for 16 min, cause not
+ * seen from outside). One step of the watch is bounded by the same time, so a call that never answers cannot hold it.
+ */
+export const WATCH_GONE_POLLS = 3;
 
 /**
  * One counted request (`LaneEntryRole.begin`): calling it ends the answer (idempotent: the body's end, a cancelled body,
@@ -111,17 +121,30 @@ export interface LaneEntryRoleOptions {
    * (0: none left), or null when peerlink did not answer. `idle` is checked again right before the closes.
    */
   readonly closeSessions?: (idle: () => boolean) => Promise<number | null>;
-  /** The entrypoint's stop (`ENTRY_STOP`'s `POST /stop`): true once it answered 200. Absent: no stop can be sent. */
-  readonly requestStop?: () => Promise<boolean>;
+  /** The entrypoint's stop (`ENTRY_STOP`'s `POST /stop`): the status it answered (200: sent). Absent: no stop can be sent. */
+  readonly requestStop?: () => Promise<number>;
   readonly sleep?: (ms: number) => Promise<void>;
+  /** The bound of one step of the watch; WATCH_GONE_POLLS poll intervals by default. */
+  readonly stepMaxMs?: number;
 }
 
-/** What `/healthz` says of a replica. */
+/**
+ * What `/healthz` says of a replica: its role and in-flight count, and the stop's state, counts and booleans only, so the
+ * release tool can say where a stop is stuck: whether the role last read was written during this boot (only such a
+ * `stopping` stops), whether a watch runs and how long ago it last polled, whether the entrypoint answered the stop with
+ * 200 and its last answer (the status, the failure's code, or null before any), and whether the stack VMs' sessions were
+ * closed.
+ */
 export interface EntryReplicaSummary {
   readonly index: number;
   readonly origin: string;
   readonly role: EntryRole;
   readonly in_flight: number;
+  readonly role_this_boot: boolean;
+  readonly watch: { readonly running: boolean; readonly since_poll_ms: number | null };
+  readonly stop_sent: boolean;
+  readonly stop_answer: string | null;
+  readonly sessions_closed: boolean;
 }
 
 function codeOf(error: unknown): string {
@@ -208,9 +231,17 @@ export class LaneEntryRole {
   readonly #bootMs: number;
   /** Reads in a row that answered `stopping` written during this boot. */
   #stops = 0;
-  #watching = false;
+  /** The watch's loop: which one, and when it last polled (a step or a role read). Null when none was started or it ended. */
+  #loop: { readonly id: number; polledMs: number } | null = null;
+  #loops = 0;
+  /** The step running now: at most one, whether the loop or a request asked for it. */
+  #stepping: Promise<boolean> | null = null;
+  /** When the last step began: a request asks for one at most every poll interval. */
+  #steppedMs: number | null = null;
   /** The entrypoint answered the stop with 200: workerd's drain has begun, nothing undoes it. */
   #stopSent = false;
+  /** The entrypoint's last answer to the stop: its status, or the failure's code; null before any. */
+  #stopAnswer: string | null = null;
   /** peerlink listed no session after the stop: the watch is done (until a read of `serving`). */
   #closed = false;
   #noStopLogged = false;
@@ -255,7 +286,24 @@ export class LaneEntryRole {
   }
 
   summary(): EntryReplicaSummary {
-    return { index: this.#options.index, origin: this.#options.origin, role: this.#role, in_flight: this.inFlight };
+    const now = this.#options.now();
+    return {
+      index: this.#options.index,
+      origin: this.#options.origin,
+      role: this.#role,
+      in_flight: this.inFlight,
+      role_this_boot: this.#fresh(),
+      watch: { running: this.#liveLoop(now) !== null, since_poll_ms: this.#loop === null ? null : Math.max(0, now - this.#loop.polledMs) },
+      stop_sent: this.#stopSent,
+      stop_answer: this.#stopAnswer,
+      sessions_closed: this.#closed,
+    };
+  }
+
+  /** The watch's loop when it polled within WATCH_GONE_POLLS poll intervals; null when there is none or it is gone. */
+  #liveLoop(now: number): { readonly id: number; polledMs: number } | null {
+    const loop = this.#loop;
+    return loop !== null && now - loop.polledMs <= WATCH_GONE_POLLS * this.#options.pollMs ? loop : null;
   }
 
   /** Reads the role when a poll is due (one at a time). Never throws: a failed read keeps the role. */
@@ -303,53 +351,101 @@ export class LaneEntryRole {
   }
 
   /**
-   * The stop's watch (see above), started behind a request once a role other than `serving`, written during this boot,
-   * has been read; at most one runs. `keepAlive` is the request's `ctx.waitUntil`. Every poll: on a `stopping` of this
-   * boot it asks for the stop until the entrypoint answers 200; once it has, and nothing is in flight, it closes the
-   * sessions until peerlink lists none, then ends. Before the stop it ends when the role is `serving` again. It never
-   * holds workerd's drain longer than the stop needs.
+   * The stop's watch (see above), behind every request (the release tool's `/healthz` and the load balancer's `/readyz`
+   * included) once a role other than `serving`, written during this boot, has been read. `keepAlive` is the request's
+   * `ctx.waitUntil`. A loop polls on its own (after SIGTERM no new request is answered): at most one runs, and one that
+   * has not polled for more than WATCH_GONE_POLLS poll intervals counts as gone, so the next request starts another
+   * (the gone one ends at its next turn). While a loop runs, a request advances the stop by one step when one is due
+   * (at most one step a poll interval, one at a time). A step: on a `stopping` of this boot it asks for the stop until
+   * the entrypoint answers 200; once it has, and nothing is in flight, it closes the sessions until peerlink lists none,
+   * and the watch is done. Before the stop it is done when the role is `serving` again. It never holds workerd's drain
+   * longer than the stop needs.
    */
   watch(keepAlive: (work: Promise<unknown>) => void): void {
-    if (this.#watching || this.#closed || this.#role === "serving" || !this.#fresh()) return;
-    this.#watching = true;
-    const sleep = this.#options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    keepAlive(
-      (async () => {
-        try {
-          for (;;) {
-            if (!this.#stopSent && this.#stops > 0) this.#stopSent = await this.#requestStop();
-            if (this.#stopSent) {
-              // After the stop workerd takes no new request, so the count only falls; `closeSessions` checks it again
-              // right before its closes. The count holds each request's own end (its record, receipt and outcome
-              // report): the sessions are what holds workerd's drain while that work runs.
-              if (this.inFlight === 0 && (await this.#closeSessions())) return;
-            } else if (this.#role === "serving") {
-              return;
-            }
-            await sleep(this.#options.pollMs);
-            await this.#askNow();
-          }
-        } finally {
-          this.#watching = false;
-        }
-      })(),
-    );
+    if (this.#closed || this.#role === "serving" || !this.#fresh()) return;
+    const now = this.#options.now();
+    if (this.#liveLoop(now) === null) {
+      if (this.#loop !== null) this.#log({ level: "error", event: "lane_entry_watch_gone", index: this.#options.index, since_poll_ms: now - this.#loop.polledMs });
+      keepAlive(this.#runLoop());
+      return;
+    }
+    if (this.#stepping === null && (this.#steppedMs === null || now - this.#steppedMs >= this.#options.pollMs)) keepAlive(this.#step());
   }
 
-  /** The entrypoint's stop; false (asked again at the next poll) without a 200. */
+  /** A new loop of the watch: a step, a poll interval, a read of the role, until a step says the watch is done. */
+  #runLoop(): Promise<void> {
+    const loop = { id: ++this.#loops, polledMs: this.#options.now() };
+    this.#loop = loop;
+    const current = (): boolean => this.#loop === loop;
+    const sleep = this.#options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    return (async () => {
+      try {
+        for (;;) {
+          loop.polledMs = this.#options.now();
+          if ((await this.#step()) || !current()) return;
+          await sleep(this.#options.pollMs);
+          if (!current()) return;
+          loop.polledMs = this.#options.now();
+          await this.#askNow();
+        }
+      } finally {
+        if (current()) this.#loop = null;
+      }
+    })();
+  }
+
+  /**
+   * One step of the watch (the one running, if one runs); true when the watch is done. Bounded by `stepMaxMs`: a step
+   * whose call never answers is let go (logged), and the next step runs.
+   */
+  #step(): Promise<boolean> {
+    if (this.#stepping !== null) return this.#stepping;
+    this.#steppedMs = this.#options.now();
+    const boundMs = this.#options.stepMaxMs ?? WATCH_GONE_POLLS * this.#options.pollMs;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const late = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => {
+        this.#log({ level: "error", event: "lane_entry_watch_step_timeout", index: this.#options.index, bound_ms: boundMs, stop_sent: this.#stopSent });
+        resolve(false);
+      }, boundMs);
+    });
+    const stepping: Promise<boolean> = Promise.race([this.#stepWork(), late]).finally(() => {
+      if (timer !== null) clearTimeout(timer);
+      if (this.#stepping === stepping) this.#stepping = null;
+    });
+    this.#stepping = stepping;
+    return stepping;
+  }
+
+  async #stepWork(): Promise<boolean> {
+    if (this.#closed) return true;
+    // A step let go may still answer: only a 200 changes what was sent.
+    if (!this.#stopSent && this.#stops > 0 && (await this.#requestStop())) this.#stopSent = true;
+    // After the stop workerd takes no new request, so the count only falls; `closeSessions` checks it again right
+    // before its closes. The count holds each request's own end (its record, receipt and outcome report): the sessions
+    // are what holds workerd's drain while that work runs.
+    if (this.#stopSent) return this.inFlight === 0 && (await this.#closeSessions());
+    return this.#role === "serving";
+  }
+
+  /** The entrypoint's stop; false (asked again at the next step) without a 200. */
   async #requestStop(): Promise<boolean> {
     const index = this.#options.index;
     const request = this.#options.requestStop;
     if (request === undefined) {
       if (!this.#noStopLogged) this.#log({ level: "error", event: "lane_entry_stop_unavailable", index, code: "no_entry_stop" });
       this.#noStopLogged = true;
+      this.#stopAnswer = "no_entry_stop";
       return false;
     }
     try {
-      const sent = await request();
-      this.#log({ level: sent ? "warn" : "error", event: sent ? "lane_entry_stop_sent" : "lane_entry_stop_refused", index, in_flight: this.inFlight });
+      const status = await request();
+      const sent = status === 200;
+      this.#stopAnswer = String(status);
+      this.#log({ level: sent ? "warn" : "error", event: sent ? "lane_entry_stop_sent" : "lane_entry_stop_refused", index, status, in_flight: this.inFlight });
       return sent;
     } catch (error) {
+      this.#stopAnswer = codeOf(error);
       this.#log({ level: "error", event: "lane_entry_stop_refused", index, code: codeOf(error) });
       return false;
     }
