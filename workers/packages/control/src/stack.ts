@@ -188,16 +188,15 @@ export const stackAccountInputSchema = z
     /** The type of credential the relay seals for the account; null: not declared. */
     credential_type: z.enum(["api_key", "oauth_access_token"]).nullable().default(null),
     /**
-     * The client identity the relay registers for the account (S32a, the owner's trust-model decision of 2026-10-29):
-     * the static `headers` and Anthropic `betas` of the vendor's own client and the ids egress makes itself
-     * (`generated`), which egress holds the account's calls to. Which names a vendor's route takes and the values'
-     * rules are `@gray/lane-wire`'s (`stackIdentitySchema`, `stackIdentityProblem`), which the console applies; null:
-     * none. An account replaced without it has none.
+     * A client identity stored with the account (S32a), retired on 2026-11-18 (owner): still taken, checked as before
+     * (`@gray/lane-wire` `stackIdentitySchema`, `stackIdentityProblem`, which the console applies) and shown, but never
+     * sent to the VM; the vendor gets the client's own headers and any the deployment's software sends. Null: none. An
+     * account replaced without it has none.
      */
     identity: stackIdentityInputSchema.nullable().default(null),
     /**
-     * The relay's identity profile the account takes its client identity from (`.../identity-profiles/{name}`), or
-     * null. An inline `identity` wins when both are set; the profile must be of the account's vendor. An account
+     * The deployment's identity profile the account names (`.../identity-profiles/{name}`), retired with `identity`:
+     * stored and checked (the profile exists and is of the account's vendor), never applied. Null: none. An account
      * replaced without it names none.
      */
     identity_profile: z.string().regex(STACK_IDENTITY_PROFILE_PATTERN, STACK_IDENTITY_PROFILE_RULE).nullable().default(null),
@@ -206,13 +205,10 @@ export const stackAccountInputSchema = z
 export type StackAccountInput = z.infer<typeof stackAccountInputSchema>;
 
 /**
- * An identity profile (`PUT .../identity-profiles/{name}` body): a vendor and a client identity, or a preset of
- * Gray's (`GET .../identity-presets`) to copy; the `none` preset names no vendor, so its body names one.
+ * An identity profile (`PUT .../identity-profiles/{name}` body): a vendor and a client identity. Retired on 2026-11-18
+ * with an account's `identity`: stored and shown, never sent to the VM. Gray's presets to copy are gone.
  */
-export const stackIdentityProfileInputSchema = z.union([
-  z.object({ vendor: z.enum(STACK_VENDORS), identity: stackIdentityInputSchema }).strict(),
-  z.object({ preset: z.string().min(1).max(64), vendor: z.enum(STACK_VENDORS).optional() }).strict(),
-]);
+export const stackIdentityProfileInputSchema = z.object({ vendor: z.enum(STACK_VENDORS), identity: stackIdentityInputSchema }).strict();
 export type StackIdentityProfileInput = z.infer<typeof stackIdentityProfileInputSchema>;
 
 /** The most accounts one batch names: the most a relay's VM serves (`@gray/relay-connector` DEFAULT_MAX_ACCOUNTS_PER_RELAY, S42). */
@@ -220,7 +216,7 @@ export const STACK_ACCOUNTS_PATCH_MAX = 1000;
 
 /**
  * A batch edit of accounts (`PATCH .../accounts` body): for every listed account, the identity profile (null clears
- * it).
+ * it). Retired with the profiles (2026-11-18): still taken, never applied.
  */
 export const stackAccountsPatchSchema = z
   .object({
@@ -725,6 +721,42 @@ export function stackAccountSettingsMessage(r: StackAccountSettingsRequest): Uin
   const models = r.models === undefined ? "-" : r.models === "*" ? "*" : `=${r.models.join(",")}`;
   const value = (v: number | boolean | undefined): string => (v === undefined ? "-" : String(v));
   return new TextEncoder().encode([STACK_ACCOUNT_SETTINGS_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, models, value(r.weight), value(r.max_concurrency), value(r.paused), ...r.account_ids].join("\n"));
+}
+
+// ------------------------------------------------------------------------------------- the relay's public name
+
+/**
+ * A relay's own read or change of its workspace's public name (`POST /v1/lane-stack/public-name`; docs/api-contract.md,
+ * "Provider handle"): what the provider pages' Public name panel does, signed by the relay key as the settings change is,
+ * so `gray-assistant public-name [set <name> | show | hide]` offer what the panel offers. `handle` claims the name (once:
+ * the console's claim rules), `show_name` chooses whether the Models page shows it; neither: a read.
+ */
+export const stackPublicNameRequestSchema = z
+  .object({
+    relay_id: z.string().regex(LANE_RELAY_ID_PATTERN),
+    issued_ms: u64,
+    nonce: z.string().regex(STACK_PANEL_VIEW_NONCE_PATTERN),
+    // The console checks the grammar and the reserved names; here only that the signed message reads one way.
+    handle: z.string().regex(/^[a-z0-9-]{1,64}$/).optional(),
+    show_name: z.boolean().optional(),
+  })
+  .strict()
+  .refine((r) => r.handle === undefined || r.show_name === undefined, { message: "a request names handle or show_name, or neither (a read)" });
+export type StackPublicNameRequest = z.infer<typeof stackPublicNameRequestSchema>;
+
+/** The request and the relay's Ed25519 signature over `stackPublicNameMessage`, 128 lower-case hex digits. */
+export const stackPublicNameReportSchema = z.object({ request: stackPublicNameRequestSchema, signature: z.string().regex(/^[0-9a-f]{128}$/) }).strict();
+export type StackPublicNameReport = z.infer<typeof stackPublicNameReportSchema>;
+
+/** The first line of the signed public-name request. */
+export const STACK_PUBLIC_NAME_DOMAIN = "gray-relay-public-name/v1";
+
+/**
+ * The bytes the relay signs: the domain, `relay_id`, `issued_ms`, `nonce`, then `handle` (`=` and the name) and
+ * `show_name` (`true`, `false`), `-` for one the request does not name, each on a line of its own.
+ */
+export function stackPublicNameMessage(r: StackPublicNameRequest): Uint8Array {
+  return new TextEncoder().encode([STACK_PUBLIC_NAME_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, r.handle === undefined ? "-" : `=${r.handle}`, r.show_name === undefined ? "-" : String(r.show_name)].join("\n"));
 }
 
 /** Where a restart request stands: recorded and waiting, or settled by the provisioner or Gray's operator. */

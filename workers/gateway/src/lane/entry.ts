@@ -937,7 +937,9 @@ function warmerOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
  * finds its copy; a relay's credentials (`readyRelay`, its routes due now) read it too, a fresh look at what the relay
  * serves. Otherwise the copy is looked at (`peek`), and checked ahead of a route's expiry (`SnapshotCache.ahead`, M15):
  * the requests' own reads keep it current while they come, and these fetches while they do not. A route the reads
- * bring is warmed at the next fetch.
+ * bring is warmed at the next fetch. The source reads as the request path's does (r16; lead's decision R1, 2026-11-15):
+ * with the ranking members and the isolate's snapshot latch (`laneGatewayDeps`), so the boot's first copy brings the
+ * D7 check for the whole ranking feed in its background, and the lane's first customer request ranks with samples.
  */
 function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, ctx: ExecutionContext, readyRelay?: string, peers: EntryPeers | null = null): void {
   const warmer = warmerOf(state, env, cfg);
@@ -947,6 +949,8 @@ function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
     const source = new RemoteSnapshotSource({
       ...bridge,
       now: state.now,
+      ranking: true,
+      legacy: laneIsolateOnce().legacy.snapshot,
       onSnapshot: (snapshot) => {
         state.registry.refresh(snapshot);
         endpointRoutes?.sync(snapshot.version, endpointRowsOfSnapshot(snapshot));

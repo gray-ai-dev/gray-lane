@@ -62,7 +62,7 @@ export async function affinityKeyFromMaterial(material: Uint8Array): Promise<Uin
 /**
  * The domain of the conversation id a relay's container is sent (relay standard v1.7 `X-Gray-Conversation`, design
  * docs/relay-standard-v1.7.md section 3): the same inputs under its own label, so the container's value is never the
- * affinity token egress derives the vendor's session ids from.
+ * lane's affinity token.
  */
 export const CONVERSATION_DOMAIN = "gray-conversation-v1";
 

@@ -210,7 +210,7 @@ export interface PeerCallInput {
   readonly route: { readonly endpoint: string; readonly protocol: PeerProtocol; readonly model: string };
   /** The client's path and raw query (`/v1/messages?…`), as the stack VM serves it. */
   readonly path: string;
-  /** The client headers the stack path reads (`stack.ts` STACK_CLIENT_HEADERS, STACK_BEHAVIOUR_HEADERS). */
+  /** The client's own headers the stack path reads (`stack.ts` `stackClientHeaders`, `@gray/lane-wire` stack-client-headers.ts). */
   readonly headers: Readonly<Record<string, string>>;
   /** The client's exact bytes. */
   readonly body: Uint8Array;

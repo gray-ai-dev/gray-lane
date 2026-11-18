@@ -1,8 +1,10 @@
-import { snapshotAnswerOf, snapshotCurrentCall, snapshotCurrentRequestSchema, type SnapshotCurrentRequest } from "@gray/lane-wire";
+import { snapshotAnswerOf, snapshotCurrentCall, snapshotCurrentRequestSchema, snapshotRankingRequestOf, type SnapshotAnswerDto, type SnapshotCurrentRequest } from "@gray/lane-wire";
+import type { FeedAnswer, FeedHave } from "@gray/routing";
 import { dedupedLaneRelays, entryEndpointRoute, laneRelayOf, type EntryRouteFacts, type GatewaySealedLaneRelay, type GatewayStackLaneRelay, type Snapshot } from "@gray/snapshot";
 import { gatewaySnapshotOf, type AgeJudgement, type Runner, type SnapshotAnswer, type SnapshotSource } from "../../snapshot.ts";
 import type { LaneRelay, LaneRelayRegistry } from "../types.ts";
-import { BridgeClient, type BridgeClientOptions } from "./client.ts";
+import { BridgeCallError, BridgeClient, type BridgeClientOptions } from "./client.ts";
+import type { LegacyLatch } from "./legacy.ts";
 
 /**
  * The snapshot over the bridge (design v2 section D, M19).
@@ -11,7 +13,7 @@ import { BridgeClient, type BridgeClientOptions } from "./client.ts";
  * CVM maps it with `gatewaySnapshotOf` (`mapSnapshot` below), so the bridge never reimplements
  * gateway logic and one mapping serves both the main lane's `ReplicaSource` and this source.
  *
- * The source's three callbacks and parameters, all honoured here:
+ * The source's callback and parameters, all honoured here:
  *
  * - `run` wraps the one bridge call, so it is inside the request's six-connection budget
  *   (`Outbound.run`); a remote source that ignored it would bypass `Outbound`.
@@ -25,6 +27,17 @@ import { BridgeClient, type BridgeClientOptions } from "./client.ts";
  *   writer's age. The bridge passes a lagging copy over and asks the next source or ConfigDO, as
  *   the main lane's `ReplicaSource` does; when nothing passes, it returns the best answer it saw,
  *   which this source returns to the cache rather than inventing a refusal.
+ * - `ranking` (r16, the routing of the main gateway: workers/lane-bridge IMPLEMENTATION_NOTES.md "The snapshot
+ *   read"): the request path's source (`options.ranking`) says in every read that it takes the ranking members,
+ *   `ranking=word` when the cache asks for no changes (undefined), `ranking=all` when it holds nothing (null) and
+ *   `ranking=since` with its `FeedHave`; the bridge asks the replicas for them as `ReplicaSource` does, and this source
+ *   gives the answer's `ranking` (the replica's `FeedAnswer`, its columns decoded back to typed arrays) and
+ *   `rankingFailingSince` to the cache as they came. The cache's ranking base checks the feed answer as the main
+ *   gateway's checks a replica's (`RankingBase.apply`), and the failing-since brings its D7 check after the first copy.
+ *   A bridge before r16 refuses the members (400): the read goes again without them and keeps to that for the latch's
+ *   window (`options.legacy`, remote/legacy.ts), and the lane ranks as it did before r16, with no samples. The boot's
+ *   warm read fills the same cache and reads the same way (`entry.ts` `warmLane`); the registry's boot read and intake's
+ *   sources read as before r16 whatever the cache passes.
  *
  * The lane snapshot's invariants (`assertLaneSnapshot`, design v2 section B): every route but the lane
  * relays' and the endpoint routes the entry serves (docs/design/lane-provider-routes.md section 2) is
@@ -42,21 +55,36 @@ export interface RemoteSnapshotSourceOptions extends BridgeClientOptions {
    * the process serves is the one intake and the providers use. A throw keeps the previous registry.
    */
   readonly onSnapshot?: (snapshot: Snapshot) => void;
+  /**
+   * The request path's source (r16): it says in every read that it takes the ranking members (`ranking=word`, or the
+   * feed it holds when the snapshot cache asks for the ranking), so the bridge passes the replica's word on the ranking
+   * feed and its changes; the boot's warm read, which fills the request path's cache, is one too (`entry.ts` `warmLane`).
+   * Absent (the registry's boot read, intake's): the read of before r16, which no bridge refuses.
+   */
+  readonly ranking?: boolean;
+  /** The snapshot read's latch (remote/legacy.ts): a bridge that refused the ranking members lately is asked without them. */
+  readonly legacy?: LegacyLatch;
 }
 
-/** The remote source: `current(have, run, confirmedAfter, judge)` over the bridge. */
+/** The remote source: `current(have, run, confirmedAfter, judge, ranking)` over the bridge. */
 export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource {
   /** The snapshot as the last answer mapped it (the same one-version memo `ReplicaSource` keeps). */
   #mapped: { readonly version: number; readonly snapshot: Awaited<ReturnType<typeof mapSnapshot>> } | null = null;
 
   readonly #onSnapshot: ((snapshot: Snapshot) => void) | undefined;
+  readonly #ranking: boolean;
+  readonly #legacy: LegacyLatch | undefined;
+  readonly #now: () => number;
 
   constructor(options: RemoteSnapshotSourceOptions) {
     super(options);
     this.#onSnapshot = options.onSnapshot;
+    this.#ranking = options.ranking === true;
+    this.#legacy = options.legacy;
+    this.#now = options.now ?? (() => Date.now());
   }
 
-  async current(have: number, run: Runner = (call) => call(), confirmedAfter?: number, judge?: AgeJudgement): Promise<SnapshotAnswer> {
+  async current(have: number, run: Runner = (call) => call(), confirmedAfter?: number, judge?: AgeJudgement, ranking?: FeedHave | null): Promise<SnapshotAnswer> {
     // `judge` is applied by the bridge (bridge-3), which sees all the copies: sending it in the
     // signed query lets the bridge pass over a replica whose copy is its own lag and ask ConfigDO
     // instead, as the main lane's `ReplicaSource` does. The client no longer judges the answer
@@ -68,10 +96,45 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
       judge_now: judge === undefined ? null : BigInt(judge.now),
       judge_age_ms: judge === undefined ? null : BigInt(judge.ageMs),
     };
-    const raw = snapshotAnswerOf(await run(() => this.#read(request)));
+    if (!this.#ranking || this.#legacy?.legacy(this.#now()) === true) return this.#answer(await run(() => this.#read(request)), false);
+    let dto: SnapshotAnswerDto;
+    try {
+      dto = await run(() => this.#read({ ...request, ...snapshotRankingRequestOf(ranking) }));
+    } catch (error) {
+      // A bridge before r16 refuses a query parameter it does not know (400, its `snapshotCurrentRequestOf`'s
+      // `unknown_field`), as a new bridge refuses no read this source builds: the read of before r16 once more, and
+      // that one until the latch's window passes (remote/legacy.ts). The latch is set once that read was taken, as the
+      // endpoint ops set theirs (review r16 minor 7): a 400 for another reason, which it gets too, or a failure of it,
+      // throws as before and changes nothing. Any other failure of the first read is the read's, as before.
+      if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
+      const before = await run(() => this.#read(request));
+      this.#legacy?.refused(this.#now());
+      return this.#answer(before, false);
+    }
+    return this.#answer(dto, true);
+  }
+
+  /**
+   * An answer as the cache takes it. The ranking members only from a read that named them (a bridge answers them to
+   * no other), as they came: the base checks the feed answer as the main gateway's checks a replica's (`feedAnswerValid`,
+   * each key `feedKeyValid`), and a failure's kind with it.
+   */
+  #answer(dto: SnapshotAnswerDto, asked: boolean): SnapshotAnswer {
+    const raw = snapshotAnswerOf(dto);
     if (raw.snapshot !== null) this.#onSnapshot?.(raw.snapshot);
     const snapshot = raw.snapshot === null ? null : this.#map(raw.snapshot);
-    return { version: raw.version, refreshedAt: raw.refreshedAt, confirmedAt: raw.confirmedAt, snapshot };
+    return {
+      version: raw.version,
+      refreshedAt: raw.refreshedAt,
+      confirmedAt: raw.confirmedAt,
+      snapshot,
+      ...(asked && raw.ranking !== undefined ? { ranking: raw.ranking as FeedAnswer } : {}),
+      // A ranking member this build could not read goes to the base as no feed answer, which it counts unreadable as the
+      // main gateway's base counts a replica's answer it cannot read (`ranking_answer_unreadable`, and `ranking_stale`
+      // once that lasts past the alert age); the snapshot is taken all the same (review r16 finding 3).
+      ...(asked && raw.rankingUnreadable !== undefined ? { ranking: { unreadable: raw.rankingUnreadable.reason } as unknown as FeedAnswer } : {}),
+      ...(asked && raw.rankingFailingSince !== undefined ? { rankingFailingSince: raw.rankingFailingSince } : {}),
+    };
   }
 
   /** One signed GET; the answer is read by `parseBridgeResponse` inside `call` and given back as its DTO. */

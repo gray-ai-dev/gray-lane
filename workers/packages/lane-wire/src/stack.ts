@@ -88,10 +88,12 @@ export const STACK_IDENTITY_ROUTES: Readonly<Record<StackVendorName, StackIdenti
 });
 
 /**
- * An account's client identity (S32a, the owner's trust-model decision of 2026-10-29): the static `headers` of the
- * vendor's own client the relay registered for the account (at most 16, each value 1 to 512 bytes of printable ASCII
- * with no space at either end), the Anthropic `betas` it sends (`anthropic-beta`, at most 8), and the ids egress makes
- * itself per call or session (`generated`). Egress holds each of the account's calls to it. The names are the closed
+ * Retired on 2026-11-18 (owner: Gray sets no client-identity header on a customer's request; the vendor gets the
+ * client's own and the relay's): the console still stores and shows an identity a relay registered, checked by these
+ * rules, and nothing applies it. Before: an account's client identity (S32a, the owner's trust-model decision of
+ * 2026-10-29): the static `headers` of the vendor's own client the relay registered for the account (at most 16, each
+ * value 1 to 512 bytes of printable ASCII with no space at either end), the Anthropic `betas` it sends
+ * (`anthropic-beta`, at most 8), and the ids egress made itself per call or session (`generated`). The names are the closed
  * lists of stack-health.ts; which a route takes is `stackIdentityProblem`'s.
  */
 export const stackIdentitySchema = z
@@ -125,7 +127,8 @@ export function stackIdentityProblem(vendor: StackVendorName, identity: StackIde
 /**
  * One upstream account (section 8): vendors as section 8 names them, `@gray/control` STACK_VENDORS. `credential_type`
  * (the sealed credential's type the relay declares) and `identity` (S32a) are later members: absent when the relay set
- * none, so an entry that predates them still reads every configuration whose accounts set none.
+ * none, so an entry that predates them still reads every configuration whose accounts set none. `identity` is retired
+ * (2026-11-18): still read, so a console that sends it is not refused, and never applied.
  */
 const accountSchema = z
   .object({
@@ -263,7 +266,10 @@ export interface StackConfigAccount {
   readonly credential_version: number;
   /** The sealed credential's type the relay declares; absent when it declared none. */
   readonly credential_type?: (typeof STACK_CREDENTIAL_TYPES)[number];
-  /** The account's client identity (S32a); absent when the relay registered none. */
+  /**
+   * The account's client identity (S32a), retired on 2026-11-18: an older console still sends the one the panel
+   * registered, and the entry ignores it (Gray sets no client-identity header; the vendor gets the client's own).
+   */
   readonly identity?: StackIdentity;
 }
 export interface StackConfigProxy {

@@ -45,6 +45,7 @@ export * from "./snapshot.ts";
 export * from "./scheduler.ts";
 export * from "./records.ts";
 export * from "./stack.ts";
+export * from "./stack-client-headers.ts";
 export * from "./stack-health.ts";
 export * from "./stack-rules.ts";
 export * from "./stack-report.ts";

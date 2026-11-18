@@ -13,8 +13,9 @@ import (
 // POST /v1/stack/account-tests (S44): the entry asks egress to send one account a fixed request of a few tokens
 // and to say how it went. The body is the vendor operations table's `test:<protocol>` template (stack_ops_table.go,
 // docs/relay-changes-v2.md §6): constants, the vendor's texts and the model the panel picked from the account's
-// models; no text of the relay's or the container's reaches it (stackTestBody). The headers are S32a's, from the
-// account's registered identity (stackVendorHeader); the call
+// models; no text of the relay's or the container's reaches it (stackTestBody). The headers are Gray's own set for the
+// credential form (stackVendorHeader) with no client's: no user-agent, x-stainless-* or session id (since 2026-11-18
+// no account registers an identity, and a test has no client); the call
 // dials exactly as a relay call does (forward, the relay transports, the account's proxy), its error is held and
 // classified the same way, and its windows and the rules apply as to a relay call. Only SSE event types are read
 // (and, on Chat, whether a delta had content); nothing of the answer is kept or answered. A test bypasses cooling,
@@ -39,7 +40,6 @@ type wireAccountTest struct {
 	Protocol       *string            `json:"protocol"`
 	Model          *string            `json:"model"`
 	Credential     *map[string]string `json:"credential"`
-	Identity       *wireIdentity      `json:"identity"`
 	Proxy          *json.RawMessage   `json:"proxy"`
 	ProxyID        *string            `json:"proxy_id"`
 }
@@ -133,8 +133,8 @@ type accountTest struct {
 }
 
 // parseAccountTest checks a request (false: stack_control_invalid). An answer without a vendor call comes back
-// at once: route_refused for a protocol with no route or no test template for the vendor, header_refused for an identity naming a
-// header off the route's identity lists.
+// at once: route_refused for a protocol with no route or no test template for the vendor. (header_refused, for an
+// identity naming a header off the route's identity lists, is reserved since identities were retired on 2026-11-18.)
 func parseAccountTest(w wireAccountTest) (accountTest, *accountTestAnswer, bool) {
 	var t accountTest
 	if w.TestID == nil || len(*w.TestID) != 32 || !isLowerHex(*w.TestID) || w.AccountID == nil || !validStackID(*w.AccountID) ||
@@ -142,7 +142,7 @@ func parseAccountTest(w wireAccountTest) (accountTest, *accountTestAnswer, bool)
 		return t, nil, false
 	}
 	vendor, protocol := *w.Vendor, *w.Protocol
-	routeName, known := stackVendors[vendor]
+	_, known := stackVendors[vendor]
 	if _, protocolKnown := stackProtocolRoutes[protocol]; !known || !protocolKnown || !inList(stackCredentialTypes[vendor], *w.CredentialType) {
 		return t, nil, false
 	}
@@ -172,27 +172,6 @@ func parseAccountTest(w wireAccountTest) (accountTest, *accountTestAnswer, bool)
 	if _, routed := stackProtocolRoutes[protocol][vendor]; !routed || stackOpsTable.op(vendor, *w.CredentialType, opTestPrefix+protocol) == nil {
 		return t, failedTest(testRouteRefused), true
 	}
-	if w.Identity != nil {
-		if w.Identity.Headers != nil {
-			for name := range *w.Identity.Headers {
-				if !staticIdentityName(routeName, name) {
-					return t, failedTest(testHeaderRefused), true
-				}
-			}
-		}
-		if w.Identity.Generated != nil {
-			for _, name := range *w.Identity.Generated {
-				if !generatedIdentityName(routeName, name) {
-					return t, failedTest(testHeaderRefused), true
-				}
-			}
-		}
-	}
-	identity, ok := parseIdentity(vendor, w.Identity)
-	if !ok {
-		return t, nil, false
-	}
-	t.account.identity = identity
 	t.protocol, t.model = protocol, *w.Model
 	return t, nil, true
 }
@@ -221,7 +200,7 @@ func (s *server) runAccountTest(ctx context.Context, t accountTest) *accountTest
 	plan := requestPlan{route: rt, spec: t.account.spec,
 		target: &url.URL{Scheme: "https", Host: rt.host, Opaque: "/" + strings.TrimPrefix(path, rt.prefix)}}
 	oauth := rt.name == "/anthropic" && t.account.credentialType == "oauth_access_token"
-	header := stackVendorHeader(rt, t.credential, map[string]string{}, oauth, t.account.identity, randomUUID())
+	header := stackVendorHeader(rt, t.credential, map[string]string{}, oauth)
 	// An account test is egress's own call, with no relay preference to repeat; its observer reads the events
 	// uncoded.
 	header.Set("Accept-Encoding", "identity")

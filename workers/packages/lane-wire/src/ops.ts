@@ -1,5 +1,5 @@
 import { shardName as accountShardName, type ShardAddress } from "@gray/account";
-import { shardName as endpointShardName, type ShardIdentity } from "@gray/endpoint";
+import { rootName as endpointRootName, shardName as endpointShardName, type ShardIdentity } from "@gray/endpoint";
 import { BridgeWireError } from "./error.ts";
 
 /**
@@ -38,6 +38,11 @@ import { BridgeWireError } from "./error.ts";
  * credentials) and every half standing return. A bridge of a release before it answers it as an unknown path, and the
  * lane serves as before.
  *
+ * `endpoint.file_rest` (r16, workers/lane-bridge IMPLEMENTATION_NOTES.md "Routing like the main gateway") files a failure
+ * rest at one endpoint root, as the gateway's rests.ts `fileRest` calls each root a rest covers: one call per root, best
+ * effort. Its target is the root's Durable Object name (`endpointRootTarget`). A bridge of a release before it answers an
+ * unknown path, and the lane's attempt rests nothing there, as before r16.
+ *
  * `release.lists` and `attest.collateral` (docs/confidential-lane-stack-routing.md section 4.2) are the two reads a lane VM
  * makes in the background to verify a peer VM: the environment's signed release lists and Intel's DCAP collateral
  * (background.ts). Neither is on a request path, and neither ends at an object: the bridge reads the lists' public origin
@@ -74,6 +79,7 @@ export const BRIDGE_OPS = [
   "endpoint.probe_answered",
   "endpoint.reserve_retry",
   "endpoint.warm",
+  "endpoint.file_rest",
   "snapshot.current",
   "scheduler.forward",
   "records.index",
@@ -115,6 +121,7 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "endpoint.probe_answered": "POST",
   "endpoint.reserve_retry": "POST",
   "endpoint.warm": "POST",
+  "endpoint.file_rest": "POST",
   "snapshot.current": "GET",
   "scheduler.forward": "POST",
   "records.index": "POST",
@@ -154,6 +161,7 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "endpoint.probe_answered": "/v1/lane-bridge/endpoint/probe-answered",
   "endpoint.reserve_retry": "/v1/lane-bridge/endpoint/reserve-retry",
   "endpoint.warm": "/v1/lane-bridge/endpoint/warm",
+  "endpoint.file_rest": "/v1/lane-bridge/endpoint/file-rest",
   "snapshot.current": "/v1/lane-bridge/snapshot/current",
   "scheduler.forward": "/v1/lane-bridge/scheduler/forward",
   "records.index": "/v1/lane-bridge/records/index",
@@ -223,6 +231,11 @@ export function accountTarget(shard: ShardAddress): string {
 /** The endpoint shard's Durable Object name (`@gray/endpoint`'s `shardName`, the name the gateway uses). */
 export function endpointTarget(shard: ShardIdentity): string {
   return endpointShardName(shard);
+}
+
+/** The endpoint root's Durable Object name (`@gray/endpoint`'s `rootName`, the gateway's `endpointRootStub`): `endpoint.file_rest`'s target. */
+export function endpointRootTarget(endpointId: string): string {
+  return endpointRootName(endpointId);
 }
 
 /** One signed call: what the op is, where it goes, and the request target the signature covers. */

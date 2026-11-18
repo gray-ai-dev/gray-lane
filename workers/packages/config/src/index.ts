@@ -2819,6 +2819,27 @@ export const SETTINGS: readonly SettingSpec[] = [
       "ORIGIN's host serves the console and none of the model API, and the console's pages call the model API there across origins",
   },
   {
+    name: "CUSTOMER_CHAT_ORIGIN",
+    key: "customerChatOrigin",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    shown: "API_ORIGIN",
+    textCheck: (v) => (v === "" ? null : originProblem(v)),
+    source:
+      "GRAY_CUSTOMER_CHAT_ORIGIN of the server (crates/gray-gateway/src/config/origins.rs). The owner's decision of 2026-11-18: customers use " +
+      "one address for chat, the confidential entry's (LANE_STACK_ENTRY_ORIGIN, https://lane.usefallback.com in production), where the routing " +
+      "preference decides where a request goes and `verifiable: true` keeps it on lane relays. Empty, the model API's: nothing changes until the " +
+      "entry serves every chat route (the lane release after #776), and then the deploy session sets it to LANE_STACK_ENTRY_ORIGIN. The " +
+      "console checks it is API_ORIGIN or LANE_STACK_ENTRY_ORIGIN, https outside DEPLOY_ENV local (workers/console/src/settings.ts).",
+    doc:
+      "The chat address customers are given: the base URL of the Chat Completions, Responses, Messages and Gemini generation APIs in the agent " +
+      "setups (agent.md, the setup files, the console's setups) and the console's examples. Another origin than API_ORIGIN is Gray's " +
+      "confidential entry, which serves those APIs: the agent setups then offer the models served there, and to a key whose own or workspace " +
+      "routing default is verifiable only the verifiable ones. The setup routes, /v1/key, images, embeddings, audio, video, rerank and the other " +
+      "model APIs stay on API_ORIGIN",
+  },
+  {
     name: "ADMIN_WALLETS",
     key: "adminWallets",
     workers: ["console"],
@@ -2977,6 +2998,34 @@ export const SETTINGS: readonly SettingSpec[] = [
       "is $1 (WELCOME_CREDIT_MICROUSD 1000000, compose.production.yaml); grants past that wait for the funder's next day anyway. Above it the " +
       "count stops being a limit: a mistyped value lets every sign-in record a grant.",
     doc: "Welcome credits recorded per UTC day, all users together; a sign-in past it is granted at a later sign-in",
+  },
+  {
+    name: "OPERATOR_GRANT_MAX_MICROUSD",
+    key: "operatorGrantMaxMicroUsd",
+    workers: ["console"],
+    type: "int",
+    default: "100000000",
+    min: 1,
+    max: 10_000_000_000,
+    source:
+      "GRAY_OPERATOR_GRANT_MAX_MICROUSD of the server: $100 by default, the owner's per-grant bound of 2026-11-18 (an operator gives a " +
+      "friend in the internal beta credit to use the API). At most $10,000: it guards against a mistyped amount, and one grant above it is " +
+      "a top-up, not a grant.",
+    doc: "The most one operator grant gives a workspace (POST /api/v1/ops/ledger/grants); a larger one is refused",
+  },
+  {
+    name: "OPERATOR_GRANT_DAILY_LIMIT_MICROUSD",
+    key: "operatorGrantDailyLimitMicroUsd",
+    workers: ["console"],
+    type: "int",
+    default: "1000000000",
+    min: 1,
+    max: 1_000_000_000_000,
+    source:
+      "GRAY_OPERATOR_GRANT_DAILY_LIMIT_MICROUSD of the server: $1,000 by default, the owner's daily bound of 2026-11-18, all operators " +
+      "together. At most $1,000,000, the most the credit Workers' funder pays out in a day (FUND_DAILY_BUDGET_MICRO, " +
+      "workers/credit/src/lib/config.ts): grants past that would wait for the funder's next day anyway.",
+    doc: "The most all operator grants of one UTC day give together, all operators and workspaces; a grant past it is refused",
   },
   {
     name: "MOSS_RPC_URL",
@@ -3300,7 +3349,25 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 0,
     max: 1_000_000_000_000,
     source: "GRAY_CHECK_GLOBAL_DAILY_MICROUSD of the server: $50 a day by default, at most 10^12 (crates/gray-gateway/src/check_budget.rs CheckBudget::new).",
-    doc: "What all providers' verification checks together may cost Gray per UTC day, at the providers' own prices; past it no check is sent.",
+    doc:
+      "What all providers' verification checks together may cost Gray per UTC day, at the providers' own prices; past it no check is " +
+      "sent. Checks that buy a media generation count against CHECK_MEDIA_GLOBAL_DAILY_MICROUSD instead.",
+  },
+  {
+    name: "CHECK_MEDIA_GLOBAL_DAILY_MICROUSD",
+    key: "checkMediaGlobalDailyMicroUsd",
+    workers: ["console"],
+    type: "int",
+    default: "50000000",
+    min: 0,
+    max: 1_000_000_000_000,
+    source:
+      "GRAY_CHECK_MEDIA_GLOBAL_DAILY_MICROUSD of the server: $50 a day by default, at most 10^12 (crates/gray-gateway/src/check_budget.rs " +
+      "CheckBudget::new). Owner decision 2026-11-18: checks that buy a media generation (a video, an image) get a platform cap of their " +
+      "own, so they can never use up the one text checks run on.",
+    doc:
+      "What all providers' checks that buy a media generation together may cost Gray per UTC day, at the providers' own prices; past it " +
+      "no such check is sent, while other checks go on within CHECK_GLOBAL_DAILY_MICROUSD.",
   },
   {
     name: "CHECK_WORKSPACE_DAILY_MICROUSD",
@@ -3405,6 +3472,22 @@ export const SETTINGS: readonly SettingSpec[] = [
     max: 604800,
     source: "GRAY_EVIDENCE_FLOOR_SECONDS of the server: a day, from EVIDENCE_REFRESH_SECONDS to a week (evidence_schedule.rs).",
     doc: "The longest customer traffic may carry a mapping's pass without a full active check.",
+  },
+  {
+    name: "PAID_EVIDENCE_FLOOR_SECONDS",
+    key: "paidEvidenceFloorSeconds",
+    workers: ["console"],
+    type: "int",
+    default: "604800",
+    min: 40,
+    max: 604800,
+    source:
+      "GRAY_PAID_EVIDENCE_FLOOR_SECONDS of the server: a week, from PAID_EVIDENCE_REFRESH_SECONDS to a week (evidence_schedule.rs " +
+      "EvidenceSchedule::with_paid_floor). Owner decision 2026-11-18: each check of such a mapping buys a generation on the provider's own " +
+      "vendor account, so its successful customer traffic stands in for the check for this long.",
+    doc:
+      "EVIDENCE_FLOOR_SECONDS for a mapping whose check buys a media generation: the longest its successful customer traffic may carry its " +
+      "pass without a full active check.",
   },
   {
     name: "FAILURE_RECHECK_SECONDS",
@@ -3569,12 +3652,13 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "trafficStatMinSamples",
     workers: ["console"],
     type: "int",
-    default: "100",
+    default: "10",
     min: 1,
     max: 1000000,
     source:
-      "GRAY_TRAFFIC_STAT_MIN_SAMPLES of the server: 100, 1 to 1,000,000 (crates/gray-gateway/src/config/traffic_stats.rs). Decided by the " +
-      "product owner on 2026-11-13 with the data plan (docs/live-speed.md \"Definitions\"): 100 in each figure's own denominator. A setting " +
+      "GRAY_TRAFFIC_STAT_MIN_SAMPLES of the server: 10, 1 to 1,000,000 (crates/gray-gateway/src/config/traffic_stats.rs). Decided by the " +
+      "product owner on 2026-11-18 (docs/live-speed.md \"Definitions\"): 10 in each figure's own denominator, each figure shown with its " +
+      "count, down from 2026-11-13's 100, under which no provider had a figure. A setting " +
       "of its own, not ANSWER_CHECK_MIN_ANSWERS or ROUTE_USAGE_MIN_REQUESTS, which count other things. It may lower the threshold to 1. " +
       "The maximum is a bound of ours, far above any provider's week, so a mistyped value is refused rather than hiding every figure.",
     doc:
@@ -4959,6 +5043,12 @@ export const CROSS_CHECKS: readonly CrossCheck[] = [
     source: "The floor may not ask for full checks more often than the re-check does (evidence_schedule.rs EvidenceSchedule::new).",
   },
   {
+    workers: ["console"],
+    names: ["PAID_EVIDENCE_FLOOR_SECONDS", "PAID_EVIDENCE_REFRESH_SECONDS"],
+    check: (a, b) => (a >= b ? null : `${a} must be at least PAID_EVIDENCE_REFRESH_SECONDS (${b})`),
+    source: "A paid mapping's floor may not ask for full checks more often than its re-check does (evidence_schedule.rs EvidenceSchedule::with_paid_floor).",
+  },
+  {
     workers: ["gateway"],
     names: ["ACCOUNT_ROOT_CALL_TIMEOUT_MS", "ACCOUNT_ADMIT_BUDGET_MS"],
     check: (a, b) => (a <= b ? null : `${a} must be at most ACCOUNT_ADMIT_BUDGET_MS (${b})`),
@@ -5655,6 +5745,8 @@ export interface ConsoleConfig {
   readonly origin: string;
   /** The model API's origin; `origin` itself in the one-origin setup. */
   readonly apiOrigin: string;
+  /** CUSTOMER_CHAT_ORIGIN: the chat address customers are given; empty: `apiOrigin`. */
+  readonly customerChatOrigin: string;
   /** Comma-separated; workers/console reads it as a list. */
   readonly adminWallets: string;
   readonly accessTeamDomain: string;
@@ -5670,6 +5762,8 @@ export interface ConsoleConfig {
   readonly platformFeeBps: number;
   readonly welcomeCreditMicroUsd: number;
   readonly welcomeCreditDailyLimit: number;
+  readonly operatorGrantMaxMicroUsd: number;
+  readonly operatorGrantDailyLimitMicroUsd: number;
   /** "" when unset. */
   readonly mossRpcUrl: string;
   readonly mossVerifyTimeoutMs: number;
@@ -5794,6 +5888,8 @@ export interface ConsoleConfig {
   /** The gateway's CONFIG_MAX_AGE_MS: the operations investigation reports when the current snapshot expires. */
   readonly configMaxAgeMs: number;
   readonly checkGlobalDailyMicroUsd: number;
+  /** CHECK_MEDIA_GLOBAL_DAILY_MICROUSD: the platform cap of checks that buy a media generation. */
+  readonly checkMediaGlobalDailyMicroUsd: number;
   readonly checkWorkspaceDailyMicroUsd: number;
   readonly checkConfirmation: CheckConfirmation;
   /** ALLOW_PRIVATE_UPSTREAMS, as set; `allowPrivateUpstreams` says whether it applies. */
@@ -5808,6 +5904,7 @@ export interface ConsoleConfig {
   readonly paidEvidenceRefreshSeconds: number;
   readonly evidenceFloorSeconds: number;
   readonly failureRecheckSeconds: number;
+  readonly paidEvidenceFloorSeconds: number;
   readonly maintenanceStallAlertPercent: number;
   /**
    * MODELTRACE_MODELS as given ("" when unset): which models ModelTrace checks, read by @gray/modeltrace

@@ -152,7 +152,7 @@ const (
 	testStreamIncomplete  = "stream_incomplete"
 	testTimeout           = "timeout"
 	testRouteRefused      = "route_refused"
-	testHeaderRefused     = "header_refused"
+	testHeaderRefused     = "header_refused" // reserved: an identity name off its route's lists, retired 2026-11-18
 	testNotSealed         = "not_sealed"
 	testCredentialExpired = "credential_expired"
 	testAccountUnknown    = "account_unknown"

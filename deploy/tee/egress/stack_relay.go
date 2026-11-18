@@ -191,9 +191,10 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		return
 	}
 
-	// Gray's own header set (S32a), then each header the relay sent in its place, recorded as the relay's change, then
+	// Gray's own header set, the client's own headers among it (S32a, 2026-11-18), then each header the relay sent in its
+	// place, recorded as the relay's change, then
 	// the relay's own content type and coding preference (stack_coding.go: egress decodes the answer for its digests).
-	header := stackVendorHeader(plan.route, relayHeader, req.headers, oauth, account.identity, req.sessionID)
+	header := stackVendorHeader(plan.route, relayHeader, req.headers, oauth)
 	header, headerChanges := stackRelayHeader(plan.route, header, relayHeader, oauth)
 	headerChanges = stackRelayFraming(header, relayHeader, headerChanges)
 	changed := encodeStackChanged(accepted.Changed, headerChanges)

@@ -1,10 +1,14 @@
 import {
   NOT_COUNTED,
   SUPPLIER_FAILURES,
+  validMeasure,
   type AcquireInput,
   type AcquireResult,
+  type EndedRest,
+  type FiledRest,
   type NoteInput,
   type Outcome,
+  type OutcomeMeasure,
   type PermitToken,
   type RefusalClass,
   type RefusalReason,
@@ -14,6 +18,7 @@ import {
   type RetryReleaseInput,
   type RetryReserveInput,
   type RetryReserveResult,
+  type RestInput,
   type ShardIdentity,
   type WarmResult,
 } from "@gray/endpoint";
@@ -28,6 +33,14 @@ import { asBigint, asNumber, uintSchema } from "./ints.ts";
  * account regions, so it is validated by the Durable Object name rule (`@gray/endpoint`
  * `NAME_PART`) rather than the region list: the bridge must be able to make the same call with the
  * same name the gateway would, and a name the shard could not be created under is refused here.
+ *
+ * Since r16 (workers/lane-bridge IMPLEMENTATION_NOTES.md "Routing like the main gateway") the lane routes as the main
+ * gateway does: an attempt names its rank key (`rest_key` on `acquire` and `reserve_retry`, `key` on the permit), its
+ * release and note carry its measures (`measure`), its acquire the rests its isolate ended (`ended`) and its snapshot's
+ * version (`snapshot_version`), and the answer may say `resting` and carry the rests (`rests`, `held_rests`);
+ * `endpoint.file_rest` files a rest at one root. Each is optional on the strict documents, so a document of a lane
+ * before r16 is still the op's own, and each converter writes a member only where its value has one: a request without
+ * the new members, and the shard's answer to it, are the bytes of before r16.
  */
 
 const id = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/, "an id is 1-128 characters of [A-Za-z0-9_.:-]");
@@ -36,6 +49,93 @@ const namePart = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/, "a Durable Object 
 const durableName = z.string().regex(/^[A-Za-z0-9._:/-]{1,384}$/, "a Durable Object name is made of its parts and separators");
 const text = (max: number) => z.string().min(1).max(max).refine((value) => value.isWellFormed(), "a string of Unicode scalar values");
 const index = uintSchema.refine((value) => value >= 0n, "a shard index is not negative");
+
+/** A rank key (@gray/routing `measurementKey`, the gateway's rests.ts `rankKey`): 64 lower-case hex characters. */
+export const rankKeySchema = z.string().regex(/^[0-9a-f]{64}$/, "a rank key is 64 lower-case hex characters");
+
+/**
+ * The most keys a rest names, and roots: the endpoint root's bound on the keys its rests cover together (@gray/endpoint
+ * root.ts `REST_KEYS_BOUND`, the server ranker's `max_endpoints`), which one rest cannot pass either.
+ */
+export const FILED_REST_KEYS_MAX = 4096;
+
+/**
+ * The most rests an acquire says its isolate ended (`ended`): far more than a root holds in practice, and few enough that
+ * an acquire stays one of the small ops (`BRIDGE_SMALL_REQUEST_MAX_BYTES`, about 100 bytes each). The lane sends the first
+ * this many; one left out ends at the shard once that answer's release reaches its root, as before r16.
+ */
+export const ACQUIRE_ENDED_MAX = 256;
+
+/**
+ * The largest `endpoint.file_rest` body (1 MiB): a rest over FILED_REST_KEYS_MAX rank keys and as many roots of the
+ * longest name is about 800 KB, past the small ops' 64 KiB.
+ */
+export const ENDPOINT_FILE_REST_MAX_BYTES = 1024 * 1024;
+
+/** A rest's scope id or covered key as the root takes them (root.ts `checkRest`: 1-512 characters). */
+const restWord = text(512);
+
+const restCauses = ["rate", "quota", "credit", "auth", "restricted"] as const satisfies readonly FiledRest["cause"][];
+const restScopes = ["route", "model", "endpoint"] as const satisfies readonly FiledRest["scope"][];
+const measureFailures = ["timeout", "rate_limited", "transport", "rejected", "protocol"] as const satisfies readonly NonNullable<OutcomeMeasure[3]>[];
+// Each list is the whole of its type (@gray/errors REST_CAUSES and REST_SCOPES, @gray/routing AttemptFailure): a word added
+// there is a compile error here until the wire takes it.
+const wholeLists: [
+  [Exclude<FiledRest["cause"], (typeof restCauses)[number]>] extends [never] ? true : false,
+  [Exclude<FiledRest["scope"], (typeof restScopes)[number]>] extends [never] ? true : false,
+  [Exclude<NonNullable<OutcomeMeasure[3]>, (typeof measureFailures)[number]>] extends [never] ? true : false,
+] = [true, true, true];
+void wholeLists;
+
+/**
+ * `FiledRest` (@gray/endpoint): a failure rest at a route's root, as the root takes it (`checkRest`) and its view holds it
+ * (the rests of an acquire's answer). The lane's own carry no upstream words (`filedRestOutSchema`): they may quote a
+ * request, and the lane sends no free text out (allow.ts, M13).
+ */
+const filedRestFields = {
+  scope_id: restWord,
+  keys: z.array(restWord).min(1).max(FILED_REST_KEYS_MAX),
+  roots: z.array(namePart).max(FILED_REST_KEYS_MAX),
+  cause: z.enum(restCauses),
+  scope: z.enum(restScopes),
+  endpoint: text(256),
+  model: text(1024),
+  protocol: text(64),
+  since_ms: uintSchema,
+  until_ms: uintSchema,
+  stated: z.boolean(),
+  status: uintSchema.nullable(),
+  said: z
+    .string()
+    .max(16_384)
+    .refine((value) => value.isWellFormed(), "a string of Unicode scalar values")
+    .nullable(),
+};
+
+const endsNoEarlier = (rest: { readonly since_ms: bigint; readonly until_ms: bigint }) => rest.until_ms >= rest.since_ms;
+
+export const filedRestSchema = z.object(filedRestFields).strict().refine(endsNoEarlier, "a rest ends no earlier than it begins");
+
+export type FiledRestDto = z.infer<typeof filedRestSchema>;
+
+/**
+ * The rest the lane files (`endpoint.file_rest`): `FiledRest` without the upstream's words, `said` null on the wire itself
+ * (review r16 finding 6), so neither a lane that forgot to drop them nor any other caller sends free text out of the CVM
+ * this way (allow.ts, M13).
+ */
+export const filedRestOutSchema = z
+  .object({ ...filedRestFields, said: z.null() })
+  .strict()
+  .refine(endsNoEarlier, "a rest ends no earlier than it begins");
+
+const filedRests = z.array(filedRestSchema).max(FILED_REST_KEYS_MAX);
+
+/** `OutcomeMeasure` (@gray/endpoint `validMeasure`): latency, time to first token, output tokens, failure kind. */
+export const outcomeMeasureSchema = z.tuple([uintSchema, uintSchema.nullable(), uintSchema, z.enum(measureFailures).nullable()]);
+export type OutcomeMeasureDto = z.infer<typeof outcomeMeasureSchema>;
+
+/** A rest an answer at the caller's isolate ended (`AcquireInput.ended`). */
+const endedRestSchema = z.object({ scope_id: restWord, sent_ms: uintSchema }).strict();
 
 /** `Outcome`: how an attempt that held a permit ended (`@gray/endpoint`). */
 export const outcomeSchema = z.discriminatedUnion("kind", [
@@ -60,6 +160,8 @@ export const permitTokenSchema = z
     deadline: uintSchema,
     probe_id: z.string().min(1).max(128).nullable(),
     trial: z.boolean().nullable(),
+    /** The rank key whose circuit judges the attempt (r16); absent: the route's circuit. */
+    key: rankKeySchema.optional(),
   })
   .strict();
 
@@ -77,16 +179,31 @@ export const acquireInputSchema = z
     workspace: id.nullable(),
     retry_ticket: uintSchema.nullable(),
     first: z.boolean().nullable(),
+    rest_key: rankKeySchema.optional(),
+    ended: z.array(endedRestSchema).max(ACQUIRE_ENDED_MAX).optional(),
+    snapshot_version: uintSchema.optional(),
   })
   .strict();
 
 export type AcquireInputDto = z.infer<typeof acquireInputSchema>;
 
-const refusalReasons = ["unconfigured", "withdrawn", "breaker_open", "breaker_recovering", "busy", "circuit", "budget", "retry_concurrency"] as const satisfies readonly RefusalReason[];
+const refusalReasons = ["unconfigured", "withdrawn", "breaker_open", "breaker_recovering", "busy", "circuit", "budget", "retry_concurrency", "resting"] as const satisfies readonly RefusalReason[];
 
-/** `AcquireResult`: a permit, or the shard's refusal with what it knows. */
+/**
+ * `AcquireResult`: a permit, or the shard's refusal with what it knows. `resting`, `rests` and `held_rests` (r16) come
+ * only to an acquire that named its rank key: the shard refuses `resting` and says what it holds for such a call alone.
+ */
 export const acquireResultSchema = z.union([
-  z.object({ ok: z.literal(true), permit: permitTokenSchema, view_version: uintSchema, shards_per_region: uintSchema }).strict(),
+  z
+    .object({
+      ok: z.literal(true),
+      permit: permitTokenSchema,
+      view_version: uintSchema,
+      shards_per_region: uintSchema,
+      rests: filedRests.optional(),
+      held_rests: filedRests.optional(),
+    })
+    .strict(),
   z
     .object({
       ok: z.literal(false),
@@ -95,6 +212,7 @@ export const acquireResultSchema = z.union([
       lease_pending: z.boolean(),
       view_version: uintSchema,
       shards_per_region: uintSchema,
+      held_rests: filedRests.optional(),
     })
     .strict(),
 ]);
@@ -113,6 +231,7 @@ export const endpointReleaseInputSchema = z
     repeat: z.boolean().nullable(),
     refusal: z.enum(["refusal", "final_refusal", "account_request"] satisfies readonly RefusalClass[]).nullable(),
     free_no_usage: z.boolean().nullable(),
+    measure: outcomeMeasureSchema.optional(),
   })
   .strict();
 
@@ -123,7 +242,7 @@ export const endpointReleaseResultSchema = z.object({ released: z.boolean() }).s
 export type EndpointReleaseResultDto = z.infer<typeof endpointReleaseResultSchema>;
 
 /** `NoteInput`: an outcome learned after its permit went back. */
-export const noteInputSchema = z.object({ permit: permitTokenSchema, outcome: outcomeSchema, repeat: z.boolean() }).strict();
+export const noteInputSchema = z.object({ permit: permitTokenSchema, outcome: outcomeSchema, repeat: z.boolean(), measure: outcomeMeasureSchema.optional() }).strict();
 export type NoteInputDto = z.infer<typeof noteInputSchema>;
 
 /** `RetryReleaseInput`: a retry ticket handed back before its repeat asked for a permit (bridge-2). */
@@ -159,6 +278,7 @@ export const retryReserveInputSchema = z
       .object({ signature: text(512), status: uintSchema.refine((value) => value >= 100n && value <= 599n, "a status is 100-599"), code: text(128).nullable() })
       .strict()
       .nullable(),
+    rest_key: rankKeySchema.optional(),
   })
   .strict();
 
@@ -181,6 +301,14 @@ export type WarmInputDto = z.infer<typeof warmInputSchema>;
 /** `WarmResult`: what the shard holds after the warm, and whether its view is configured. */
 export const warmResultSchema = z.object({ holding: uintSchema, configured: z.boolean() }).strict();
 export type WarmResultDto = z.infer<typeof warmResultSchema>;
+
+/** `RestInput` (`endpoint.file_rest`, r16): a rest the lane files at one root its scope covers, named by its capacity key. */
+export const fileRestInputSchema = z.object({ endpoint_id: id, rest: filedRestOutSchema }).strict();
+export type FileRestInputDto = z.infer<typeof fileRestInputSchema>;
+
+/** Whether the root filed it (EndpointRootDO `rest`): not when a rest of its scope runs as long, or a check ended it. */
+export const fileRestAnswerSchema = z.object({ filed: z.boolean() }).strict();
+export type FileRestAnswerDto = z.infer<typeof fileRestAnswerSchema>;
 
 /** The empty answer of an op that returns `void` (`note`): no fields, so an unknown one is refused. */
 export const emptyAnswerSchema = z.object({}).strict();
@@ -210,7 +338,7 @@ export function permitTokenOf(dto: PermitTokenDto): PermitToken {
     deadline: asNumber(dto.deadline, "deadline"),
     probeId: dto.probe_id,
   };
-  return dto.trial === null ? permit : { ...permit, trial: dto.trial };
+  return { ...permit, ...(dto.trial === null ? {} : { trial: dto.trial }), ...(dto.key === undefined ? {} : { key: dto.key }) };
 }
 
 export function permitTokenDtoOf(permit: PermitToken): PermitTokenDto {
@@ -221,7 +349,58 @@ export function permitTokenDtoOf(permit: PermitToken): PermitTokenDto {
     deadline: asBigint(permit.deadline, "deadline"),
     probe_id: permit.probeId,
     trial: permit.trial === undefined ? null : permit.trial,
+    ...(permit.key === undefined ? {} : { key: permit.key }),
   };
+}
+
+export function filedRestOf(dto: FiledRestDto): FiledRest {
+  return {
+    scopeId: dto.scope_id,
+    keys: [...dto.keys],
+    roots: [...dto.roots],
+    cause: dto.cause,
+    scope: dto.scope,
+    endpoint: dto.endpoint,
+    model: dto.model,
+    protocol: dto.protocol,
+    sinceMs: asNumber(dto.since_ms, "since_ms"),
+    untilMs: asNumber(dto.until_ms, "until_ms"),
+    stated: dto.stated,
+    status: dto.status === null ? null : asNumber(dto.status, "status"),
+    said: dto.said,
+  };
+}
+
+export function filedRestDtoOf(rest: FiledRest): FiledRestDto {
+  return {
+    scope_id: rest.scopeId,
+    keys: [...rest.keys],
+    roots: [...rest.roots],
+    cause: rest.cause,
+    scope: rest.scope,
+    endpoint: rest.endpoint,
+    model: rest.model,
+    protocol: rest.protocol,
+    since_ms: asBigint(rest.sinceMs, "sinceMs"),
+    until_ms: asBigint(rest.untilMs, "untilMs"),
+    stated: rest.stated,
+    status: rest.status === null ? null : asBigint(rest.status, "status"),
+    said: rest.said,
+  };
+}
+
+export function outcomeMeasureOf(dto: OutcomeMeasureDto): OutcomeMeasure {
+  return [asNumber(dto[0], "measure.latency"), dto[1] === null ? null : asNumber(dto[1], "measure.ttft"), asNumber(dto[2], "measure.output_tokens"), dto[3]];
+}
+
+/**
+ * An attempt's measures as the wire carries them, or nothing when they are not measures (`validMeasure`, which the shard
+ * applies too): a malformed measure is left out, never the release or note it rides on.
+ */
+function measureMember(measure: OutcomeMeasure | undefined): { readonly measure?: OutcomeMeasureDto } {
+  if (measure === undefined || !validMeasure(measure)) return {};
+  const [latency, ttft, tokens, failure] = measure;
+  return { measure: [BigInt(latency), ttft === null ? null : BigInt(ttft), BigInt(tokens), failure] };
 }
 
 export function acquireInputOf(dto: AcquireInputDto): AcquireInput {
@@ -238,6 +417,9 @@ export function acquireInputOf(dto: AcquireInputDto): AcquireInput {
     ...(dto.workspace === null ? {} : { workspace: dto.workspace }),
     ...(dto.retry_ticket === null ? {} : { retryTicket: asNumber(dto.retry_ticket, "retry_ticket") }),
     ...(dto.first === null ? {} : { first: dto.first }),
+    ...(dto.rest_key === undefined ? {} : { restKey: dto.rest_key }),
+    ...(dto.ended === undefined ? {} : { ended: dto.ended.map((e): EndedRest => ({ scopeId: e.scope_id, sentMs: asNumber(e.sent_ms, "ended.sent_ms") })) }),
+    ...(dto.snapshot_version === undefined ? {} : { snapshotVersion: asNumber(dto.snapshot_version, "snapshot_version") }),
   };
 }
 
@@ -247,6 +429,9 @@ export function acquireInputOf(dto: AcquireInputDto): AcquireInput {
  * reject either field. A lane shard keeps ending its waits at its own root-call timeout. Follow-up: an
  * `answer_within_ms` field the bridge turns into a time on its own clock, and `await_lease`, with the
  * bridge deployed before the gateway that sends them.
+ *
+ * The rank key, the rests the isolate ended (the first ACQUIRE_ENDED_MAX) and the snapshot's version (r16) go when the
+ * input has them.
  */
 export function acquireInputDtoOf(input: AcquireInput): AcquireInputDto {
   return {
@@ -259,11 +444,24 @@ export function acquireInputDtoOf(input: AcquireInput): AcquireInputDto {
     workspace: input.workspace === undefined ? null : input.workspace,
     retry_ticket: input.retryTicket === undefined ? null : asBigint(input.retryTicket, "retryTicket"),
     first: input.first === undefined ? null : input.first,
+    ...(input.restKey === undefined ? {} : { rest_key: input.restKey }),
+    ...(input.ended === undefined ? {} : { ended: input.ended.slice(0, ACQUIRE_ENDED_MAX).map((e) => ({ scope_id: e.scopeId, sent_ms: asBigint(e.sentMs, "ended.sentMs") })) }),
+    ...(input.snapshotVersion === undefined ? {} : { snapshot_version: asBigint(input.snapshotVersion, "snapshotVersion") }),
   };
 }
 
 export function acquireResultOf(dto: AcquireResultDto): AcquireResult {
-  if (dto.ok) return { ok: true, permit: permitTokenOf(dto.permit), viewVersion: asNumber(dto.view_version, "view_version"), shardsPerRegion: asNumber(dto.shards_per_region, "shards_per_region") };
+  const held = dto.held_rests === undefined ? {} : { heldRests: dto.held_rests.map(filedRestOf) };
+  if (dto.ok) {
+    return {
+      ok: true,
+      permit: permitTokenOf(dto.permit),
+      viewVersion: asNumber(dto.view_version, "view_version"),
+      shardsPerRegion: asNumber(dto.shards_per_region, "shards_per_region"),
+      ...(dto.rests === undefined ? {} : { rests: dto.rests.map(filedRestOf) }),
+      ...held,
+    };
+  }
   return {
     ok: false,
     reason: dto.reason,
@@ -271,20 +469,30 @@ export function acquireResultOf(dto: AcquireResultDto): AcquireResult {
     leasePending: dto.lease_pending,
     viewVersion: asNumber(dto.view_version, "view_version"),
     shardsPerRegion: asNumber(dto.shards_per_region, "shards_per_region"),
+    ...held,
   };
 }
 
 export function acquireResultDtoOf(result: AcquireResult): AcquireResultDto {
-  if (result.ok) return { ok: true, permit: permitTokenDtoOf(result.permit), view_version: asBigint(result.viewVersion, "viewVersion"), shards_per_region: asBigint(result.shardsPerRegion, "shardsPerRegion") };
+  const held = result.heldRests === undefined ? {} : { held_rests: result.heldRests.map(filedRestDtoOf) };
+  if (result.ok) {
+    return {
+      ok: true,
+      permit: permitTokenDtoOf(result.permit),
+      view_version: asBigint(result.viewVersion, "viewVersion"),
+      shards_per_region: asBigint(result.shardsPerRegion, "shardsPerRegion"),
+      ...(result.rests === undefined ? {} : { rests: result.rests.map(filedRestDtoOf) }),
+      ...held,
+    };
+  }
   return {
     ok: false,
-    // The lane's acquires name no rank key, so no shard refuses them `resting`; were one to, the lane reads it as
-    // the open circuit it is passed over like, with the same Retry-After (the wire's reasons predate rests).
-    reason: result.reason === "resting" ? "breaker_open" : result.reason,
+    reason: result.reason,
     retry_after_ms: result.retryAfterMs === null ? null : asBigint(result.retryAfterMs, "retryAfterMs"),
     lease_pending: result.leasePending,
     view_version: asBigint(result.viewVersion, "viewVersion"),
     shards_per_region: asBigint(result.shardsPerRegion, "shardsPerRegion"),
+    ...held,
   };
 }
 
@@ -299,6 +507,7 @@ export function endpointReleaseInputOf(dto: EndpointReleaseInputDto): ReleaseInp
     ...(dto.repeat === null ? {} : { repeat: dto.repeat }),
     ...(dto.refusal === null ? {} : { refusal: dto.refusal }),
     ...(dto.free_no_usage === null ? {} : { freeNoUsage: dto.free_no_usage }),
+    ...(dto.measure === undefined ? {} : { measure: outcomeMeasureOf(dto.measure) }),
   };
 }
 
@@ -313,6 +522,7 @@ export function endpointReleaseInputDtoOf(input: ReleaseInput): EndpointReleaseI
     repeat: input.repeat === undefined ? null : input.repeat,
     refusal: input.refusal === undefined ? null : input.refusal,
     free_no_usage: input.freeNoUsage === undefined ? null : input.freeNoUsage,
+    ...measureMember(input.measure),
   };
 }
 
@@ -325,11 +535,11 @@ export function endpointReleaseResultDtoOf(result: ReleaseResult): EndpointRelea
 }
 
 export function noteInputOf(dto: NoteInputDto): NoteInput {
-  return { permit: permitTokenOf(dto.permit), outcome: outcomeOf(dto.outcome), repeat: dto.repeat };
+  return { permit: permitTokenOf(dto.permit), outcome: outcomeOf(dto.outcome), repeat: dto.repeat, ...(dto.measure === undefined ? {} : { measure: outcomeMeasureOf(dto.measure) }) };
 }
 
 export function noteInputDtoOf(input: NoteInput): NoteInputDto {
-  return { permit: permitTokenDtoOf(input.permit), outcome: outcomeDtoOf(input.outcome), repeat: input.repeat };
+  return { permit: permitTokenDtoOf(input.permit), outcome: outcomeDtoOf(input.outcome), repeat: input.repeat, ...measureMember(input.measure) };
 }
 
 export function retryReleaseInputOf(dto: RetryReleaseInputDto): RetryReleaseInput {
@@ -381,6 +591,7 @@ export function retryReserveInputOf(dto: RetryReserveInputDto): RetryReserveInpu
     cost: asNumber(dto.cost, "cost"),
     holdMs: asNumber(dto.hold_ms, "hold_ms"),
     gate: dto.gate === null ? null : { signature: dto.gate.signature, status: asNumber(dto.gate.status, "gate.status"), code: dto.gate.code },
+    ...(dto.rest_key === undefined ? {} : { restKey: dto.rest_key }),
   };
 }
 
@@ -395,6 +606,7 @@ export function retryReserveInputDtoOf(input: RetryReserveInput): RetryReserveIn
     cost: asBigint(input.cost, "cost"),
     hold_ms: asBigint(input.holdMs, "holdMs"),
     gate: input.gate === null ? null : { signature: input.gate.signature, status: asBigint(input.gate.status, "gate.status"), code: input.gate.code },
+    ...(input.restKey === undefined ? {} : { rest_key: input.restKey }),
   };
 }
 
@@ -406,4 +618,21 @@ export function retryReserveResultOf(dto: RetryReserveResultDto): RetryReserveRe
 export function retryReserveResultDtoOf(result: RetryReserveResult): RetryReserveResultDto {
   if (result.ok) return { ok: true, ticket: asBigint(result.ticket, "ticket"), view_version: asBigint(result.viewVersion, "viewVersion"), shards_per_region: asBigint(result.shardsPerRegion, "shardsPerRegion") };
   return { ok: false, reason: result.reason, view_version: asBigint(result.viewVersion, "viewVersion"), shards_per_region: asBigint(result.shardsPerRegion, "shardsPerRegion") };
+}
+
+export function fileRestInputOf(dto: FileRestInputDto): RestInput {
+  return { endpointId: dto.endpoint_id, rest: filedRestOf(dto.rest) };
+}
+
+/** The rest without the upstream's words, whatever it said (`filedRestOutSchema`). */
+export function fileRestInputDtoOf(input: RestInput): FileRestInputDto {
+  return { endpoint_id: input.endpointId, rest: { ...filedRestDtoOf(input.rest), said: null } };
+}
+
+export function fileRestAnswerOf(dto: FileRestAnswerDto): { readonly filed: boolean } {
+  return { filed: dto.filed };
+}
+
+export function fileRestAnswerDtoOf(answer: { readonly filed: boolean }): FileRestAnswerDto {
+  return { filed: answer.filed };
 }

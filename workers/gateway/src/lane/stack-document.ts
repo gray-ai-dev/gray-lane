@@ -1,7 +1,7 @@
 import { sha256BareHex } from "@gray/attest";
 import { isObject, parseStrict, toJsonString, type JsonObject } from "@gray/json";
 import { DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_BYTES, isLaneProtocol, OPENAI_COMPATIBLE_VENDOR_IDS, POSITIONS_BY_PROTOCOL, utf8Length, type LaneProtocol } from "@gray/lane";
-import type { StackConfigAccount, StackConfigDocument, StackConfigProxy, StackIdentity } from "@gray/lane-wire";
+import type { StackConfigAccount, StackConfigDocument, StackConfigProxy } from "@gray/lane-wire";
 import { authHeaders, egressValue, type Credential, type CredentialType, type EgressSpec, type StackSealedAccount } from "@gray/relay-connector";
 import type { StackRelayAppend, StackRelayCap, StackRelayConfig, StackRelayRoute, StackVendor } from "./stack-config.ts";
 
@@ -31,8 +31,9 @@ import type { StackRelayAppend, StackRelayCap, StackRelayConfig, StackRelayRoute
  * `paused` account is served as paused (§8) but egress refuses its credential (403
  * `stack_credential_unknown`), so a pause holds whatever the relay's software does with it. Each row
  * names the sealed credential's type (`credential_type`, what the cooling rules' `credential` filter
- * matches, S38) and the account's client identity when the panel registered one (S32a): egress writes
- * it on every call of the account. A panel account that declares a `credential_type` other than the
+ * matches, S38). No row carries a client identity (owner, 2026-11-18: Gray sets no client-identity
+ * header; the vendor gets the client's own and the relay's): an `identity` the configuration still names
+ * is ignored. A panel account that declares a `credential_type` other than the
  * sealed credential's is not served (`invalid_credential`): the relay's container would send a form
  * the declaration does not name, and the panel's test profile would be another class's.
  *
@@ -122,7 +123,7 @@ export interface StackExclusion {
 
 /**
  * One S15 row (`PUT /v1/stack/accounts`): `proxy` and `proxy_id` together or not at all; `credential_type`
- * the sealed credential's; `identity` (S32a) only when the panel registered one.
+ * the sealed credential's.
  */
 export interface StackAccountRow {
   readonly account_id: string;
@@ -131,7 +132,6 @@ export interface StackAccountRow {
   readonly credential_type: CredentialType;
   readonly proxy?: JsonObject;
   readonly proxy_id?: string;
-  readonly identity?: StackIdentity;
 }
 
 /** What a build needs. */
@@ -322,7 +322,6 @@ export function buildStackDocument(input: StackDocumentInput): StackDocument {
       credential_sha256: sha256,
       credential_type: sealed.credential.type,
       ...(account.proxy_id === null || sealed.egress === undefined ? {} : { proxy: egressValue(sealed.egress), proxy_id: account.proxy_id }),
-      ...(account.identity === undefined ? {} : { identity: account.identity }),
     });
   }
 
@@ -451,5 +450,5 @@ export function stackAppendsBy(metadata: StackConfigDocument): "relay" | "gray" 
 
 /** The S15 body of a table: the rows as a JSON array (`[]` empties egress's table). */
 export function stackTableBody(rows: readonly StackAccountRow[]): string {
-  return toJsonString(rows.map((row) => ({ ...row, ...(row.identity === undefined ? {} : { identity: { headers: { ...row.identity.headers }, betas: [...row.identity.betas], generated: [...row.identity.generated] } }) })) as unknown as JsonObject[]);
+  return toJsonString(rows.map((row) => ({ ...row })) as unknown as JsonObject[]);
 }

@@ -146,6 +146,7 @@ export {
   type Billing,
   type ContentLimits,
   type Decision,
+  type JobBinding,
   type JobPricing,
   type JobStatus,
   type MissingRule,

@@ -29,9 +29,8 @@ type stack struct {
 	now       func() time.Time
 	afterFunc func(time.Duration, func()) *time.Timer
 
-	// health is the accounts' live state and cooling (S37-S40); sessionKey the per-boot key of session ids (S32a).
-	health     *stackHealth
-	sessionKey []byte
+	// health is the accounts' live state and cooling (S37-S40).
+	health *stackHealth
 	// testsRunning counts the account tests in flight (S44: at most stackTestsMax).
 	testsRunning atomic.Int32
 	// lease is the KMS lease's end the lane last pushed (stack_lease.go): past it, no account of the relay is used.
@@ -58,7 +57,6 @@ func newStack(cfg config, check stackRequestCheck, newDigester func() stackEvent
 		afterFunc:      time.AfterFunc,
 		accounts:       map[string]stackAccount{},
 		requests:       map[string]*stackRequest{},
-		sessionKey:     newSessionKey(),
 	}
 	// The health clock reads st.now at each call, so a test's clock replaces both.
 	st.health = newStackHealth(func() time.Time { return st.now() })
@@ -67,15 +65,14 @@ func newStack(cfg config, check stackRequestCheck, newDigester func() stackEvent
 }
 
 // stackAccount is one row of the S15 account table: the account a credential names and the proxy its calls
-// dial (nil: direct); its credential type (S38; "" when the row names none, and then the call's header form
-// names it) and its registered client identity (S32a; nil: none).
+// dial (nil: direct), and its credential type (S38; "" when the row names none, and then the call's header form
+// names it).
 type stackAccount struct {
 	id             string
 	vendor         string
 	credentialType string
 	proxyID        *string
 	spec           *egressSpec
-	identity       *stackIdentity
 }
 
 // stackRequest is one registered rid (S15). The registration's fields never change; the call count, the
@@ -84,16 +81,15 @@ type stackRequest struct {
 	rid      string
 	protocol string
 	// vendor, query and headers fix the call (S32): the account's vendor, the client's raw query, and the
-	// client's behaviour headers by lower-case name (values joined with ", ").
+	// client's own headers the entry passed by lower-case name (values joined with ", "; stack_client_headers.go),
+	// which the vendor's header set starts from.
 	vendor   string
 	query    string
 	headers  map[string]string
 	received []byte
 	rewrite  json.RawMessage
-	// model is the rewrite spec's upstream model (S38's model scope; "" when it names none a scope can use), and
-	// sessionID the session id egress sends for the rid (S32a).
+	// model is the rewrite spec's upstream model (S38's model scope; "" when it names none a scope can use).
 	model       string
-	sessionID   string
 	attemptsMax int
 	expiresAt   time.Time
 	size        int64 // the registration's share of the budget, held until the rid ends

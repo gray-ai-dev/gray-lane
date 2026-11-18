@@ -113,8 +113,8 @@ func isLowerHex(s string) bool {
 
 // wireAccount is one S15 account row as the entry sends it. proxy_id names the proxy for the feed's
 // `attempt` record (S17) and is present exactly when proxy is. credential_type (S38) is optional: when given, a
-// call whose header form names another type matches no account; absent, the call's form names it. identity (S32a)
-// is optional: absent or null is none.
+// call whose header form names another type matches no account; absent, the call's form names it. A row names no
+// client identity (S32a's `identity` is retired, 2026-11-18): the vendor gets the client's own headers.
 type wireAccount struct {
 	AccountID        *string         `json:"account_id"`
 	Vendor           *string         `json:"vendor"`
@@ -122,7 +122,6 @@ type wireAccount struct {
 	CredentialType   *string         `json:"credential_type"`
 	Proxy            json.RawMessage `json:"proxy"`
 	ProxyID          *string         `json:"proxy_id"`
-	Identity         *wireIdentity   `json:"identity"`
 }
 
 // stackVendors are the account vendors of §8 and the route each one calls.
@@ -152,7 +151,7 @@ func (s *server) putAccounts(rec *responseRecorder, r *http.Request, entry *requ
 		return
 	}
 	// A JSON null decodes to a nil slice; only an array (possibly empty) is a table. checkStrictJSON refuses a
-	// repeated member, which encoding/json would read as its last value (an identity's headers among them).
+	// repeated member, which encoding/json would read as its last value.
 	var rows []wireAccount
 	if checkStrictJSON(body) != nil || !decodeControl(body, &rows) || rows == nil {
 		refuse()
@@ -219,11 +218,6 @@ func parseAccount(row wireAccount) (stackAccount, bool) {
 		}
 		account.credentialType = *row.CredentialType
 	}
-	identity, ok := parseIdentity(account.vendor, row.Identity)
-	if !ok {
-		return stackAccount{}, false
-	}
-	account.identity = identity
 	if (row.Proxy == nil) != (row.ProxyID == nil) {
 		return stackAccount{}, false
 	}
@@ -249,20 +243,19 @@ func validStackID(id string) bool {
 // Unix seconds (as the bundles' expires_at); received_b64 is standard base64 with padding.
 //
 // S32 adds three members, all required: query (the client's raw query, no leading `?`, "" for none), headers (the
-// client's behaviour headers for the vendor, by lower-case name, values joined with ", ", {} for none) and
-// vendor (the route's account vendor). S32a adds conversation, optional: the lane's conversation-affinity token
-// for the request (affinity.ts deriveAffinity, 32 lower hex; absent or null when the client named no session),
-// which egress's session ids are derived from.
+// client's own headers the entry passed, by lower-case name, values joined with ", ", {} for none: the closed rule of
+// stack_client_headers.go, its behaviour headers among them) and vendor (the route's account vendor). S32a's
+// conversation, the token egress derived session ids from, is retired with the identities (2026-11-18): egress makes no
+// id of its own, and a registration that names one is refused as any unknown member is.
 type wireRegistration struct {
-	Protocol     *string            `json:"protocol"`
-	ReceivedB64  *string            `json:"received_b64"`
-	Rewrite      json.RawMessage    `json:"rewrite"`
-	AttemptsMax  *int               `json:"attempts_max"`
-	ExpiresAt    *int64             `json:"expires_at"`
-	Query        *string            `json:"query"`
-	Headers      *map[string]string `json:"headers"`
-	Vendor       *string            `json:"vendor"`
-	Conversation *string            `json:"conversation"`
+	Protocol    *string            `json:"protocol"`
+	ReceivedB64 *string            `json:"received_b64"`
+	Rewrite     json.RawMessage    `json:"rewrite"`
+	AttemptsMax *int               `json:"attempts_max"`
+	ExpiresAt   *int64             `json:"expires_at"`
+	Query       *string            `json:"query"`
+	Headers     *map[string]string `json:"headers"`
+	Vendor      *string            `json:"vendor"`
 	// Forwarded, optional (docs/design/relay-debug-sharing.md): true asks for each accepted call's body as the vendor
 	// got it, in a `forwarded` record after its `attempt` (stackRequest.recordForwarded); absent or false, none.
 	Forwarded *bool `json:"forwarded"`
@@ -295,14 +288,9 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 	// every call.
 	protocol, vendor := *wire.Protocol, *wire.Vendor
 	if _, routed := stackProtocolRoutes[protocol][vendor]; !routed || string(wire.Rewrite) == "null" || *wire.AttemptsMax < 1 ||
-		!validQueryText(*wire.Query) || !validBehaviourHeaders(vendor, *wire.Headers) ||
-		(wire.Conversation != nil && (len(*wire.Conversation) != 32 || !isLowerHex(*wire.Conversation))) {
+		!validQueryText(*wire.Query) || !validClientHeaders(protocol, *wire.Headers) {
 		refuse(errStackControlInvalid)
 		return
-	}
-	conversation := ""
-	if wire.Conversation != nil {
-		conversation = *wire.Conversation
 	}
 	size := int64(len(received) + len(wire.Rewrite) + len(protocol) + len(*wire.Query))
 	for name, value := range *wire.Headers {
@@ -335,7 +323,6 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 		received:    received,
 		rewrite:     wire.Rewrite,
 		model:       rewriteModel(wire.Rewrite),
-		sessionID:   sessionID(s.stack.sessionKey, conversation),
 		attemptsMax: *wire.AttemptsMax,
 		expiresAt:   expiresAt,
 		size:        size,
@@ -367,26 +354,6 @@ func validQueryText(query string) bool {
 	for i := 0; i < len(query); i++ {
 		if query[i] <= 0x20 || query[i] == 0x7f || query[i] == '#' {
 			return false
-		}
-	}
-	return true
-}
-
-// validBehaviourHeaders holds a registration's headers to the vendor's behaviour headers (S32), each value one
-// a header line can carry (no control byte but tab).
-func validBehaviourHeaders(vendor string, headers map[string]string) bool {
-	for name, value := range headers {
-		known := false
-		for _, behaviour := range stackBehaviourHeaders[vendor] {
-			known = known || name == behaviour
-		}
-		if !known {
-			return false
-		}
-		for i := 0; i < len(value); i++ {
-			if (value[i] < 0x20 && value[i] != '\t') || value[i] == 0x7f {
-				return false
-			}
 		}
 	}
 	return true

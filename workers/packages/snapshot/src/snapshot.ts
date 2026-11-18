@@ -299,6 +299,13 @@ export interface SnapshotContent {
    * has a handle, and in a snapshot stored before handles: such a snapshot is the bytes it was.
    */
   readonly handles?: Readonly<Record<string, string>>;
+  /**
+   * The handle of every supplier workspace that chose to be named on the Models page (control_provider_handles
+   * `show_name`, owner 2026-11-18), by workspace id: the public catalog lists it as each of its routes' `name`
+   * (inference.rs `Snapshot.names`). Absent while no workspace chose it, and in a snapshot stored before: such a
+   * snapshot is the bytes it was.
+   */
+  readonly names?: Readonly<Record<string, string>>;
 }
 
 /** A published snapshot: the content, its version and when the rebuild that first produced it ran. */
@@ -465,7 +472,7 @@ export interface SnapshotReader {
    */
   stackTraffic?(): Promise<ReadonlyMap<string, { readonly untilMs: number }>>;
   /** Every registered public handle and its workspace (control_provider_handles); a reader without it reads none. */
-  handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string }[]>;
+  handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string; readonly show_name?: boolean }[]>;
 }
 
 /** modeltrace.rs `PROFILE_ID`: the profile prefix of ModelTrace's records. */
@@ -1249,6 +1256,9 @@ export async function buildSnapshot(
     ...(models === undefined ? {} : { modelFacts: models.facts, modelLimits: models.limits }),
     ...(reference === undefined || reference.largestWindow === null ? {} : { largestWindow: reference.largestWindow }),
     ...(handleRows.length === 0 ? {} : { handles: Object.fromEntries(handleRows.map((r) => [r.handle, r.workspace_id])) }),
+    ...((named) => (named.length === 0 ? {} : { names: Object.fromEntries(named.map((r) => [r.workspace_id, r.handle])) }))(
+      handleRows.filter((r) => r.show_name === true).sort((a, b) => byText(a.workspace_id, b.workspace_id)),
+    ),
   };
 }
 

@@ -95,14 +95,20 @@ export function restRoutes<R extends RestBinding>(routes: Iterable<R>, failed: R
  * scope replaces the one before it unless that one runs longer. A route's rest is of the rank key that failed
  * (`failedKey`); a model's of the endpoint's model, and an endpoint's of the endpoint, each under its credential
  * generation and configuration fingerprint.
+ *
+ * `egressRegion`: the region of the keys the rest covers. The gateway's own (`REST_EGRESS_REGION`) names the server's
+ * scope exactly. Another (a confidential entry's endpoint route, `lane-<env>`, inference.ts `rankRegion`) is named in a
+ * model's or an endpoint's scope too: the roots keep one rest per scope id, so without it the entry's rest and the `api`
+ * address's of the same endpoint would replace each other, and an answer at one would end the other's at every root.
  */
-export function restScopeId(scope: RestScope, endpoint: string, model: string, fingerprint: string, generation: number | bigint, failedKey: string): string {
+export function restScopeId(scope: RestScope, endpoint: string, model: string, fingerprint: string, generation: number | bigint, failedKey: string, egressRegion: string = REST_EGRESS_REGION): string {
+  const region = egressRegion === REST_EGRESS_REGION ? "" : `,${JSON.stringify(egressRegion)}`;
   const covered =
     scope === "route"
       ? `["route",${JSON.stringify(failedKey)}]`
       : scope === "model"
-        ? `["model",${JSON.stringify(endpoint)},${JSON.stringify(model)},${JSON.stringify(fingerprint)},${generation.toString()}]`
-        : `["endpoint",${JSON.stringify(endpoint)},${JSON.stringify(fingerprint)},${generation.toString()}]`;
+        ? `["model",${JSON.stringify(endpoint)},${JSON.stringify(model)},${JSON.stringify(fingerprint)},${generation.toString()}${region}]`
+        : `["endpoint",${JSON.stringify(endpoint)},${JSON.stringify(fingerprint)},${generation.toString()}${region}]`;
   return bytesToHex(sha256(new TextEncoder().encode(covered)));
 }
 
@@ -158,7 +164,8 @@ export interface RestRoute extends RestBinding {
  * and an endpoint's at each covered route's over its keys streamed and not (`restKeys`; the keys of the routes that
  * share a root in one filing), each under the scope's name (`restScopeId`) and naming every root it is filed at, so
  * that an answer ending it at one ends it at all. Best effort: a root the call does not reach keeps no rest, and its
- * route serves meanwhile.
+ * route serves meanwhile. `egressRegion`: the failing attempt's (`failedKey`'s), whose keys alone the rest covers
+ * (`restScopeId`): a confidential entry's failure rests the entry's keys, never the `api` address's.
  */
 export async function fileRest<R extends RestRoute>(
   locate: EndpointRootLocator,
@@ -167,13 +174,14 @@ export async function fileRest<R extends RestRoute>(
   failedKey: string,
   decided: DecidedRest,
   rest: { readonly sinceMs: number; readonly untilMs: number; readonly status: number | null; readonly said: string | null },
+  egressRegion: string = REST_EGRESS_REGION,
 ): Promise<void> {
   const covered = coveredBy(routes, failed, decided.scope);
   const roots = [...new Set(covered.map((r) => r.capacityKey))];
-  const scopeId = restScopeId(decided.scope, failed.endpointId, failed.model, failed.configFingerprint, failed.credentialGeneration, failedKey);
+  const scopeId = restScopeId(decided.scope, failed.endpointId, failed.model, failed.configFingerprint, failed.credentialGeneration, failedKey, egressRegion);
   await Promise.allSettled(
     roots.map(async (root) => {
-      const keys = decided.scope === "route" ? [failedKey] : await restKeys(covered.filter((r) => r.capacityKey === root), failed, decided.scope, REST_EGRESS_REGION);
+      const keys = decided.scope === "route" ? [failedKey] : await restKeys(covered.filter((r) => r.capacityKey === root), failed, decided.scope, egressRegion);
       const filed: FiledRest = {
         scopeId,
         keys,
@@ -402,17 +410,17 @@ function rankingRest(f: FiledRest): Rest {
  * route's rank key in the request's mode, routes.ts `rankKeyOf`): the rest each route's rank key for the request
  * (`stream`) is in, as its shard last said within
  * `maxAgeMs` to a request under the request's snapshot (`version`) or a newer one (`ShardRests`); none without `heard`
- * (the confidential lane, which reads no rests). The ranking never reads rests of its own: the shards' are the only
- * ones the gateway keeps.
+ * (a test's). The ranking never reads rests of its own: the shards' are the only ones the gateway keeps. `regionOf`: each
+ * route's keys' egress region, as ranking keys its candidates (routes.ts `RankRegionOf`); the gateway's own by default.
  */
-export async function shardRestView(heard: ShardRests | undefined, routes: readonly { readonly record: RestRoute & { readonly endpointId: string } }[], stream: boolean, nowMs: number, maxAgeMs: number, version: number): Promise<RestView> {
+export async function shardRestView<R extends RestRoute & { readonly endpointId: string }>(heard: ShardRests | undefined, routes: readonly { readonly record: R }[], stream: boolean, nowMs: number, maxAgeMs: number, version: number, regionOf?: (record: R) => string): Promise<RestView> {
   // By rank key in the request's mode: ranking's candidates are the routes' rank keys (routes.ts `rankKeyOf`).
   const byKey = new Map<string, Rest>();
   if (heard !== undefined) {
     for (const route of routes) {
       const r = route.record;
       if (!heard.holds(r.capacityKey, nowMs, maxAgeMs, version)) continue;
-      const key = await rankKey(r, REST_EGRESS_REGION, stream);
+      const key = await rankKey(r, regionOf?.(r) ?? REST_EGRESS_REGION, stream);
       const f = heard.inForce(r.capacityKey, key, nowMs, maxAgeMs, version);
       if (f === undefined) continue;
       const known = byKey.get(key);

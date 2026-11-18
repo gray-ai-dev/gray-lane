@@ -228,7 +228,7 @@ import {
   StackCall,
   stackAppendReserveBytes,
   STACK_KEEP_ALIVE,
-  stackBehaviourHeaders,
+  stackClientHeaders,
   stackPeerHeaders,
   stackRawQuery,
   stackRelayHeaders,
@@ -342,13 +342,14 @@ export interface GatewayDeps {
   readonly endpoints: EndpointLocator;
   readonly endpointCounts: EndpointCounts;
   /**
-   * The endpoint roots a failure's rest is filed at (rests.ts `fileRest`); absent, no rest is filed: the
-   * confidential lane, whose bridge carries no root calls, and tests that are not about rests.
+   * The endpoint roots a failure's rest is filed at (rests.ts `fileRest`): the Worker's ENDPOINT_ROOT, or since r16 the
+   * confidential lane's over its bridge (`endpoint.file_rest`, lane/deps.ts). Absent, no rest is filed: tests that are
+   * not about rests.
    */
   readonly endpointRoots?: EndpointRootLocator;
   /**
    * The rests each route's endpoint shard last said it holds (rests.ts `ShardRests`, one per isolate, tables.ts), which
-   * ranking reads (`shardRestView`); absent, ranking reads none: the confidential lane, which files none.
+   * ranking reads (`shardRestView`), on the main gateway and the confidential lane alike; absent, ranking reads none.
    */
   readonly shardRests?: ShardRests;
   readonly continuation: ContinuationLocator;
@@ -372,8 +373,8 @@ export interface GatewayDeps {
   readonly affinity?: Affinity;
   /**
    * The isolate's exploration budget (@gray/routing `DispatchBudgets`, tables.ts; the server's `reserve_dispatch`, one per
-   * process): each attempt reserves its routing group's dispatch once its permit is taken. Absent, no budget: the
-   * confidential lane, whose routes have no rank keys and are never measured.
+   * process): each attempt reserves its routing group's dispatch once its permit is taken, on the main gateway and, since
+   * r16, the confidential lane (its attempts name their rank keys and are measured). Absent, no budget.
    */
   readonly dispatchBudgets?: DispatchBudgets;
   readonly clock: () => number;
@@ -667,6 +668,16 @@ const lenient = new TextDecoder();
 const MODEL_REFUSED = "model_refused";
 /** The ledger's largest amount (i64): what a model check's usage may cost, since nothing was held to bound it. */
 const LEDGER_MAX = (1n << 63n) - 1n;
+
+/**
+ * Whether a failure at `route` of a lane request files no rest (`restRoute`): a lane relay's route is a pool of the
+ * relay's accounts, and every failure there, a rate limit's too (the account's own allowance), is one account's, which
+ * the relay and egress cool themselves. The lead's proposal of 2026-11-15, confirmed by the user on 2026-11-16
+ * (conformance/README.md "声明过的差别"; review r16 blocker 1).
+ */
+function laneRouteFilesNoRest(lane: LaneDeps | null, route: RouteRecord): boolean {
+  return lane !== null && route.auth === "lane_relay";
+}
 
 function hexDigest(bytes: Uint8Array): Promise<string> {
   return crypto.subtle.digest("SHA-256", bytes).then((d) => [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join(""));
@@ -3084,13 +3095,13 @@ export class InferenceRun {
         issued,
         (id) => {
           const route = routes.find((r) => r.record.endpointId === id);
-          return route !== undefined && pinHolds(snapshot, routes, route, pinAt, this.stream === true);
+          return route !== undefined && pinHolds(snapshot, routes, route, pinAt, this.stream === true, this.rankRegionOf);
         },
       );
       // Ranking passes over a route resting after a failure as its endpoint shard holds the rest (rests.ts
       // `shardRestView`; gateway.md 13 #22), as the server's ranking passes a resting route over.
-      const rests = await shardRestView(this.deps.shardRests, routes, this.stream === true, clock(), cfg.endpointReportMs, snapshot.version);
-      const ranking = await rankDetailed(snapshot, routes, requestKey, clock(), policy, steered.exploration, rests, this.stream === true);
+      const rests = await shardRestView(this.deps.shardRests, routes, this.stream === true, clock(), cfg.endpointReportMs, snapshot.version, this.rankRegionOf);
+      const ranking = await rankDetailed(snapshot, routes, requestKey, clock(), policy, steered.exploration, rests, this.stream === true, true, this.rankRegionOf);
       this.explored = ranking.explored;
       const rankedAt = clock();
       this.rankingBaseAgeMs = rankingBaseAge(snapshot, rankedAt);
@@ -3107,8 +3118,8 @@ export class InferenceRun {
         new Map(routes.map((r) => [r.record.endpointId, r])),
         steered,
         preference,
-        async (unranked) => (await rankDetailed(snapshot, unranked, requestKey, clock(), policy, "suppressed", rests, this.stream === true, false)).ordered.map((r) => r.record.endpointId),
-        (left, planned) => settleHead(routeProbeLeases(snapshot, clock(), [...left.values(), ...planned], this.stream === true), clock(), preference, ranking.result, left, planned, requestKey),
+        async (unranked) => (await rankDetailed(snapshot, unranked, requestKey, clock(), policy, "suppressed", rests, this.stream === true, false, this.rankRegionOf)).ordered.map((r) => r.record.endpointId),
+        (left, planned) => settleHead(routeProbeLeases(snapshot, clock(), [...left.values(), ...planned], this.stream === true, this.rankRegionOf), clock(), preference, ranking.result, left, planned, requestKey),
       );
       const plan = ordered.routes;
       this.cacheTarget = steered.affinityTarget;
@@ -3591,8 +3602,13 @@ export class InferenceRun {
    * request log's attempt names the rest in force on its route, this one or one already running longer there. It
    * begins on the gateway's clock, as the shard's permits, whose answers end it, are timed. The request's next acquire
    * at a covered route waits for the filing (`acquire`, `restFilings`).
+   *
+   * A lane relay's route rests on no failure (`laneRouteFilesNoRest`): each is one of the relay's accounts', which the relay
+   * and egress cool themselves. Its circuit, samples and exploration budget count it as before, and the request goes on
+   * as it would without a rest (the relay's next pick, or `lane_account_unavailable` when it has no account left).
    */
   private restRoute(attempt: Attempt, reading: RestReading, status: number | undefined): void {
+    if (laneRouteFilesNoRest(this.lane, attempt.route.record)) return;
     const decided = decideRest(reading, restConfigOf(this.deps.cfg));
     const known = this.permitRests.get(InferenceRun.permitKey(attempt.permit));
     if (decided === undefined || known === undefined) return;
@@ -3600,13 +3616,15 @@ export class InferenceRun {
     const until = restUntil(BigInt(sinceMs), decided.lengthMs);
     const untilMs = until > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(until);
     const r = attempt.route.record;
-    const scopeId = restScopeId(decided.scope, r.endpointId, r.model, r.configFingerprint, r.credentialGeneration, known.key);
+    // The failing key's egress region: an entry's endpoint route rests its own keys (`lane-<env>`), not the `api` address's.
+    const region = this.rankRegion(r);
+    const scopeId = restScopeId(decided.scope, r.endpointId, r.model, r.configFingerprint, r.credentialGeneration, known.key, region);
     const inForce = restInForce({ scopeId, cause: decided.cause, untilMs }, known.rests, sinceMs);
     if (inForce !== undefined) attempt.rest = inForce;
     const roots = this.io.endpointRoots;
     if (roots === null || untilMs <= sinceMs) return;
     const routes = (this.snapshot?.routes ?? []).filter((route) => route.endpointId === r.endpointId);
-    const filing = fileRest(roots, routes, r, known.key, decided, { sinceMs, untilMs, status: status ?? null, said: reading.said ?? null });
+    const filing = fileRest(roots, routes, r, known.key, decided, { sinceMs, untilMs, status: status ?? null, said: reading.said ?? null }, region);
     this.restFilings.add(restRoots(routes, r, decided.scope), filing);
     this.ctx.waitUntil(filing);
   }
@@ -4104,7 +4122,7 @@ export class InferenceRun {
     const budgets = this.deps.dispatchBudgets;
     if (budgets === undefined) return undefined;
     const at = this.deps.clock();
-    return budgets.reserve(this.routingGroup, dispatchExploratory(o.snapshot, route, at, this.stream === true), this.matureAvailable, at) ?? null;
+    return budgets.reserve(this.routingGroup, dispatchExploratory(o.snapshot, route, at, this.stream === true, this.rankRegionOf), this.matureAvailable, at) ?? null;
   }
 
   /**
@@ -4133,7 +4151,7 @@ export class InferenceRun {
     const breakerRefused = (route: Route, acquired: Extract<HeadPermit, { readonly ok: false }>): void => {
       // Every refusal of a first call's permit, by its own reason, for the soak's `route_refusal` points: the route, its
       // rank key and the routing group of the ranking that asked.
-      this.routeRefusals.push({ endpointId: route.record.endpointId, rankKey: rankKeyOf(route.record, this.stream === true), group: this.routingGroup, reason: acquired.reason, exploration: this.explored === route, atMs: clock(), borrowing: acquired.borrowing });
+      this.routeRefusals.push({ endpointId: route.record.endpointId, rankKey: rankKeyOf(route.record, this.stream === true, this.rankRegion(route.record)), group: this.routingGroup, reason: acquired.reason, exploration: this.explored === route, atMs: clock(), borrowing: acquired.borrowing });
       if (acquired.reason === "busy" && acquired.retryAfterMs !== null) this.rebuildingEnds = Math.min(this.rebuildingEnds ?? Number.POSITIVE_INFINITY, clock() + acquired.retryAfterMs);
       if (acquired.reason !== "breaker_recovering" && acquired.reason !== "breaker_open" && acquired.reason !== "resting") return;
       const ends = acquired.awaitedMs ?? acquired.retryAfterMs;
@@ -4154,18 +4172,18 @@ export class InferenceRun {
         this.modelPasses += 1;
       },
       // The lease is the route's rank key's in the request's mode, as ranking took it (the server's `abandon_recovery`).
-      abandonRecovery: (route) => void probeLeases(o.snapshot, clock()).abandonRecovery(rankKeyOf(route.record, this.stream === true), requestKey),
+      abandonRecovery: (route) => void probeLeases(o.snapshot, clock()).abandonRecovery(rankKeyOf(route.record, this.stream === true, this.rankRegion(route.record)), requestKey),
       rerank: async (remaining) => {
-        const rests = await shardRestView(this.deps.shardRests, remaining, this.stream === true, clock(), cfg.endpointReportMs, o.snapshot.version);
+        const rests = await shardRestView(this.deps.shardRests, remaining, this.stream === true, clock(), cfg.endpointReportMs, o.snapshot.version, this.rankRegionOf);
         // A failover re-ranks under the request's own ordering policy, as admission did (`Plan::ordering_policy`), and
         // its head is settled as admission's: under a customer order the routes it names go first, in its order
         // (inference.rs `rerank`: `settle_head` with the plan's preference; the dispatch replay's `rerank` does the same).
         const rankedAt = clock();
-        const ranking = await rankDetailed(o.snapshot, remaining, requestKey, rankedAt, this.preference.orderingPolicy(this.deps.policy), "suppressed", rests, this.stream === true);
+        const ranking = await rankDetailed(o.snapshot, remaining, requestKey, rankedAt, this.preference.orderingPolicy(this.deps.policy), "suppressed", rests, this.stream === true, true, this.rankRegionOf);
         this.ranked = rankedWith(o.snapshot, rankedAt);
         const ranked = [...ranking.ordered];
         const left = new Map(remaining.filter((r) => !ranked.includes(r)).map((r) => [r.record.endpointId, r]));
-        await settleHead(routeProbeLeases(o.snapshot, clock(), remaining, this.stream === true), clock(), planPreference<Route>(this.preference), ranking.result, left, ranked, requestKey);
+        await settleHead(routeProbeLeases(o.snapshot, clock(), remaining, this.stream === true, this.rankRegionOf), clock(), planPreference<Route>(this.preference), ranking.result, left, ranked, requestKey);
         if (ranked[0] === undefined) awaiting = [];
         return { head: ranked[0] ?? null, leftOut: ranked[0] === undefined ? [...left.values()] : [] };
       },
@@ -4555,8 +4573,8 @@ export class InferenceRun {
 
   /**
    * The request's conversation id at one relay (relay standard v1.7 `X-Gray-Conversation`, docs/relay-standard-v1.7.md
-   * section 3): the affinity token's inputs under `CONVERSATION_DOMAIN`, so the container's value is never the token
-   * egress derives the vendor's session ids from. Undefined without a session id, computed once per relay.
+   * section 3): the affinity token's inputs under `CONVERSATION_DOMAIN`, so the container's value is never the lane's
+   * affinity token. Undefined without a session id, computed once per relay.
    */
   private laneConversationFor(relayId: string): string | undefined {
     return this.laneTokenFor(this.laneConversations, relayId, CONVERSATION_DOMAIN);
@@ -4918,6 +4936,13 @@ export class InferenceRun {
     return this.laneEndpointRoute(route) ? `lane-${this.deps.cfg.deployEnv}` : REST_EGRESS_REGION;
   }
 
+  /**
+   * `rankRegion` as ranking reads it (routes.ts `RankRegionOf`): an entry ranks its endpoint routes on the samples, rests,
+   * exploration and recovery leases of the keys their attempts are measured, judged and rested under, as a server process
+   * ranks on its own region's keys; the `api` address's measures of the same route are another egress's.
+   */
+  private readonly rankRegionOf = (route: RouteRecord): string => this.rankRegion(route);
+
   /** A stack relay's route (S22): `lane_relay` whose lane record is `mode: "stack"`. */
   private stackRoute(route: RouteRecord): boolean {
     return this.lane !== null && route.auth === "lane_relay" && route.lane?.mode === "stack";
@@ -5063,7 +5088,6 @@ export class InferenceRun {
     const transport = this.lane!.stackTransport!;
     const protocol = attempt.route.record.protocol as LaneProtocol;
     const rid = newStackRid();
-    const conversation = this.laneAffinityFor(plan.config.relayId);
     // Relay standard v1.7: the container is sent the required changes and the two headers; egress is registered the
     // client's bytes. `openAttempt` made the plan with `stackAttemptPlan`, which sets the body.
     const body = plan.body!;
@@ -5074,12 +5098,11 @@ export class InferenceRun {
       protocol,
       received: this.laneReceived!,
       forwarded: body.forwarded,
-      // S32: the client's raw query and behaviour headers and the route's vendor are part of egress's check.
+      // S32: the client's raw query and own headers and the route's vendor are part of egress's check; the vendor's
+      // header set starts from the client's own headers (owner, 2026-11-18).
       query: stackRawQuery(this.request.url),
-      behaviourHeaders: stackBehaviourHeaders(this.request.headers, protocol),
+      clientHeaders: stackClientHeaders(this.request.headers, protocol),
       vendor: plan.vendor,
-      // S32a: one session id per conversation at the vendor, derived by egress from the lane's affinity token.
-      ...(conversation === undefined ? {} : { conversation }),
       // With `relay_changes` egress accepts the relay's own changes, which the receipt describes; a customer who chose
       // relays that change nothing gets a spec without it, so egress refuses them (docs/relay-request-changes.md).
       rewrite: stackRewriteSpec({

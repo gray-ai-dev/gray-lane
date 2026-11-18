@@ -4,6 +4,7 @@ import { z } from "zod";
 import { BridgeWireError } from "./error.ts";
 import { asBigint, asNumber, integersOfJson, numbersOfJson, uintSchema } from "./ints.ts";
 import { BRIDGE_PATHS, SNAPSHOT_TARGET, bridgeCall, type BridgeCall } from "./ops.ts";
+import { decodeSchedulerBody, encodeSchedulerBody } from "./scheduler.ts";
 
 /** The judge pair the bridge applies to its answers (`AgeJudgement`, bridge-3). */
 export interface SnapshotJudge {
@@ -25,15 +26,57 @@ export interface SnapshotJudge {
  *
  * `SNAPSHOT_RESPONSE_MAX_BYTES` bounds the answer before it is parsed: the snapshot holds every key
  * and route, so a malformed or runaway document must be refused by its size, not buffered. 8 MiB is
- * the lane's largest wire bound (the scheduler forward's answer is 512 bytes after D27), and a
+ * the lane's largest bound of a document's own (the scheduler forward's answer is 512 bytes after D27), and a
  * gateway snapshot of the sizes Gray serves today is well under it.
+ *
+ * The ranking members (r16, workers/lane-bridge IMPLEMENTATION_NOTES.md "The snapshot read"). The request path's source
+ * says in the query that it takes them (`ranking=word`), or what it holds of the ranking feed when the snapshot cache
+ * asks for the feed's changes (`ranking=all`: nothing; `ranking=since&ranking_epoch=<epoch>&ranking_seq=<n>`: its
+ * `FeedHave`). The bridge passes the replica's word on: `ranking`, the replica's `FeedAnswer` for `all` and `since`
+ * (`snapshotRankingSchema`: its sample columns as base64 of their little-endian bytes, the measures' width named), and
+ * `ranking_failing_since`, whenever the replica that answered keeps a copy of the collector. A read that names none of
+ * them is the read of before r16, byte for byte, and its answer carries neither, so a lane of an earlier release (whose
+ * answer schema is strict) never meets one. The ranking part of an answer (the bytes its two members add) has its own
+ * bound, `RANKING_ANSWER_MAX_BYTES`; past it the bridge leaves `ranking` out (`snapshotAnswerBytes`).
  */
 export const SNAPSHOT_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The most bytes the ranking members add to a snapshot answer (r16): 32 MiB. A whole answer at the feed's bound (4,096
+ * keys of 128 samples) is about 16.3 MB of data (@gray/routing `feedAnswerBytes`) and about 22 MB so encoded; one whose
+ * keys also hold many failures is about 37 MB, past it, and is left out (the bridge alerts `lane_bridge_ranking_left_out`).
+ * Gray's feed is far below that (docs/cloudflare-native/endpoint.md section 12). The snapshot keeps its own bound beside it.
+ */
+export const RANKING_ANSWER_MAX_BYTES = 32 * 1024 * 1024;
+
+/** The most bytes a `snapshot.current` answer has: the snapshot's bound and the ranking part's (wire.ts `bridgeResponseMaxBytes`). */
+export const SNAPSHOT_RANKING_RESPONSE_MAX_BYTES = SNAPSHOT_RESPONSE_MAX_BYTES + RANKING_ANSWER_MAX_BYTES;
+
+/**
+ * The ranking collector's epoch as a read names it (`ranking_epoch`) and an answer carries it: the collector's
+ * `crypto.randomUUID()` (workers/gateway/src/objects/endpoint-ranking.ts), or a test's short name. URL-unreserved
+ * characters only, so the signed query carries it as it is, with nothing to escape.
+ */
+export const RANKING_EPOCH_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** What a read says of the ranking feed: the replica's word only, the whole feed, or its changes since a `FeedHave`. */
+export const SNAPSHOT_RANKING_ASKS = ["word", "all", "since"] as const;
+export type SnapshotRankingAsk = (typeof SNAPSHOT_RANKING_ASKS)[number];
+
+/** What a caller holds of the ranking feed (@gray/routing `FeedHave`): the collector's epoch and its last change's number. */
+export interface SnapshotFeedHave {
+  readonly epoch: string;
+  readonly seq: number;
+}
+
+const epochSchema = z.string().regex(RANKING_EPOCH_PATTERN);
 
 /**
  * The integers of a `current` call: `have`, an optional `confirmed_after`, and the optional judge
  * pair `judge_now`/`judge_age_ms` (bridge-3). The judge pair is both present or both absent: one
  * without the other describes no judgement, and a reader must not guess which half was meant.
+ * The ranking members (r16) are absent, or `ranking` is one of `SNAPSHOT_RANKING_ASKS`, with `ranking_epoch` and
+ * `ranking_seq` exactly when it is `since`.
  */
 export const snapshotCurrentRequestSchema = z
   .object({
@@ -41,12 +84,19 @@ export const snapshotCurrentRequestSchema = z
     confirmed_after: uintSchema.nullable(),
     judge_now: uintSchema.nullable().optional(),
     judge_age_ms: uintSchema.nullable().optional(),
+    ranking: z.enum(SNAPSHOT_RANKING_ASKS).optional(),
+    ranking_epoch: epochSchema.optional(),
+    ranking_seq: uintSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
     const now = value.judge_now ?? null;
     const age = value.judge_age_ms ?? null;
     if ((now === null) !== (age === null)) ctx.addIssue({ code: "custom", path: ["judge_now"], message: "judge_now and judge_age_ms are both present or both absent" });
+    const since = value.ranking === "since";
+    if (since !== (value.ranking_epoch !== undefined) || since !== (value.ranking_seq !== undefined)) {
+      ctx.addIssue({ code: "custom", path: ["ranking"], message: "ranking=since names ranking_epoch and ranking_seq, and no other read names them" });
+    }
   });
 export type SnapshotCurrentRequest = z.infer<typeof snapshotCurrentRequestSchema>;
 
@@ -57,13 +107,38 @@ export function snapshotJudgeOf(request: SnapshotCurrentRequest): SnapshotJudge 
   return now === null || age === null ? null : { now, ageMs: age };
 }
 
-/** The query of one `current` call, in a fixed order, digits only. */
+/**
+ * The ranking members of a read for what its caller holds of the feed (`SnapshotSource.current`'s `ranking`): `word`
+ * for undefined (the replica's word on the feed, no changes), `all` for null (nothing held), `since` for a have. A have
+ * this wire cannot name (an epoch outside RANKING_EPOCH_PATTERN, a number that is not a safe non-negative integer) asks
+ * for `all`, which an answer of another epoch would bring anyway: a ranking value never fails a snapshot read.
+ */
+export function snapshotRankingRequestOf(have: SnapshotFeedHave | null | undefined): Pick<SnapshotCurrentRequest, "ranking" | "ranking_epoch" | "ranking_seq"> {
+  if (have === undefined) return { ranking: "word" };
+  if (have === null || !RANKING_EPOCH_PATTERN.test(have.epoch) || !Number.isSafeInteger(have.seq) || have.seq < 0) return { ranking: "all" };
+  return { ranking: "since", ranking_epoch: have.epoch, ranking_seq: BigInt(have.seq) };
+}
+
+/**
+ * The replica's third argument for a read (gray-jobs `ConfigReplicaDO.current`'s `ranking`): undefined for `word` and
+ * for a read without the ranking members (the replica's word only, as before r16), null for `all`, the caller's have
+ * for `since`.
+ */
+export function snapshotRankingHaveOf(request: SnapshotCurrentRequest): SnapshotFeedHave | null | undefined {
+  if (request.ranking === "all") return null;
+  if (request.ranking !== "since" || request.ranking_epoch === undefined || request.ranking_seq === undefined) return undefined;
+  return { epoch: request.ranking_epoch, seq: asNumber(request.ranking_seq, "ranking_seq") };
+}
+
+/** The query of one `current` call, in a fixed order: the integers, then the ranking members (r16). */
 export function snapshotCurrentQuery(request: SnapshotCurrentRequest): string {
   const parsed = snapshotCurrentRequestSchema.parse(request);
   const parts = [`have=${parsed.have}`];
   if (parsed.confirmed_after !== null) parts.push(`confirmed_after=${parsed.confirmed_after}`);
   const judge = snapshotJudgeOf(parsed);
   if (judge !== null) parts.push(`judge_now=${judge.now}`, `judge_age_ms=${judge.ageMs}`);
+  if (parsed.ranking !== undefined) parts.push(`ranking=${parsed.ranking}`);
+  if (parsed.ranking === "since") parts.push(`ranking_epoch=${parsed.ranking_epoch}`, `ranking_seq=${parsed.ranking_seq}`);
   return parts.join("&");
 }
 
@@ -72,10 +147,15 @@ export function snapshotCurrentCall(request: SnapshotCurrentRequest): BridgeCall
   return bridgeCall("snapshot.current", SNAPSHOT_TARGET, `${BRIDGE_PATHS["snapshot.current"]}?${snapshotCurrentQuery(request)}`);
 }
 
+/** The names a snapshot read's query may carry: before r16's, then the ranking members. */
+const SNAPSHOT_PARAMETERS: ReadonlySet<string> = new Set(["have", "confirmed_after", "judge_now", "judge_age_ms", "ranking", "ranking_epoch", "ranking_seq"]);
+
 /**
  * Read a `current` request from its query; refuses another name. A repeated name reads as its first
  * occurrence: the canonical query (`snapshotCurrentQuery`) writes each name once, and only the
  * signing client builds it, so a repeat is a malformed caller rather than a second value to bind.
+ * The ranking members are in the request only when the query names them, so a read without them is
+ * the document of before r16.
  */
 export function snapshotCurrentRequestOf(search: string): SnapshotCurrentRequest {
   const params = new URLSearchParams(search);
@@ -91,13 +171,291 @@ export function snapshotCurrentRequestOf(search: string): SnapshotCurrentRequest
   const judgeNow = integer("judge_now");
   const judgeAge = integer("judge_age_ms");
   for (const key of params.keys()) {
-    if (key !== "have" && key !== "confirmed_after" && key !== "judge_now" && key !== "judge_age_ms") throw new BridgeWireError("unknown_field", key, `the snapshot read has no parameter ${key}`);
+    if (!SNAPSHOT_PARAMETERS.has(key)) throw new BridgeWireError("unknown_field", key, `the snapshot read has no parameter ${key}`);
   }
-  const request = { have, confirmed_after: after, judge_now: judgeNow, judge_age_ms: judgeAge };
+  const ask = params.get("ranking");
+  if (ask !== null && !(SNAPSHOT_RANKING_ASKS as readonly string[]).includes(ask)) throw new BridgeWireError("invalid_document", "ranking", "ranking is word, all or since");
+  const epoch = params.get("ranking_epoch");
+  if (epoch !== null && !RANKING_EPOCH_PATTERN.test(epoch)) throw new BridgeWireError("invalid_document", "ranking_epoch", "ranking_epoch is 1 to 128 URL-unreserved characters");
+  const seq = integer("ranking_seq");
+  const request = {
+    have,
+    confirmed_after: after,
+    judge_now: judgeNow,
+    judge_age_ms: judgeAge,
+    ...(ask === null ? {} : { ranking: ask }),
+    ...(epoch === null ? {} : { ranking_epoch: epoch }),
+    ...(seq === null ? {} : { ranking_seq: seq }),
+  };
   const parsed = snapshotCurrentRequestSchema.safeParse(request);
-  if (!parsed.success) throw new BridgeWireError("invalid_document", "judge_now", parsed.error.issues[0]?.message ?? "a snapshot parameter is invalid");
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    throw new BridgeWireError("invalid_document", issue?.path.map(String).join(".") || "judge_now", issue?.message ?? "a snapshot parameter is invalid");
+  }
   return parsed.data;
 }
+
+// ------------------------------------------------------------------------------------------------- the ranking feed
+
+/**
+ * A rank key's samples as a feed answer carries them (@gray/routing `FeedColumns`): `flags.length` samples, oldest first;
+ * `nAt` their run numbers then their times; `measures` their latencies, times to first token (none: 0xFFFFFFFF in a
+ * Uint32Array, NaN in a Float64Array) and output tokens; `flags` bit 0 success, bit 1 repeat.
+ */
+export interface SnapshotRankingColumns {
+  readonly nAt: Float64Array;
+  readonly measures: Uint32Array | Float64Array;
+  readonly flags: Uint8Array;
+}
+
+/** One rank key of a feed answer (@gray/routing `FeedKey`); a failure's kind is checked by the reader's base. */
+export interface SnapshotRankingKey {
+  readonly key: string;
+  readonly whole: boolean;
+  readonly firstN: number;
+  readonly samples: SnapshotRankingColumns;
+  readonly failures?: readonly (readonly [atMs: number, failure: string])[];
+  readonly lastObserved: number | null;
+  readonly trial: {
+    readonly windowStarted: number | null;
+    readonly samples: number;
+    readonly failures: number;
+    readonly stableWindows: number;
+    readonly graduated: boolean;
+  };
+}
+
+/**
+ * A replica's answer of the ranking feed (@gray/routing `FeedAnswer`, the shape of `v`), in the form the lane's ranking
+ * base takes it (`RankingBase.apply`, which checks it as it checks a replica's answer on the main gateway:
+ * `feedAnswerValid`, each key `feedKeyValid`).
+ */
+export interface SnapshotRanking {
+  readonly v: number;
+  readonly epoch: string;
+  readonly seq: number;
+  readonly asOf: number;
+  readonly full: boolean;
+  readonly keys: readonly SnapshotRankingKey[];
+  readonly removed: readonly string[];
+}
+
+/** The measures' width on the wire: 32-bit unsigned integers, or 64-bit floats for a key with a value past 32 bits. */
+export const RANKING_MEASURES_TYPES = ["u32", "f64"] as const;
+
+/**
+ * The wire form of `SnapshotRanking`: integers as bigints (M27), each typed array as canonical standard base64 of its
+ * little-endian bytes (an empty one is ""), and the measures' width named (`measures_type`). Strict, as every document.
+ */
+export const snapshotRankingSchema = z
+  .object({
+    v: uintSchema,
+    epoch: epochSchema,
+    seq: uintSchema,
+    as_of: uintSchema,
+    full: z.boolean(),
+    keys: z.array(
+      z
+        .object({
+          key: z.string(),
+          whole: z.boolean(),
+          first_n: uintSchema,
+          samples: z.object({ n_at: z.string(), measures: z.string(), measures_type: z.enum(RANKING_MEASURES_TYPES), flags: z.string() }).strict(),
+          failures: z.array(z.tuple([uintSchema, z.string()])).optional(),
+          last_observed: uintSchema.nullable(),
+          trial: z.object({ window_started: uintSchema.nullable(), samples: uintSchema, failures: uintSchema, stable_windows: uintSchema, graduated: z.boolean() }).strict(),
+        })
+        .strict(),
+    ),
+    removed: z.array(z.string()),
+  })
+  .strict();
+export type SnapshotRankingDto = z.infer<typeof snapshotRankingSchema>;
+
+const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** The little-endian bytes of a typed array's own view (not the rest of its buffer). */
+function littleEndianBytes(view: Float64Array | Uint32Array | Uint8Array): Uint8Array {
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  const size = view.BYTES_PER_ELEMENT;
+  if (LITTLE_ENDIAN || size === 1) return bytes;
+  const out = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i += size) for (let j = 0; j < size; j++) out[i + j] = bytes[i + size - 1 - j]!;
+  return out;
+}
+
+/**
+ * A typed array of `size`-byte elements over the little-endian bytes of a decoded column (`base64Of`: a buffer of its
+ * own, from offset 0), or a throw naming `field`. A big-endian platform swaps each element's bytes in place first.
+ */
+function typedOf<T>(bytes: Uint8Array<ArrayBuffer>, size: number, make: (buffer: ArrayBuffer) => T, field: string): T {
+  if (bytes.length % size !== 0) throw new BridgeWireError("invalid_document", field, `ranking ${field}: ${bytes.length} bytes are not whole ${size}-byte values`);
+  if (!LITTLE_ENDIAN && size > 1) for (let i = 0; i < bytes.length; i += size) bytes.subarray(i, i + size).reverse();
+  return make(bytes.buffer);
+}
+
+/** A column's bytes: canonical standard base64 ("" for none), decoded into a buffer of their own. */
+function base64Of(text: string, field: string): Uint8Array<ArrayBuffer> {
+  const bytes = text === "" ? new Uint8Array(0) : decodeSchedulerBody(text);
+  if (bytes === null) throw new BridgeWireError("invalid_document", field, `ranking ${field} is not canonical standard base64`);
+  // `decodeSchedulerBody` writes into a new array of exactly the bytes; a copy keeps that true whatever it returns.
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer ? (bytes as Uint8Array<ArrayBuffer>) : new Uint8Array(bytes);
+}
+
+/** A non-negative safe integer of a feed answer as the wire's bigint, or a throw naming `field`. */
+function feedCount(value: unknown, field: string): bigint {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new BridgeWireError("invalid_document", field, `ranking ${field} is a non-negative safe integer`);
+  return BigInt(value);
+}
+
+function feedObject(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || ArrayBuffer.isView(value)) throw new BridgeWireError("invalid_document", field, `ranking ${field} is an object`);
+  return value as Record<string, unknown>;
+}
+
+function feedFlag(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") throw new BridgeWireError("invalid_document", field, `ranking ${field} is a boolean`);
+  return value;
+}
+
+function feedText(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new BridgeWireError("invalid_document", field, `ranking ${field} is a string`);
+  return value;
+}
+
+/**
+ * The wire form of a replica's feed answer, as the bridge writes it. Only its shape is checked here (the types the wire
+ * carries, the epoch's characters); what the values mean (the columns' lengths, the run numbers' order, a failure's
+ * kind, the feed's bounds) is the lane's ranking base's to check, as the main gateway's base checks a replica's answer.
+ * A value of another shape throws: the bridge then leaves `ranking` out.
+ */
+export function snapshotRankingDtoOf(value: unknown): SnapshotRankingDto {
+  const a = feedObject(value, "answer");
+  const epoch = feedText(a.epoch, "epoch");
+  if (!RANKING_EPOCH_PATTERN.test(epoch)) throw new BridgeWireError("invalid_document", "epoch", "ranking epoch is 1 to 128 URL-unreserved characters");
+  if (!Array.isArray(a.keys)) throw new BridgeWireError("invalid_document", "keys", "ranking keys is an array");
+  if (!Array.isArray(a.removed)) throw new BridgeWireError("invalid_document", "removed", "ranking removed is an array");
+  return {
+    v: feedCount(a.v, "v"),
+    epoch,
+    seq: feedCount(a.seq, "seq"),
+    as_of: feedCount(a.asOf, "asOf"),
+    full: feedFlag(a.full, "full"),
+    keys: (a.keys as unknown[]).map((entry, i) => {
+      const k = feedObject(entry, `keys.${i}`);
+      const samples = feedObject(k.samples, `keys.${i}.samples`);
+      const { nAt, measures, flags } = samples;
+      if (!(nAt instanceof Float64Array) || !(measures instanceof Uint32Array || measures instanceof Float64Array) || !(flags instanceof Uint8Array)) {
+        throw new BridgeWireError("invalid_document", `keys.${i}.samples`, "ranking samples are a Float64Array, a Uint32Array or Float64Array and a Uint8Array");
+      }
+      const trial = feedObject(k.trial, `keys.${i}.trial`);
+      if (k.failures !== undefined && !Array.isArray(k.failures)) throw new BridgeWireError("invalid_document", `keys.${i}.failures`, "ranking failures are an array");
+      return {
+        key: feedText(k.key, `keys.${i}.key`),
+        whole: feedFlag(k.whole, `keys.${i}.whole`),
+        first_n: feedCount(k.firstN, `keys.${i}.firstN`),
+        samples: {
+          n_at: encodeSchedulerBody(littleEndianBytes(nAt)),
+          measures: encodeSchedulerBody(littleEndianBytes(measures)),
+          measures_type: measures instanceof Uint32Array ? ("u32" as const) : ("f64" as const),
+          flags: encodeSchedulerBody(littleEndianBytes(flags)),
+        },
+        ...(k.failures === undefined
+          ? {}
+          : {
+              failures: (k.failures as unknown[]).map((failure, j): [bigint, string] => {
+                if (!Array.isArray(failure) || failure.length !== 2) throw new BridgeWireError("invalid_document", `keys.${i}.failures.${j}`, "ranking failure is [atMs, kind]");
+                return [feedCount(failure[0], `keys.${i}.failures.${j}`), feedText(failure[1], `keys.${i}.failures.${j}`)];
+              }),
+            }),
+        last_observed: k.lastObserved === null ? null : feedCount(k.lastObserved, `keys.${i}.lastObserved`),
+        trial: {
+          window_started: trial.windowStarted === null ? null : feedCount(trial.windowStarted, `keys.${i}.trial.windowStarted`),
+          samples: feedCount(trial.samples, `keys.${i}.trial.samples`),
+          failures: feedCount(trial.failures, `keys.${i}.trial.failures`),
+          stable_windows: feedCount(trial.stableWindows, `keys.${i}.trial.stableWindows`),
+          graduated: feedFlag(trial.graduated, `keys.${i}.trial.graduated`),
+        },
+      };
+    }),
+    removed: (a.removed as unknown[]).map((key, i) => feedText(key, `removed.${i}`)),
+  };
+}
+
+const UTF8 = new TextEncoder();
+
+/** What every key of a written feed answer has whatever its values: its members' names, its punctuation, its least values. */
+const KEY_FIXED_BYTES = toJsonString({
+  first_n: 0n,
+  key: "",
+  last_observed: 0n,
+  samples: { flags: "", measures: "", measures_type: "u32", n_at: "" },
+  trial: { failures: 0n, graduated: true, samples: 0n, stable_windows: 0n, window_started: 0n },
+  whole: true,
+} as unknown as Json).length;
+
+/**
+ * A lower bound of the bytes a replica's feed answer comes to once written (`snapshotRankingDtoOf`, then `toJsonString`),
+ * from its typed arrays' lengths and its texts alone, nothing encoded: @gray/routing `feedAnswerBytes`' accounting of a
+ * key (its columns' bytes and its text), each column as base64 (4 characters per 3 bytes), each key's fixed members
+ * (`KEY_FIXED_BYTES`), and each removed key's text. A ranking part past RANKING_ANSWER_MAX_BYTES by it is past it
+ * written, so the bridge leaves it out without building its strings (r16); one within it is written and measured
+ * (`snapshotAnswerBytes`). 0 for a value of no feed answer's shape, which the writer refuses.
+ */
+export function snapshotRankingBytesAtLeast(value: unknown): number {
+  if (typeof value !== "object" || value === null) return 0;
+  const { keys, removed } = value as { readonly keys?: unknown; readonly removed?: unknown };
+  let bytes = 0;
+  if (Array.isArray(keys)) {
+    for (const entry of keys as unknown[]) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const { key, samples } = entry as { readonly key?: unknown; readonly samples?: unknown };
+      bytes += KEY_FIXED_BYTES + (typeof key === "string" ? UTF8.encode(key).length : 0);
+      if (typeof samples !== "object" || samples === null) continue;
+      const { nAt, measures, flags } = samples as { readonly nAt?: unknown; readonly measures?: unknown; readonly flags?: unknown };
+      for (const column of [nAt, measures, flags]) if (ArrayBuffer.isView(column)) bytes += 4 * Math.ceil(column.byteLength / 3);
+    }
+  }
+  if (Array.isArray(removed)) for (const key of removed as unknown[]) if (typeof key === "string") bytes += UTF8.encode(key).length + 2;
+  return bytes;
+}
+
+/** A feed answer read from the wire: the columns back to typed arrays. A column that is not canonical base64 of whole values throws. */
+export function snapshotRankingOf(dto: SnapshotRankingDto): SnapshotRanking {
+  return {
+    v: asNumber(dto.v, "v"),
+    epoch: dto.epoch,
+    seq: asNumber(dto.seq, "seq"),
+    asOf: asNumber(dto.as_of, "as_of"),
+    full: dto.full,
+    keys: dto.keys.map((k, i) => {
+      const field = `keys.${i}.samples`;
+      const wide = k.samples.measures_type === "f64";
+      return {
+        key: k.key,
+        whole: k.whole,
+        firstN: asNumber(k.first_n, "first_n"),
+        samples: {
+          nAt: typedOf(base64Of(k.samples.n_at, `${field}.n_at`), 8, (b) => new Float64Array(b), `${field}.n_at`),
+          measures: wide ? typedOf(base64Of(k.samples.measures, `${field}.measures`), 8, (b) => new Float64Array(b), `${field}.measures`) : typedOf(base64Of(k.samples.measures, `${field}.measures`), 4, (b) => new Uint32Array(b), `${field}.measures`),
+          flags: typedOf(base64Of(k.samples.flags, `${field}.flags`), 1, (b) => new Uint8Array(b), `${field}.flags`),
+        },
+        ...(k.failures === undefined ? {} : { failures: k.failures.map(([at, kind]) => [asNumber(at, "failures"), kind] as const) }),
+        lastObserved: k.last_observed === null ? null : asNumber(k.last_observed, "last_observed"),
+        trial: {
+          windowStarted: k.trial.window_started === null ? null : asNumber(k.trial.window_started, "window_started"),
+          samples: asNumber(k.trial.samples, "trial.samples"),
+          failures: asNumber(k.trial.failures, "trial.failures"),
+          stableWindows: asNumber(k.trial.stable_windows, "stable_windows"),
+          graduated: k.trial.graduated,
+        },
+      };
+    }),
+    removed: [...dto.removed],
+  };
+}
+
+// ------------------------------------------------------------------------------------------------- the answer
 
 /**
  * What the bridge answers and what the CVM's remote source returns: the version, when it was last
@@ -111,15 +469,31 @@ export interface RawSnapshotAnswer {
   /** Absent when the source did not say, as `SnapshotAnswer.confirmedAt` is optional. */
   readonly confirmedAt?: number;
   readonly snapshot: Snapshot | null;
+  /** The ranking feed's changes since what the read held (`ranking=all|since`), when the replica that answered had them (r16). */
+  readonly ranking?: SnapshotRanking;
+  /**
+   * A `ranking` member this build could not read (not `snapshotRankingSchema`'s, or a column that is not canonical base64
+   * of whole values), as it came off the wire, and why (review r16 finding 3): the snapshot is read all the same, and the
+   * lane hands the value to its ranking base, which counts it unreadable as the main gateway's base counts a replica's
+   * answer it cannot read (`RankingBase.apply`; its `ranking_stale` comes once that lasts past the alert age).
+   */
+  readonly rankingUnreadable?: { readonly value: unknown; readonly reason: string };
+  /** Since when the answering replica's syncs with the collector fail (null: they work): to a read that takes the ranking members, from a replica that keeps a copy (r16). */
+  readonly rankingFailingSince?: number | null;
 }
 
-/** The wire form: the same answer with bigint integers and the snapshot as a JSON value. */
+/**
+ * The wire form: the same answer with bigint integers and the snapshot as a JSON value. `ranking` is any value at the
+ * envelope, read on its own (`snapshotAnswerOf`), so a ranking the lane cannot read never costs it the snapshot.
+ */
 export const snapshotAnswerSchema = z
   .object({
     version: uintSchema,
     refreshed_at: uintSchema,
     confirmed_at: uintSchema.nullable(),
     snapshot: z.unknown(),
+    ranking: z.unknown().optional(),
+    ranking_failing_since: uintSchema.nullable().optional(),
   })
   .strict();
 
@@ -147,40 +521,98 @@ function snapshotOfValue(value: unknown): Snapshot {
   return numbersOfJson(snapshot, "snapshot") as Snapshot;
 }
 
-/** The DO-facing answer of a wire answer: bigints back to numbers, the snapshot back to `Snapshot`. */
+/**
+ * The DO-facing answer of a wire answer: bigints back to numbers, the snapshot back to `Snapshot`, the ranking's columns
+ * to typed arrays. A ranking that does not read is `rankingUnreadable`, the rest of the answer as it is (review r16
+ * finding 3); a snapshot that does not read still throws.
+ */
 export function snapshotAnswerOf(dto: SnapshotAnswerDto): RawSnapshotAnswer {
   const answer: RawSnapshotAnswer = {
     version: asNumber(dto.version, "version"),
     refreshedAt: asNumber(dto.refreshed_at, "refreshed_at"),
     snapshot: dto.snapshot === null ? null : snapshotOfValue(dto.snapshot),
   };
-  return dto.confirmed_at === null ? answer : { ...answer, confirmedAt: asNumber(dto.confirmed_at, "confirmed_at") };
+  return {
+    ...answer,
+    ...(dto.confirmed_at === null ? {} : { confirmedAt: asNumber(dto.confirmed_at, "confirmed_at") }),
+    ...(dto.ranking === undefined ? {} : rankingOfWire(dto.ranking)),
+    ...(dto.ranking_failing_since === undefined ? {} : { rankingFailingSince: dto.ranking_failing_since === null ? null : asNumber(dto.ranking_failing_since, "ranking_failing_since") }),
+  };
 }
 
-/** The wire answer of a DO-facing answer: integers to bigints, the snapshot to a JSON value. */
+/** A `ranking` member read on its own: the feed answer, or the value as it came and why it does not read. */
+function rankingOfWire(value: unknown): Pick<RawSnapshotAnswer, "ranking" | "rankingUnreadable"> {
+  const parsed = snapshotRankingSchema.safeParse(value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    return { rankingUnreadable: { value, reason: `ranking ${issue?.path.map(String).join(".") || "(root)"}: ${issue?.message ?? "not the wire shape"}` } };
+  }
+  try {
+    return { ranking: snapshotRankingOf(parsed.data) };
+  } catch (error) {
+    return { rankingUnreadable: { value, reason: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
+/** The wire answer of a DO-facing answer: integers to bigints, the snapshot to a JSON value, the ranking members only when given. */
 export function snapshotAnswerDtoOf(answer: RawSnapshotAnswer): SnapshotAnswerDto {
   return {
     version: asBigint(answer.version, "version"),
     refreshed_at: asBigint(answer.refreshedAt, "refreshedAt"),
     confirmed_at: answer.confirmedAt === undefined ? null : asBigint(answer.confirmedAt, "confirmedAt"),
     snapshot: answer.snapshot === null ? null : integersOfJson(answer.snapshot, "snapshot"),
+    ...(answer.ranking === undefined ? {} : { ranking: snapshotRankingDtoOf(answer.ranking) }),
+    ...(answer.rankingFailingSince === undefined ? {} : { ranking_failing_since: answer.rankingFailingSince === null ? null : asBigint(answer.rankingFailingSince, "rankingFailingSince") }),
   };
 }
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-/** The bytes of one snapshot answer, within `SNAPSHOT_RESPONSE_MAX_BYTES`. */
-export function snapshotAnswerText(dto: SnapshotAnswerDto): Uint8Array {
-  const text = toJsonString(dto as unknown as Json);
-  const bytes = ENCODER.encode(text);
-  if (bytes.byteLength > SNAPSHOT_RESPONSE_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the snapshot answer is over ${SNAPSHOT_RESPONSE_MAX_BYTES} bytes`);
-  return bytes;
+/** The two bounds of a snapshot answer's bytes: the answer without its ranking members, and what those add. */
+export interface SnapshotAnswerBounds {
+  readonly snapshotBytes: number;
+  readonly rankingBytes: number;
 }
 
-/** Read a snapshot answer: size first, then strict UTF-8, serde JSON and the envelope schema. */
+const SNAPSHOT_ANSWER_BOUNDS: SnapshotAnswerBounds = { snapshotBytes: SNAPSHOT_RESPONSE_MAX_BYTES, rankingBytes: RANKING_ANSWER_MAX_BYTES };
+
+/** A snapshot answer's bytes as the bridge writes them, and whether the ranking was left out. */
+export interface SnapshotAnswerBytes {
+  readonly bytes: Uint8Array;
+  /** What the ranking part came to when it was past its bound and `ranking` was left out (the bridge logs it); else null. */
+  readonly rankingLeftOut: number | null;
+}
+
+/**
+ * The bytes of one snapshot answer: the answer without its ranking members within `bounds.snapshotBytes`
+ * (SNAPSHOT_RESPONSE_MAX_BYTES; past it a throw, as before r16), and the bytes the two ranking members add within
+ * `bounds.rankingBytes` (RANKING_ANSWER_MAX_BYTES). Past that the answer goes without `ranking`, still with
+ * `ranking_failing_since`, and says how large the part was. An answer without the ranking members is written once and
+ * is the text of before r16.
+ */
+export function snapshotAnswerBytes(dto: SnapshotAnswerDto, bounds: SnapshotAnswerBounds = SNAPSHOT_ANSWER_BOUNDS): SnapshotAnswerBytes {
+  const { ranking, ranking_failing_since: failingSince, ...rest } = dto;
+  const plain = ENCODER.encode(toJsonString(rest as unknown as Json));
+  if (plain.byteLength > bounds.snapshotBytes) throw new BridgeWireError("body_too_large", null, `the snapshot answer is over ${bounds.snapshotBytes} bytes`);
+  if (ranking === undefined && failingSince === undefined) return { bytes: plain, rankingLeftOut: null };
+  const whole = ENCODER.encode(toJsonString(dto as unknown as Json));
+  const part = whole.byteLength - plain.byteLength;
+  if (part <= bounds.rankingBytes) return { bytes: whole, rankingLeftOut: null };
+  const { ranking: _left, ...without } = dto;
+  return { bytes: ENCODER.encode(toJsonString(without as unknown as Json)), rankingLeftOut: part };
+}
+
+/** The bytes of one snapshot answer within both bounds (`snapshotAnswerBytes`); a throw when either is passed. */
+export function snapshotAnswerText(dto: SnapshotAnswerDto): Uint8Array {
+  const written = snapshotAnswerBytes(dto);
+  if (written.rankingLeftOut !== null) throw new BridgeWireError("body_too_large", "ranking", `the snapshot answer's ranking is over ${RANKING_ANSWER_MAX_BYTES} bytes`);
+  return written.bytes;
+}
+
+/** Read a snapshot answer: size first (SNAPSHOT_RANKING_RESPONSE_MAX_BYTES), then strict UTF-8, serde JSON and the envelope schema. */
 export function snapshotAnswerOfText(bytes: Uint8Array): SnapshotAnswerDto {
-  if (bytes.byteLength > SNAPSHOT_RESPONSE_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the snapshot answer is over ${SNAPSHOT_RESPONSE_MAX_BYTES} bytes`);
+  if (bytes.byteLength > SNAPSHOT_RANKING_RESPONSE_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the snapshot answer is over ${SNAPSHOT_RANKING_RESPONSE_MAX_BYTES} bytes`);
   let text: string;
   try {
     text = DECODER.decode(bytes);

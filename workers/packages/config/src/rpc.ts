@@ -74,7 +74,7 @@ export const RPC_SURFACES = {
     target: "ConfigDO",
     kind: "object",
     callers: ["gateway", "lane-bridge", "console", "jobs"],
-    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain"],
+    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain", "videoJobEndpoint"],
   },
   configReplica: { callee: "jobs", target: "ConfigReplicaDO", kind: "object", callers: ["gateway", "lane-bridge", "jobs"], calls: ["current", "version", "snapshot", "gatewaySnapshot", "debtMode"] },
   round: {
@@ -88,7 +88,8 @@ export const RPC_SURFACES = {
     callee: "gateway",
     target: "EndpointRootDO",
     kind: "object",
-    callers: ["jobs", "console", "gateway"],
+    // The lane bridge files a lane attempt's rest (`rest`, endpoint.file_rest, r16): a call every root has long had.
+    callers: ["jobs", "console", "gateway", "lane-bridge"],
     calls: ["configure", "withdraw", "reinstate", "report", "flushRanking", "rankingExport", "claimProbe", "probeResult", "rest", "answered", "endRests", "probeAnswered", "probeSent", "health", "rankingState", "view", "state"],
   },
   endpointShard: {
@@ -129,6 +130,9 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // An endpoint root whose storage started over asks ConfigDO to tell it its terms again (M12): a gray-jobs of a release
   // before `tellAgain` throws, and the root waits for the hourly re-send as before.
   "config.tellAgain": "gateway/test/workerd/endpoint.test.ts > a root whose storage started over waits for the hourly re-send when gray-jobs is of a release before tellAgain",
+  // A video job whose route left the snapshot is polled on its endpoint's record (docs/cloudflare-native/media.md 3.2
+  // rule 11): a gray-jobs of a release before `videoJobEndpoint` throws, and the job has no route, as before.
+  "config.videoJobEndpoint": "gateway/test/workerd/video-jobs.test.ts > has no route when gray-jobs is of a release before videoJobEndpoint: the poll decides nothing, as before",
   // The lane bridge asks a lane route's shard to hold its standing permit before the route's first request (M13): a shard
   // of a release before `warm` throws, the bridge answers unavailable, and the lane serves as before (its first request borrows).
   "endpointShard.warm": "lane-bridge/test/workerd/bridge.test.ts > a shard of a release before warm answers that it has no such method: unavailable, and the lane serves as before",

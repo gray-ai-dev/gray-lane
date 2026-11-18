@@ -17,10 +17,11 @@ import { IsolateTables } from "../tables.ts";
 import { toolCallIdShards } from "../tool-call-id-shards.ts";
 import { trustGate } from "../trust.ts";
 import { BridgeCallError, type BridgeClientOptions } from "./remote/client.ts";
-import { remoteEndpointLocator } from "./remote/endpoint.ts";
+import { remoteEndpointLocator, remoteEndpointRootLocator } from "./remote/endpoint.ts";
 import { remoteShardLocator } from "./remote/account.ts";
 import { remoteSinks } from "./remote/sinks.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
+import { LegacyLatch } from "./remote/legacy.ts";
 import { remoteModelCheckTickets } from "./remote/tickets.ts";
 import { LaneFetchRefusal } from "./fetch-refusal.ts";
 import { gatedUpstreamAuth } from "./kms-lease.ts";
@@ -36,7 +37,8 @@ import type { LaneProcessState } from "./state.ts";
  * | --- | --- | --- |
  * | `source` | `replicaSource` (ConfigReplicaDO/ConfigDO) | `RemoteSnapshotSource` (one signed GET) |
  * | `accounts` | `accountShards` (DO namespace) | `remoteShardLocator` (signed `account.*`) |
- * | `endpoints` | `endpointShards` (DO namespace) | `remoteEndpointLocator` (signed `endpoint.*`) |
+ * | `endpoints` | `endpointShards` (DO namespace) | `remoteEndpointLocator` (signed `endpoint.*`; r16: the attempt's rank key, measures and rests, and the documents of before r16 to a bridge that refused them, remote/legacy.ts) |
+ * | `endpointRoots` | `endpointRoots` (ENDPOINT_ROOT, ENDPOINT_ROOT_LOCATION_HINT) | `remoteEndpointRootLocator` (signed `endpoint.file_rest`, r16; none while the endpoint ops keep to the documents of before) |
  * | `sinks` | `bindingSinks` (Queue/Pipeline/AE) | `remoteSinks` (signed `records.*`, flushed in `waitUntil`) |
  * | `continuation` | `continuationStores` | unused in v1: the lane refuses `previous_response_id`/`conversation` (L2b's rule, M11), so the locator throws if anything reaches it |
  * | `toolCallIds` | `toolCallIdShards` | `undefined` (off; the lane refuses `gtc1_` handles, M25) |
@@ -47,10 +49,11 @@ import type { LaneProcessState } from "./state.ts";
  * | `region` | `request.cf` | the CVM's region from configuration (workerd has no `request.cf`) |
  *
  * Everything else is the same code as the main lane: `cfg`, `gate`, `shardCounts`, `endpointCounts`,
- * `clock`, `service`, `policy`, `load`, `degraded`, `content`, `fingerprintKey`, `meter`. The tables,
- * the load and the content state are the lane process's singletons (the gateway's `index.ts` keeps
- * its own private, and moving them would change the main lane's code; the lane's behaviour is
- * identical because they are the same classes with the same bounds).
+ * `shardRests` and `dispatchBudgets` (r16: the rests the shards said they hold, which ranking reads, and the
+ * exploration budget each attempt reserves its dispatch in), `clock`, `service`, `policy`, `load`, `degraded`,
+ * `content`, `fingerprintKey`, `meter`. The tables, the load and the content state are the lane process's
+ * singletons (the gateway's `index.ts` keeps its own private, and moving them would change the main lane's code;
+ * the lane's behaviour is identical because they are the same classes with the same bounds).
  */
 
 /** The lane's egress binding (`EGRESS`): one `external` service on the sidecar's unix socket. */
@@ -169,6 +172,8 @@ export interface LaneIsolate {
   load: IsolateLoad;
   content(maxBytes: number): ContentState;
   identity: { readonly instance: string; readonly startedAt: number };
+  /** Whether the bridge refused the r16 members of each op group lately (remote/legacy.ts): the endpoint ops', the snapshot read's. */
+  readonly legacy: { readonly endpoint: LegacyLatch; readonly snapshot: LegacyLatch };
 }
 
 /** The lane's isolate singletons: the same classes and bounds as the main lane's (`index.ts`). */
@@ -177,7 +182,9 @@ export function laneIsolate(): LaneIsolate {
   let content: ContentState | null = null;
   let identity: { readonly instance: string; readonly startedAt: number } | null = null;
   const load = new IsolateLoad();
+  const legacy = { endpoint: new LegacyLatch("endpoint"), snapshot: new LegacyLatch("snapshot") };
   return {
+    legacy,
     tables(max) {
       if (tables === null || tables.max !== max) tables = new IsolateTables(max);
       return tables;
@@ -223,6 +230,10 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
   const source = new RemoteSnapshotSource({
     ...state.bridge,
     now: state.state.now,
+    // The request path's source: the snapshot cache asks it for the ranking feed (r16), and it falls back to the earlier
+    // read when the bridge predates the ranking members (remote/legacy.ts).
+    ranking: true,
+    legacy: isolate.legacy.snapshot,
     onSnapshot: (snapshot) => {
       state.state.registry.refresh(snapshot);
       // The endpoint routes of the version the request reads: its attempts find their rows.
@@ -241,8 +252,14 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     gate: trustGate(cfg),
     accounts: remoteShardLocator(state.bridge, cfg.laneBridgeAnswerMarginMs),
     shardCounts: learned.shardCounts,
-    endpoints: remoteEndpointLocator(state.bridge),
+    // The endpoint ops over the bridge, and the roots a failure's rest is filed at (r16), on the isolate's one latch for a
+    // bridge that predates their members (remote/legacy.ts); the rests the shards said they hold, which ranking reads, and
+    // the exploration budget, as the main gateway's index.ts wires them.
+    endpoints: remoteEndpointLocator(state.bridge, { legacy: isolate.legacy.endpoint, now: state.state.now }),
     endpointCounts: learned.endpointCounts,
+    endpointRoots: remoteEndpointRootLocator(state.bridge, { legacy: isolate.legacy.endpoint, now: state.state.now }),
+    shardRests: learned.shardRests,
+    dispatchBudgets: learned.dispatchBudgets,
     continuation: laneContinuation(),
     // Off: the lane refuses a body carrying a `gtc1_` handle (documents not resolved, M25).
     toolCallIds: undefined,

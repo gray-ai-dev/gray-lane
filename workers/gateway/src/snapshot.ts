@@ -1,7 +1,7 @@
 import type { GatewayConfig, LocationHint } from "@gray/config";
 import { REFERENCE_LARGEST_WINDOW } from "@gray/holds";
 import type { Protocol } from "@gray/protocol";
-import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneRelay, type GatewayMode, type GatewayRecipient, type ModelFacts, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, snapshotAlertKey, within } from "@gray/snapshot";
+import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneOffer, type GatewayLaneRelay, type GatewayMode, type GatewayRecipient, type ModelFacts, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, snapshotAlertKey, within } from "@gray/snapshot";
 
 // The age rule lives in `@gray/snapshot` so the bridge's `snapshot.current` and the CVM's sources
 // judge an answer by the same function (bridge-3); the gateway's own importers keep the old names.
@@ -302,6 +302,11 @@ export interface GatewaySnapshot {
    */
   readonly laneServed?: Readonly<Record<string, number>>;
   /**
+   * What the agent setups offer of each lane relay route at the confidential VM (@gray/snapshot `GatewayView.laneOffers`):
+   * its price, capabilities and output allowance, without the route. Absent: none, or a writer older than the field.
+   */
+  readonly laneOffers?: readonly GatewayLaneOffer[];
+  /**
    * Every registered public handle with its supplier's workspace id, with a live route or not (inference.rs
    * `Snapshot.handles`): what a tag pattern's handle is looked up in (preference.ts `layeredOver`). Absent: none.
    */
@@ -505,6 +510,7 @@ export function gatewaySnapshotOf(snapshot: Snapshot, mode: GatewayMode = "main"
     published: view.published,
     ...(view.handles === undefined ? {} : { handles: view.handles }),
     ...(Object.keys(view.laneServed).length === 0 ? {} : { laneServed: view.laneServed }),
+    ...(view.laneOffers === undefined ? {} : { laneOffers: view.laneOffers }),
     // The model-check tickets' keys, the main gateway's and the lane entry's alike (both map through here).
     ...(snapshot.modelCheckKeys === undefined || snapshot.modelCheckKeys.length === 0 ? {} : { modelCheckKeys: modelCheckKeysOf(snapshot.modelCheckKeys) }),
   };

@@ -1,6 +1,6 @@
 import {
   BRIDGE_REQUEST_MAX_BYTES,
-  BRIDGE_RESPONSE_MAX_BYTES,
+  bridgeResponseMaxBytes,
   BridgeWireError,
   LANE_BRIDGE_CALL_MS,
   encodeBridgeRequest,
@@ -173,14 +173,14 @@ export abstract class BridgeClient {
         throw new BridgeCallError("bridge_transport", `${op} answered ${response.status}`, response.status);
       }
       const stated = response.headers.get("content-length");
-      if (stated !== null && /^[0-9]+$/.test(stated) && Number(stated) > BRIDGE_RESPONSE_MAX_BYTES) {
+      if (stated !== null && /^[0-9]+$/.test(stated) && Number(stated) > bridgeResponseMaxBytes(op)) {
         await response.body?.cancel().catch(() => undefined);
-        throw new BridgeCallError("bridge_transport", `${op} answered ${stated} bytes, over ${BRIDGE_RESPONSE_MAX_BYTES}`, response.status);
+        throw new BridgeCallError("bridge_transport", `${op} answered ${stated} bytes, over ${bridgeResponseMaxBytes(op)}`, response.status);
       }
       // The deadline covers the body too: a bridge that sends headers and then stalls must not hold
       // the request path (the relay scheduler's client has the same rule). The body is read with a
       // bound and cancelled past it, as the bridge reads a request (bridge-5).
-      const reading = readBoundedBody(op, response, BRIDGE_RESPONSE_MAX_BYTES);
+      const reading = readBoundedBody(op, response, bridgeResponseMaxBytes(op));
       // The deadline may win; a late rejection of the read is expected and already handled by the throw.
       reading.catch(() => undefined);
       const bytes = await Promise.race([reading, deadline]);

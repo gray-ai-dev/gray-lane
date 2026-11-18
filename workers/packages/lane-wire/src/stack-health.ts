@@ -315,9 +315,10 @@ export const STACK_LOGIN_CODES = ["vendor_rejected", "invalid_answer", "proxy_fa
 export type StackLoginCode = (typeof STACK_LOGIN_CODES)[number];
 
 /**
- * The client identity a relay registers per account (S32a, egress `stack_identity.go`): the static headers of the
- * vendor's own client, which egress holds each of the account's calls to (their union over the routes), and the
- * per-request and session ids egress makes itself (`generated`, their union). Egress's parity test reads these.
+ * The client identity a relay registered per account (S32a), retired on 2026-11-18: the console checks a stored
+ * identity's names against these, and nothing applies it. They were the static headers of the vendor's own client,
+ * which egress held each of the account's calls to (their union over the routes), and the per-request and session ids
+ * egress made itself (`generated`, their union).
  */
 export const STACK_IDENTITY_HEADERS = [
   "user-agent",

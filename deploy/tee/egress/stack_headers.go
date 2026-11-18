@@ -6,29 +6,13 @@ import (
 	"strings"
 )
 
-// S32: a relay call's headers are part of the request check. Behaviour headers (versions and betas change
-// output limits, context, tools and price) must carry the client's values, registered with the rid, plus
-// only what the credential form needs; every other header passes only by name from its route's list, and a
-// name off the list is refused (stack_header_refused), since an unknown header could carry a second
-// credential or switch a vendor feature on.
-//
-// The lists come from what reaches a vendor today:
-//   - the lane's own requests: laneHeaders (workers/gateway/src/lane/hooks.ts: content-type, the
-//     protocol's version and beta headers) over relay-connector's authHeaders (packages/relay-connector/
-//     src/auth.ts: x-api-key or authorization, anthropic-version, the OAuth beta, chatgpt-account-id,
-//     originator), and the Accept every Gray request carries (@gray/protocol withDefaultAccept);
-//   - what the stack entry forwards to the container (gateway/src/lane/stack.ts: content-type, accept,
-//     user-agent and the behaviour headers) and what the three migrated relays add (D2 round 2:
-//     the credential form, originator on /chatgpt, Go's default user-agent);
-//   - the client-identity headers a subscription account is sent with, which relays set from their own
-//     client profiles: the conformance tool's fake entry (x-stainless-lang, x-app on Messages; originator
-//     and session_id on Codex), sub2api's Claude Code profile (pkg/claude/constants.go: user-agent, eight
-//     x-stainless-*, x-app, anthropic-dangerous-direct-browser-access) and Codex headers
-//     (openai_gateway_forward.go: originator, version, session_id, conversation_id), CLIProxyAPI's Claude
-//     and Codex request builders (x-claude-code-session-id, x-client-request-id, session_id, session-id,
-//     version, thread-id), and Codex CLI's own (relay-connector auth.ts notes session-id and thread-id).
-//     Their values are the relay's. Headers those builders also set that switch behaviour or state
-//     (x-codex-beta-features, x-openai-internal-codex-responses-lite, x-codex-turn-state, …) are not listed.
+// S32: a relay call's headers are part of the request check. Since 2026-11-12 (docs/relay-request-changes.md) a
+// relay's headers reach the vendor as it sent them, each difference from Gray's own set recorded in the receipt
+// (stack_changes.go `stackRelayHeader`); refused are only the headers that add a credential or switch the account
+// (P6), and, for a customer who chose relays that change nothing, a change to a behaviour header the customer sent.
+// Gray's own set (stack_vendor_headers.go) starts from the client's own headers, which the entry registers with the
+// rid under one closed rule (stack_client_headers.go, owner 2026-11-18); S32's per-route name lists and S32a's
+// account identities, which once bounded and replaced those names, are retired.
 
 // stackOAuthBeta is the beta an Anthropic OAuth credential is sent with (relay-connector ANTHROPIC_OAUTH_BETA).
 const stackOAuthBeta = "oauth-2025-04-20"
@@ -37,32 +21,14 @@ const stackOAuthBeta = "oauth-2025-04-20"
 // (relay-connector ANTHROPIC_VERSION, the lane's laneHeaders default).
 const stackAnthropicVersion = "2023-06-01"
 
-// stackBehaviourHeaders are the client headers a registration carries per vendor (S32), the protocol's own
-// version and beta headers (@gray/protocol nativeHeaders). The entry registers Chat's openai-beta whatever the
-// route's vendor, so an OpenAI-compatible vendor takes it too: the client's value passes, as on /openai.
+// stackBehaviourHeaders are the client's behaviour headers per vendor (S32), the protocol's own version and beta
+// headers (@gray/protocol nativeHeaders), which Gray's set writes in one spelling and a customer who chose relays
+// that change nothing keeps. An OpenAI-compatible vendor takes Chat's openai-beta, as /openai does.
 var stackBehaviourHeaders = withCompat(map[string][]string{
 	"anthropic":     {"anthropic-version", "anthropic-beta"},
 	"openai":        {"openai-beta"},
 	"chatgpt_codex": {"openai-beta"},
 }, false, func(openAICompatibleVendor) []string { return []string{"openai-beta"} })
-
-// stackPassHeaders are the names of Gray's own header set by route (S32's lists): the credential form's, the
-// body's type, Accept, the identity headers above and Accept-Encoding. They no longer bound what a relay call may
-// carry (stackHeaderRefusal); the tests hold every name egress writes to one role on them.
-var stackPassHeaders = withCompat(map[string]map[string]bool{
-	"/anthropic": setOf("x-api-key", "authorization", "content-type", "accept", "accept-encoding", "user-agent",
-		"x-app", "anthropic-dangerous-direct-browser-access", "x-claude-code-session-id", "x-client-request-id"),
-	"/openai": setOf("authorization", "content-type", "accept", "accept-encoding", "user-agent"),
-	"/chatgpt": setOf("authorization", "chatgpt-account-id", "content-type", "accept", "accept-encoding", "user-agent",
-		"originator", "version", "session_id", "session-id", "conversation_id", "thread-id", "x-client-request-id"),
-}, true, func(openAICompatibleVendor) map[string]bool {
-	return setOf("authorization", "content-type", "accept", "accept-encoding", "user-agent")
-})
-
-// stackPassPrefixes are name prefixes that are client identity the same way: the Stainless SDK telemetry of Claude Code.
-var stackPassPrefixes = map[string][]string{
-	"/anthropic": {"x-stainless-"},
-}
 
 // stackRefusedHeaderMax bounds the header name a refusal names, as egress bounds a refusal path (S32: 256
 // UTF-16 units; a header name is ASCII).
@@ -132,15 +98,6 @@ func joinValues(joined string, values []string) string {
 		joined += value
 	}
 	return joined
-}
-
-func hasPrefix(name string, prefixes []string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // sameValues compares two comma-separated lists by their values, the way a vendor reads a beta list: the

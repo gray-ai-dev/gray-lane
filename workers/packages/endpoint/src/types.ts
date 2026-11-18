@@ -176,8 +176,9 @@ export interface AcquireInput extends ShardIdentity {
    * configuration, streamed or not). A first call to a key a rest in force covers is refused `resting`, as the
    * server's ranking passes a resting key over; a same-operator repeat is not (the server repeats at a route its
    * plan holds). An answer at the key ends the rests on it that began no later than it was sent. The key's circuit
-   * judges the attempt (src/circuit.ts). Absent: no rest applies, and the route's circuit (`ROUTE_CIRCUIT`) judges it
-   * (an attempt the confidential lane's bridge carried).
+   * judges the attempt (src/circuit.ts). The confidential lane's bridge carries it since r16 (`rest_key`). Absent: no
+   * rest applies, and the route's circuit (`ROUTE_CIRCUIT`) judges it (a lane of a release before r16, or one kept to a
+   * bridge's earlier documents).
    */
   readonly restKey?: string;
   /**

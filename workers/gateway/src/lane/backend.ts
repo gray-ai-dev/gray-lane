@@ -38,7 +38,7 @@ import {
   newStackRid,
   reportViolation,
   StackCall,
-  stackBehaviourHeaders,
+  stackClientHeaders,
   stackRawQuery,
   stackRelayHeaders,
   stackRewriteSpec,
@@ -339,11 +339,7 @@ class BackendRun {
     const input = this.#input;
     if (input.debug === undefined) return;
     try {
-      const headers: Record<string, string> = { ...stackBehaviourHeaders(input.request.headers, input.protocol) };
-      for (const name of ["user-agent", "accept"]) {
-        const value = input.request.headers.get(name);
-        if (value !== null) headers[name] = value;
-      }
+      const headers: Record<string, string> = stackClientHeaders(input.request.headers, input.protocol);
       const answer = new Uint8Array(this.#capturedBytes);
       let at = 0;
       for (const chunk of this.#captured) {
@@ -458,12 +454,9 @@ class BackendRun {
       received: input.body,
       forwarded: body.forwarded,
       query: stackRawQuery(input.request.url),
-      behaviourHeaders: stackBehaviourHeaders(input.request.headers, protocol),
+      // The client's own headers, as the entry passed them over the hop, under the same rule again.
+      clientHeaders: stackClientHeaders(input.request.headers, protocol),
       vendor: route.vendor,
-      // S32a over the hop: the envelope names no workspace, so the entry derived the conversation id with its own boot
-      // key (relay standard v1.7) and egress derives the vendor's session ids from it; absent (no session named), egress
-      // makes one per rid, as for a direct client that named no session.
-      ...(conversation === undefined ? {} : { conversation }),
       // The customer's opt-out comes over the hop in the envelope (docs/relay-request-changes.md).
       rewrite: stackRewriteSpec({ protocol, upstreamModel: route.upstream_model, route, stream, appends: input.config.appends, relayChanges: envelope.relay_changes !== "exclude" }),
       attemptsMax: input.config.limits.attempts_max,

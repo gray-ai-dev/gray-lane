@@ -11,7 +11,7 @@
  * holds this record (`VideoJobDO`); the functions here are the rules both run.
  */
 import { ApiError } from "@gray/errors";
-import { upstreamAuthHeaders } from "@gray/protocol";
+import { type Protocol, upstreamAuthHeaders } from "@gray/protocol";
 import { type Json, type SerdeObject, get, parseStrictBytes } from "@gray/json";
 import { checkEvidence, customerRates, parseEvidence, storedEvidence, usageCost } from "@gray/ledger-keys";
 import { sha256 } from "@noble/hashes/sha2";
@@ -95,6 +95,20 @@ export interface VideoJob {
   /** When the current run of "no such job" answers began. */
   readonly missingSince: number | null;
   readonly deleted: boolean;
+  /**
+   * The mapping binding its create was sent to, beside `endpointId` (video_jobs.rs `JobBinding`): what its completion
+   * is traffic evidence about (owner decision 2026-11-18). Absent on a job recorded before it was kept, whose
+   * completion is then no evidence.
+   */
+  readonly binding?: JobBinding;
+}
+
+/** `JobBinding`: a credential generation, a configuration fingerprint, the mapping's Gray model id and its API. */
+export interface JobBinding {
+  readonly generation: number;
+  readonly fingerprint: string;
+  readonly model: string;
+  readonly protocol: Protocol;
 }
 
 const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");

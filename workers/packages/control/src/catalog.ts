@@ -59,6 +59,28 @@ export interface CatalogRoute {
    * proves no capability and carries no ModelTrace check or weight. Absent: a main-lane route (the server's only kind).
    */
   readonly confidential?: boolean;
+  /**
+   * The supplier's public handle, when its workspace chose to be named on the Models page (inference.rs
+   * `Snapshot.names`, owner 2026-11-18). Absent: an anonymous supplier, listed by its pseudonyms only.
+   */
+  readonly name?: string;
+}
+
+/**
+ * A route the catalog lists while it is down (docs/provider-uptime.md "Rows kept while down"; catalog.rs `DownRoute`):
+ * offered, not published now, and served within the uptime window, as the catalog step's uptime observation found it.
+ */
+export interface CatalogDownRoute {
+  readonly endpoint_id: string;
+  readonly workspace_id: string;
+  readonly model: string;
+  readonly protocol: Protocol;
+  /** Its approved offer: its own end date as `eligible_until` (Unix seconds; `LATEST_END_DATE` without one) and its terms. */
+  readonly offer: { readonly eligible_until: number; readonly terms: CatalogTerms };
+  /** A confidential-lane relay's route (`CatalogRoute.confidential`). */
+  readonly confidential?: boolean;
+  /** The supplier's public handle, when its workspace chose to be named (`CatalogRoute.name`). */
+  readonly name?: string;
 }
 
 /** ModelTrace's check of a route as buyers see it (mixing.rs `ModelCheck`). */
@@ -176,6 +198,8 @@ export const PUBLIC_REFS: PublicRefs = {
 export interface CatalogInput {
   readonly routes: readonly CatalogRoute[];
   readonly unavailable: readonly UnavailableModel[];
+  /** The routes listed while they are down (`CatalogDownRoute`); none when absent. */
+  readonly down?: readonly CatalogDownRoute[];
   readonly metadata: ReadonlyMap<string, CatalogMetadata>;
   readonly feeBps: number;
   /** Unix milliseconds. */
@@ -190,6 +214,47 @@ const U64_MAX = 18_446_744_073_709_551_615n;
 function modelCheckJson(c: CatalogModelCheck): JsonObject {
   const int = (n: number | null) => (n === null ? null : BigInt(n));
   return { status: c.status, routing_weight: c.routing_weight, answers: BigInt(c.answers), unlike: BigInt(c.unlike), threshold: int(c.threshold), recent: c.recent, checked_at_ms: int(c.checked_at_ms) };
+}
+
+/**
+ * inference.rs `priced_entry`: what a provider entry says from its offer and customer rate: its references, its API, its
+ * token prices, its media and per-selector unit prices at the customer rate, and its offer's service region. A route
+ * listed now and one listed while down add the rest.
+ */
+async function pricedEntry(
+  refs: PublicRefs,
+  workspaceId: string,
+  endpointId: string,
+  protocol: Protocol,
+  terms: CatalogTerms,
+  rate: CustomerRate,
+  feeBps: number,
+): Promise<JsonObject> {
+  const effective = tokenRates(rate);
+  const provider: JsonObject = {
+    id: await refs.providerRef(workspaceId, endpointId),
+    supplier: await refs.supplierRef(workspaceId),
+    protocol,
+    pricing: {
+      input_microusd_per_million: rate.input,
+      output_microusd_per_million: rate.output,
+      cache_read_microusd_per_million: effective.cacheRead,
+      cache_write_microusd_per_million: effective.cacheWrite,
+      cache_write_1h_microusd_per_million: effective.cacheWrite1h,
+    },
+  };
+  const media = mediaJson(rate);
+  if (Object.keys(media).length > 0) provider.media = media;
+  // Image, audio and default unit prices; per-selector unit prices each at the customer rate.
+  const unitPrices: JsonObject = {};
+  for (const [selector, price] of Object.entries(terms.media.unit_prices).sort(([a], [b]) => compareUtf8(a, b))) {
+    const p = u64(price);
+    const c = p === undefined ? undefined : customerRate(p, feeBps);
+    if (c !== undefined) unitPrices[selector] = c;
+  }
+  if (Object.keys(unitPrices).length > 0) provider.unit_prices = unitPrices;
+  if (terms.service_region !== null) provider.service_region = terms.service_region;
+  return provider;
 }
 
 /**
@@ -228,47 +293,51 @@ export async function publicCatalog(input: CatalogInput, refs: PublicRefs = PUBL
       maxCacheWrite = max(maxCacheWrite, effective.cacheWrite);
       minCacheWrite1h = min(minCacheWrite1h, effective.cacheWrite1h);
       maxCacheWrite1h = max(maxCacheWrite1h, effective.cacheWrite1h);
-      const provider: JsonObject = {
-        id: await refs.providerRef(route.workspace_id, route.endpoint_id),
-        supplier: await refs.supplierRef(route.workspace_id),
-        protocol: route.protocol,
-        pricing: {
-          input_microusd_per_million: rate.input,
-          output_microusd_per_million: rate.output,
-          cache_read_microusd_per_million: effective.cacheRead,
-          cache_write_microusd_per_million: effective.cacheWrite,
-          cache_write_1h_microusd_per_million: effective.cacheWrite1h,
-        },
-        verification:
-          route.confidential === true
-            ? // A confidential route serves on the lane's attestation: Gray's checks never ran on it, so none passed.
-              { status: "not_checked", compatibility: "not_checked", behavior: "not_checked", behavioral_score: null, expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n }
-            : {
-                status: "passed",
-                compatibility: "passed",
-                behavior: "advisory",
-                behavioral_score: route.behavioral_score,
-                expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n,
-                // What ModelTrace found, on a chat API it probes.
-                ...(route.model_check == null ? {} : { model_check: modelCheckJson(route.model_check) }),
-              },
-      };
+      const provider = await pricedEntry(refs, route.workspace_id, route.endpoint_id, route.protocol, offer.terms, rate, input.feeBps);
+      provider.verification =
+        route.confidential === true
+          ? // A confidential route serves on the lane's attestation: Gray's checks never ran on it, so none passed.
+            { status: "not_checked", compatibility: "not_checked", behavior: "not_checked", behavioral_score: null, expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n }
+          : {
+              status: "passed",
+              compatibility: "passed",
+              behavior: "advisory",
+              behavioral_score: route.behavioral_score,
+              expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n,
+              // What ModelTrace found, on a chat API it probes.
+              ...(route.model_check == null ? {} : { model_check: modelCheckJson(route.model_check) }),
+            };
       // Only a confidential route says so: a main-lane provider's document is the server's.
       if (route.confidential === true) provider.confidential = true;
-      const media = mediaJson(rate);
-      if (Object.keys(media).length > 0) provider.media = media;
-      // Image, audio and default unit prices; per-selector unit prices each at the customer rate.
-      const unitPrices: JsonObject = {};
-      for (const [selector, price] of Object.entries(offer.terms.media.unit_prices).sort(([a], [b]) => compareUtf8(a, b))) {
-        const p = u64(price);
-        const c = p === undefined ? undefined : customerRate(p, input.feeBps);
-        if (c !== undefined) unitPrices[selector] = c;
-      }
-      if (Object.keys(unitPrices).length > 0) provider.unit_prices = unitPrices;
       provider.capabilities = [...route.capabilities];
-      if (offer.terms.service_region !== null) provider.service_region = offer.terms.service_region;
+      // The supplier's public handle, when it chose to be named on the Models page.
+      if (route.name !== undefined) provider.name = route.name;
       providers.push(provider);
     }
+    // The model's routes listed while down (docs/provider-uptime.md "Rows kept while down"): at their offer's price
+    // while it lasts, marked unavailable, with no check passed and nothing proved, after the routes listed now, by
+    // provider reference and API in byte order. They are no provider, API or price of the model's: those say what a
+    // buyer can be served at now.
+    const serving = new Set(routes.map(({ route }) => `${route.endpoint_id}\u0000${route.protocol}`));
+    const down: [string, string, JsonObject][] = [];
+    for (const d of input.down ?? []) {
+      if (d.model !== id || serving.has(`${d.endpoint_id}\u0000${d.protocol}`) || d.offer.eligible_until <= nowSec) continue;
+      const rate = customerRateOf(d.offer.terms, input.feeBps);
+      if (rate === null) continue;
+      const provider = await pricedEntry(refs, d.workspace_id, d.endpoint_id, d.protocol, d.offer.terms, rate, input.feeBps);
+      provider.available = false;
+      const expires = BigInt(d.offer.eligible_until) * 1000n;
+      provider.verification =
+        d.confidential === true
+        ? { status: "not_checked", compatibility: "not_checked", behavior: "not_checked", behavioral_score: null, expires_at_ms: expires }
+        : { status: "not_passed", compatibility: "not_passed", behavior: "not_checked", behavioral_score: null, expires_at_ms: expires };
+      if (d.confidential === true) provider.confidential = true;
+      provider.capabilities = [];
+      if (d.name !== undefined) provider.name = d.name;
+      down.push([provider.id as string, d.protocol, provider]);
+    }
+    down.sort(([a, p], [b, q]) => compareUtf8(a, b) || compareUtf8(p, q));
+    for (const [, , provider] of down) providers.push(provider);
     const model: JsonObject = {
       id,
       protocols: [...protocols].sort(compareUtf8),
@@ -296,15 +365,16 @@ export async function publicCatalog(input: CatalogInput, refs: PublicRefs = PUBL
 }
 
 /**
- * The first time (Unix milliseconds) after `nowMs` at which {@link publicCatalog} of `routes` and `unavailable`
+ * The first time (Unix milliseconds) after `nowMs` at which {@link publicCatalog} of `routes`, `unavailable` and `down`
  * can list differently, all else held: a route leaves the listing once `floor(now / 1000)` reaches the earlier of
- * its expiry and its quote's eligibility (`listedSupply`), so at that second's first millisecond; an unavailable
+ * its expiry and its quote's eligibility (`listedSupply`), so at that second's first millisecond, and a route listed
+ * while down once it reaches its offer's `eligible_until`; an unavailable
  * model leaves it once `now - UNAVAILABLE_WINDOW_MS` passes its `since_ms`, so one millisecond after
  * `since_ms + UNAVAILABLE_WINDOW_MS`. Nothing else in the listing moves with the clock (whether it is `expired`
  * is the caller's). Infinity when nothing listed can leave. Whoever holds a rendered catalog may answer it until
  * then (gray-jobs ConfigDO `catalog`).
  */
-export function catalogChangesAt(routes: readonly CatalogRoute[], unavailable: readonly UnavailableModel[], nowMs: number): number {
+export function catalogChangesAt(routes: readonly CatalogRoute[], unavailable: readonly UnavailableModel[], nowMs: number, down: readonly CatalogDownRoute[] = []): number {
   let at = Number.POSITIVE_INFINITY;
   for (const route of routes) {
     if (route.offer === null) continue;
@@ -313,6 +383,10 @@ export function catalogChangesAt(routes: readonly CatalogRoute[], unavailable: r
   }
   for (const u of unavailable) {
     const end = u.since_ms + UNAVAILABLE_WINDOW_MS + 1;
+    if (end > nowMs) at = Math.min(at, end);
+  }
+  for (const d of down) {
+    const end = d.offer.eligible_until * 1000;
     if (end > nowMs) at = Math.min(at, end);
   }
   return at;

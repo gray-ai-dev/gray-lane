@@ -321,6 +321,33 @@ export interface GatewayView {
    * one serves a model it lists on its API (workers/gateway preference.ts `laneServes`).
    */
   readonly laneServed: Readonly<Record<string, number>>;
+  /**
+   * What the agent setups offer of each `lane_relay` route at Gray's confidential VM (`laneOffersOf`): its price, its
+   * capabilities and its output allowance, without the route. In the main mode only, and only when a lane relay route
+   * is priced; absent otherwise, and from a writer older than the field (the setups then offer the pairs bare).
+   */
+  readonly laneOffers?: readonly GatewayLaneOffer[];
+}
+
+/**
+ * One `lane_relay` route as the agent setups offer it at Gray's confidential VM (`laneOffersOf`; inference.rs
+ * `Snapshot.lane_offers`): its (model, API), when it stops serving (Unix ms, `GatewayRouteRecord.expiresAt`), its
+ * approved quote (the gateway adds its platform fee, as for every route), what the lane serves its requests on and the
+ * claim words that comes to, and its output allowance. Gray's checks do not run on a lane relay, so the capabilities
+ * are those the lane admits a request on: its endpoint's claims for the API (`laneRouteCapabilities`), streamed and
+ * buffered alike. No endpoint, URL, credential or relay: the main gateway never sends to one.
+ */
+export interface GatewayLaneOffer {
+  readonly model: string;
+  readonly protocol: Protocol;
+  readonly expiresAt: number;
+  readonly quote: GatewayQuote;
+  readonly streaming: boolean;
+  readonly tools: boolean;
+  readonly reasoning: boolean;
+  /** The claim words of its capabilities (`GatewayRouteRecord.proved` of the lane's route). */
+  readonly capabilities: readonly string[];
+  readonly outputOverheadTokens: number | null;
 }
 
 function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
@@ -428,6 +455,32 @@ export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
 }
 
 /**
+ * The `lane_relay` routes of `snapshot` as the agent setups offer them (`GatewayView.laneOffers`), those `laneServedOf`
+ * counts (priced, on an API the lane serves), in the snapshot's route order: each as the lane's own view records it
+ * (`routeRecord`), its price, capabilities and output allowance alone.
+ */
+export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): GatewayLaneOffer[] {
+  const offers: GatewayLaneOffer[] = [];
+  for (const r of snapshotRoutes(snapshot)) {
+    if (r.config.auth !== "lane_relay" || !LANE_PROTOCOLS.includes(r.mapping.protocol)) continue;
+    const record = routeRecord(r);
+    if (record === null) continue;
+    offers.push({
+      model: record.model,
+      protocol: record.protocol,
+      expiresAt: record.expiresAt,
+      quote: record.quote,
+      streaming: record.capabilities.streaming,
+      tools: record.capabilities.tools,
+      reasoning: record.capabilities.reasoning,
+      capabilities: record.proved,
+      outputOverheadTokens: record.outputOverheadTokens,
+    });
+  }
+  return offers;
+}
+
+/**
  * The gateway's view of `snapshot` for `mode` (design v2 sections B and E, module L3).
  *
  * `main`: every route except a confidential-lane one, so Gray's public gateway never sends to a relay. Its
@@ -527,6 +580,7 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     published,
     ...(snapshot.handles === undefined ? {} : { handles: snapshot.handles }),
     laneServed: mode === "main" ? laneServedOf(snapshot) : {},
+    ...((offers) => (offers.length === 0 ? {} : { laneOffers: offers }))(mode === "main" ? laneOffersOf(snapshot) : []),
   };
 }
 

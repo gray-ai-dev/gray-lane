@@ -5,14 +5,30 @@ import { entryRoleAnswerSchema, entryRoleRequestSchema } from "./entry-role.ts";
 import { endpointCredentialAnswerSchema, endpointCredentialRequestSchema } from "./endpoint-credential.ts";
 import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
 import { attestCollateralAnswerSchema, attestCollateralRequestSchema, releaseListsAnswerSchema, releaseListsRequestSchema } from "./background.ts";
-import { acquireInputSchema, acquireResultSchema, emptyAnswerSchema, endpointReleaseInputSchema, endpointReleaseResultSchema, noteInputSchema, probeAnsweredInputSchema, retryReleaseInputSchema, retryReserveInputSchema, retryReserveResultSchema, warmInputSchema, warmResultSchema } from "./endpoint.ts";
+import {
+  ENDPOINT_FILE_REST_MAX_BYTES,
+  acquireInputSchema,
+  acquireResultSchema,
+  emptyAnswerSchema,
+  endpointReleaseInputSchema,
+  endpointReleaseResultSchema,
+  fileRestAnswerSchema,
+  fileRestInputSchema,
+  noteInputSchema,
+  probeAnsweredInputSchema,
+  retryReleaseInputSchema,
+  retryReserveInputSchema,
+  retryReserveResultSchema,
+  warmInputSchema,
+  warmResultSchema,
+} from "./endpoint.ts";
 import { BridgeWireError } from "./error.ts";
 import { laneAcmeFailedAnswerSchema, laneAcmeFailedSchema } from "./lane-acme.ts";
 import { BRIDGE_METHODS, type BridgeOp } from "./ops.ts";
 import { laneEventsSchema, laneIndexMessageSchema, lanePointsSchema, laneServiceEventsSchema, recordsAcceptedSchema } from "./records.ts";
 import { SCHEDULER_FORWARD_REQUEST_MAX_BYTES, schedulerForwardAnswerSchema, schedulerForwardRequestSchema, schedulerForwardRequestV1Schema } from "./scheduler.ts";
 import type { LaneBridgeApiVersion } from "./signing.ts";
-import { SNAPSHOT_RESPONSE_MAX_BYTES, snapshotAnswerSchema, snapshotCurrentRequestSchema } from "./snapshot.ts";
+import { SNAPSHOT_RANKING_RESPONSE_MAX_BYTES, SNAPSHOT_RESPONSE_MAX_BYTES, snapshotAnswerSchema, snapshotCurrentRequestSchema } from "./snapshot.ts";
 import { stackConfigAnswerSchema, stackConfigRequestSchema, stackProxyChecksAnswerSchema, stackProxyChecksRequestSchema } from "./stack.ts";
 import { stackDebugSharesAnswerSchema, stackDebugSharesRequestSchema } from "./stack-debug.ts";
 import { stackInstanceAnswerSchema, stackInstanceRequestSchema } from "./stack-instance.ts";
@@ -62,18 +78,29 @@ export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
  * own bound (a report batch, base64-expanded, which is below the records' 8 MiB and above the small
  * ops' 64 KiB); `stack.report` has S42's 1 MiB (a relay's 1000 accounts); `stack.vault.put` carries a sealed
  * record of up to 1 MiB (`STACK_VAULT_PUT_MAX_BYTES`); `stack.vault.share` a TDX quote and its event log
- * (`STACK_VAULT_SHARE_MAX_BYTES`); every other op's document is a few KB.
+ * (`STACK_VAULT_SHARE_MAX_BYTES`); `endpoint.file_rest` a rest over as many keys and roots as a root's rests cover
+ * (`ENDPOINT_FILE_REST_MAX_BYTES`); every other op's document is a few KB.
  */
 export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
+  if (op === "endpoint.file_rest") return ENDPOINT_FILE_REST_MAX_BYTES;
   if (op === "stack.report") return STACK_REPORT_MAX_BYTES;
   if (op === "stack.vault.put") return STACK_VAULT_PUT_MAX_BYTES;
   if (op === "stack.vault.share") return STACK_VAULT_SHARE_MAX_BYTES;
   return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
 }
 
-/** The largest answer body a bridge op carries, the snapshot included (`SNAPSHOT_RESPONSE_MAX_BYTES`). */
+/** The largest answer body a bridge op carries, the snapshot without its ranking members included (`SNAPSHOT_RESPONSE_MAX_BYTES`). */
 export const BRIDGE_RESPONSE_MAX_BYTES = SNAPSHOT_RESPONSE_MAX_BYTES;
+
+/**
+ * The answer body bound of `op`: `snapshot.current`'s is the snapshot's bound and its ranking part's
+ * (`SNAPSHOT_RANKING_RESPONSE_MAX_BYTES`, r16: the bridge writes each part within its own, snapshot.ts
+ * `snapshotAnswerBytes`); every other op's is `BRIDGE_RESPONSE_MAX_BYTES`.
+ */
+export function bridgeResponseMaxBytes(op: BridgeOp): number {
+  return op === "snapshot.current" ? SNAPSHOT_RANKING_RESPONSE_MAX_BYTES : BRIDGE_RESPONSE_MAX_BYTES;
+}
 
 /**
  * The default deadline of one bridge call (the gateway's `internalCallTimeoutMs` range), shared so
@@ -116,6 +143,7 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "endpoint.probe_answered": probeAnsweredInputSchema,
   "endpoint.reserve_retry": retryReserveInputSchema,
   "endpoint.warm": warmInputSchema,
+  "endpoint.file_rest": fileRestInputSchema,
   "snapshot.current": snapshotCurrentRequestSchema,
   "scheduler.forward": schedulerForwardRequestSchema,
   "records.index": laneIndexMessageSchema,
@@ -154,6 +182,7 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "endpoint.probe_answered": emptyAnswerSchema,
   "endpoint.reserve_retry": retryReserveResultSchema,
   "endpoint.warm": warmResultSchema,
+  "endpoint.file_rest": fileRestAnswerSchema,
   "snapshot.current": snapshotAnswerSchema,
   "scheduler.forward": schedulerForwardAnswerSchema,
   "records.index": recordsAcceptedSchema,
@@ -241,12 +270,13 @@ export function parseBridgeRequest<O extends BridgeOp>(op: O, value: unknown): B
 /** One answer's body bytes. */
 export function encodeBridgeResponse<O extends BridgeOp>(op: O, value: BridgeResponseOf<O>): Uint8Array {
   const bytes = ENCODER.encode(toJsonString(value as unknown as Json));
-  if (bytes.byteLength > BRIDGE_RESPONSE_MAX_BYTES) throw new BridgeWireError("body_too_large", null, `the ${op} answer is over ${BRIDGE_RESPONSE_MAX_BYTES} bytes`);
+  const max = bridgeResponseMaxBytes(op);
+  if (bytes.byteLength > max) throw new BridgeWireError("body_too_large", null, `the ${op} answer is over ${max} bytes`);
   return bytes;
 }
 
-/** Read one answer: size, strict UTF-8, serde JSON, then the op's response schema. Throws `BridgeWireError`. */
+/** Read one answer: size (`bridgeResponseMaxBytes`), strict UTF-8, serde JSON, then the op's response schema. Throws `BridgeWireError`. */
 export function parseBridgeResponse<O extends BridgeOp>(op: O, body: Uint8Array): BridgeResponseOf<O> {
-  const value = parseJson(decode(body, BRIDGE_RESPONSE_MAX_BYTES), "invalid_document");
+  const value = parseJson(decode(body, bridgeResponseMaxBytes(op)), "invalid_document");
   return checked(value, BRIDGE_RESPONSE_SCHEMAS[op], `answer to ${op}`) as BridgeResponseOf<O>;
 }

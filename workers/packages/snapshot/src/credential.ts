@@ -27,3 +27,30 @@ export async function decryptCredential(key: CryptoKey, endpointId: string, cred
     return null;
   }
 }
+
+/**
+ * A video job's endpoint as gray-jobs' ConfigDO reads it for the gateway (`videoJobEndpoint`) once the job's route has
+ * left the snapshot (crates/gray-control `ControlStore::job_endpoint`; docs/cloudflare-native/media.md 3.2 rule 11):
+ * its control_endpoints row as it is now, enabled or not, and its credential sealed as stored (`decryptCredential`
+ * opens it), null once the provider removed the key (`active_revoked`, the stored credential cleared) and for a lane
+ * relay, whose stored credential is its sentinel, never a key. A rotated-away key is no longer stored: the one read is
+ * always the endpoint's current one.
+ */
+export interface JobEndpointAnswer {
+  readonly endpoint: {
+    readonly id: string;
+    readonly workspace_id: string;
+    readonly owner_user_id: string;
+    readonly config: string;
+    readonly generation: number;
+    readonly enabled: number;
+  };
+  readonly credential: string | null;
+}
+
+/** `JobEndpointAnswer`'s read: $1 the endpoint id, $2 its provider workspace; PostgreSQL's base64 breaks its lines. */
+export const JOB_ENDPOINT_SQL =
+  "SELECT e.id,e.workspace_id,e.owner_user_id,e.config,e.generation,e.enabled," +
+  "CASE WHEN COALESCE(l.active_revoked,0)=0 AND octet_length(e.credential)>0 AND ((e.config::jsonb #>> '{auth}') IS DISTINCT FROM 'lane_relay') " +
+  "THEN encode(e.credential,'base64') END AS credential " +
+  "FROM control_endpoints e LEFT JOIN control_endpoint_lifecycle l ON l.endpoint_id=e.id WHERE e.id=$1 AND e.workspace_id=$2";

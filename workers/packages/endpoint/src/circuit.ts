@@ -3,9 +3,9 @@
  * `EndpointRanker::record` and its recovery spell), held to the conformance fixtures of area `circuit`. A rank key is
  * one route under one credential and configuration in one mode (the gateway's rests.ts `rankKey`, @gray/routing
  * `measurementKey`), so a route's streamed and buffered requests each have their own circuit, a model API's as a
- * generation request's (the server's model APIs rank through the same `admit`). An attempt that names no rank key (one
- * that came over the confidential lane's bridge, which carries none) is judged under one more circuit of the route,
- * `ROUTE_CIRCUIT`.
+ * generation request's (the server's model APIs rank through the same `admit`), the confidential lane's too since r16 (its
+ * bridge carries the rank key). An attempt that names no rank key (a lane of a release before r16, or one kept to a
+ * bridge's earlier documents) is judged under one more circuit of the route, `ROUTE_CIRCUIT`.
  *
  * Each circuit keeps what the server's `EndpointState` keeps of a key: the samples of the stale window (when, whether it
  * succeeded, whether it repeated its request at an operator already called, and the attempt's measures: its latency,
@@ -581,7 +581,7 @@ export class Circuits {
 
   /**
    * The keys whose state changed since the ranking feed last took them (`takeDirty`), every key after a load or another
-   * build's restore. The route's own circuit (`ROUTE_CIRCUIT`, the lane's attempts, which have no rank key) is never pushed.
+   * build's restore. The route's own circuit (`ROUTE_CIRCUIT`, the attempts that name no rank key) is never pushed.
    */
   private readonly dirty = new Set<string>();
 

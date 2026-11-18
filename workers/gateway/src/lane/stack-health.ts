@@ -866,7 +866,6 @@ export class StackHealthService {
       protocol: test.protocol,
       model: test.model,
       credential,
-      identity: account.identity === undefined ? null : { headers: { ...account.identity.headers }, betas: [...account.identity.betas], generated: [...account.identity.generated] },
       // No text of the relay's: egress builds the body from its vendor operations table's test template
       // (docs/relay-changes-v2.md §6), whose texts are the table's own constants.
       proxy: sealed.egress === undefined ? null : egressValue(sealed.egress),

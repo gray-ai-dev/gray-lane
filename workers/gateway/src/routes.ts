@@ -237,12 +237,37 @@ function rankerFor(snapshot: GatewaySnapshot, nowMs: number): Ranker {
 /** Each route record's rank keys, buffered and streamed (`rank_key`), worked out once per record (a snapshot version's). */
 const rankKeys = new WeakMap<RouteRecord, [buffered: string | undefined, streamed: string | undefined]>();
 
+/** Each route record's rank keys in an egress region other than the gateway's (`rankKeyOf`), by region and mode. */
+const regionRankKeys = new WeakMap<RouteRecord, Map<string, string>>();
+
+/**
+ * The egress region each route's rank key names (inference.ts `rankRegion`): the gateway's own (`REST_EGRESS_REGION`)
+ * for every route of the main gateway, a confidential entry's `lane-<env>` for its endpoint routes, whose attempts are
+ * measured, judged and rested under it (docs/design/lane-provider-routes.md section 5). Absent: the gateway's own.
+ */
+export type RankRegionOf = (record: RouteRecord) => string;
+
 /**
  * `route`'s rank key in the request's mode (rests.ts `rankKey`, the server's `rank_key` with egress `local`): what ranking
  * keys its candidates and samples by, as the server's ranker does (inference.rs `admit`, design G3), so a route's
- * streamed and buffered requests are measured apart and ties hash the rank key.
+ * streamed and buffered requests are measured apart and ties hash the rank key. `region`: the egress region of the key
+ * (`RankRegionOf`), the gateway's own by default; a route is ranked under the key its attempts are measured under.
  */
-export function rankKeyOf(record: RouteRecord, stream: boolean): string {
+export function rankKeyOf(record: RouteRecord, stream: boolean, region: string = REST_EGRESS_REGION): string {
+  if (region !== REST_EGRESS_REGION) {
+    let byRegion = regionRankKeys.get(record);
+    if (byRegion === undefined) {
+      byRegion = new Map();
+      regionRankKeys.set(record, byRegion);
+    }
+    const name = `${stream ? "s" : "b"}${region}`;
+    let key = byRegion.get(name);
+    if (key === undefined) {
+      key = measurementKeySync(record.endpointId, record.model, record.protocol, record.configFingerprint, BigInt(record.credentialGeneration), region, stream);
+      byRegion.set(name, key);
+    }
+    return key;
+  }
   let keys = rankKeys.get(record);
   if (keys === undefined) {
     keys = [undefined, undefined];
@@ -258,10 +283,11 @@ export function rankKeyOf(record: RouteRecord, stream: boolean): string {
  * A route ranking leaves out is still eligible for a failover re-rank (D3). Circuit state is the
  * endpoint root's (its shards refuse a permit), so the order here only decides who is asked first. A route resting
  * after a failure (`rests`: the rests its endpoint shard holds, rests.ts `shardRestView`) is passed over, as its shard
- * refuses it. `stream`: the request's mode, whose rank keys rank it.
+ * refuses it. `stream`: the request's mode, whose rank keys rank it; `regionOf`: each route's keys' egress region
+ * (`RankRegionOf`, the gateway's own by default).
  */
-export async function rank(snapshot: GatewaySnapshot, routes: readonly Route[], requestKey: string, nowMs: number, policy: RankingPolicy, exploration: Exploration, rests: RestView, stream: boolean): Promise<Route[]> {
-  return (await rankDetailed(snapshot, routes, requestKey, nowMs, policy, exploration, rests, stream)).ordered;
+export async function rank(snapshot: GatewaySnapshot, routes: readonly Route[], requestKey: string, nowMs: number, policy: RankingPolicy, exploration: Exploration, rests: RestView, stream: boolean, regionOf?: RankRegionOf): Promise<Route[]> {
+  return (await rankDetailed(snapshot, routes, requestKey, nowMs, policy, exploration, rests, stream, true, regionOf)).ordered;
 }
 
 /**
@@ -273,9 +299,9 @@ export async function rank(snapshot: GatewaySnapshot, routes: readonly Route[], 
  * probe (`rank_without_probe`). The routes' rests are read from `rests`, the rests their endpoint shards hold
  * (rests.ts `shardRestView`), never from the ranker: the shards' are the only ones the gateway keeps.
  *
- * The candidates are the routes' rank keys in the request's mode (`rankKeyOf`); the ranking's ids are given back as the
- * routes' endpoint ids, which the plan's ordering, the steering and the request log read (the server's log maps them back
- * too, capture.rs `ranking`).
+ * The candidates are the routes' rank keys in the request's mode (`rankKeyOf`), each in its egress region (`regionOf`);
+ * the ranking's ids are given back as the routes' endpoint ids, which the plan's ordering, the steering and the request
+ * log read (the server's log maps them back too, capture.rs `ranking`).
  */
 export async function rankDetailed(
   snapshot: GatewaySnapshot,
@@ -287,11 +313,12 @@ export async function rankDetailed(
   rests: RestView,
   stream: boolean,
   probe = true,
+  regionOf?: RankRegionOf,
 ): Promise<{ readonly ordered: Route[]; readonly explored: Route | null; readonly unsampled: Route[]; readonly result: RankingResult }> {
   const byKey = new Map<string, Route>();
   const candidates: Candidate[] = [];
   for (const r of routes) {
-    const key = rankKeyOf(r.record, stream);
+    const key = rankKeyOf(r.record, stream, regionOf?.(r.record));
     if (!byKey.has(key)) byKey.set(key, r);
     candidates.push({ endpointId: key, quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore });
   }
@@ -328,8 +355,8 @@ export async function rankDetailed(
  * request's mode (`Ranker.dispatchExploratory`, the server's `reserve_dispatch`): what the isolate's exploration budget
  * counts.
  */
-export function dispatchExploratory(snapshot: GatewaySnapshot, route: Route, nowMs: number, stream: boolean): boolean {
-  return rankerFor(snapshot, nowMs).dispatchExploratory(rankKeyOf(route.record, stream), nowMs);
+export function dispatchExploratory(snapshot: GatewaySnapshot, route: Route, nowMs: number, stream: boolean, regionOf?: RankRegionOf): boolean {
+  return rankerFor(snapshot, nowMs).dispatchExploratory(rankKeyOf(route.record, stream, regionOf?.(route.record)), nowMs);
 }
 
 /** The recovery leases of the ranker that ranks `snapshot`'s routes, which settle a plan's head (plan-order.ts `settleHead`). */
@@ -362,12 +389,12 @@ export function probeLeases(snapshot: GatewaySnapshot, nowMs: number): ProbeLeas
  * each id as its route's rank key in the request's mode (`stream`), the ranker's own keys (plan-order.ts
  * `rankKeyLeases`).
  */
-export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, routes: Iterable<Route>, stream: boolean): ProbeLeases {
+export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, routes: Iterable<Route>, stream: boolean, regionOf?: RankRegionOf): ProbeLeases {
   const records = new Map<string, RouteRecord>();
   for (const r of routes) records.set(r.record.endpointId, r.record);
   return rankKeyLeases(rankerFor(snapshot, nowMs), (id) => {
     const record = records.get(id);
-    return record === undefined ? id : rankKeyOf(record, stream);
+    return record === undefined ? id : rankKeyOf(record, stream, regionOf?.(record));
   });
 }
 
@@ -377,7 +404,7 @@ export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, route
  * tool-call ids leads the routing only so (inference.rs: "as long as it is about as reliable as the best route";
  * tool-ids.ts).
  */
-export function pinHolds(snapshot: GatewaySnapshot, routes: readonly Route[], route: Route, nowMs: number, stream: boolean): boolean {
-  const candidates: Candidate[] = routes.map((r) => ({ endpointId: rankKeyOf(r.record, stream), quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore }));
-  return rankerFor(snapshot, nowMs).pinHolds(rankKeyOf(route.record, stream), candidates, nowMs);
+export function pinHolds(snapshot: GatewaySnapshot, routes: readonly Route[], route: Route, nowMs: number, stream: boolean, regionOf?: RankRegionOf): boolean {
+  const candidates: Candidate[] = routes.map((r) => ({ endpointId: rankKeyOf(r.record, stream, regionOf?.(r.record)), quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore }));
+  return rankerFor(snapshot, nowMs).pinHolds(rankKeyOf(route.record, stream, regionOf?.(route.record)), candidates, nowMs);
 }

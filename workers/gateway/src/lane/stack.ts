@@ -37,6 +37,7 @@ import {
   STACK_VENDOR_CODES,
   STACK_VIOLATION_BODY_FIELD_PATTERN,
   STACK_VIOLATION_HEADER_FIELD_PATTERN,
+  stackPassedClientHeaders,
   type StackAttemptClass,
   type StackFaultBy,
   type StackFaultWhy,
@@ -57,14 +58,13 @@ import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rew
  *
  * A call, in order (S23):
  *
- * 1. `PUT /v1/stack/requests/{rid}` on egress's control API: the client's bytes, raw query and
- *    behaviour headers, the route's vendor, the conversation's affinity token (S32a), the `RewriteSpec`
- *    the route's mapping and the relay's config allow, the attempt count and the request's deadline
- *    (S15, S32).
+ * 1. `PUT /v1/stack/requests/{rid}` on egress's control API: the client's bytes, raw query and own
+ *    headers ({@link stackClientHeaders}), the route's vendor, the `RewriteSpec` the route's mapping and the
+ *    relay's config allow, the attempt count and the request's deadline (S15, S32).
  * 2. `GET /v1/stack/requests/{rid}/events`: the feed of S17 records, read in the background for the
  *    whole call ({@link StackFeed}), each record checked against the receipt's shapes as it comes.
  * 3. `POST http://10.231.10.3:3000/<the protocol's path>?<the client's query>` on `RELAY` with the
- *    client's body with the required changes applied (`stack-rewrite.ts`), a few of its headers ({@link stackRelayHeaders}), `authorization: Bearer
+ *    client's body with the required changes applied (`stack-rewrite.ts`), its own headers ({@link stackRelayHeaders}), `authorization: Bearer
  *    <inbound_token>` and `X-Gray-Request: <rid>`.
  *
  * The answer (S24). Nothing the container makes up may reach the client: an event is released only
@@ -141,39 +141,26 @@ export const STACK_RELAY_PATHS: Readonly<Record<LaneProtocol, string>> = Object.
 });
 
 /**
- * The protocol's behaviour headers (S32): they change output limits, context, tools and price, so egress
- * requires each forwarded one to be the client's value plus only what the credential form needs, and the
- * registration carries them as the client sent them.
+ * The client's own headers a stack request carries (owner, 2026-11-18: Gray sets no client-identity header of its own;
+ * the client's go through unchanged): `@gray/lane-wire`'s one closed rule (`stack-client-headers.ts`), by lower-case
+ * name in name order, each value as fetch's `Headers` reads it (a repeated header joined with ", "). The client's
+ * user-agent, `x-app`, `x-stainless-*`, the protocol's `anthropic-*` or `openai-*` headers (its behaviour headers
+ * among them) and its session and request ids; never the customer's Gray credential, cookies, hop-by-hop or framing
+ * headers, Gray's `x-gray-*`, or what an address or a proxy adds. The same set is the container's, the peer hop's and
+ * the registration's `headers` (S32), from which egress starts the vendor's header set.
  */
-const STACK_BEHAVIOUR_HEADERS: Readonly<Record<LaneProtocol, readonly string[]>> = Object.freeze({
-  anthropic_messages: ["anthropic-version", "anthropic-beta"],
-  open_ai_chat: ["openai-beta"],
-  open_ai_responses: ["openai-beta"],
-});
+export function stackClientHeaders(client: Headers, protocol: LaneProtocol): Record<string, string> {
+  return stackPassedClientHeaders(protocol, client);
+}
 
 /**
- * The client headers the container is sent (S23's allowlist): the protocol's behaviour headers and the
- * two a relay may need to answer like the vendor (`accept`) or to present the client it serves
- * (`user-agent`, the relay standard's example request). Never the client's credential, its session
- * ids, its address, or anything Gray adds.
- */
-const STACK_CLIENT_HEADERS: Readonly<Record<LaneProtocol, readonly string[]>> = Object.freeze({
-  anthropic_messages: ["accept", "user-agent", ...STACK_BEHAVIOUR_HEADERS.anthropic_messages],
-  open_ai_chat: ["accept", "user-agent", ...STACK_BEHAVIOUR_HEADERS.open_ai_chat],
-  open_ai_responses: ["accept", "user-agent", ...STACK_BEHAVIOUR_HEADERS.open_ai_responses],
-});
-
-/**
- * The headers of the container call: the allowlisted client headers, the inbound token, the rid, the config route it
- * serves (`X-Gray-Route-Model`: the body's `model` is the upstream one, `stack-rewrite.ts`) and the request's
- * conversation (`X-Gray-Conversation`, absent when the client named no session).
+ * The headers of the container call: the client's own ({@link stackClientHeaders}), the inbound token, the rid, the
+ * config route it serves (`X-Gray-Route-Model`: the body's `model` is the upstream one, `stack-rewrite.ts`) and the
+ * request's conversation (`X-Gray-Conversation`, absent when the client named no session).
  */
 export function stackRelayHeaders(client: Headers, protocol: LaneProtocol, inboundToken: string, rid: string, routeModel: string, conversation?: string): Headers {
-  const headers = new Headers({ "content-type": "application/json" });
-  for (const name of STACK_CLIENT_HEADERS[protocol]) {
-    const value = client.get(name);
-    if (value !== null) headers.set(name, value);
-  }
+  const headers = new Headers(stackClientHeaders(client, protocol));
+  headers.set("content-type", "application/json");
   headers.set("authorization", `Bearer ${inboundToken}`);
   headers.set(STACK_REQUEST_HEADER, rid);
   headers.set(STACK_ROUTE_MODEL_HEADER, routeModel);
@@ -182,31 +169,12 @@ export function stackRelayHeaders(client: Headers, protocol: LaneProtocol, inbou
 }
 
 /**
- * The client headers an entry forwards over the peer hop (docs/confidential-lane-stack-routing.md section 4.5): every
- * header the stack VM's attempt reads from its request (`stackRelayHeaders`, whose list holds `stackBehaviourHeaders`'),
- * and no other: never the client's credential.
+ * The client headers an entry forwards over the peer hop (docs/confidential-lane-stack-routing.md section 4.5): the
+ * client's own ({@link stackClientHeaders}), the set the stack VM's attempt reads from its request (it applies the same
+ * rule again), and no other: never the client's credential.
  */
 export function stackPeerHeaders(client: Headers, protocol: LaneProtocol): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const name of STACK_CLIENT_HEADERS[protocol]) {
-    const value = client.get(name);
-    if (value !== null) out[name] = value;
-  }
-  return out;
-}
-
-/**
- * The registration's `headers` (S32): the behaviour headers the client sent and the container is sent,
- * under their lowercase names, each value as fetch's `Headers` reads it (a repeated header joined with
- * ", "). A header of another protocol never reaches the container, so it is not registered either.
- */
-export function stackBehaviourHeaders(client: Headers, protocol: LaneProtocol): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const name of STACK_BEHAVIOUR_HEADERS[protocol]) {
-    const value = client.get(name);
-    if (value !== null) out[name] = value;
-  }
-  return out;
+  return stackClientHeaders(client, protocol);
 }
 
 /**
@@ -759,16 +727,13 @@ export interface StackCallInput {
   readonly forwarded: Uint8Array;
   /** The client's raw query without its `?` ({@link stackRawQuery}), registered and sent to the container (S32). */
   readonly query: string;
-  /** The client's behaviour headers ({@link stackBehaviourHeaders}), registered (S32). */
-  readonly behaviourHeaders: Readonly<Record<string, string>>;
+  /**
+   * The client's own headers ({@link stackClientHeaders}), registered as `headers` (S32): egress starts the vendor's
+   * header set from them and keeps the customer's behaviour headers among them.
+   */
+  readonly clientHeaders: Readonly<Record<string, string>>;
   /** The route's vendor, registered: egress refuses an account of another (S32 `stack_route_refused`). */
   readonly vendor: StackVendor;
-  /**
-   * The request's conversation-affinity token at the relay (`affinity.ts` `deriveAffinity`, 32 lower hex),
-   * registered as `conversation` (S32a): egress derives the vendor's session ids from it, so a conversation
-   * keeps one session id for the boot. Absent when the client named no session (egress makes one per rid).
-   */
-  readonly conversation?: string;
   readonly rewrite: StackRewriteSpec;
   /** Section 8 `limits.attempts_max`: what egress enforces, as the relay was told (S15). */
   /**
@@ -1019,9 +984,8 @@ export class StackCall {
           protocol: input.protocol,
           received_b64: bytesBase64(input.received),
           query: input.query,
-          headers: input.behaviourHeaders,
+          headers: input.clientHeaders,
           vendor: input.vendor,
-          ...(input.conversation === undefined ? {} : { conversation: input.conversation }),
           rewrite: input.rewrite,
           attempts_max: input.attemptsMax,
           expires_at: input.expiresAt,
