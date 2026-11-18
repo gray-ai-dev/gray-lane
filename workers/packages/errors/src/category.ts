@@ -48,6 +48,8 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "api_key_expired",
       "api_key_owner_viewer",
       "model_not_found",
+      // A model served at another address, Gray's confidential VM's.
+      "model_at_lane",
       "wrong_api_for_model",
       "context_length_exceeded",
       "provider_request_rejected",
@@ -64,6 +66,9 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "routing_invalid",
       "routing_ambiguous",
       "routing_unknown_provider",
+      // Verifiable routes are served at another address, or not for this API at all.
+      "verifiable_routes_at_lane",
+      "verifiable_routes_unavailable",
       // A ModelTrace probe that does not pin one route (Workers only, docs/model-authenticity-workflow.md).
       "model_check_unpinned",
       "count_tokens_request_rejected",

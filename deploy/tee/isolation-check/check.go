@@ -29,15 +29,23 @@ var (
 		"/var/run/tappd.sock", "/run/tappd.sock",
 		"/var/run/docker.sock", "/run/docker.sock",
 	}
-	// The entry's peer routes (docs/confidential-lane-stack-routing.md §4.4), each in a form a listener that served
-	// it could not refuse with a 4xx: a valid pin push of the highest version (204), a request to a peer with no pin
-	// (502) and an attestation of a name that never resolves (502). The relay may reach neither.
+	// The entry's peer routes (docs/confidential-lane-stack-routing.md §4.4) and endpoint routes
+	// (docs/design/lane-provider-routes.md §4.4), each in a form a listener that served it could not refuse with a
+	// 4xx: a valid pin push of the highest version (204), a request to a peer with no pin (502), an attestation of a
+	// name that never resolves (502), a valid route table push of the highest version with one row (204; the row has
+	// already ended, so it could never be dialed), and a request for a route id with no row (502 route_unknown). The
+	// relay may reach none of them.
 	peerProbes = []peerProbe{
 		{method: "PUT", path: "/v1/peer/pins", body: "[]", header: map[string]string{
 			"Content-Type": "application/json", "X-Gray-Peer-Version": "18446744073709551615", "X-Gray-Peer-Push": "18446744073709551615",
 		}},
 		{method: "POST", path: "/peer/" + strings.Repeat("0", 64) + "/v1/messages", body: "{}", header: map[string]string{"Content-Type": "application/json"}},
 		{method: "GET", path: "/peer/attest/isolation-check.invalid/healthz"},
+		{method: "PUT", path: "/v1/routes", body: `[{"route":"isolation-check","host":"isolation-check.example-provider.com","path_prefix":"/v1/","not_after":0}]`,
+			header: map[string]string{
+				"Content-Type": "application/json", "X-Gray-Route-Version": "18446744073709551615", "X-Gray-Route-Push": "18446744073709551615",
+			}},
+		{method: "POST", path: "/route/isolation-check-none/v1/chat/completions", body: "{}", header: map[string]string{"Content-Type": "application/json"}},
 	}
 )
 
@@ -202,8 +210,8 @@ func deniedSilent(ctx context.Context, sys system, deny []netip.Addr) bool {
 	return probeAll(ctx, sys, targets, scanTimeout, func(o outcome) bool { return o == outcomeSilent || o == outcomeUnreachable })
 }
 
-// peerRoutesRefused sends every peer probe to every allowed endpoint: each must answer, and with a 4xx. A listener
-// that served a probe answers 2xx or 5xx (peerProbes), and no answer proves nothing.
+// peerRoutesRefused sends every probe of the entry's routes, peer and endpoint, to every allowed endpoint: each must
+// answer, and with a 4xx. A listener that served a probe answers 2xx or 5xx (peerProbes), and no answer proves nothing.
 func peerRoutesRefused(ctx context.Context, sys system, allow []netip.AddrPort) bool {
 	for _, endpoint := range allow {
 		for _, probe := range peerProbes {

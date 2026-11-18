@@ -1,5 +1,5 @@
 import { snapshotAnswerOf, snapshotCurrentCall, snapshotCurrentRequestSchema, type SnapshotCurrentRequest } from "@gray/lane-wire";
-import { dedupedLaneRelays, laneRelayOf, type GatewaySealedLaneRelay, type GatewayStackLaneRelay, type Snapshot } from "@gray/snapshot";
+import { dedupedLaneRelays, entryEndpointRoute, laneRelayOf, type EntryRouteFacts, type GatewaySealedLaneRelay, type GatewayStackLaneRelay, type Snapshot } from "@gray/snapshot";
 import { gatewaySnapshotOf, type AgeJudgement, type Runner, type SnapshotAnswer, type SnapshotSource } from "../../snapshot.ts";
 import type { LaneRelay, LaneRelayRegistry } from "../types.ts";
 import { BridgeClient, type BridgeClientOptions } from "./client.ts";
@@ -26,11 +26,13 @@ import { BridgeClient, type BridgeClientOptions } from "./client.ts";
  *   the main lane's `ReplicaSource` does; when nothing passes, it returns the best answer it saw,
  *   which this source returns to the cache rather than inventing a refusal.
  *
- * The lane snapshot's invariants (`assertLaneSnapshot`, design v2 section B): every non-lane route
- * is removed, `translation` is unset and `contentRecipients` is empty. A snapshot that carries
- * either is a configuration/boot error, not a request-time refusal: the lane would otherwise
- * translate a protocol the customer proved it does not (and the TEE would send a body the receipt
- * cannot describe). `laneRelaysOf` reads the relay registry from the raw snapshot's lane routes.
+ * The lane snapshot's invariants (`assertLaneSnapshot`, design v2 section B): every route but the lane
+ * relays' and the endpoint routes the entry serves (docs/design/lane-provider-routes.md section 2) is
+ * removed, `translation` is unset and `contentRecipients` is empty. A snapshot that carries any other
+ * is a configuration/boot error, not a request-time refusal: the lane would otherwise translate a
+ * protocol the customer proved it does not (and the TEE would send a body the receipt cannot
+ * describe), or send to an address its egress cannot carry. `laneRelaysOf` reads the relay registry
+ * from the raw snapshot's lane routes.
  */
 
 export interface RemoteSnapshotSourceOptions extends BridgeClientOptions {
@@ -93,22 +95,24 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
  * such a snapshot.
  */
 export function mapSnapshot(snapshot: Snapshot): ReturnType<typeof gatewaySnapshotOf> {
-  // The lane's view: only lane_relay routes, no translation policy, no content recipients (L3's lane mode).
-  // gray-jobs publishes one snapshot with both kinds, so the main mode here would leave the lane no route.
+  // The lane's view: the lane_relay routes and the endpoint routes the entry serves, no translation policy, no content
+  // recipients (L3's lane mode). gray-jobs publishes one snapshot with every kind; the main mode here would leave the lane
+  // no relay.
   const mapped = gatewaySnapshotOf(snapshot, "lane");
-  assertLaneSnapshot(mapped.version, mapped.routes.map((r) => r.auth), mapped.translation, Object.keys(mapped.contentRecipients).length);
+  assertLaneSnapshot(mapped.version, mapped.routes, mapped.translation, Object.keys(mapped.contentRecipients).length);
   return mapped;
 }
 
 /**
- * The lane snapshot's invariants (design v2 section B): a normal snapshot with every non-lane route
- * removed, `translation` unset and `contentRecipients` empty. Kept as its own function so
- * `state.ts` can assert the same rules on a snapshot it maps itself.
+ * The lane snapshot's invariants (design v2 section B): a normal snapshot with every route removed but the lane relays'
+ * and the endpoint routes the entry serves (`entryEndpointRoute`: `bearer` or `protocol_native` on the entry's three
+ * protocols, no adapter, a base URL egress's `/route/` kind carries), `translation` unset and `contentRecipients` empty.
+ * Kept as its own function so `state.ts` can assert the same rules on a snapshot it maps itself.
  */
-export function assertLaneSnapshot(version: number, auths: readonly string[], translation: string | undefined, recipientScopes: number): void {
-  const foreign = auths.filter((auth) => auth !== "lane_relay");
+export function assertLaneSnapshot(version: number, routes: readonly EntryRouteFacts[], translation: string | undefined, recipientScopes: number): void {
+  const foreign = routes.filter((route) => route.auth !== "lane_relay" && !entryEndpointRoute(route));
   if (foreign.length > 0) {
-    throw new Error(`lane snapshot ${version} carries ${foreign.length} non-lane route(s) (${foreign[0] ?? ""}): a lane snapshot is a normal snapshot with every non-lane route removed`);
+    throw new Error(`lane snapshot ${version} carries ${foreign.length} route(s) its entry does not serve (${foreign[0]?.auth ?? ""}): a lane snapshot holds the lane relays' routes and the endpoint routes its entry serves`);
   }
   if (translation !== undefined) throw new Error(`lane snapshot ${version} carries a translation policy: a lane snapshot never translates`);
   if (recipientScopes > 0) throw new Error(`lane snapshot ${version} carries ${recipientScopes} content recipient scope(s): a lane snapshot has contentRecipients empty`);

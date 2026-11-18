@@ -27,6 +27,8 @@ import { catalogRoute, serveCatalog } from "../listings.ts";
 import { RemoteEndpointShard } from "./remote/endpoint.ts";
 import { snapshots, snapshotTiming } from "../snapshot.ts";
 import { LaneRouteWarmer, laneRoutesOf } from "./warm.ts";
+import { EntryEndpointRoutes, endpointRowsOfSnapshot, endpointRowsOfView } from "./endpoint-routes.ts";
+import { remoteEndpointCredentials } from "./remote/endpoint-credential.ts";
 import { backendOf, isPeerRequest, peerRoute } from "./peer-routes.ts";
 import { serveReceipt } from "./receipt-route.ts";
 import { DEBUG_REQUESTS_PREFIX, debugCorsOrigin, debugGrantsOf, debugRequestIdOf, serveDebugGrant } from "./debug-route.ts";
@@ -42,7 +44,7 @@ import { EntryLink } from "./entry-link.ts";
 import { BackgroundClient } from "./remote/background.ts";
 import { setLaneNonceReplica } from "./remote/nonces.ts";
 import { platformTimers } from "../client.ts";
-import { EntryRoleClient, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
+import { EntryRoleClient, entryReadiness, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
 import type { LanePeers } from "./types.ts";
 
 /**
@@ -69,6 +71,8 @@ import type { LanePeers } from "./types.ts";
  * - `GET /v1/aci/relay-policy/{relay_id}` → the accepted bundle's templates (M22).
  * - `GET /healthz` → liveness and whether this boot's identity parsed; an entry replica adds its index, origin, role and
  *   in-flight count (`entry-role.ts`).
+ * - `GET /readyz` → 200 when the entry may take new connections from the load balancer, 503 otherwise
+ *   (docs/design/entry-replicas.md §13, `entryReadiness`).
  *
  * The relay-stack layout adds a second entrypoint, `relayConfig` below, on its own socket (S28): the
  * relay's two config GETs and nothing else. This one never serves them.
@@ -89,6 +93,8 @@ export const ATTESTATION_PATH = "/v1/aci/attestation";
 export const RECEIPTS_PATH = "/v1/aci/receipts/";
 /** The health route (the dstack deployment's probe). */
 export const HEALTH_PATH = "/healthz";
+/** The readiness route (the load balancer's HTTPS monitor, docs/design/entry-replicas.md §13). */
+export const READY_PATH = "/readyz";
 
 /**
  * The answer headers a browser page may read on a lane answer (F-02): the main lane's list plus the
@@ -627,6 +633,7 @@ async function primeRegistry(state: LaneProcessState, env: LaneGatewayEnv, cfg: 
     // snapshot no longer names is cleared from every store here, before the route looks it up.
     onSnapshot: (snapshot) => {
       state.registry.refresh(snapshot);
+      endpointRouteTables.get(state)?.sync(snapshot.version, endpointRowsOfSnapshot(snapshot));
     },
   });
   try {
@@ -700,6 +707,32 @@ function peersOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfi
   const peers: EntryPeers = { registry, call: (input) => new PeerCall({ ...input, registry, signer: state.signer }), egress: toEgress };
   peerClients.set(state, peers);
   return peers;
+}
+
+/**
+ * An entry's endpoint routes (`endpoint-routes.ts`, docs/design/lane-provider-routes.md section 5), one per boot state:
+ * on in the default layout, whose egress serves the `/route/` kind (`-routes`, deploy/tee/compose.yaml); off on a relay
+ * stack VM, whose egress refuses it, and then the view's endpoint routes are passed over as `route_inactive`.
+ */
+const endpointRouteTables = new WeakMap<LaneProcessState, EntryEndpointRoutes | null>();
+
+function endpointRoutesOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig): EntryEndpointRoutes | null {
+  const known = endpointRouteTables.get(state);
+  if (known !== undefined) return known;
+  const egress = env.EGRESS;
+  if (state.stack !== null || egress === undefined || typeof egress.fetch !== "function") {
+    endpointRouteTables.set(state, null);
+    return null;
+  }
+  const keys = remoteEndpointCredentials({ baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv), now: state.now });
+  const routes = new EntryEndpointRoutes({
+    egress: (input, init) => egress.fetch(input, init),
+    credential: (endpointId, generation, timeoutMs) => keys.credential(endpointId, generation, timeoutMs),
+    clock: state.now,
+    log: (line) => console.log(JSON.stringify(line)),
+  });
+  endpointRouteTables.set(state, routes);
+  return routes;
 }
 
 /**
@@ -905,6 +938,7 @@ function warmerOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
  */
 function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, ctx: ExecutionContext, readyRelay?: string, peers: EntryPeers | null = null): void {
   const warmer = warmerOf(state, env, cfg);
+  const endpointRoutes = endpointRoutesOf(state, env, cfg);
   const bridge = { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv) };
   const work = (async () => {
     const source = new RemoteSnapshotSource({
@@ -912,6 +946,7 @@ function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
       now: state.now,
       onSnapshot: (snapshot) => {
         state.registry.refresh(snapshot);
+        endpointRoutes?.sync(snapshot.version, endpointRowsOfSnapshot(snapshot));
       },
     });
     const timing = snapshotTiming(cfg);
@@ -924,19 +959,28 @@ function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
       if (!read.ok) return;
       snapshot = read.snapshot;
     }
+    // The entry's endpoint routes (lane-provider-routes.md section 5): the table of this copy (a boot that found the copy
+    // in the cache has seen no snapshot arrive), egress's table pushed and the keys prefetched when due.
+    endpointRoutes?.sync(snapshot.version, endpointRowsOfView(snapshot));
+    const endpointWork = endpointRoutes === null ? Promise.resolve() : endpointRoutes.maintain();
     const relays = new Set(state.registry.relays.map((relay) => relay.relayId));
     if (state.stack !== null) relays.add(state.stack.relayId);
     // An entry (LANE_PEERS) routes every stack route too: their shards are warmed, and their stack VMs attested, pinned
     // and helloed, at the boot and as the snapshot changes (docs/confidential-lane-stack-routing.md section 5, row 1).
     const peerWork = peers === null ? Promise.resolve() : peerWarm(state, peers, snapshot, cfg, readyRelay === undefined);
     if (peers !== null) for (const route of snapshot.routes) if (route.auth === "lane_relay" && route.lane?.mode === "stack") relays.add(route.lane.relayId);
-    const routes = laneRoutesOf(snapshot, relays);
+    // An entry warms its endpoint routes' shards too.
+    const routes = laneRoutesOf(snapshot, relays, endpointRoutes !== null);
     const force = readyRelay === undefined ? new Set<string>() : new Set(laneRoutesOf(snapshot, new Set([readyRelay])));
-    await Promise.all([warmer.run(routes, force), peerWork]);
+    await Promise.all([warmer.run(routes, force), peerWork, endpointWork]);
   })().catch((thrown: unknown) => {
     console.warn(JSON.stringify({ level: "warn", event: "lane_route_warm_failed", code: thrown instanceof Error ? thrown.name : "error" }));
   });
   ctx.waitUntil(work);
+}
+
+function endpointRoutesField(routes: EntryEndpointRoutes | null): { readonly endpointRoutes?: EntryEndpointRoutes } {
+  return routes === null ? {} : { endpointRoutes: routes };
 }
 
 /** The isolate's tables, load and content state, made at the first request. */
@@ -994,6 +1038,7 @@ export default {
     } catch (thrown) {
       return bootFailure(thrown);
     }
+    if (!bootTimes.has(state)) bootTimes.set(state, state.now());
     const url = new URL(request.url);
     const origin = allowedOrigin(request, cfg.consoleOrigin) ?? debugCorsOrigin(request, declaredPath(url.pathname)?.path ?? url.pathname);
     // §D/M23: every Cloudflare-bound path of a deployed lane is a binding. `local` (a test) may use the
@@ -1023,7 +1068,8 @@ export default {
     // ER9 as revised: a replica counts every request but its health route's from here to its answer's end, and until the
     // work it leaves behind settled: the handler's run and its `ctx.waitUntil` (its record, receipt and the relay's
     // outcome report, which frees the pick's lease), which workerd's SIGTERM drain does not wait for (`entry-role.ts`).
-    const end = replica === null || (declaredPath(url.pathname)?.path ?? url.pathname) === HEALTH_PATH ? null : replica.begin(request.signal);
+    const probe = declaredPath(url.pathname)?.path ?? url.pathname;
+    const end = replica === null || probe === HEALTH_PATH || probe === READY_PATH ? null : replica.begin(request.signal);
     let answer: Response;
     try {
       if (missing.length > 0) {
@@ -1077,7 +1123,7 @@ function misconfigured(request: Request, url: URL, state: LaneProcessState, miss
   }
   const declared = declaredPath(url.pathname);
   const path = declared?.path ?? url.pathname;
-  if (path === HEALTH_PATH && request.method === "GET") return aciJson(503, { status: "not_ready" }, state.keysetDigest);
+  if ((path === HEALTH_PATH || path === READY_PATH) && request.method === "GET") return aciJson(503, { status: "not_ready" }, state.keysetDigest);
   return aciJson(503, { status: "lane_misconfigured" }, state.keysetDigest);
 }
 
@@ -1097,8 +1143,9 @@ async function route(
   if (preflighted !== null) return preflighted;
   const declared = declaredPath(url.pathname);
   const path = declared?.path ?? url.pathname;
-  if (!isPublicPath(path) && path !== HEALTH_PATH) return unmatched(request, cfg, url, path);
+  if (!isPublicPath(path) && path !== HEALTH_PATH && path !== READY_PATH) return unmatched(request, cfg, url, path);
   if (path === HEALTH_PATH) return health(request, url, identity, state, warmerOf(state, env, cfg), peers, replica);
+  if (path === READY_PATH) return readiness(request, cfg, state, warmerOf(state, env, cfg), peers, replica);
   if (path === ATTESTATION_PATH) return attestation(request, env, url, state, identity);
   if (path.startsWith(RECEIPTS_PATH)) return serveReceipt(request, { receipts: state.receipts, keysetDigest: state.keysetDigest, followUpMs: cfg.peerFollowUpMs, clock: state.now }, path.slice(RECEIPTS_PATH.length));
   if (path.startsWith(DEBUG_REQUESTS_PREFIX)) {
@@ -1119,14 +1166,15 @@ async function route(
     if (backend !== null) return peerRoute(request, env, cfg, state, backend, laneIsolateOnce(), path, ctx);
     if (path.startsWith("/v1/peer/")) return unmatched(request, cfg, url, path);
   }
-  // `GET /v1/models` and `/v1/models/{id}` (listings.ts): the models this lane serves, with their list prices, from the
-  // lane's own snapshot. The public catalog lists the main lane's routes only (snapshot gateway.ts `routeInMode`), and
-  // every error's text points at this origin's `/v1/models` (hosts.ts `originsOf`): without it that pointer led to a
-  // 404 (rehearsal of 2026-11-13). The Gemini listings and `/v1/key` stay the main gateway's.
+  // `GET /v1/models` and `/v1/models/{id}`, and Gemini's `GET /v1beta/models` and `/v1beta/models/{id}` (listings.ts): the
+  // models this lane serves, with their list prices, from the lane's own snapshot, as the main gateway lists its own.
+  // Every error's text points at this origin's `/v1/models` (hosts.ts `originsOf`): without it that pointer led to a 404
+  // (rehearsal of 2026-11-13). `/v1/key` stays the main gateway's. Gemini generation is served for the endpoint routes
+  // the lane's view holds (docs/design/lane-provider-routes.md sections 2 and 7; a lane relay maps no Gemini route).
   const listing = catalogRoute(request.method, path);
   const served = servedProtocol(request.method, path);
-  if (listing === null && (served === null || served.protocol === "gemini")) return unmatched(request, cfg, url, path);
-  if (listing !== null && listing.kind !== "models" && listing.kind !== "model") return unmatched(request, cfg, url, path);
+  if (listing === null && served === null) return unmatched(request, cfg, url, path);
+  if (listing !== null && listing.kind === "key") return unmatched(request, cfg, url, path);
   // The generation path: the same `InferenceRun` the main lane runs, with the lane's dependencies.
   const lane: LaneRequestState = {
     cfg,
@@ -1134,6 +1182,7 @@ async function route(
     state,
     bridge: { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv) },
     ...(peers === null ? {} : { peers }),
+    ...endpointRoutesField(endpointRoutesOf(state, env, cfg)),
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
   if (listing !== null) return serveCatalog(request, listing, path, { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => ctx.waitUntil(p) });
@@ -1215,6 +1264,53 @@ function health(request: Request, url: URL, identity: LaneIdentity, state: LaneP
     state.keysetDigest,
     // The TEE's own clock, which `gray-relay doctor`'s clock line compares with the relay host's: workerd adds no Date.
     { date: new Date(state.now()).toUTCString() },
+  );
+}
+
+/** When each boot state was first served (the fetch that made or found it): the readiness bound runs from it. */
+const bootTimes = new WeakMap<LaneProcessState, number>();
+
+/**
+ * `GET /readyz` (docs/design/entry-replicas.md §13): 200 when the entry may take new connections from the load balancer,
+ * 503 otherwise. Local facts only (`entryReadiness`): not told to stop, its routes warmed (`routes_warm` of `routes`, as
+ * the release tool's gate reads them from `/healthz`), and every stack relay its routes name holding a pinned session;
+ * or, unless told to stop, a boot older than LANE_ENTRY_READY_BOUND_MS. `/healthz` keeps its meaning (liveness, read by
+ * the release tool and dstack's probe). Counts only, as `/healthz`: the route is public and names no relay. The stopped
+ * responder (deploy/tee/bin/entrypoint.mjs `stoppedAnswer`) answers this path 503 `entry_stopped`.
+ */
+function readiness(request: Request, cfg: GatewayConfig, state: LaneProcessState, warmer: LaneRouteWarmer, peers: EntryPeers | null, replica: LaneEntryRole | null): Response {
+  if (request.method !== "GET") return methodNotAllowed(state.keysetDigest, "GET");
+  const warm = warmer.status();
+  const relays = peers === null ? [] : [...peers.registry.stackRelays()];
+  // With the outbound-only channel a relay counts once peerlink holds a pinned session for it (the gate's check);
+  // without one, once it has a usable peer.
+  const channel = (peerLinks.get(state) ?? null) !== null;
+  const pinned = peers === null ? 0 : relays.filter((relay) => (channel ? peers.registry.hasSession(relay) : peers.registry.usable(relay).length > 0)).length;
+  const now = state.now();
+  const ageMs = now - (bootTimes.get(state) ?? now);
+  const verdict = entryReadiness({
+    ageMs,
+    boundMs: cfg.laneEntryReadyBoundMs,
+    stopping: replica?.stopping === true,
+    listed: warmer.listed,
+    routes: warm.routes,
+    routesWarm: warm.warm,
+    stackRelays: relays.length,
+    stackRelaysPinned: pinned,
+  });
+  return aciJson(
+    verdict.ready ? 200 : 503,
+    {
+      status: verdict.ready ? "ready" : "not_ready",
+      reasons: verdict.reasons,
+      fail_open: verdict.failOpen,
+      boot_age_ms: ageMs,
+      routes: warm.routes,
+      routes_warm: warm.warm,
+      stack_relays: relays.length,
+      stack_relays_pinned: pinned,
+    },
+    state.keysetDigest,
   );
 }
 

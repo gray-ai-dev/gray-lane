@@ -36,8 +36,13 @@
  * prints it as the `relay_record` line; such a receipt verifies like any other.
  *
  * The protocol is the receipt's `endpoint` path (`/v1/messages`, `/v1/chat/completions`,
- * `/v1/responses`), or an explicit override. Templates are supplied by id: the receipt deliberately
+ * `/v1/responses`, or a Gemini model's `/v1beta/models/<model>:generateContent` and
+ * `:streamGenerateContent`), or an explicit override. Templates are supplied by id: the receipt deliberately
  * carries digests, not text (review.md §2.5).
+ *
+ * A Gemini receipt is an entry's endpoint route's (docs/design/lane-provider-routes.md section 5): the lane has no
+ * rewrite policy and no relay templates for Gemini, so Gray forwards the customer's bytes as they are, and step 1 is
+ * the whole content check (a `request.modified` or `relay_policy` event fails it).
  */
 import { get, isObject, type Json } from "@gray/json";
 import {
@@ -117,7 +122,7 @@ export interface VerifyResponseReceiptOptions {
   /** The raw response bytes the customer received, SSE framing included, when kept. */
   readonly responseBytes?: Uint8Array;
   /** Override the protocol the receipt's endpoint implies. */
-  readonly protocol?: LaneProtocol;
+  readonly protocol?: ReceiptProtocol;
   /**
    * S52/S55: the relay image of the attested lane (`AttestationVerification.stackBoot`'s sealed image), or
    * null for a default-layout lane. Given, the receipt's `relay_image` must be exactly it (a stack lane's
@@ -140,7 +145,7 @@ export interface ResponseReceiptVerification {
   readonly receivedBodyHash: string | null;
   readonly forwardedBodyHash: string | null;
   readonly responseBodyHash: string | null;
-  readonly protocol: LaneProtocol | null;
+  readonly protocol: ReceiptProtocol | null;
   readonly relayPolicy: "applied" | "refused" | "absent";
   readonly appended: readonly AppendedTextRecord[];
   /** Gray's declared `request.modified` events, in log order (a v1 receipt; a stack receipt has them per attempt). */
@@ -201,12 +206,25 @@ export interface StackReceiptSummary {
   readonly feed_incomplete: string | null;
 }
 
+/**
+ * A protocol a lane receipt may name: the lane relays' three, and Gemini's generation API, which the entry serves on
+ * endpoint routes only (docs/design/lane-provider-routes.md sections 2 and 7).
+ */
+export type ReceiptProtocol = LaneProtocol | "gemini";
+
+/**
+ * A Gemini generation path as the gateway serves it (`servedProtocol`): `/v1beta/models/<model>` or, without the `models`
+ * segment, `/v1beta/<org>/<model>`, then `:generateContent` or `:streamGenerateContent`. A model id may hold a '/'.
+ */
+const GEMINI_GENERATION_PATH = /\/v1beta\/(?:models\/[^:]+|[^:/]+\/[^:]+):(?:generateContent|streamGenerateContent)$/;
+
 /** The protocol an ACI receipt's `endpoint` path implies, or null for an endpoint this lane does not serve. */
-export function protocolForEndpoint(endpoint: string): LaneProtocol | null {
+export function protocolForEndpoint(endpoint: string): ReceiptProtocol | null {
   const path = endpoint.split(/[?#]/, 1)[0] ?? "";
   if (path.endsWith("/v1/messages")) return "anthropic_messages";
   if (path.endsWith("/v1/chat/completions")) return "open_ai_chat";
   if (path.endsWith("/v1/responses")) return "open_ai_responses";
+  if (GEMINI_GENERATION_PATH.test(path)) return "gemini";
   return null;
 }
 
@@ -254,7 +272,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     receivedBodyHash: null as string | null,
     forwardedBodyHash: null as string | null,
     responseBodyHash: null as string | null,
-    protocol: null as LaneProtocol | null,
+    protocol: null as ReceiptProtocol | null,
     relayPolicy: "absent" as ResponseReceiptVerification["relayPolicy"],
     appended: [] as AppendedTextRecord[],
     modified: [] as RequestModifiedEvent[],
@@ -329,6 +347,12 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
 
   if (state.protocol === null) {
     checks.push(fail("protocol", `the receipt endpoint ${JSON.stringify(document.endpoint)} is not a lane protocol`));
+    return result();
+  }
+  if (state.protocol === "gemini") {
+    checks.push(pass("protocol", "gemini"));
+    if (options.expectedRelayImage !== undefined) checks.push(relayImageCheck(document.relay_image, options.expectedRelayImage));
+    geminiChecks(document.event_log, state.forwardedBodyHash, state.receivedBodyHash, checks);
     return result();
   }
   if (!isLaneProtocol(state.protocol)) {
@@ -444,6 +468,29 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   }
 
   return result();
+}
+
+/**
+ * A Gemini receipt's content check (an entry's endpoint route): no relay and no declared op, so the forwarded bytes are
+ * the received bytes (step 1). A stack log, a `request.modified` or a `relay_policy` event has no meaning for one.
+ */
+function geminiChecks(events: readonly Json[], forwardedHash: string | null, receivedHash: string | null, checks: ReceiptCheck[]): void {
+  if (isStackEventLog(events)) {
+    checks.push(fail("gemini", "a Gemini receipt is never a relay stack's"));
+    return;
+  }
+  const declared = [EVENT_REQUEST_MODIFIED, EVENT_RELAY_POLICY_APPLIED, EVENT_RELAY_POLICY_REFUSED].filter((type) => findEvent(events, type) !== undefined);
+  if (declared.length > 0) {
+    checks.push(fail("gemini", `the lane declares no rewrite and no relay policy on a Gemini body, but the receipt carries ${declared.join(", ")}`));
+    return;
+  }
+  if (forwardedHash === null) {
+    checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
+  } else if (forwardedHash !== receivedHash) {
+    checks.push(fail("forwarded_body_hash", `no relay_policy.applied and no request.modified, but forwarded ${forwardedHash} != received ${String(receivedHash)}`));
+  } else {
+    checks.push(pass("forwarded_body_hash", "no rewrites; forwarded hash equals received hash"));
+  }
 }
 
 /**

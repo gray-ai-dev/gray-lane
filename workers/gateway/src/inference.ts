@@ -3,7 +3,7 @@ import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type Locati
 import { workspaceHome } from "./account.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
-import type { TicketUseOutcome } from "@gray/lane-wire";
+import { LANE_BRIDGE_CALL_MS, type TicketUseOutcome } from "@gray/lane-wire";
 import { type ContinuationLocator, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
 import { answeredFailure, FREE_DELIVERY, type AccountBlockGates, type OutcomeMeasure, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type Pattern, type PermitToken } from "@gray/endpoint";
 import {
@@ -113,7 +113,7 @@ import { openCredential } from "./crypto.ts";
 import { Dispatcher, attemptCode, countedFailure, failureEnd, noAttemptError, noRouteRetryAfter, servedLater, skipLabel, type AttemptEnd, type BlockGates, type ColdPass, type DispatchEnv, type DispatchPlan, type HeldRefusal, type PassFacts } from "./dispatcher.ts";
 import { accountBlockGauges, accountBlockIsolate, blockGates } from "./account-blocks.ts";
 import { headReason, orderPlan, settleHead, steering } from "./plan-order.ts";
-import { isolateAffinity, layeredOver, takeTags, tierAdmitted, modelCheckPinned, modelCheckUnpinned, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, unadmitted, unreadableDefault, unreadablePreference, type PreferenceFacts } from "./preference.ts";
+import { isolateAffinity, layeredOver, takeTags, tierAdmitted, modelCheckPinned, modelCheckUnpinned, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, unadmitted, unreadableDefault, unreadablePreference, laneServes, unverifiable, verifiableRoute, verifiableUpFront, type PreferenceFacts } from "./preference.ts";
 import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releasePermit, releaseRetry, reserveRetry, settledWithin, shardFor, type EndpointCounts, type EndpointLocator, type ReleaseFacts, type ShardChoice } from "./endpoints.ts";
 import { fileRest, rankKey, recoveryRefusal, REST_EGRESS_REGION, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView, type EndpointRootLocator, type ShardRests } from "./rests.ts";
 import { evidenceFor, generationMediaEvidence, judgeEvidence } from "./evidence.ts";
@@ -190,6 +190,7 @@ import {
   laneContinuationUnsupported,
   laneRoutingInBody,
   laneDuplicateKey,
+  laneUpstreamOf,
   officialUpstream,
   laneHeaders,
   lanePolicyRefused,
@@ -565,8 +566,14 @@ export interface Attempt {
    */
   lane?: LaneAttempt;
   /**
+   * An entry's attempt at an endpoint route (docs/design/lane-provider-routes.md section 5): its own fetch, which sends
+   * the route's URL to egress's `/route/` kind under the endpoint's row (`lane.endpointFetch`); the provider's key is
+   * `credential`. Absent on the main lane and for every other route.
+   */
+  endpoint?: { readonly fetch: (input: string, init: RequestInit) => Promise<Response> };
+  /**
    * A lane attempt's receipt draft (design v2 §C.8, M6): dropped with a failed attempt, adopted when
-   * this one commits.
+   * this one commits. An entry's endpoint attempt has one too (docs/design/lane-provider-routes.md section 5).
    */
   laneDraft?: LaneReceiptDraft;
   /**
@@ -963,6 +970,11 @@ export class InferenceRun {
   /** The position of the model being served in the customer's list, and the list (empty when it listed none). */
   private modelIndex = 0;
   private listedModels: readonly string[] = [];
+  /**
+   * Whether a verifiable route serves a model this request lists on its API at Gray's confidential VM (`laneServes`):
+   * what a `verifiable` request this gateway leaves nothing is told (`unverifiable`).
+   */
+  private laneServed = false;
   /** When the request's first model was admitted: a stream's headers go STREAM_HEADERS_MS after it at the latest. */
   private firstAdmittedAt: number | null = null;
   /** `reserved` and `firstAdmittedAt` before the model being served was admitted: an `unrouted` model gives them back. */
@@ -2106,6 +2118,7 @@ export class InferenceRun {
       forwardedHash: null,
       accountId: null,
       upstreamModel: route.record.upstreamModel,
+      upstream: laneUpstreamOf(route.record),
     });
     this.laneReceiptId ??= newLaneReceiptId();
   }
@@ -2375,9 +2388,8 @@ export class InferenceRun {
    */
   private laneRefusal(bytes: Uint8Array, parsed: ParsedRequest): ApiError | null {
     if (this.lane === null) return null;
-    if (this.protocol === "gemini") {
-      return new ApiError(400, "invalid_protocol_request").withMessage("The confidential lane serves the Anthropic Messages and OpenAI Chat Completions and Responses APIs.");
-    }
+    // A Gemini request is served too, on the entry's endpoint routes (docs/design/lane-provider-routes.md sections 2, 7),
+    // under the same refusals: Gray forwards its bytes as they came (`laneForwardedFor`).
     // A duplicate anywhere is the lane's fixed 400. `readSerdeBytes` is the reader the main lane's
     // own parse uses, so the rule is the same one that decided the body's meaning upstream.
     const read = readSerdeBytes(bytes);
@@ -2459,6 +2471,7 @@ export class InferenceRun {
     this.toolCount = canonical.tools.length;
     this.turnStart = parsed.whole ? turnStart(canonical) : null;
     this.listedModels = parsed.models;
+    this.laneServed = this.lane === null && laneServes(snapshot, chain, protocol, this.deps.clock());
 
     // The key's model scope. A key restricted to some models must allow every model the request lists, not
     // only the one it is served by: which one serves is decided later, by supply the customer does not control.
@@ -2492,6 +2505,10 @@ export class InferenceRun {
         preferences.push(later.preference);
       }
     }
+    // No route of this gateway is verifiable but in lane mode: a `verifiable` request is answered here, before any
+    // route is looked at, translated or admitted (`verifiableUpFront`), and tries no next model.
+    const upFront = verifiableUpFront(this.lane !== null, snapshot, registeredOf(snapshot), layered.preference, chain, protocol, true, this.deps.clock());
+    if (upFront !== null) return this.refuse(unadmitted(upFront).error, "preference");
     // A ModelTrace probe is a model check only with the ticket the console signed for it (`takeModelCheck`). It checks one
     // route: its own preference names that endpoint alone, with fallbacks refused, for one model; the stored defaults
     // layered over it only narrow it. Anything else is refused before anything is held or sent.
@@ -2732,8 +2749,10 @@ export class InferenceRun {
     // The preference narrows the native routes before anything else considers them (`retain_admitted`), so a
     // request whose filter excludes every native route is refused here rather than served by a translation.
     // Excluding every route is this model's lack of an eligible provider (a model listed next may serve);
-    // a reference naming nothing registered is the request's, whatever the model.
-    const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf);
+    // a reference naming nothing registered is the request's, whatever the model. Verifiable routes are the lane's:
+    // a `verifiable` request this gateway leaves nothing is told where they are served when one serves a model it
+    // lists on its API there (`laneServed`), but in lane mode.
+    const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf, verifiableRoute, unverifiable(this.lane !== null, this.laneServed));
     if (!admitted.ok) {
       const refused = unadmitted(admitted.code);
       return refused.next ? this.unserved(refused.error, "routes") : { kind: "response", response: this.refuse(refused.error, "routes") };
@@ -2849,9 +2868,17 @@ export class InferenceRun {
           // routes only, as `retain_admitted` does on the native path: a target with no route that could serve
           // the request anyway is missing supply, not supply the filter excluded (`select_translation`).
           const preference = this.preference;
+          // Verifiable routes are the lane's, which never translates: a `verifiable` request they leave nothing is told
+          // where they are served when one serves a model it lists on the API the client sent it to (`retainAdmitted`).
+          const verifiable = preference.verifiable ? able.filter(verifiableRoute) : able;
+          if (verifiable.length === 0) {
+            const code = unverifiable(this.lane !== null, this.laneServed);
+            if (code === "routing_filter_excluded_all") return { kind: "excluded" };
+            return { kind: "failed", error: new ApiError(400, code) };
+          }
           const admitted = preference.isDefault()
-            ? able
-            : able.filter((r) => {
+            ? verifiable
+            : verifiable.filter((r) => {
                 const [provider, supplier] = refsOf(r);
                 return preference.admits(provider, supplier);
               });
@@ -2984,6 +3011,10 @@ export class InferenceRun {
       // the ceiling lowered the model's own) cannot be held to: the request is refused rather than sent
       // uncovered, and told to state its own limit.
       if (written && routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok)) return final(this.refuse(stackCapRequired(), "cost_ceiling"));
+      // Nor into a Gemini body at the lane's entry (docs/design/lane-provider-routes.md section 5): the published rewrite
+      // policy (`gray-lane-rewrites-v1`) declares no op on Gemini's `generationConfig`, and a receipt names only declared
+      // changes, so a request whose hold needs a cap Gray would write is refused the same way.
+      if (written && this.lane !== null && protocol === "gemini") return final(this.refuse(geminiCapRequired(), "cost_ceiling"));
       const decisions = rewriteDecisions({
         protocol,
         stream: canonical.stream,
@@ -3513,7 +3544,7 @@ export class InferenceRun {
     if (waitMs === 0) return { ok: false, reason: "unanswered", retryAfterMs: null, borrowing: false, shardChoice: options.shard ?? (await shardFor(this.deps.endpointCounts, route.record.capacityKey, this.deps.region, requestKey, index)) };
     // The attempt's rank key (`rank_key`, of the request's stream): a failure rest covering it refuses a first call
     // to it at the shard, an answer at it ends the rests on it, and a failure of it rests it (`restRoute`).
-    const restKey = await rankKey(route.record, REST_EGRESS_REGION, this.stream === true);
+    const restKey = await rankKey(route.record, this.rankRegion(route.record), this.stream === true);
     const acquired = await acquirePermit({
       locate: this.io.endpoints,
       counts: this.deps.endpointCounts,
@@ -4258,7 +4289,7 @@ export class InferenceRun {
           waitMs: reserveWait,
           timers: this.deps.permitTimers,
           // The repeat's circuit is its rank key's, as its permit's is (`acquire`): a key in recovery takes no repeat.
-          restKey: await rankKey(target.record, REST_EGRESS_REGION, this.stream === true),
+          restKey: await rankKey(target.record, this.rankRegion(target.record), this.stream === true),
         });
         if (!reserved.ok) {
           // The key's circuit refused the repeat before its wait, where the server's `rank_repeats` leaves the route out.
@@ -4601,7 +4632,7 @@ export class InferenceRun {
     if (!answer.allow) {
       // A refusal forwarded nothing, so no attempt commits and the receipt is this step's own
       // (design v2 §C.8, M6): `request.received`, the refusal and the error body the client gets.
-      this.laneDraft = receiptDraft({ modifiedEvents: [], policy: answer.outcome, forwardedHash: null, accountId: null, upstreamModel: target.record.upstreamModel });
+      this.laneDraft = receiptDraft({ modifiedEvents: [], policy: answer.outcome, forwardedHash: null, accountId: null, upstreamModel: target.record.upstreamModel, upstream: laneUpstreamOf(target.record) });
       this.laneReceiptId ??= newLaneReceiptId();
       return { kind: "stop", stop: null, error: lanePolicyRefused() };
     }
@@ -4688,11 +4719,17 @@ export class InferenceRun {
       return { kind: "continue" };
     }
     const laneAttempt = lanePick?.attempt ?? null;
+    // An entry's endpoint route (docs/design/lane-provider-routes.md section 5): the provider's key from the entry's
+    // memory, or one `endpoint.credential` call within the attempt's budget; none in time passes the route over below.
+    // A lane without the entry's table (a relay stack VM) opens no key: its `master` is null, so the route is passed over.
+    const laneEndpoint = this.laneEndpointRoute(route.record) ? this.lane!.endpointFetch : undefined;
     // The lane's attempt carries no supplier credential at all (`upstreamHeaders` refuses a lane route
     // rather than send one); the empty string keeps the attempt's shape and is never read for it.
     let credential: string | null;
     if (laneAttempt !== null || stackPlan !== null) {
       credential = "";
+    } else if (laneEndpoint !== undefined) {
+      credential = await this.laneEndpointKey(route.record, answerDeadline);
     } else {
       const master = await this.deps.master();
       credential = master === null ? null : await openCredential(master, route.record.endpointId, route.record.credential);
@@ -4746,6 +4783,7 @@ export class InferenceRun {
       backoffMs,
       retest,
       ...(laneAttempt === null ? {} : { lane: laneAttempt }),
+      ...(laneEndpoint === undefined ? {} : { endpoint: { fetch: laneEndpoint(route.record) } }),
       ...(dispatch === undefined ? {} : { dispatch, ...(ranked === undefined ? {} : { ranked }) }),
     };
     if (stackPlan !== null && stackPlan.peers !== undefined) attempt.peer = this.peerCall(stackPlan, attempt, o);
@@ -4776,12 +4814,13 @@ export class InferenceRun {
         // reported as not reaching the vendor, and the response names no id. If early stream headers
         // already went (the narrow race), the id they named stays and the receipt is finalised from
         // this attempt's draft (`request.forwarded` then means handed to the attested egress).
-        if (laneAttempt !== null && egressSidecarFailure(status, body)) {
+        // An entry's endpoint attempt goes through egress too (its `/route/` kind): its fixed 502s are egress's own.
+        if ((laneAttempt !== null || attempt.endpoint !== undefined) && egressSidecarFailure(status, body)) {
           if (egressBeforeVendor(status, body) && !this.headersSent) {
             this.laneReceiptId = laneBefore.receiptId;
             this.laneForwardedDraft = laneBefore.forwardedDraft;
             attempt.sentToVendor = false;
-            attempt.laneNotSentReport = true;
+            if (laneAttempt !== null) attempt.laneNotSentReport = true;
             this.failAttempt(d, attempt, bareOutcome("connect", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
             return { kind: "continue" };
           }
@@ -4842,6 +4881,42 @@ export class InferenceRun {
   }
 
   // ---------------------------------------------------------------- the stack relay (S22–S27)
+
+  /**
+   * An entry's endpoint route (docs/design/lane-provider-routes.md section 5): any route the lane's view holds that is
+   * not a lane relay's, attempted through egress's `/route/` kind when the entry has its keys and table
+   * (`lane.endpointFetch`).
+   */
+  private laneEndpointRoute(route: RouteRecord): boolean {
+    return this.lane !== null && route.auth !== "lane_relay" && this.lane.endpointFetch !== undefined && this.lane.endpointCredentials !== undefined;
+  }
+
+  /**
+   * The provider's key of an entry's endpoint route at its credential generation (section 3.2): the one in the entry's
+   * memory, else one `endpoint.credential` call within what the request's pre phase leaves (a call of Gray's own before
+   * the first upstream byte), at most a bridge call's bound and the time to the answer's deadline. Null when none came.
+   */
+  private async laneEndpointKey(route: RouteRecord, answerDeadline: number): Promise<string | null> {
+    const keys = this.lane?.endpointCredentials;
+    if (keys === undefined) return null;
+    const budgetMs = this.budget.preWait(Math.max(1, Math.min(LANE_BRIDGE_CALL_MS, answerDeadline - this.deps.clock())));
+    try {
+      return await keys.credential(route.endpointId, route.credentialGeneration, budgetMs);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The egress region of an attempt's rank key, whose circuit judges it at the endpoint's root (rests.ts `rankKey`). An
+   * entry's endpoint route has the entry's own, `lane-<env>`: the provider sees the entry's requests come from the CVM's
+   * address, so a failure only the entry sees (a provider that refuses that address) opens the entry's circuits and not
+   * the `api` address's, and the other way round (docs/design/lane-provider-routes.md section 5). The shard the permit
+   * comes from is the same either way (the request's region): a route's concurrency is one, whoever sends.
+   */
+  private rankRegion(route: RouteRecord): string {
+    return this.laneEndpointRoute(route) ? `lane-${this.deps.cfg.deployEnv}` : REST_EGRESS_REGION;
+  }
 
   /** A stack relay's route (S22): `lane_relay` whose lane record is `mode: "stack"`. */
   private stackRoute(route: RouteRecord): boolean {
@@ -5618,9 +5693,10 @@ export class InferenceRun {
     // allocated when a fetch took a body (F2 hooks-4, D29); the `??=` stays as a safety net for a
     // commit that somehow never sent. Only a relay's attempt has a receipt to adopt: a non-lane route
     // served beside the lane (the harness's main-lane case, design v2 §C.2 m15) advertises none.
-    if (this.lane !== null && attempt.lane !== undefined) {
+    if (this.lane !== null && (attempt.lane !== undefined || attempt.endpoint !== undefined)) {
       this.laneDraft = attempt.laneDraft ?? null;
-      this.laneServing = attempt.lane;
+      // Only a relay's account has a scheduler to tell (`reportLaneOutcome`).
+      if (attempt.lane !== undefined) this.laneServing = attempt.lane;
       this.laneReceiptId ??= newLaneReceiptId();
     }
     // The attempt that answered is the last: the request path lets go of the body.
@@ -5962,7 +6038,7 @@ export class InferenceRun {
     // cannot disagree.
     // A stack relay's container is sent the client's own bytes (S23), which admission already measured.
     if (this.stackRoute(candidate.record)) return false;
-    const laneForwards = this.lane === null || candidate.record.auth !== "lane_relay" ? null : await this.laneForwardedFor(candidate, prepared, o);
+    const laneForwards = this.lane === null || (candidate.record.auth !== "lane_relay" && !this.laneEndpointRoute(candidate.record)) ? null : await this.laneForwardedFor(candidate, prepared, o);
     if (laneForwards !== null) {
       if (!laneForwards.ok) return false;
       return laneForwards.bytes.length > Number(requestLimit(prepared.protocol));
@@ -5993,8 +6069,14 @@ export class InferenceRun {
     const relayId = this.relayOf(route);
     const received = this.laneReceived;
     const decisions = this.laneDecisions;
-    if (relayId === null || received === null || decisions === null) return null;
-    const appends = await this.laneAppendsFor(relayId, prepared.protocol, o);
+    // An entry's endpoint route forwards Gray's declared ops alone (docs/design/lane-provider-routes.md section 5): it has
+    // no relay and so no appends, and its receipt describes the bytes as for a relay's.
+    const endpoint = route.record.auth !== "lane_relay";
+    if ((relayId === null && !endpoint) || received === null || decisions === null) return null;
+    // A Gemini body goes as it came: the rewrite policy declares no Gemini op, and the request is refused at admission
+    // when Gray would have to write its cap (`geminiCapRequired`). Its model is in the URL, never in the body.
+    if (endpoint && prepared.protocol === "gemini") return { ok: true, bytes: received, events: [], applied: [] };
+    const appends = relayId === null ? [] : await this.laneAppendsFor(relayId, prepared.protocol, o);
     const plan = planRewrites(decisions, route.record.upstreamModel, this.laneCodexRoute(route.record));
     // F2 hooks-2: the key carries the route's upstream model too. Two models (a customer's fallback
     // list) or two endpoints of one relay (D13) with the same client cap and the same appends would
@@ -6002,7 +6084,7 @@ export class InferenceRun {
     // the scheduler and the receipt name another. The appends' full text, not its length, names them.
     // D129: and whether the route is the Codex backend, whose body also carries `stream` and `store`:
     // a relay's OpenAI and Codex routes of one model must not share bytes either.
-    const key = `${relayId}\u0000${route.record.upstreamModel}\u0000${plan.codex ? "codex" : ""}\u0000${plan.cap === null ? "" : `${plan.cap.field}=${plan.cap.value}`}\u0000${appends.map((a) => `${a.templateId}:${a.position}:${a.text}`).join("\u0001")}`;
+    const key = `${relayId ?? "\u0001endpoint"}\u0000${route.record.upstreamModel}\u0000${plan.codex ? "codex" : ""}\u0000${plan.cap === null ? "" : `${plan.cap.field}=${plan.cap.value}`}\u0000${appends.map((a) => `${a.templateId}:${a.position}:${a.text}`).join("\u0001")}`;
     let forwarded = this.laneForwarded.get(key);
     if (forwarded === undefined) {
       forwarded = forwardedBody(received, prepared.protocol, plan, appends);
@@ -6055,6 +6137,9 @@ export class InferenceRun {
     // never rebuilt, and a URL that names any other origin is refused rather than sent.
     const lane = attempt.lane;
     if (lane !== undefined && !officialUpstream(url)) return { kind: "not_official" };
+    // An entry's endpoint attempt (docs/design/lane-provider-routes.md section 5): its own fetch checks the URL against the
+    // endpoint's row in egress's table, and egress checks it again.
+    const endpoint = attempt.endpoint;
     // A recovery probe goes out from here: its spell's clock runs whatever becomes of its lease (the server's
     // `probe_sent`, called as it dispatches). So does the attempt's dispatch: its group's budget counts it
     // (`mark_dispatched`).
@@ -6073,10 +6158,10 @@ export class InferenceRun {
     const headers = lane !== undefined ? new Headers(lane.headers) : upstreamHeaders(protocol, route, attempt.credential, this.translation === null ? this.request.headers : new Headers());
     // E1/E2: the attempt's egress proxy travels in the one sidecar header, never in the vendor's
     // header set. Delete first, so no account or client header can ever supply this control value;
-    // a direct account sends nothing and the sidecar dials directly.
-    if (lane !== undefined) {
+    // a direct account sends nothing and the sidecar dials directly. An endpoint route has no proxy.
+    if (lane !== undefined || endpoint !== undefined) {
       headers.delete(EGRESS_HEADER);
-      if (lane.egress !== undefined) headers.set(EGRESS_HEADER, egressHeader(lane.egress));
+      if (lane?.egress !== undefined) headers.set(EGRESS_HEADER, egressHeader(lane.egress));
     }
     // The attempt's bound and the client's leaving abort it from here on, also while its calls wait for a
     // connection (outbound.ts): a tier C body's R2 connection, then the upstream's.
@@ -6116,7 +6201,7 @@ export class InferenceRun {
       // (one Content-Length, design v2 §C.7 M4) and its hash and events are the attempt's receipt
       // draft (§C.8 M6). A failed attempt's draft is dropped with it; the committed one is adopted.
       let forwarded: Uint8Array | undefined;
-      if (lane !== undefined) {
+      if (lane !== undefined || endpoint !== undefined) {
         const composed = await this.laneForwardedFor(attempt.route, prepared, o);
         // F2 hooks-10: the composition's own refusal is the answer (a 403 for the relay's appends, a
         // fixed 400 for a body Gray cannot rewrite), never a bare `invalid_json`.
@@ -6125,10 +6210,12 @@ export class InferenceRun {
         forwarded = composed.bytes;
         attempt.laneDraft = receiptDraft({
           modifiedEvents: composed.events,
-          policy: this.laneOutcomeFor(lane.relayId, protocol, o) ?? null,
+          policy: lane === undefined ? null : (this.laneOutcomeFor(lane.relayId, protocol, o) ?? null),
           forwardedHash: bodyHashOf(composed.bytes),
-          accountId: lane.accountId,
+          accountId: lane?.accountId ?? null,
           upstreamModel: route.upstreamModel,
+          // The host the bytes went to (`upstream_name`): the vendor's for a relay, the provider's for an endpoint route.
+          upstream: laneUpstreamOf(route),
         });
       }
       made = await this.attemptBody(o, prepared, overlay, attempt.controller.signal, change, forwarded);
@@ -6142,7 +6229,7 @@ export class InferenceRun {
       body = sendable(made.body, () => {
         taken = true;
         attempt.sentToVendor = true;
-        if (lane !== undefined) {
+        if (lane !== undefined || endpoint !== undefined) {
           // F2 hooks-4/D3: the body is handed to the vendor's fetch now, so a stream may follow with its
           // headers at once: the response must name the id its receipt will use, and the last body that
           // really went is the receipt of a request nothing commits or refuses.
@@ -6151,7 +6238,9 @@ export class InferenceRun {
           this.markLaneSent();
         }
       });
-      const response = await this.io.fetch(url, { method: "POST", headers, body, signal: attempt.controller.signal, redirect: "manual" }, () => {
+      // An endpoint attempt's own fetch, through the request's outbound gate as every upstream fetch.
+      const upstream = endpoint === undefined ? this.io.fetch : this.outbound.fetch(endpoint.fetch);
+      const response = await upstream(url, { method: "POST", headers, body, signal: attempt.controller.signal, redirect: "manual" }, () => {
         started = true;
       });
       if (response.status >= 200 && response.status <= 299) return { kind: "answered", response };
@@ -7673,6 +7762,16 @@ function laneEntryRequired(): ApiError {
 function stackCapRequired(): ApiError {
   return new ApiError(400, "request_exceeds_cost_ceiling").withMessage(
     "This relay's route has no output limit of its own, and this request's could cost more than can be held for it. Send `max_tokens` (`max_output_tokens` on the Responses API) within what you can spend on one request.",
+  );
+}
+
+/**
+ * 400 for a Gemini request at the lane's entry whose whole output cannot be held unless Gray writes a cap into its body,
+ * which it does not there (`gray-lane-rewrites-v1` has no Gemini op): the client states its own.
+ */
+function geminiCapRequired(): ApiError {
+  return new ApiError(400, "request_exceeds_cost_ceiling").withMessage(
+    "This request's output could cost more than can be held for it, and the confidential lane forwards a Gemini body as it was sent. Send `generationConfig.maxOutputTokens` within what you can spend on one request.",
   );
 }
 

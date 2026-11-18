@@ -49,11 +49,19 @@ interface RouteWarm {
   running: Promise<void> | null;
 }
 
-/** The capacity keys of `snapshot`'s lane routes whose relay this lane serves (`relays`), each once, in order. */
-export function laneRoutesOf(snapshot: GatewaySnapshot, relays: ReadonlySet<string>): string[] {
+/**
+ * The capacity keys of `snapshot`'s lane routes whose relay this lane serves (`relays`), and with `endpoints` (an entry's,
+ * docs/design/lane-provider-routes.md section 5) its endpoint routes, which the lane view holds only when the entry
+ * serves them: each once, in order.
+ */
+export function laneRoutesOf(snapshot: GatewaySnapshot, relays: ReadonlySet<string>, endpoints = false): string[] {
   const keys = new Set<string>();
   for (const route of snapshot.routes) {
-    if (route.auth !== "lane_relay" || route.lane === undefined || route.lane === null || !relays.has(route.lane.relayId)) continue;
+    if (route.auth !== "lane_relay") {
+      if (endpoints) keys.add(route.capacityKey);
+      continue;
+    }
+    if (route.lane === undefined || route.lane === null || !relays.has(route.lane.relayId)) continue;
     keys.add(route.capacityKey);
   }
   return [...keys].sort();
@@ -62,6 +70,7 @@ export function laneRoutesOf(snapshot: GatewaySnapshot, relays: ReadonlySet<stri
 export class LaneRouteWarmer {
   readonly #deps: LaneRouteWarmerDeps;
   readonly #routes = new Map<string, RouteWarm>();
+  #listed = false;
 
   constructor(deps: LaneRouteWarmerDeps) {
     this.#deps = deps;
@@ -73,6 +82,7 @@ export class LaneRouteWarmer {
    * has ended.
    */
   run(capacityKeys: readonly string[], force: ReadonlySet<string> = new Set()): Promise<void> {
+    this.#listed = true;
     const listed = new Set(capacityKeys);
     for (const key of [...this.#routes.keys()]) if (!listed.has(key)) this.#routes.delete(key);
     const now = this.#deps.clock();
@@ -95,6 +105,11 @@ export class LaneRouteWarmer {
       runs.push(running);
     }
     return Promise.all(runs).then(() => undefined);
+  }
+
+  /** Whether a route list was given yet (`run`): before the boot's first snapshot read, no route is known (`GET /readyz`). */
+  get listed(): boolean {
+    return this.#listed;
   }
 
   /** The routes this lane serves, and how many of them its last warm left holding a permit (`GET /healthz`). */

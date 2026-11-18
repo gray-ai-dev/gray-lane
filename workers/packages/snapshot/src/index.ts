@@ -17,6 +17,7 @@ export * from "./capabilities.ts";
 export * from "./control.ts";
 export * from "./credential.ts";
 export * from "./debt.ts";
+export * from "./endpoint-route.ts";
 export * from "./evidence.ts";
 export * from "./expiry.ts";
 export * from "./facts.ts";

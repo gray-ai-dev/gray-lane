@@ -973,6 +973,25 @@ export const SETTINGS: readonly SettingSpec[] = [
       "read. Read by the lane in the entry layout with a replica index only.",
   },
   {
+    name: "LANE_ENTRY_READY_BOUND_MS",
+    key: "laneEntryReadyBoundMs",
+    workers: ["gateway"],
+    type: "int",
+    default: "180000",
+    min: 30000,
+    max: 900000,
+    source:
+      "docs/design/entry-replicas.md §13 (readiness), from release S, staging's first rolling release (2026-11-17, §10.3): a " +
+      "replica's new boot answered its first 200 51 s and 76 s before the release tool's gate passed (stack VMs' sessions " +
+      "pinned and routes warmed), so 180 s is over twice the slowest. A VM that is down, or a console the boot cannot read, " +
+      "keeps a replica out of the load balancer for this long at most. The maximum is the drain's bound " +
+      "(PROVISION_DRAIN_MAX_MS, 15 min); the minimum is under the faster of the two measured boots.",
+    doc:
+      "How long after its boot an entry's GET /readyz answers 200 even when a route has not warmed or a stack relay holds no " +
+      "pinned session (fail open): a VM that is down, or a console that cannot be read, must never keep every replica out " +
+      "of the load balancer. A replica told to stop is never ready. Read by the lane in the entry layout.",
+  },
+  {
     name: "LANE_STACK_REPORT_MIN_MS",
     key: "laneStackReportMinMs",
     workers: ["gateway"],
@@ -5451,6 +5470,8 @@ export interface GatewayConfig {
   readonly laneStackPollMs: number;
   /** LANE_ENTRY_ROLE_POLL_MS (entry replicas, ER9 as revised): how often an entry replica reads its role through the bridge. */
   readonly laneEntryRolePollMs: number;
+  /** LANE_ENTRY_READY_BOUND_MS (entry replicas, §13 readiness): how long after its boot an entry's /readyz fails open. */
+  readonly laneEntryReadyBoundMs: number;
   /** LANE_STACK_REPORT_MIN_MS (S42): the shortest interval between two stack.report calls carrying a change. */
   readonly laneStackReportMinMs: number;
   /** LANE_STACK_REPORT_HEARTBEAT_MS (S42): stack.report's interval when nothing changed. */

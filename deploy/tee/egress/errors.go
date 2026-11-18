@@ -76,6 +76,14 @@ const (
 	errPeerSessionMissing = "peer_session_missing"
 	errPeerSessionRefused = "peer_session_refused"
 
+	// The endpoint routes' codes (endpoint_routes.go; docs/design/lane-provider-routes.md §4). route_unknown is an id
+	// with no live row, a 502 like peer_unpinned: nothing was dialed, and a listener that serves /route/ cannot answer
+	// it with a 4xx (the isolation check tells the two apart by it). route_control_invalid and routes_stale are the
+	// table's (PUT /v1/routes), as the pin table's.
+	errRouteUnknown        = "route_unknown"
+	errRouteControlInvalid = "route_control_invalid"
+	errRoutesStale         = "routes_stale"
+
 	// These two are log-only: the response headers are already on the wire when
 	// they occur, so the status stays the upstream status and only the fixed log
 	// code records that the stream ended early.
@@ -133,13 +141,14 @@ func refusalStatus(code string) int {
 		return http.StatusTooManyRequests
 	case errStackRewriteRefused, errStackRouteRefused, errStackHeaderRefused, errStackIdentityMismatch, errStackHelloRefused:
 		return http.StatusUnprocessableEntity
-	case errStackRequestExists, errStackFeedBusy, errStackAccountsStale, errStackCoolingStale, errPeerPinsStale, errStackOpsAckStale:
+	case errStackRequestExists, errStackFeedBusy, errStackAccountsStale, errStackCoolingStale, errPeerPinsStale, errStackOpsAckStale,
+		errRoutesStale:
 		return http.StatusConflict
 	case errStackRequestsFull, errEgressLimit, errStackTestsBusy, errStackTunnelReady, errStackRelayNotReady:
 		return http.StatusServiceUnavailable
 	// The hop's own failures are 502 like a vendor connection's: the peer was not reached, or failed.
 	case errPeerUnpinned, errPeerConnectFailed, errPeerTLSFailed, errPeerPinMismatch, errPeerFailedAfterSend, errPeerTimeout,
-		errPeerSessionMissing, errPeerSessionRefused:
+		errPeerSessionMissing, errPeerSessionRefused, errRouteUnknown:
 		return http.StatusBadGateway
 	default:
 		return http.StatusBadRequest

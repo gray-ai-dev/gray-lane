@@ -37,16 +37,20 @@ import { planOps } from "./plan.ts";
  */
 export const EGRESS_HEADER = "x-gray-egress";
 
-/** The fixed error codes the egress sidecar answers a failed 502 with (deploy/tee/egress/README.md). */
-const EGRESS_FAILURES = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed", "egress_upstream_failed"] as const;
+/**
+ * The fixed error codes the egress sidecar answers a failed 502 with (deploy/tee/egress/README.md), `route_unknown`
+ * among them: an endpoint route's id with no live row in egress's table (docs/design/lane-provider-routes.md 4.1).
+ */
+const EGRESS_FAILURES = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed", "egress_upstream_failed", "route_unknown"] as const;
 
 /**
  * The egress failures that happen before the vendor connection is made, so no byte of the request
  * reached the vendor (D72): the direct dial, any stage of a proxy (the proxy stands before the
- * vendor), and the vendor TLS handshake. `egress_upstream_failed` is deliberately not here: the
- * sidecar answers it only after the vendor connection exists.
+ * vendor), the vendor TLS handshake, and an endpoint route with no row (refused before any dial).
+ * `egress_upstream_failed` is deliberately not here: the sidecar answers it only after the vendor
+ * connection exists.
  */
-const EGRESS_BEFORE_VENDOR = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed"] as const;
+const EGRESS_BEFORE_VENDOR = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed", "route_unknown"] as const;
 
 /** The compact JSON the sidecar receives: the port is written as an integer, not a float. */
 export function egressHeader(egress: LaneEgress): string {
@@ -395,12 +399,18 @@ export function addReceiptEvents(builder: ReceiptBuilder, input: { readonly rece
     }
     if (policy !== null) addPolicyEvent(builder, policy);
     builder.addRequestForwardedHash(forwarded);
-    builder.addUpstreamVerificationFailed({ modelId: input.draft.upstreamModel, required: false, reason: UPSTREAM_NOT_TEE });
+    builder.addUpstreamVerificationFailed(upstreamFailure(input.draft));
   } else if (policy !== null && policy.type === "relay_policy.refused") {
     addPolicyEvent(builder, policy);
-    builder.addUpstreamVerificationFailed({ modelId: input.draft.upstreamModel, required: false, reason: UPSTREAM_NOT_TEE });
+    builder.addUpstreamVerificationFailed(upstreamFailure(input.draft));
   }
   builder.addResponseReturnedHash(input.responseHash);
+}
+
+/** The draft's `upstream.verified` failure: its reason and the host it names, the vendor-API reason without one. */
+function upstreamFailure(draft: LaneReceiptDraft): { readonly modelId: string; readonly required: false; readonly reason: string; readonly upstreamName?: string } {
+  const upstream = draft.upstream;
+  return upstream === undefined ? { modelId: draft.upstreamModel, required: false, reason: UPSTREAM_NOT_TEE } : { modelId: draft.upstreamModel, required: false, reason: upstream.reason, upstreamName: upstream.name };
 }
 
 /** A `request.modified` event's fields, without its `type` (the builder writes that from the type it is given). */
@@ -412,8 +422,14 @@ function modifiedFields(event: Readonly<Record<string, unknown>>): Readonly<Reco
   return fields;
 }
 
-/** Why every lane receipt says its upstream verification failed (§C.8): the vendor's API is not a TEE. */
+/** Why every lane relay's receipt says its upstream verification failed (§C.8): the vendor's API is not a TEE. */
 export const UPSTREAM_NOT_TEE = "vendor_api_not_tee";
+
+/**
+ * Why an endpoint route's receipt says its upstream verification failed (docs/design/lane-provider-routes.md section 5):
+ * the provider's API, where the model runs and which reads the request, is not a TEE.
+ */
+export const PROVIDER_NOT_TEE = "provider_api_not_tee";
 
 /** One `relay_policy.*` event, in the shared wire shape (`@gray/attest`'s builders, which validate it). */
 function addPolicyEvent(builder: ReceiptBuilder, outcome: LanePolicyOutcome): void {
@@ -577,6 +593,8 @@ export function receiptDraft(input: {
   readonly forwardedHash: string | null;
   readonly accountId: string | null;
   readonly upstreamModel: string;
+  /** The host the attempt went to and why its verification failed (`LaneReceiptDraft.upstream`). */
+  readonly upstream?: { readonly name: string; readonly reason: string } | null;
 }): LaneReceiptDraft {
   return {
     modifiedEvents: input.forwardedHash === null ? [] : input.modifiedEvents,
@@ -584,7 +602,28 @@ export function receiptDraft(input: {
     forwardedHash: input.forwardedHash,
     accountId: input.accountId,
     upstreamModel: input.upstreamModel,
+    ...(input.upstream === undefined || input.upstream === null ? {} : { upstream: input.upstream }),
   };
+}
+
+/**
+ * Where a lane attempt at `route` goes, for its receipt's `upstream.verified` (docs/design/lane-provider-routes.md
+ * section 5): a lane relay's route names its official vendor host, the vendor's API not being a TEE
+ * (`vendor_api_not_tee`); an endpoint route the provider's API host, which is not one either (`provider_api_not_tee`).
+ * Null for a URL that names no host the lane would send to.
+ */
+export function laneUpstreamOf(route: { readonly auth: string; readonly url: string }): { readonly name: string; readonly reason: string } | null {
+  if (route.auth === "lane_relay") {
+    const official = checkOfficialUpstream(route.url);
+    return official.ok ? { name: official.host, reason: UPSTREAM_NOT_TEE } : null;
+  }
+  let host: string;
+  try {
+    host = new URL(route.url).hostname;
+  } catch {
+    return null;
+  }
+  return host === "" ? null : { name: host, reason: PROVIDER_NOT_TEE };
 }
 
 /**

@@ -2,6 +2,7 @@ import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { z } from "zod";
 import { acmeChallengeAnswerSchema, acmeChallengeSchema } from "./acme-challenge.ts";
 import { entryRoleAnswerSchema, entryRoleRequestSchema } from "./entry-role.ts";
+import { endpointCredentialAnswerSchema, endpointCredentialRequestSchema } from "./endpoint-credential.ts";
 import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
 import { attestCollateralAnswerSchema, attestCollateralRequestSchema, releaseListsAnswerSchema, releaseListsRequestSchema } from "./background.ts";
 import { acquireInputSchema, acquireResultSchema, emptyAnswerSchema, endpointReleaseInputSchema, endpointReleaseResultSchema, noteInputSchema, probeAnsweredInputSchema, retryReleaseInputSchema, retryReserveInputSchema, retryReserveResultSchema, warmInputSchema, warmResultSchema } from "./endpoint.ts";
@@ -138,6 +139,7 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "ticket.use": ticketUseInputSchema,
   "acme.challenge": acmeChallengeSchema,
   "entry.role": entryRoleRequestSchema,
+  "endpoint.credential": endpointCredentialRequestSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 export const BRIDGE_RESPONSE_SCHEMAS = {
@@ -175,6 +177,7 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "ticket.use": ticketUseAnswerSchema,
   "acme.challenge": acmeChallengeAnswerSchema,
   "entry.role": entryRoleAnswerSchema,
+  "endpoint.credential": endpointCredentialAnswerSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 /**

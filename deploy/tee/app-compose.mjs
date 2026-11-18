@@ -326,6 +326,14 @@ export const ACME_STATE_DIR = "/certs";
  * optional overrides on the default layout's lane, each inside its row's bounds.
  */
 export const RELEASE_KEY_ENVS = Object.freeze(["LANE_RELEASE_PUBLIC_KEY", "LANE_RELEASE_FRESHNESS_PUBLIC_KEY"]);
+/**
+ * docs/design/lane-provider-routes.md §4, default layout only: egress serves the endpoint routes (`-routes`) with the
+ * deployment's own zone denied to every row (`-route-deny-suffix usefallback.com`, @gray/snapshot's
+ * ENTRY_ROUTE_DENY_SUFFIXES, which the lane's view applies before it pushes a row). Each spelled so, once.
+ */
+export const ROUTES_FLAG = "-routes";
+export const ROUTE_DENY_SUFFIX_FLAG = "-route-deny-suffix";
+export const ROUTE_DENY_SUFFIX = "usefallback.com";
 const RELEASE_KEY = /^[0-9a-f]{64}$/;
 export const PEERS_ENV = "LANE_PEERS";
 export const PEER_FLAG = "-peer";
@@ -1621,6 +1629,7 @@ export function checkCompose(composeText, options = {}) {
   } else {
     checkImages(parsed.services, images, options, problems);
     checkEntryPeers(parsed.services, label, problems);
+    checkEntryRoutes(parsed.services, label, problems);
     checkEntryPeerlink(parsed.services, label, problems);
     replicas = checkEntryReplica(parsed.services, label, problems);
     // The stack settings are what makes the entrypoint render the relay listener (S28); the default
@@ -1921,6 +1930,28 @@ function checkEntryPeers(services, label, problems) {
   }
   if (on === 0 && links.length > 0) {
     problems.push(`${label}: egress.command has ${PEER_LINK_FLAG} without ${PEER_FLAG}: egress refuses it, and only an entry dials channel peers`);
+  }
+}
+
+/**
+ * docs/design/lane-provider-routes.md §4, default layout: egress runs `-routes` and `-route-deny-suffix
+ * usefallback.com`, each spelled so and once. The lane serves an endpoint route only through them (its view admits a
+ * row only under that zone's denial), and the relay-stack layout's egress command is fixed without either
+ * (STACK_FIXED), which egress refuses beside -relay-listen anyway.
+ */
+function checkEntryRoutes(services, label, problems) {
+  const egress = services.get("egress");
+  if (!isMap(egress)) return;
+  const command = egress.get("command");
+  // checkEntryPeers names a command it cannot read.
+  if (!isList(command) || !command.every((arg) => typeof arg === "string")) return;
+  const routes = command.filter((arg) => goFlag("routes").test(arg));
+  if (routes.length !== 1 || routes[0] !== ROUTES_FLAG) {
+    problems.push(`${label}: egress.command must have ${ROUTES_FLAG} once, spelled so (it has ${routes.length === 0 ? "none" : routes.join(", ")}): the lane's endpoint routes leave through egress's /route/ kind (docs/design/lane-provider-routes.md §4)`);
+  }
+  const deny = command.flatMap((arg, index) => (goFlag("route-deny-suffix").test(arg) ? [index] : []));
+  if (deny.length !== 1 || command[deny[0]] !== ROUTE_DENY_SUFFIX_FLAG || command[deny[0] + 1] !== ROUTE_DENY_SUFFIX) {
+    problems.push(`${label}: egress.command must have ${ROUTE_DENY_SUFFIX_FLAG} ${ROUTE_DENY_SUFFIX} once, spelled so: no route row may point back at the deployment's own zone, and the lane's view denies exactly that one`);
   }
 }
 

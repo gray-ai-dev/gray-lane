@@ -83,6 +83,8 @@ type server struct {
 	// peers is the peer mode (peer.go): nil unless -peer is set. roots and dial are the vendor transports'
 	// own, which every peer transport uses too.
 	peers *peerTable
+	// routes is the endpoint routes (endpoint_routes.go): nil unless -routes is set.
+	routes *endpointRouteTable
 	// signIn is the sign-in proxy's and sessions' state (signin_session.go); used only with ops.
 	signIn *signInState
 	roots  *x509.CertPool
@@ -131,6 +133,9 @@ func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logg
 	if cfg.peer {
 		srv.peers = newPeerTable(srv)
 	}
+	if cfg.routes {
+		srv.routes = newEndpointRouteTable(srv)
+	}
 	return srv
 }
 
@@ -151,6 +156,9 @@ func (s *server) closeIdleConnections() {
 	s.mirror.closeIdle()
 	if s.peers != nil {
 		s.peers.closeIdleConnections()
+	}
+	if s.routes != nil {
+		s.routes.closeIdleConnections()
 	}
 }
 
@@ -316,8 +324,9 @@ func planTarget(r *http.Request, checkHost bool) (requestPlan, string) {
 }
 
 // ServeHTTP is the unix socket's handler: the entry's direct vendor traffic, with a relay stack the
-// control API under /v1/stack/ (S14, S15), and with -peer the peer mode under /v1/peer/ and /peer/
-// (peer.go). The relay listener has its own handler (serveRelay), which has neither.
+// control API under /v1/stack/ (S14, S15), with -peer the peer mode under /v1/peer/ and /peer/
+// (peer.go), and with -routes the endpoint routes, /v1/routes and /route/ (endpoint_routes.go). The relay
+// listener has its own handler (serveRelay), which has none of them.
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := rawPathOf(r)
 	switch {
@@ -329,6 +338,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handled(w, r, s.servePeerControl)
 	case s.peers != nil && strings.HasPrefix(path, peerPrefix):
 		s.handled(w, r, s.servePeer)
+	case s.routes != nil && path == routesControlPath:
+		s.handled(w, r, s.serveRoutesControl)
+	case s.routes != nil && strings.HasPrefix(path, endpointRoutePrefix):
+		// Not a routeTable row: the host is the pushed table's, and the request's Host is not checked.
+		s.handled(w, r, s.serveEndpointRoute)
 	default:
 		s.handled(w, r, s.serveDirect)
 	}

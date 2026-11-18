@@ -162,7 +162,7 @@ interface Resolution {
 const UNRESOLVED: Resolution = { known: [], opted: [], resolved: false };
 
 /** The fields of `Preference` serde reads. */
-const FIELDS = ["order", "only", "ignore", "allow_fallbacks", "sort", "max_price", "affinity", "relay_changes"] as const;
+const FIELDS = ["order", "only", "ignore", "allow_fallbacks", "sort", "max_price", "affinity", "relay_changes", "verifiable"] as const;
 
 /** A preference as one level stated it, before `validated`. */
 interface Stated {
@@ -174,6 +174,7 @@ interface Stated {
   readonly maxPrice: MaxPrice | null;
   readonly affinity: AffinityMode;
   readonly relayChanges: RelayChangesMode;
+  readonly verifiable: boolean;
 }
 
 /** serde refused the value: the reader's only error, since every refusal answers alike. */
@@ -266,6 +267,7 @@ function statedOf(value: Json): Stated {
   let maxPrice: MaxPrice | null = null;
   let affinity: AffinityMode = "auto";
   let relayChanges: RelayChangesMode = "allow";
+  let verifiable = false;
   const read = (field: (typeof FIELDS)[number], member: Json) => {
     switch (field) {
       case "order":
@@ -293,6 +295,10 @@ function statedOf(value: Json): Stated {
       case "relay_changes":
         relayChanges = unitVariant(member, RELAY_CHANGES_MODES);
         break;
+      case "verifiable":
+        if (typeof member !== "boolean") refuse();
+        verifiable = member;
+        break;
     }
   };
   if (!isObject(value)) refuse();
@@ -300,7 +306,7 @@ function statedOf(value: Json): Stated {
     const field = FIELDS.find((f) => f === key) ?? refuse();
     read(field, get(value, key)!);
   }
-  return { order, only, ignore, allowFallbacks, sort, maxPrice, affinity, relayChanges };
+  return { order, only, ignore, allowFallbacks, sort, maxPrice, affinity, relayChanges, verifiable };
 }
 
 /**
@@ -360,6 +366,12 @@ export class Preference {
    */
   readonly relayChanges: RelayChangesMode;
   /**
+   * `true` keeps only verifiable routes: those whose record's `auth` is `lane_relay`, served at Gray's confidential VM
+   * address, which reach an official vendor from inside the VM (workers/gateway `retainAdmitted`). `false` (the
+   * default) changes nothing. True at any level holds.
+   */
+  readonly verifiable: boolean;
+  /**
    * Every allow list the levels stated, kept apart rather than merged (`narrowed_by`). A reference is an
    * opaque digest, so no string comparison can tell that an endpoint belongs to a supplier; a candidate knows
    * both of its names, so each list is applied to the candidate instead: it must be named by every one.
@@ -393,6 +405,7 @@ export class Preference {
     this.maxPrice = stated.maxPrice;
     this.affinity = stated.affinity;
     this.relayChanges = stated.relayChanges;
+    this.verifiable = stated.verifiable;
     this.narrowedBy = narrowedBy;
     this.requested = requested;
     this.ownOnly = ownOnly;
@@ -400,7 +413,7 @@ export class Preference {
   }
 
   /** No preference (`Preference::default`). */
-  static readonly DEFAULT = new Preference({ order: [], only: [], ignore: [], allowFallbacks: true, sort: null, maxPrice: null, affinity: "auto", relayChanges: "allow" }, [], null);
+  static readonly DEFAULT = new Preference({ order: [], only: [], ignore: [], allowFallbacks: true, sort: null, maxPrice: null, affinity: "auto", relayChanges: "allow", verifiable: false }, [], null);
 
   /** The preference serde reads from `value`, validated; null where the server refuses it. */
   private static read(value: Json): Preference | null {
@@ -488,7 +501,7 @@ export class Preference {
     const only = list(this.only, true);
     const ignore = list(this.ignore, false);
     const narrowedBy = modelTag === null ? this.narrowedBy : [...this.narrowedBy, list([modelTag], true)];
-    const stated: Stated = { order, only, ignore, allowFallbacks: this.allowFallbacks, sort: this.sort, maxPrice: this.maxPrice, affinity: this.affinity, relayChanges: this.relayChanges };
+    const stated: Stated = { order, only, ignore, allowFallbacks: this.allowFallbacks, sort: this.sort, maxPrice: this.maxPrice, affinity: this.affinity, relayChanges: this.relayChanges, verifiable: this.verifiable };
     return new Preference(stated, narrowedBy, this.requested, this.only.length, { known, opted, resolved: true });
   }
 
@@ -522,7 +535,8 @@ export class Preference {
       this.sort === null &&
       this.maxPrice === null &&
       this.affinity === "auto" &&
-      this.relayChanges === "allow"
+      this.relayChanges === "allow" &&
+      !this.verifiable
     );
   }
 
@@ -571,6 +585,7 @@ export class Preference {
       maxPrice,
       affinity: stated.some((p) => p.affinity === "off") ? "off" : "auto",
       relayChanges: stated.some((p) => p.relayChanges === "exclude") ? "exclude" : "allow",
+      verifiable: stated.some((p) => p.verifiable),
     };
     const ownOnly = this.ownOnlyLen();
     const resolution: Resolution = {

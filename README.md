@@ -1,12 +1,12 @@
-# gray-lane 2026.11.17-2df8f03a462f
+# gray-lane 2026.11.18-6aa24eac5159
 
-The source of Gray's `gray-lane` image built from Gray's commit `2df8f03a462f2b0cf7b7d26e47605af46717200c`, published so that a relay, or the
+The source of Gray's `gray-lane` image built from Gray's commit `6aa24eac5159ff27ec0152d5b6cfcb73eca28fbb`, published so that a relay, or the
 coding agent a relay uses, can review each release before it accepts it. The image runs in every lane CVM: in the
-entry's default layout and in each relay's stack VM. This tree holds exactly the 679 files its build reads, at
+entry's default layout and in each relay's stack VM. This tree holds exactly the 686 files its build reads, at
 the paths they have in Gray's repository, so the build scripts run unchanged. It also holds the measured compose
 templates and pre-launch scripts that decide what the CVM starts. Tests, documentation and Gray's other services
 are not included. Each release is one commit in this repository. Its parent is the release published before it, so
-`git diff <previous tag> 2026.11.17-2df8f03a462f` shows the code that changed between the two.
+`git diff <previous tag> 2026.11.18-6aa24eac5159` shows the code that changed between the two.
 
 | What runs in the CVM | Where its source is |
 |-|-|
@@ -41,7 +41,7 @@ The question to answer for each release is whether any code path can keep a rela
 the boot that uses them, or send them, or anything derived from them, anywhere except the vendor they belong to.
 Suggested instructions for a coding agent:
 
-> Review this tree (and `git diff <the tag you accepted last> 2026.11.17-2df8f03a462f`) for any way it could retain or transmit a
+> Review this tree (and `git diff <the tag you accepted last> 2026.11.18-6aa24eac5159`) for any way it could retain or transmit a
 > relay's account keys. Trace: (1) where credentials enter: the sealed account records the lane opens with its
 > per-boot keyset (`workers/gateway/src/lane/state.ts`, `workers/gateway/src/lane/stack-service.ts`,
 > `workers/packages/relay-connector/`, `workers/packages/attest/`) and hands to gray-egress over its unix socket

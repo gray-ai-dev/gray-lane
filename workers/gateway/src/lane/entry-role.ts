@@ -470,3 +470,45 @@ export function laneReplicaIndex(env: Readonly<Record<string, unknown>>, replica
   if (replicaDomain === null) return { index: null, problem: "LANE_REPLICA is set without TLS_REPLICA_DOMAIN: a replica's index comes with its name" };
   return { index: Number(value), problem: null };
 }
+
+/** What an entry knows of itself for `GET /readyz` (docs/design/entry-replicas.md §13, readiness): local facts only. */
+export interface EntryReadinessFacts {
+  /** How long ago this boot's state was made. */
+  readonly ageMs: number;
+  /** LANE_ENTRY_READY_BOUND_MS: past it, an entry not told to stop is ready whatever its routes and sessions. */
+  readonly boundMs: number;
+  /** A `stopping` written during this boot was read, or the stop was sent (`LaneEntryRole.stopping`). */
+  readonly stopping: boolean;
+  /** Whether the warmer was given a route list yet (the boot's first snapshot read). */
+  readonly listed: boolean;
+  readonly routes: number;
+  readonly routesWarm: number;
+  /** The stack relays the entry's routes name, and how many of them hold a pinned session. */
+  readonly stackRelays: number;
+  readonly stackRelaysPinned: number;
+}
+
+export interface EntryReadiness {
+  readonly ready: boolean;
+  /** Why not ready, or what the bound let through: `stopping`, `routes_unknown`, `routes_cold`, `sessions_missing`. */
+  readonly reasons: readonly string[];
+  /** Ready only because the bound passed (the reasons say what was still missing). */
+  readonly failOpen: boolean;
+}
+
+/**
+ * Whether an entry may take new connections from the load balancer (docs/design/entry-replicas.md §13). Ready: not told
+ * to stop, routes listed and every one warmed, and every stack relay its routes name holding a pinned session; or, unless
+ * told to stop, a boot older than the bound, so a VM that is down or a console that cannot be read never keeps every
+ * replica out at once. `draining` is ready: the release tool disables the endpoint itself for a drain.
+ */
+export function entryReadiness(facts: EntryReadinessFacts): EntryReadiness {
+  if (facts.stopping) return { ready: false, reasons: ["stopping"], failOpen: false };
+  const reasons: string[] = [];
+  if (!facts.listed) reasons.push("routes_unknown");
+  else if (facts.routesWarm < facts.routes) reasons.push("routes_cold");
+  if (facts.stackRelaysPinned < facts.stackRelays) reasons.push("sessions_missing");
+  if (reasons.length === 0) return { ready: true, reasons, failOpen: false };
+  if (facts.ageMs >= facts.boundMs) return { ready: true, reasons, failOpen: true };
+  return { ready: false, reasons, failOpen: false };
+}

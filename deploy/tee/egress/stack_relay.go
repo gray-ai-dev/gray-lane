@@ -46,9 +46,10 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	// A write deadline an earlier call on this keep-alive connection set must not cut this one's answer.
 	controller := http.NewResponseController(rec)
 	_ = controller.SetWriteDeadline(time.Time{})
-	// Design §4.4: the peer mode is the entry's alone. Its paths are refused here by name, before every other
-	// rule, so no change to the vendor routes can open them to the relay (the isolation check asks for it).
-	if isPeerPath(rawPathOf(r)) {
+	// Design §4.4: the peer mode is the entry's alone, and so are the endpoint routes (lane-provider-routes.md §4.3).
+	// Their paths are refused here by name, before every other rule and whether or not -routes is set, so no change to
+	// the vendor routes can open them to the relay (the isolation check asks for both).
+	if path := rawPathOf(r); isPeerPath(path) || isRoutePath(path) {
 		entry.Error = errRouteRefused
 		writeRefusal(rec, errRouteRefused)
 		return

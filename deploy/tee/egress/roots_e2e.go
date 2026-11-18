@@ -18,7 +18,7 @@ import (
 // flag nor this file (`roots_production.go`), and a production test proves the option is absent.
 func addExtraRootCAFlag(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.extraRootCAPath, "extra-root-ca", "", "E2E ONLY: a PEM file with one additional root CA (never set in production)")
-	fs.StringVar(&cfg.directDialAddress, "e2e-direct", "", "E2E ONLY: dial this host:port for every official origin instead of resolving it (never set in production)")
+	fs.StringVar(&cfg.directDialAddress, "e2e-direct", "", "E2E ONLY: dial this host:port for every official origin and every endpoint route row's host instead of resolving it (never set in production)")
 	e2ePeerDial = peerDialTarget{}
 	fs.Var(&e2ePeerDial, "e2e-peer-dial", "E2E ONLY: <peer host>=<ip>:<port>, dial that address for the peer host's port 443 instead of resolving it (never set in production)")
 	fs.BoolVar(&cfg.allowInternalDials, "e2e-allow-internal-dials", false, "E2E ONLY: dial loopback, private and other internal addresses for accounts, as the local harnesses' proxies and fake vendors need (never set in production)")
@@ -75,6 +75,18 @@ func directDial(cfg config) dialFunc {
 			return dialer.DialContext(ctx, network, peerAddress)
 		}
 		return dialer.DialContext(ctx, network, addr)
+	}
+}
+
+// routeRowDial is an endpoint route row's dial (endpoint_routes.go). With -e2e-direct every row's host goes to that
+// address too, as an official host's does, through the same dial and its rule: a row's host is the pushed table's, not
+// a constant directDial could list. The URL, Host header and TLS ServerName stay the row's host.
+func routeRowDial(cfg config, dial dialFunc) dialFunc {
+	if cfg.directDialAddress == "" {
+		return dial
+	}
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return dial(ctx, network, cfg.directDialAddress)
 	}
 }
 

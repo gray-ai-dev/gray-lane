@@ -53,6 +53,12 @@ export interface CatalogRoute {
   readonly capabilities: readonly string[];
   /** The route's approved quote, or none; past `eligible_until` the route has none (`Route::quote`). */
   readonly offer: { readonly eligible_until: number; readonly terms: CatalogTerms } | null;
+  /**
+   * A confidential-lane route (decided 2026-11-17: the Models page lists one list, each route saying whether it is
+   * confidential): served only at the lane's entry origin, never by the main API. It has no console verification, so it
+   * proves no capability and carries no ModelTrace check or weight. Absent: a main-lane route (the server's only kind).
+   */
+  readonly confidential?: boolean;
 }
 
 /** ModelTrace's check of a route as buyers see it (mixing.rs `ModelCheck`). */
@@ -233,16 +239,22 @@ export async function publicCatalog(input: CatalogInput, refs: PublicRefs = PUBL
           cache_write_microusd_per_million: effective.cacheWrite,
           cache_write_1h_microusd_per_million: effective.cacheWrite1h,
         },
-        verification: {
-          status: "passed",
-          compatibility: "passed",
-          behavior: "advisory",
-          behavioral_score: route.behavioral_score,
-          expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n,
-          // What ModelTrace found, on a chat API it probes.
-          ...(route.model_check == null ? {} : { model_check: modelCheckJson(route.model_check) }),
-        },
+        verification:
+          route.confidential === true
+            ? // A confidential route serves on the lane's attestation: Gray's checks never ran on it, so none passed.
+              { status: "not_checked", compatibility: "not_checked", behavior: "not_checked", behavioral_score: null, expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n }
+            : {
+                status: "passed",
+                compatibility: "passed",
+                behavior: "advisory",
+                behavioral_score: route.behavioral_score,
+                expires_at_ms: BigInt(Math.min(route.expires, offer.eligible_until)) * 1000n,
+                // What ModelTrace found, on a chat API it probes.
+                ...(route.model_check == null ? {} : { model_check: modelCheckJson(route.model_check) }),
+              },
       };
+      // Only a confidential route says so: a main-lane provider's document is the server's.
+      if (route.confidential === true) provider.confidential = true;
       const media = mediaJson(rate);
       if (Object.keys(media).length > 0) provider.media = media;
       // Image, audio and default unit prices; per-selector unit prices each at the customer rate.

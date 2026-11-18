@@ -2,13 +2,15 @@ import { ApiError } from "@gray/errors";
 import { compareUtf8 } from "@gray/json";
 import { type CanonicalRequest, type Protocol, endpointPath, isGeneration, reasoningRequested, structured } from "@gray/protocol";
 import { type TranslationPolicy, protocolTitle } from "@gray/translation";
+import { laneModel } from "./preference.ts";
 import { chatFor, type GatewaySnapshot, type ModeCapabilities, type RouteRecord, routeServes } from "./snapshot.ts";
 
 /**
  * What a request for a model without a usable native route is told (crates/gray-gateway/src/
  * model_resolution.rs `unrouted`): a capability no live route of the model proved; a model served
- * through another API, and which; a model that has providers but none verified now; or a model
- * Gray does not have. Not ported: the "did you mean" suggestions, which need the live catalog.
+ * through another API, and which; a model that has providers but none verified now; a model only Gray's
+ * confidential VM serves, on this API there (`model_at_lane`); or a model Gray does not have. Not ported:
+ * the "did you mean" suggestions, which need the live catalog.
  */
 
 const NO_PROVIDER_RETRY_SECONDS = 60n;
@@ -143,5 +145,8 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
       .withHelp(null);
   }
   if (routes.length > 0 || (mapped?.some((m) => m.model === model) ?? false)) return noProvider(model);
+  // A model only Gray's confidential VM serves, on this API there (`laneModel`): not one it serves only on another API,
+  // which it does not translate. The lane's own snapshot carries no lane pairs, so in lane mode this is never so.
+  if (laneModel(snapshot, model, protocol, true, nowMs)) return new ApiError(404, "model_at_lane");
   return new ApiError(404, "model_not_found").withMessage(`The model \`${model}\` does not exist on Gray.`).withMeta("suggestions", []);
 }

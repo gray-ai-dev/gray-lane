@@ -197,6 +197,13 @@ type config struct {
 	// peerLink is peerlink's unix socket (docs/design/relay-outbound-only.md §3.2): a pin row naming a relay (a
 	// channel peer) is dialed through its CONNECT. Empty: only today's pins by origin; it needs -peer.
 	peerLink string
+	// routes turns on the endpoint routes on the unix socket (endpoint_routes.go, docs/design/lane-provider-routes.md
+	// §4): /route/<id>/<path> to the host of the table's row for <id>, and PUT /v1/routes. Off, their paths are refused
+	// as unknown routes. An entry's alone, as -peer: validate refuses it beside -relay-listen.
+	routes bool
+	// routeDenySuffixes are the deployment's own zones (-route-deny-suffix): no row's host may be one of them or under
+	// one, so no row points back at Gray. They need -routes.
+	routeDenySuffixes []string
 	// signInKeyDir and signInBundle (signin_ca.go, docs/design/relay-sign-in-in-vm.md D1): the egress-only memory volume
 	// the sign-in CA's key and certificate live on, and the file on the relay's read-only memory volume egress writes
 	// the trust bundle to (the system roots and the sign-in CA). Both or neither, both absolute, with -relay-listen.
@@ -280,6 +287,8 @@ func parseConfig(args []string, out io.Writer) (config, error) {
 	fs.StringVar(&cfg.peerLink, "peer-link", cfg.peerLink, "peerlink's unix socket: channel peers (pins by relay) are dialed through its CONNECT (needs -peer; empty: pins by origin only)")
 	fs.DurationVar(&cfg.loginPersistWait, "login-persist-wait", cfg.loginPersistWait, "how long a sign-in's token answer waits for the lane to persist its token family before 503 login_persist_pending")
 	fs.IntVar(&cfg.loginCallsPerMinute, "login-calls-per-minute", cfg.loginCallsPerMinute, "one account's sign-in calls in a minute before 429 login_rate_limited")
+	fs.BoolVar(&cfg.routes, "routes", cfg.routes, "serve the endpoint routes on the unix socket: /route/<id>/<path> to the host the pushed table names (an entry only; not with -relay-listen)")
+	fs.Var((*suffixList)(&cfg.routeDenySuffixes), "route-deny-suffix", "a zone no route table row's host may be or be under; repeatable or comma-separated (needs -routes)")
 	addExtraRootCAFlag(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -384,6 +393,18 @@ func (c config) validate() error {
 			return errors.New("peer-link must be an absolute, clean path")
 		case len(c.peerLink) > maxUnixSocketPath:
 			return fmt.Errorf("peer-link must be at most %d bytes (a unix socket path)", maxUnixSocketPath)
+		}
+	}
+	// The endpoint routes are an entry's, as the peer mode: a relay stack's egress never serves them.
+	if c.routes && c.relayListen != "" {
+		return errors.New("routes and relay-listen exclude each other: the endpoint routes are an entry's")
+	}
+	if len(c.routeDenySuffixes) != 0 && !c.routes {
+		return errors.New("route-deny-suffix needs -routes")
+	}
+	for _, suffix := range c.routeDenySuffixes {
+		if !validDNSName(suffix) {
+			return errors.New("route-deny-suffix takes lower-case DNS names without a trailing dot")
 		}
 	}
 	// Set only by the e2e-tagged build; empty in production.

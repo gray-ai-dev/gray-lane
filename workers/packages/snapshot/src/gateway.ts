@@ -1,6 +1,7 @@
-import type { LaneEndpoint, UpstreamAuth } from "@gray/control";
+import { LANE_PROTOCOLS, type LaneEndpoint, type UpstreamAuth } from "@gray/control";
 import type { Protocol } from "@gray/protocol";
 import { capabilityWords, type Capabilities } from "./capabilities.ts";
+import { ENTRY_ENDPOINT_PROTOCOLS, entryEndpointRoute } from "./endpoint-route.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
 import type { RouteTag } from "./offers.ts";
 import { snapshotRoutes, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
@@ -313,6 +314,13 @@ export interface GatewayView {
    * whose routes are all opt-in tiers (routing.rs `Preference::layered`).
    */
   readonly published: readonly (readonly [provider: string, supplier: string, tiered?: true])[];
+  /**
+   * The (model, API) pairs a `lane_relay` route serves at Gray's confidential VM, each with when the last of them stops
+   * serving (ms), by `laneServedKey` (`laneServedOf`): in the main mode only, empty in the lane mode. No route of this
+   * view: a `verifiable` request the main gateway leaves nothing is told where verifiable routes are served only when
+   * one serves a model it lists on its API (workers/gateway preference.ts `laneServes`).
+   */
+  readonly laneServed: Readonly<Record<string, number>>;
 }
 
 function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
@@ -384,13 +392,39 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
 }
 
 /**
- * Whether a route of `snapshot` belongs to the lane whose mode is `mode`: a `lane_relay` route in the lane
- * mode, any other in the main mode. A lane mode view holds no direct route and a main mode view holds no
- * lane relay (design v2 section B). The public catalog lists the main mode's routes only (gray-jobs
- * src/catalog.ts `catalogRoutes`), as the server, which publishes no route for a lane relay, lists none.
+ * Whether a route of `snapshot` belongs to the lane whose mode is `mode`. The main mode: every route but a
+ * `lane_relay` one, so Gray's public gateway never sends to a relay (design v2 section B). The lane mode: every
+ * `lane_relay` route, and the endpoint routes the lane's entry serves (docs/design/lane-provider-routes.md section 2,
+ * `entryEndpointRoute`: `bearer` or `protocol_native` on Messages, Chat, Responses or Gemini, no adapter, a base URL egress's
+ * `/route/` kind carries). An endpoint route is in both modes: the `api` address keeps serving it.
+ *
+ * Which routes are confidential is not this: the catalog marks `lane_relay` routes alone (gray-jobs src/catalog.ts
+ * `catalogRoutes`), since the provider of an endpoint route reads every request it is sent.
  */
 export function routeInMode(r: SnapshotRoute, mode: GatewayMode): boolean {
-  return mode === "lane" ? r.config.auth === "lane_relay" : r.config.auth !== "lane_relay";
+  if (r.config.auth === "lane_relay") return mode === "lane";
+  return mode === "main" || entryEndpointRoute({ auth: r.config.auth, protocol: r.mapping.protocol, adapter: r.mapping.adapter, baseUrl: r.config.base_url, url: r.url });
+}
+
+/** A (model, API) pair's key in `GatewayView.laneServed`. */
+export function laneServedKey(model: string, protocol: Protocol): string {
+  return `${model}\u0000${protocol}`;
+}
+
+/**
+ * The (model, API) pairs the `lane_relay` routes of `snapshot` serve at Gray's confidential VM, by `laneServedKey`, each
+ * with when the last of them stops serving (ms): a route the lane routes (priced, on an API the lane serves,
+ * `LANE_PROTOCOLS`) until its `GatewayRouteRecord.expiresAt`. These are the verifiable routes (the `verifiable`
+ * preference); the main view carries the pairs alone, never the routes (inference.rs `Snapshot.lane_served`).
+ */
+export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): Record<string, number> {
+  const served: Record<string, number> = {};
+  for (const r of snapshotRoutes(snapshot)) {
+    if (r.config.auth !== "lane_relay" || r.offer === null || !LANE_PROTOCOLS.includes(r.mapping.protocol)) continue;
+    const key = laneServedKey(r.mapping.requested_model, r.mapping.protocol);
+    served[key] = Math.max(served[key] ?? 0, Math.min(r.expires, r.offer.eligible_until) * 1000);
+  }
+  return served;
 }
 
 /**
@@ -400,13 +434,15 @@ export function routeInMode(r: SnapshotRoute, mode: GatewayMode): boolean {
  * `mapped` list drops the lane endpoints' mappings too: a model that only a lane relay maps is not a model
  * the main lane knows (its request is a 404 there, not a 503).
  *
- * `lane`: only the lane's routes; `translation` unset (the lane serves the client's own protocol);
- * `contentRecipients` empty (the lane captures no content); `mapped` the lane relays' mappings only (the lane
- * answers 503 for a known model with no live relay). Every other field is a normal snapshot's: `keys`
- * authenticate the customer, `workspaces` carry the region preference.
+ * `lane`: the lane's routes (`routeInMode`: the lane relays' and the endpoint routes its entry serves);
+ * `translation` unset (the lane serves the client's own protocol); `contentRecipients` empty (the lane captures no
+ * content); `mapped` the lane relays' mappings and the direct mappings on a protocol the entry speaks (the lane answers
+ * 503 for a known model with no live route). A pair carries no base URL or adapter, so a direct pair is kept by its
+ * protocol alone: a model only an endpoint the entry cannot carry maps answers 503 there rather than 404. Every other
+ * field is a normal snapshot's: `keys` authenticate the customer, `workspaces` carry the region preference.
  *
- * The lane mode's invariants are asserted by {@link assertLaneView}: a lane view carrying a direct route, a
- * translation policy or content recipients is a boot error, not a runtime surprise.
+ * The lane mode's invariants are asserted by {@link assertLaneView}: a lane view carrying a route its entry does not
+ * serve, a translation policy or content recipients is a boot error, not a runtime surprise.
  */
 export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): GatewayView {
   const keys: Record<string, GatewayKeyRecord> = {};
@@ -445,14 +481,15 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
   // nothing, whatever the operator's policy says (design v2 section B).
   const translation = mode === "lane" ? null : (snapshot.translation ?? null);
   const replayKey = snapshot.replayKey ?? null;
-  // A snapshot stored before the pairs travelled with it has none. A lane mode view keeps only the pairs a
-  // lane endpoint maps; the main mode keeps only those no lane endpoint maps. A pair both kinds map appears
-  // twice in the snapshot (once per kind), so the view keeps one entry per pair.
+  // A snapshot stored before the pairs travelled with it has none. A lane mode view keeps the pairs a lane
+  // endpoint maps and the direct ones on a protocol the entry speaks; the main mode keeps only those no lane
+  // endpoint maps. A pair both kinds map appears twice in the snapshot (once per kind), so the view keeps one
+  // entry per pair.
   const mapped: { readonly model: string; readonly protocol: Protocol }[] = [];
   const seenPairs = new Set<string>();
   for (const m of snapshot.mapped ?? []) {
     const isLane = m.lane === true;
-    if (mode === "lane" ? !isLane : isLane) continue;
+    if (mode === "lane" ? !isLane && !ENTRY_ENDPOINT_PROTOCOLS.includes(m.protocol) : isLane) continue;
     const key = `${m.model}\u0000${m.protocol}`;
     if (seenPairs.has(key)) continue;
     seenPairs.add(key);
@@ -489,6 +526,7 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     registered: snapshot.registered ?? [],
     published,
     ...(snapshot.handles === undefined ? {} : { handles: snapshot.handles }),
+    laneServed: mode === "main" ? laneServedOf(snapshot) : {},
   };
 }
 
@@ -534,9 +572,10 @@ export class LaneViewError extends Error {
 
 /**
  * `assert_lane_view`: the lane snapshot's invariants (design v2 section B): every route is a `lane_relay`
- * route, none is translated, no content recipient travels, and every lane route carries its relay record.
- * A violation is a boot error: the lane must fail closed rather than serve a route Gray's public gateway
- * could have served, or one whose relay it does not know.
+ * route or an endpoint route the entry serves (`entryEndpointRoute`, docs/design/lane-provider-routes.md section
+ * 2), none is translated, no content recipient travels, and every lane relay's route carries its relay record.
+ * A violation is a boot error: the lane must fail closed rather than serve a route its egress cannot carry, or
+ * one whose relay it does not know.
  *
  * This is a hand-built view's assertion; the CVM maps the raw snapshot with `mapSnapshot`, whose
  * `assertLaneSnapshot` does not read the lane record. A `lane_relay` route without one stays in that
@@ -547,7 +586,10 @@ export function assertLaneView(view: GatewayView): void {
   if (view.translation !== undefined) throw new LaneViewError("a lane snapshot carries no translation policy");
   if (Object.keys(view.contentRecipients).length > 0) throw new LaneViewError("a lane snapshot carries no content recipients");
   for (const r of view.routes) {
-    if (r.auth !== "lane_relay") throw new LaneViewError(`a lane snapshot carries no ${r.auth} route (endpoint ${r.endpointId})`);
+    if (r.auth !== "lane_relay") {
+      if (!entryEndpointRoute(r)) throw new LaneViewError(`a lane snapshot carries no ${r.auth} route its entry does not serve (endpoint ${r.endpointId})`);
+      continue;
+    }
     if (r.lane === null) throw new LaneViewError(`a lane route without its relay record (endpoint ${r.endpointId})`);
   }
 }

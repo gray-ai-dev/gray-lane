@@ -109,6 +109,9 @@ export const RPC_SURFACES = {
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
   laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut", "vaultShareNonce", "vaultShare", "stackInstance", "entryRole"] },
   laneStackSignals: { callee: "console", target: "LaneStackSignals", kind: "entrypoint", callers: ["lane-watch"], calls: ["releaseList"] },
+  // `endpoint.credential` (docs/design/lane-provider-routes.md section 3.2): a provider endpoint's key sealed to a lane
+  // entry's one-time key, an entrypoint of its own so the binding that reads relay stacks' configuration reaches no key.
+  laneEndpointCredentials: { callee: "console", target: "LaneEndpointCredentials", kind: "entrypoint", callers: ["lane-bridge"], calls: ["endpointCredential"] },
   identity: { callee: "identity", target: "IdentityService", kind: "entrypoint", callers: ["console"], calls: ["challenge", "verify"] },
   content: { callee: "content", target: "ContentService", kind: "entrypoint", callers: ["console"], calls: ["open", "ensureWorkspace"] },
 } as const satisfies Readonly<Record<string, RpcSurface>>;
@@ -146,6 +149,9 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // An entry replica's role (docs/design/entry-replicas.md ER9 as revised): a gray-console of a release before `entryRole`
   // throws, the bridge answers unavailable, and the replica keeps the role it last read (serving before any).
   "laneStackConfig.entryRole": "lane-bridge/test/entry-role.test.ts > a console of a release before entryRole answers that it has no such method: unavailable, and the replica keeps its role",
+  // A lane entry's provider endpoint key (docs/design/lane-provider-routes.md section 3.2): a gray-console of a release
+  // before `LaneEndpointCredentials` throws, the bridge answers unavailable, and the entry passes the route over.
+  "laneEndpointCredentials.endpointCredential": "lane-bridge/test/endpoint-credential.test.ts > a console of a release before endpointCredential answers that it has no such method: unavailable, and the entry passes the route over",
 };
 
 /** Each call taken off a list since the previous release's lists, as `<surface>.<call>`: why no release that runs calls it. */

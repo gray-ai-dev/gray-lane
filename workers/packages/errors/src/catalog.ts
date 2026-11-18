@@ -80,6 +80,8 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   [["routing_unknown_provider"], "The routing preference names a provider that does not exist. Check the provider ids.", "models"],
   [["routing_filter_excluded_all"], "The routing preference (`only` or `ignore`) excludes every provider that can serve this request.", "models"],
   [["routing_max_price_excluded_all"], "No provider of this model is priced within `max_price`. Raise the limit or choose another model.", "models"],
+  [["verifiable_routes_at_lane"], "The routing preference `verifiable: true` asks for verifiable routes, which are served only at Gray's confidential VM address, not at this one. Send the request to that address; the console shows it.", "docs"],
+  [["verifiable_routes_unavailable"], "No verifiable route serves this model on this API. Verifiable routes serve the Messages, Chat Completions and Responses APIs, at Gray's confidential VM address.", "docs"],
   // Workers only: a request is a ModelTrace probe of one route, a model check, only when the ticket the console signed for
   // it passes every check (docs/model-authenticity-workflow.md, "Probes are not billed", decided 2026-11-04); one that
   // does not pin that route this way is refused before its ticket is used. The server has no model checks.
@@ -121,6 +123,7 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   [["video_store_unavailable", "video_source_unavailable"], "Gray could not read the video job right now. Retry in a moment.", null],
   [["video_job_unrecorded"], "The provider accepted the video job but Gray could not record it. It is under review and you are not charged for it until it is settled.", null],
   [["model_not_found"], "This model does not exist on Gray. Use an exact model id.", "models"],
+  [["model_at_lane"], "This model is served at Gray's confidential VM address, not at this one. Send the request to that address; the console shows it.", "docs"],
   [["wrong_api_for_model"], "This model is not served through this API.", "models"],
   [["no_available_provider"], "No verified provider can serve this model right now. Retry later, or choose another model.", "models"],
   [["unsupported_capability"], "No verified provider of this model supports a feature this request uses.", "models"],

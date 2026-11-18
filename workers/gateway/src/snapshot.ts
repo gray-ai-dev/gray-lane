@@ -296,6 +296,12 @@ export interface GatewaySnapshot {
    */
   readonly published?: readonly (readonly [provider: string, supplier: string, tiered?: boolean])[];
   /**
+   * The (model, API) pairs a `lane_relay` route serves at Gray's confidential VM, with when the last of them stops
+   * serving (ms), by @gray/snapshot `laneServedKey` (`GatewayView.laneServed`; inference.rs `Snapshot.lane_served`): the
+   * main gateway's only, no route of it. Absent (a test's own snapshot, the lane's): none.
+   */
+  readonly laneServed?: Readonly<Record<string, number>>;
+  /**
    * Every registered public handle with its supplier's workspace id, with a live route or not (inference.rs
    * `Snapshot.handles`): what a tag pattern's handle is looked up in (preference.ts `layeredOver`). Absent: none.
    */
@@ -498,6 +504,7 @@ export function gatewaySnapshotOf(snapshot: Snapshot, mode: GatewayMode = "main"
     registered: new Set(view.registered),
     published: view.published,
     ...(view.handles === undefined ? {} : { handles: view.handles }),
+    ...(Object.keys(view.laneServed).length === 0 ? {} : { laneServed: view.laneServed }),
     // The model-check tickets' keys, the main gateway's and the lane entry's alike (both map through here).
     ...(snapshot.modelCheckKeys === undefined || snapshot.modelCheckKeys.length === 0 ? {} : { modelCheckKeys: modelCheckKeysOf(snapshot.modelCheckKeys) }),
   };

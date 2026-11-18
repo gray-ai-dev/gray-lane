@@ -57,6 +57,10 @@ import { BridgeWireError } from "./error.ts";
  * `entry.role` (entry-role.ts; docs/design/entry-replicas.md ER9 as revised) reads an entry replica's role, `serving` or
  * `draining`, from the console: the release tool drains a replica before it updates that replica's VM. Only an entry's
  * key may call it, and its target is the replica (`entry/<index>`).
+ *
+ * `endpoint.credential` (endpoint-credential.ts; docs/design/lane-provider-routes.md section 3.2) gives an entry one
+ * provider endpoint's API key, sealed by the console to an X25519 key the entry made for that request. Only an entry's
+ * key may call it, and its target is the endpoint (`endpoint-credential/<endpoint id>`).
  */
 export const BRIDGE_OPS = [
   "account.admit",
@@ -93,6 +97,7 @@ export const BRIDGE_OPS = [
   "ticket.use",
   "acme.challenge",
   "entry.role",
+  "endpoint.credential",
 ] as const;
 
 export type BridgeOp = (typeof BRIDGE_OPS)[number];
@@ -133,6 +138,7 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "ticket.use": "POST",
   "acme.challenge": "POST",
   "entry.role": "POST",
+  "endpoint.credential": "POST",
 });
 
 /** The base request target of each op; the snapshot read appends its two parameters (snapshot.ts). */
@@ -171,6 +177,7 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "ticket.use": "/v1/lane-bridge/ticket/use",
   "acme.challenge": "/v1/lane-bridge/acme/challenge",
   "entry.role": "/v1/lane-bridge/entry/role",
+  "endpoint.credential": "/v1/lane-bridge/endpoint/credential",
 });
 
 /**

@@ -465,3 +465,14 @@ export function promptOverhead(c: EndpointConfig): number {
 export function outputOverhead(c: EndpointConfig): number {
   return c.output_overhead_tokens ?? 0;
 }
+
+/**
+ * The snapshot's routable rule (`gateway_registry`): an endpoint the gateway may route to is enabled, not paused,
+ * quarantined or revoked (`control_endpoint_lifecycle`), in a workspace that is active and an active provider. A SQL
+ * condition on `control_endpoints` under the alias `e`. Used by gray-jobs' snapshot reader (which endpoints the snapshot
+ * carries) and by gray-console's `endpoint.credential` (an entry gets a key only for an endpoint it may route to), so the
+ * two cannot drift apart.
+ */
+export const ROUTABLE_ENDPOINT_SQL =
+  "e.enabled=1 AND NOT EXISTS (SELECT 1 FROM control_endpoint_lifecycle l WHERE l.endpoint_id=e.id AND (l.paused=1 OR l.quarantined=1 OR l.active_revoked=1)) " +
+  "AND EXISTS (SELECT 1 FROM control_workspace_states s WHERE s.workspace_id=e.workspace_id AND s.status='active' AND s.provider_status='active')";

@@ -10,6 +10,7 @@
     "./vault": "./src/vault.ts",
     "./boot-box": "./src/boot-box.ts",
     "./vault-share": "./src/vault-share.ts",
+    "./endpoint-credential": "./src/endpoint-credential.ts",
     "./vault-state": "./src/vault-state.ts"
   },
   "scripts": {

@@ -19,7 +19,9 @@
 //     docs/design/relay-outbound-only.md §3.8) answers at all, not even with a RST: the relay's position has no
 //     path to `front`, so it reaches neither peerlink nor the lane's client listener that only peerlink may use;
 //   - every allowed endpoint refuses the entry's peer routes with a 4xx (a pin push, a pinned request, an
-//     attestation: docs/confidential-lane-stack-routing.md §4.4), so the relay cannot reach egress's peer mode.
+//     attestation: docs/confidential-lane-stack-routing.md §4.4), so the relay cannot reach egress's peer mode, and
+//     its endpoint routes (a route table push, a request for a route id: docs/design/lane-provider-routes.md §4.4), so
+//     the relay cannot send a request to an address a provider registered.
 //
 // Whether a host port is published (§3.8, O1) is not visible from here: an internal network drops traffic to
 // any address off its subnet, a published port's DNAT included, so the relay's position sees the same silence

@@ -114,6 +114,7 @@ export {
 } from "./peer.ts";
 export {
   protocolForEndpoint,
+  type ReceiptProtocol,
   verifyResponseReceipt,
   verifyResponseReceiptText,
   type AppendedTextRecord,

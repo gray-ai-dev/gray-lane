@@ -22,7 +22,9 @@ import { remoteShardLocator } from "./remote/account.ts";
 import { remoteSinks } from "./remote/sinks.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { remoteModelCheckTickets } from "./remote/tickets.ts";
+import { LaneFetchRefusal } from "./fetch-refusal.ts";
 import { gatedUpstreamAuth } from "./kms-lease.ts";
+import { endpointRowsOfSnapshot, type EntryEndpointRoutes } from "./endpoint-routes.ts";
 import type { LaneDeps, LaneGatewayDeps, LanePeers, StackTransport } from "./types.ts";
 import type { LaneProcessState } from "./state.ts";
 
@@ -40,8 +42,8 @@ import type { LaneProcessState } from "./state.ts";
  * | `toolCallIds` | `toolCallIdShards` | `undefined` (off; the lane refuses `gtc1_` handles, M25) |
  * | `env.CONTENT` | R2 | a stub whose every method throws `lane_content_disabled` (content capture is off) |
  * | `keyless` | RateLimit bindings | `null` (a lane request always has a key) |
- * | `master` | `MASTER_KEY` | `async () => null`: the lane opens no Gray-sealed credential |
- * | `fetch` | global `fetch` | `laneFetch`: maps every official origin to the one `EGRESS` sidecar route and refuses anything `checkOfficialUpstream` refuses; names the type of the Codex backend's untyped stream (D126) |
+ * | `master` | `MASTER_KEY` | `async () => null`: the lane opens no Gray-sealed credential; an entry's endpoint route takes its provider's key from `lane.endpointCredentials` (`endpoint.credential`, sealed to the entry) |
+ * | `fetch` | global `fetch` | `laneFetch`: maps every official origin to the one `EGRESS` sidecar route and refuses anything `checkOfficialUpstream` refuses; names the type of the Codex backend's untyped stream (D126). An entry's endpoint route's attempt uses its own fetch instead, `lane.endpointFetch` (egress's `/route/` kind, `endpoint-routes.ts`) |
  * | `region` | `request.cf` | the CVM's region from configuration (workerd has no `request.cf`) |
  *
  * Everything else is the same code as the main lane: `cfg`, `gate`, `shardCounts`, `endpointCounts`,
@@ -70,17 +72,7 @@ export const EGRESS_ROUTES: Readonly<Record<OfficialVendor, string>> = Object.fr
   ...Object.fromEntries(OPENAI_COMPATIBLE_VENDORS.map((v) => [v.id, `/${v.id}`])),
 } as Record<OfficialVendor, string>);
 
-/** A URL the lane may not send to (the origin check refused it): a programming error, never a retry. */
-export class LaneFetchRefusal extends Error {
-  override readonly name = "LaneFetchRefusal";
-  readonly code: string;
-
-  constructor(code: string) {
-    // The code, not the URL: a refused URL may be a probe with a hostile host, and a lane log is content free.
-    super(`the lane refuses this upstream URL (${code})`);
-    this.code = code;
-  }
-}
+export { LaneFetchRefusal } from "./fetch-refusal.ts";
 
 /**
  * Map one official URL to the sidecar's route, preserving the path and query byte for byte (E1 §4):
@@ -164,6 +156,11 @@ export interface LaneRequestState {
   readonly bridge: BridgeClientOptions;
   /** An entry's peer client when LANE_PEERS is on (`peer-client.ts`); absent otherwise. */
   readonly peers?: LanePeers;
+  /**
+   * An entry's endpoint routes (`endpoint-routes.ts`, docs/design/lane-provider-routes.md section 5): the default
+   * layout's; absent on a relay stack VM, whose egress has no `/route/` kind, and then an endpoint route is passed over.
+   */
+  readonly endpointRoutes?: EntryEndpointRoutes;
 }
 
 /** The process's per-isolate tables and load, bounded as the main lane bounds them. */
@@ -228,6 +225,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     now: state.state.now,
     onSnapshot: (snapshot) => {
       state.state.registry.refresh(snapshot);
+      // The endpoint routes of the version the request reads: its attempts find their rows.
+      state.endpointRoutes?.sync(snapshot.version, endpointRowsOfSnapshot(snapshot));
     },
   });
   const sinks = remoteSinks(state.bridge);
@@ -252,7 +251,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     modelCheckTickets: remoteModelCheckTickets(state.bridge),
     clock: Date.now,
     fetch: laneFetch(egressBinding),
-    // The lane opens no Gray-sealed credential: a lane route's auth headers come from the relay's store.
+    // The lane opens no Gray-sealed credential: a lane route's auth headers come from the relay's store, an endpoint
+    // route's key from `lane.endpointCredentials`.
     master: async () => null,
     region,
     service: { env: cfg.deployEnv, ...isolate.identity },
@@ -276,8 +276,18 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     stackConfig: state.state.stackConfig,
     ...stackTransportOf(env.RELAY, egressBinding),
     ...(state.peers === undefined ? {} : { peers: state.peers }),
+    ...endpointRouteDeps(state.endpointRoutes),
   };
   return { ...deps, lane };
+}
+
+/** The request path's view of an entry's endpoint routes: the keys and each attempt's fetch (none without the table). */
+export function endpointRouteDeps(routes: EntryEndpointRoutes | undefined): Pick<LaneDeps, "endpointCredentials" | "endpointFetch"> {
+  if (routes === undefined) return {};
+  return {
+    endpointCredentials: { credential: (endpointId, generation, budgetMs) => routes.credential(endpointId, generation, budgetMs) },
+    endpointFetch: (route) => routes.fetchFor(route),
+  };
 }
 
 /**

@@ -46,3 +46,6 @@ func loadTrustBundle(path string) (*x509.CertPool, int, error) {
 
 // directDial is nil in production: the sidecar resolves each route's official host itself.
 func directDial(_ config) dialFunc { return nil }
+
+// routeRowDial is an endpoint route row's dial (endpoint_routes.go): in production the server's own, with its rule.
+func routeRowDial(_ config, dial dialFunc) dialFunc { return dial }
