@@ -953,7 +953,12 @@ export class ProtocolStreamDecoder {
         break;
       }
       case "message_delta":
-        if (open()) throw this.stateError("message_delta before content block stop");
+        if (open()) {
+          // An answer the output limit cut in a block: the vendor stops it with the limit's stop reason and no
+          // `content_block_stop`. Its open blocks end here, a call with the fragments it has (`cutAtOutputLimit`).
+          if (!cutAtOutputLimit(p, v)) throw this.stateError("message_delta before content block stop");
+          for (const item of this.items.values()) item.closed = true;
+        }
         break;
       case "message_stop":
         if (!this.finishSeen || open()) throw this.stateError("message_stop before stop_reason or content block stop");
@@ -1204,18 +1209,25 @@ export class ProtocolStreamDecoder {
 }
 
 /**
- * `cut_at_output_limit`: a Responses `response.incomplete` the client's `max_output_tokens` ended. A function call
- * whose arguments were still streaming then gets no `response.function_call_arguments.done` and no
- * `response.output_item.done`; the decoder closes it from the fragments it has, as it closes every open call of a Chat
- * stream at its finish, so the answer is a truncated one and not an incomplete stream (docs/error-rates.md "The
- * Responses truncation fix"). An answer `content_filter` cut keeps its call open (default 6).
+ * `cut_at_output_limit`: an answer its output limit ended while a call was still streaming. A Responses
+ * `response.incomplete` the client's `max_output_tokens` ended (no `response.function_call_arguments.done` and no
+ * `response.output_item.done`), or an Anthropic `message_delta` whose stop reason is `max_tokens` or
+ * `model_context_window_exceeded`, which may come with no `content_block_stop` for the block it cut. The decoder closes
+ * the open call from the fragments it has, as it closes every open call of a Chat stream at its finish, so the answer is
+ * a truncated one, passed as the vendor sent it, and not an invalid or incomplete stream (docs/error-rates.md "The
+ * Responses truncation fix", "Anthropic's"). An answer `content_filter` or `refusal` cut keeps its call open (default 6).
  */
 function cutAtOutputLimit(protocol: Protocol, native: Json | undefined): boolean {
-  return (
-    protocol === "open_ai_responses" &&
-    asStr(get(native, "type")) === "response.incomplete" &&
-    asStr(pointer(native, "/response/incomplete_details/reason")) === "max_output_tokens"
-  );
+  switch (protocol) {
+    case "open_ai_responses":
+      return asStr(get(native, "type")) === "response.incomplete" && asStr(pointer(native, "/response/incomplete_details/reason")) === "max_output_tokens";
+    case "anthropic_messages": {
+      const stop = asStr(pointer(native, "/delta/stop_reason"));
+      return asStr(get(native, "type")) === "message_delta" && (stop === "max_tokens" || stop === "model_context_window_exceeded");
+    }
+    default:
+      return false;
+  }
 }
 
 function mergeIdentity(current: string | null, incoming: string | null, protocol: Protocol, field: string): string | null {

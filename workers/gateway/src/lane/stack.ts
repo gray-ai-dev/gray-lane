@@ -34,6 +34,7 @@ import { get, isObject, parseStrict, parseStrictBytes, type Json, type JsonObjec
 import { DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_REWRITES_V1, isPositionForProtocol, stackBodyDigest, stackEventDigest, stackStoreOff, type LaneProtocol } from "@gray/lane";
 import {
   STACK_ATTEMPT_CLASSES,
+  STACK_FAULT_WHYS,
   STACK_VENDOR_CODES,
   STACK_VIOLATION_BODY_FIELD_PATTERN,
   STACK_VIOLATION_HEADER_FIELD_PATTERN,
@@ -119,11 +120,62 @@ export const LANE_RELAY_FAILED = "lane_relay_failed";
 /** The fault word, and the attempt's recorded code, of a container's decline before any vendor call (`relayDeclined`). */
 export const RELAY_DECLINED = "relay_declined";
 
-/** 502 `lane_relay_failed`: the container failed, or answered what its vendor attempts do not show. */
+/** 502 `lane_relay_failed`: the container's answer broke off (its connection, its status, egress's budget), as an upstream's may. */
 export function laneRelayFailed(): ApiError {
   return new ApiError(502, LANE_RELAY_FAILED).withMessage(
-    "The relay's software did not return its provider's answer as the provider sent it, so Gray did not pass it on. Nothing it made up reached you; retry the request.",
+    "The relay's software stopped before it passed on all of its provider's answer, so Gray did not pass on the rest. You are not charged for it; retry the request.",
   );
+}
+
+/**
+ * The lane's error for a relay whose answer failed Gray's check (S24): the container passed on an answer that is not
+ * the one egress recorded from its provider. Not a break a repeat fixes: the same relay changes the same answer the same
+ * way (production, 2026-11-19: a relay's software renamed the tool calls of a subscription account's stream back on
+ * the way out), so `x-should-retry` is false, and the attempt counts against the relay's route as any failed answer.
+ */
+export const UPSTREAM_ANSWER_REFUSED = "upstream_answer_refused";
+
+/** What failed Gray's check, in a few words for the customer, by the fault's word (`StackFault.why`). */
+const REFUSED_WHYS: ReadonlyMap<StackFaultWhy, string> = new Map<StackFaultWhy, string>([
+  ["event_mismatch", "an event that differs from the one its provider sent"],
+  ["event_unrecorded", "an event its provider did not send"],
+  ["event_hold_bound", "an event its provider did not send"],
+  ["event_missing", "it left out events its provider sent"],
+  ["no_event", "events with no provider answer behind them"],
+  ["attempt_after_release", "a second provider attempt after part of the first had been passed on"],
+  ["body_mismatch", "a body that differs from the one its provider sent"],
+  ["body_unrecorded", "a body with no provider answer behind it"],
+  ["relay_stream_invalid", "a stream that is not valid event-stream text"],
+]);
+
+/** 502 `upstream_answer_refused`, naming what failed the check (`why`, a fault word). */
+export function upstreamAnswerRefused(why: string | null): ApiError {
+  const what = (why === null ? undefined : REFUSED_WHYS.get(why as StackFaultWhy)) ?? "an answer that is not its provider's";
+  return new ApiError(502, UPSTREAM_ANSWER_REFUSED)
+    .withMessage(
+      `The relay's software did not pass on its provider's answer as the provider sent it (${what}), so Gray refused it there. You are not charged for it. The same relay would change the answer the same way, so sending the request again may fail the same way.`,
+    )
+    .noRetry();
+}
+
+/**
+ * The lane's own error for an attempt a stack fault ended, by the fault: `upstream_answer_refused` for an answer that
+ * failed Gray's check, `lane_relay_failed` for any other fault of the relay's container or of egress's budget; null for
+ * the vendor's own end and Gray's own bounds, which keep their codes. `fault` is the stack VM's (a peer attempt's `end`
+ * trace) or the entry's own call's; `code` an `end.code` when no trace came with it (a stack VM before S43's traces).
+ */
+export function laneFaultCode(fault: { readonly by: string; readonly why: string } | null, code: string | null = null): typeof UPSTREAM_ANSWER_REFUSED | typeof LANE_RELAY_FAILED | null {
+  const word = fault?.why ?? code;
+  const why = word !== null && (STACK_FAULT_WHYS as readonly string[]).includes(word) ? (word as StackFaultWhy) : null;
+  if (why === null) return null;
+  if (REFUSED_WHYS.has(why)) return UPSTREAM_ANSWER_REFUSED;
+  const by = fault?.by ?? (why === "egress_limit" ? "egress" : why.startsWith("relay_") || why === "feed_invalid" || why === "answer_too_large" ? "relay" : null);
+  return by === "relay" || by === "egress" ? LANE_RELAY_FAILED : null;
+}
+
+/** The ApiError of `laneFaultCode`'s answer. */
+export function laneFaultError(code: typeof UPSTREAM_ANSWER_REFUSED | typeof LANE_RELAY_FAILED, why: string | null): ApiError {
+  return code === UPSTREAM_ANSWER_REFUSED ? upstreamAnswerRefused(why) : laneRelayFailed();
 }
 
 /**

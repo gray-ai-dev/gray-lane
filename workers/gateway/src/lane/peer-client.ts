@@ -122,6 +122,13 @@ export function peerAppIdOf(value: string | null | undefined): string | null {
  */
 export interface PeerTiming {
   readonly probeMs: number;
+  /**
+   * ENDPOINT_BREAKER_FAILURE_THRESHOLD: dials that sent nothing in a row, the first within `downMaxMs`, before the peer
+   * rests. One alone steers its own request to the next route and rests nothing (owner, 2026-11-19: a route is not paused
+   * for one failure, often a moment's hiccup), as a route's circuit opens only after as many failures in a row. Optional:
+   * a test's timing without it rests at the first, as before.
+   */
+  readonly downAfter?: number;
   readonly downMs: number;
   readonly downMaxMs: number;
   readonly recheckMs: number;
@@ -133,6 +140,7 @@ export interface PeerTiming {
 export function peerTimingOf(cfg: GatewayConfig): PeerTiming {
   return {
     probeMs: cfg.peerProbeMs,
+    downAfter: cfg.endpointBreakerFailureThreshold,
     downMs: cfg.peerDownMs,
     downMaxMs: cfg.peerDownMaxMs,
     recheckMs: cfg.peerRecheckMs,
@@ -471,8 +479,10 @@ export class PeerRegistry implements LanePeerRegistry {
 
   /**
    * What a request's dial found (section 4.7, row 1): a pin mismatch, and a stack VM that refuses the pin's keyset
-   * (`peer_audience`), end the pin and start a re-pin at the next maintenance; egress without the pin gets the table
-   * again; any other dial that sent nothing rests the peer.
+   * (`peer_audience`), end the pin and start a re-pin at the next maintenance (a boot or a keyset this entry has not
+   * attested is never sent content); egress without the pin gets the table again; any other dial that sent nothing rests
+   * the peer once `downAfter` of them came in a row, the first within `downMaxMs`. Before that the peer stays usable: the
+   * request that failed went on to its next route, and the next request asks the peer again.
    */
   failed(peer: Peer, code: string, session?: string | null): void {
     const now = this.#deps.clock();
@@ -488,12 +498,22 @@ export class PeerRegistry implements LanePeerRegistry {
       return;
     }
     if (code === "peer_unpinned") void this.pushPins();
+    if (peer.unsent === 0 || now - peer.unsentSince > this.#deps.timing.downMaxMs) {
+      peer.unsent = 0;
+      peer.unsentSince = now;
+    }
+    peer.unsent += 1;
+    if (peer.status !== "down" && peer.unsent < (this.#deps.timing.downAfter ?? 1)) {
+      this.#deps.log({ level: "warn", event: "lane_peer_dial_failed", relay: peer.target.relayId, origin: peer.target.origin, code, in_a_row: peer.unsent });
+      return;
+    }
     this.#down(peer, code, now);
   }
 
-  /** A request went through: the peer's backoff starts again from its first step. */
+  /** A request went through: the peer's backoff starts again from its first step, and its dials that sent nothing from none. */
   answered(peer: Peer): void {
     peer.backoffMs = 0;
+    peer.unsent = 0;
   }
 
   /**
@@ -757,11 +777,12 @@ export class PeerRegistry implements LanePeerRegistry {
     try {
       answer = await this.#call(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}/healthz?relay=${encodeURIComponent(peer.target.relayId)}`, { method: "GET" });
     } catch {
-      this.#down(peer, "peer_probe_failed", this.#deps.clock());
+      this.failed(peer, "peer_probe_failed");
       return;
     }
     if (answer.status === 200) {
       peer.sealed = await sealedOf(answer, peer.target.relayId);
+      peer.unsent = 0;
       if (peer.status === "down") {
         peer.status = "pinned";
         peer.code = null;

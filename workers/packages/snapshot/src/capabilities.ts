@@ -29,6 +29,8 @@ export const NO_CAPABILITIES: Capabilities = {
 };
 
 const NAMES = Object.keys(NO_CAPABILITIES) as (keyof Capabilities)[];
+/** The claim vocabulary's words, in its order (`capabilityWords`). */
+export const CLAIM_WORDS: readonly string[] = NAMES;
 
 /** `Capabilities::from_claims`: null for a claim the verification layers cannot prove. `streaming` and `text` are always probed and add nothing. */
 export function fromClaims(claims: readonly string[]): Capabilities | null {

@@ -1055,8 +1055,9 @@ export const SETTINGS: readonly SettingSpec[] = [
       "new connection (165 ms, deploy/tee/probe/routing-measure/README.md): a sooner retry would start before a dial at that bound could " +
       "have ended. The maximum, 10 s, keeps the first rest of a transient fault short [estimated].",
     doc:
-      "How long an entry rests a stack VM after a dial that sent nothing (or a list, collateral or hello it could not get), doubling " +
-      "with each failure up to PEER_DOWN_MAX_MS. Read by the lane (an entry with LANE_PEERS on) only.",
+      "How long an entry rests a stack VM after ENDPOINT_BREAKER_FAILURE_THRESHOLD dials in a row that sent nothing, the first within " +
+      "PEER_DOWN_MAX_MS (one alone only sends its own request to the next route), or after a list, collateral or hello it could not get, " +
+      "doubling with each failure up to PEER_DOWN_MAX_MS. Read by the lane (an entry with LANE_PEERS on) only.",
   },
   {
     name: "PEER_DOWN_MAX_MS",

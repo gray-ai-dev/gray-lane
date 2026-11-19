@@ -49,6 +49,12 @@ export function nativeRoutes(snapshot: GatewaySnapshot, request: CanonicalReques
  * traffic, as a route that is not available; the request record names it as passed over for this word.
  */
 export const RELEASE_OUTDATED = "release_outdated";
+/**
+ * The `routing_skipped` reason of an entry's stack route left out because its relay's VM has no usable peer now (resting
+ * after dials that sent nothing, or being attested again after its workerd restarted): the request goes to the routes it
+ * has, and its record says which relay it did not ask (production 2026-11-19: a relay left out named nothing).
+ */
+export const RELAY_VM_UNAVAILABLE = "relay_vm_unavailable";
 
 /** Whether `route` is out of traffic at `nowMs` because its relay's VM still serves an older release. */
 export function releaseOutdated(route: Pick<RouteRecord, "trafficUntil">, nowMs: number): boolean {

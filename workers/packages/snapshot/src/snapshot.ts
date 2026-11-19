@@ -4,7 +4,7 @@ import type { Protocol } from "@gray/protocol";
 import { parsePlain } from "@gray/json";
 // The subpath, not the package: the gateway bundles this package, and @gray/control's other modules bring zod.
 import { binds, kept, recordFromRow, type CodingAgentRecord, type CodingAgentRow, type OpencodeThinking } from "@gray/control/coding-agent";
-import { both, capabilityWords, fromClaims, mappingCapabilities, NO_CAPABILITIES, type Capabilities } from "./capabilities.ts";
+import { both, capabilityWords, CLAIM_WORDS, fromClaims, mappingCapabilities, NO_CAPABILITIES, type Capabilities } from "./capabilities.ts";
 import { endpointRow, parseVerification, providerRef, registeredRefs, supplierRef, type EndpointConfig, type ModelMapping, type ProviderEndpoint, type VerificationRecord } from "./control.ts";
 import { parseSignedProbeReport, probeEvidence, type ModeCapabilities, type ProbeEvidence } from "./evidence.ts";
 import { routeExpires } from "./expiry.ts";
@@ -91,13 +91,24 @@ export interface SnapshotMapped {
  * What a lane relay's route states (design v2 section B): the lane does not probe a relay, so every capability
  * the endpoint claims is taken as claimed — the vendor's API is what the relay resells, and the lane's own
  * admission is what proves the relay. A direct route takes only what its probe report proved.
+ *
+ * A relay stack's route (`lane.mode` `stack`) sends each request from Gray's VM to the vendor's own API with the model
+ * pinned, so its capabilities are the vendor's model's (owner, 2026-11-19): what the reference catalog states of the
+ * model (`stated`, `ModelReference.capabilities`), narrowed to what the endpoint declares when it declares any. The
+ * console makes a stack endpoint with no declaration (console lane-stack/models.ts `stackEndpointConfig`), so the
+ * reference is what its routes serve, are offered in the setups and are listed by. For a model the catalog does not
+ * list (`stated` null) the route keeps its endpoint's claims, as every other lane relay's.
  */
-export function laneRouteCapabilities(e: ProviderEndpoint, protocol: Protocol): RouteCapabilities {
+export function laneRouteCapabilities(e: ProviderEndpoint, protocol: Protocol, stated: ReadonlySet<string> | null = null): RouteCapabilities {
   let claimed: Capabilities = NO_CAPABILITIES;
   try {
     claimed = fromClaims(e.config.capabilities) ?? NO_CAPABILITIES;
   } catch {
     claimed = NO_CAPABILITIES;
+  }
+  if (e.config.lane?.mode === "stack" && stated !== null) {
+    const vendor = fromClaims([...stated].filter((word) => (CLAIM_WORDS as readonly string[]).includes(word))) ?? NO_CAPABILITIES;
+    claimed = capabilityWords(claimed).length === 0 ? vendor : both(claimed, vendor);
   }
   const chat = mappingCapabilities(protocol, claimed);
   // Not probed, so neither mode is narrowed: both serve what the endpoint claims.
@@ -530,6 +541,11 @@ export type ReferenceFacts = (model: string) => ModelFacts | null;
 export interface ModelReference {
   readonly facts: ReferenceFacts;
   readonly largestWindow: number | null;
+  /**
+   * The capability words (`capabilityWords`) the catalog states of a model by its Gray id, null when it does not list
+   * it: a relay stack's routes serve these (`laneRouteCapabilities`). Absent: none stated of any model.
+   */
+  readonly capabilities?: (model: string) => ReadonlySet<string> | null;
 }
 
 /** A read the server's refresh would fail on: ConfigDO keeps the last snapshot and logs it. */
@@ -1208,7 +1224,7 @@ export async function buildSnapshot(
         expires: lane ? (quote === null ? 0 : Math.min(snapshot.expires_at, quote.eligible_until)) : found!.expires,
         offer: quote,
         maxConcurrency: quote ? quote.terms.max_concurrency : UNQUOTED_CONCURRENCY,
-        capabilities: lane ? laneRouteCapabilities(e, m.protocol) : routeCapabilities(e, m.protocol, v!, proofs.get(v!.id)),
+        capabilities: lane ? laneRouteCapabilities(e, m.protocol, reference?.capabilities?.(m.requested_model) ?? null) : routeCapabilities(e, m.protocol, v!, proofs.get(v!.id)),
         evidenceId: lane ? "" : v!.id,
         behavioralScore: weights.get(capacityKey(e.id, m.requested_model, m.protocol)) ?? null,
         providerRef: providerRef(e.workspace_id, e.id),

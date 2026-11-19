@@ -141,6 +141,12 @@ export class Peer {
   /** When a refused peer is checked again, or a down one dialed again. */
   retryAt = 0;
   backoffMs = 0;
+  /**
+   * Dials and probes that sent nothing in a row since the last that went through, and when the first of them came: the
+   * peer rests once they reach `PeerTiming.downAfter` within `downMaxMs` (`PeerRegistry.failed`).
+   */
+  unsent = 0;
+  unsentSince = 0;
   probedAt = 0;
   /**
    * Whether the boot holds this relay's sealed credentials (its `/healthz?relay=` `sealed_version`), from the last probe;

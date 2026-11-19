@@ -3,7 +3,7 @@ import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type Locati
 import { workspaceHome } from "./account.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
-import { LANE_BRIDGE_CALL_MS, type TicketUseOutcome } from "@gray/lane-wire";
+import { LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
 import { type ContinuationLocator, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
 import { answeredFailure, FREE_DELIVERY, type AccountBlockGates, type OutcomeMeasure, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type Pattern, type PermitToken } from "@gray/endpoint";
 import {
@@ -138,7 +138,7 @@ import { redactedHeaders, redactedQuery } from "./redact.ts";
 import { type ChunkTap, type LimitSource, type Primed as PrimedStream, type Uncommitted as StreamUncommitted, primeStream, readAnswer, relayStream, type SettleOutcome, type StreamEnd } from "./relay.ts";
 import { unrouted } from "./resolution.ts";
 import { type AnswerShare, Retained } from "./retained.ts";
-import { capable, dispatchExploratory, nativeRoutes, outputOverhead, RELEASE_OUTDATED, releaseOutdated, pinHolds, priceRoutes, probeLeases, promptOverhead, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, routeProbeLeases, withinBound, type Route } from "./routes.ts";
+import { capable, dispatchExploratory, nativeRoutes, outputOverhead, RELAY_VM_UNAVAILABLE, RELEASE_OUTDATED, releaseOutdated, pinHolds, priceRoutes, probeLeases, promptOverhead, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, routeProbeLeases, withinBound, type Route } from "./routes.ts";
 import {
   ERROR_DETAIL_BYTES,
   FREE_NO_USAGE,
@@ -220,6 +220,8 @@ import { StackEventsChain } from "@gray/attest";
 import {
   addStackReceipt,
   LANE_RELAY_FAILED,
+  laneFaultCode,
+  laneFaultError,
   laneRelayFailed,
   newStackRid,
   RELAY_DECLINED,
@@ -2783,7 +2785,13 @@ export class InferenceRun {
     this.affinityKey = this.preference.affinityAllowed() && keyed ? affinityKey(key.workspaceId, canonical, parsed.value) : null;
     // S22: a lane routes only what its VM is laid out for (`laneRoutes`), before anything weighs the routes.
     // A route with a tier is a candidate only for a request that opts in to it (`tierAdmitted`).
-    let records = nativeRoutes(snapshot, canonical, protocol, now, !parsed.whole).filter((r) => this.laneRoutes(r) && tierAdmitted(this.preference, r));
+    let records = nativeRoutes(snapshot, canonical, protocol, now, !parsed.whole).filter((r) => {
+      if (!tierAdmitted(this.preference, r)) return false;
+      if (this.laneRoutes(r)) return true;
+      // An entry's stack route whose relay's VM has no usable peer now: left out, and the record names it.
+      if (this.entryPeers() !== null && this.stackRoute(r)) this.skippedRoutes.push({ endpointId: r.endpointId, reason: RELAY_VM_UNAVAILABLE });
+      return false;
+    });
     // The release traffic window: a relay stack still on an older release past its window is left out, as a route that
     // is not available, and the record says why (`routing_skipped` `release_outdated`).
     records = records.filter((r) => {
@@ -5320,8 +5328,13 @@ export class InferenceRun {
       if (attempt.peer !== undefined) attempt.peer.served = true;
       return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: {}, accountId: outcome.accountId } };
     }
-    this.failAttempt(d, attempt, bareOutcome("transport", elapsed), laneRelayFailed(), LANE_RELAY_FAILED, false);
-    return { kind: "stopped", stop: null, error: laneRelayFailed() };
+    // The stack VM's verdict (its trace's fault, else `end.code`): an answer that failed Gray's check is the relay's
+    // `upstream_answer_refused`, any other fault of its container `lane_relay_failed`; either counts against its route.
+    const fault = attempt.peer?.trace?.calls.at(-1)?.fault ?? null;
+    const code = laneFaultCode(fault, outcome.code) ?? LANE_RELAY_FAILED;
+    const error = laneFaultError(code, fault?.why ?? peerFaultWhy(outcome.code));
+    this.failAttempt(d, attempt, bareOutcome("transport", elapsed), error, code, false);
+    return { kind: "stopped", stop: null, error };
   }
 
   /**
@@ -5341,6 +5354,9 @@ export class InferenceRun {
     call.served = false;
     this.answerShare.hold(0, this.deps.cfg.answerHeldMaxBytes);
     if (end !== null && !end.dialed) return this.peerFailed(d, attempt, model, { kind: "not_dialed", code: end.code ?? "peer_invalid" });
+    // The stack VM ended an answer it had begun to release for a fault of the relay's (its error frame before the entry's
+    // commit): its verdict decides the code, as `peerFailed`'s does, and it counts against the relay's route.
+    if (end !== null && laneFaultCode(call.trace?.calls.at(-1)?.fault ?? null, end.code) !== null) return this.peerFailed(d, attempt, model, { kind: "relay_failed", code: end.code ?? LANE_RELAY_FAILED });
     if (end !== null) {
       // A whole answer the request path refused (its trust gate, its protocol checks): the request's own error, as
       // `stackFailed` ends a released answer the request path failed. The stack VM's attempt is over (`end` is in).
@@ -5360,7 +5376,8 @@ export class InferenceRun {
    * - the vendor answered an error: the request ends with it (`passthrough`), its classification for the
    *   record and for a stream whose headers went; an error that refused the relay's own account is not
    *   passed on, and the next route may go (`relayAccountRefused`);
-   * - a vendor attempt was dialed and nothing of it can be released: `lane_relay_failed` (the bound's
+   * - a vendor attempt was dialed and nothing of it can be released: `upstream_answer_refused` when the container's
+   *   answer failed Gray's check (an event or a body that is not the vendor's), else `lane_relay_failed` (the bound's
    *   own error when the bound ended it), and no other route;
    * - egress cut an answer at its memory budget (`egress_limit`): `lane_relay_failed`, whatever followed.
    *
@@ -5397,8 +5414,11 @@ export class InferenceRun {
       return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId } };
     }
     const timedOut = bound && !limited;
-    const error = failure !== undefined && !relayFault ? failure.error : timedOut ? upstreamUnavailable() : laneRelayFailed();
-    const code = failure !== undefined && !relayFault ? failure.code : timedOut ? "upstream_unavailable" : LANE_RELAY_FAILED;
+    // An answer that failed Gray's check is the relay's `upstream_answer_refused`; any other fault of its container, or
+    // egress's cut at its budget, `lane_relay_failed`.
+    const laneCode = laneFaultCode(fault) ?? LANE_RELAY_FAILED;
+    const error = failure !== undefined && !relayFault ? failure.error : timedOut ? upstreamUnavailable() : laneFaultError(laneCode, fault?.why ?? null);
+    const code = failure !== undefined && !relayFault ? failure.code : timedOut ? "upstream_unavailable" : laneCode;
     this.failAttempt(d, attempt, failure?.outcome ?? bareOutcome(bound ? "timeout" : "transport", elapsed), error, code, bound, failure?.answered === true);
     return { kind: "stopped", stop: null, error };
   }
@@ -7021,8 +7041,17 @@ export class InferenceRun {
     // S24: a stack relay's container whose answer stopped matching the feed, or an answer egress cut at its
     // memory budget (`egress_limit`), ends the stream with the lane's fixed error (the read itself only saw
     // the release stop); a vendor stream that was cut keeps the upstream's own code.
-    const stackFault = attempt.stack?.fault ?? null;
-    const end: StreamEnd = relayed.kind === "failed" && stackFault !== null && (stackFault.by === "relay" || stackFault.by === "egress") ? { ...relayed, code: LANE_RELAY_FAILED, reason: LANE_RELAY_FAILED } : relayed;
+    // An answer that failed Gray's check (S24) ends it with `upstream_answer_refused`, any other fault of the relay's
+    // `lane_relay_failed`. A peer attempt's fault is the stack VM's: its error frame reads here as the upstream's own
+    // (`upstream_stream_interrupted`), and its verdict comes in the `end` it writes right after that frame, waited for
+    // PEER_END_WAIT_MS at most (production, 2026-11-19: a relay that changed its answer was told to the customer as an
+    // upstream whose stream broke, inviting a retry that failed the same way).
+    let laneCode = relayed.kind === "failed" ? laneFaultCode(attempt.stack?.fault ?? null) : null;
+    if (relayed.kind === "failed" && laneCode === null && attempt.peer !== undefined && relayed.code === "upstream_stream_interrupted") {
+      const peerEnd = await attempt.peer.endWithin(clock() + PEER_END_WAIT_MS);
+      laneCode = laneFaultCode(attempt.peer.trace?.calls.at(-1)?.fault ?? null, peerEnd?.code ?? null);
+    }
+    const end: StreamEnd = relayed.kind === "failed" && laneCode !== null ? { ...relayed, code: laneCode, reason: laneCode } : relayed;
     // The answer's checks as the relay read them once the stream ended and its end went out.
     attempt.checks = end.checks;
     // What the relay held went with it.
@@ -7957,6 +7986,11 @@ type Sent = { readonly kind: "failed"; readonly response: Response | null; reado
 
 /** How serving one model of the request ended: with the client's response, or with its refusal that the next model the customer listed may take over (`Unserved::NextModel`). */
 type ModelResult = { readonly kind: "response"; readonly response: Response } | { readonly kind: "next"; readonly response: Response };
+
+/** The fault word an `end.code` names (`STACK_FAULT_WHYS`), or null for a plan code. */
+function peerFaultWhy(code: string | null): StackFaultWhy | null {
+  return code !== null && (STACK_FAULT_WHYS as readonly string[]).includes(code) ? (code as StackFaultWhy) : null;
+}
 
 /** An attempt answered 2xx, not yet committed; `firstBytesBy` bounds its first bytes after the headers (UPSTREAM_ATTEMPT_SECONDS). */
 type Answered = { readonly kind: "answered"; readonly attempt: Attempt; readonly response: Response; readonly firstBytesBy: number | null };

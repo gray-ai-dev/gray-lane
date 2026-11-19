@@ -49,14 +49,18 @@ export interface CatalogRoute {
   readonly behavioral_score: number | null;
   /** What ModelTrace found of the route, on a chat API it probes, once a round ran on it (`Route::model_check`); absent or null: none listed. */
   readonly model_check?: CatalogModelCheck | null;
-  /** Proved by the route's signed probe report (`verified_capabilities`). */
+  /**
+   * Proved by the route's signed probe report (`verified_capabilities`); on a confidential route, the vendor's: what its
+   * endpoint declares that the model's reference specification states (gray-jobs src/catalog.ts `confidentialCapabilities`).
+   */
   readonly capabilities: readonly string[];
   /** The route's approved quote, or none; past `eligible_until` the route has none (`Route::quote`). */
   readonly offer: { readonly eligible_until: number; readonly terms: CatalogTerms } | null;
   /**
    * A confidential-lane route (decided 2026-11-17: the Models page lists one list, each route saying whether it is
    * confidential): served only at the lane's entry origin, never by the main API. It has no console verification, so it
-   * proves no capability and carries no ModelTrace check or weight. Absent: a main-lane route (the server's only kind).
+   * carries no ModelTrace check or weight, and its capabilities are the vendor's (`capabilities`). Absent: a main-lane
+   * route (the server's only kind).
    */
   readonly confidential?: boolean;
   /**
