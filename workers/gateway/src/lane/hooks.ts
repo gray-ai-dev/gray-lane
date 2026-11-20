@@ -112,13 +112,14 @@ export function laneContinuationUnsupported(): ApiError {
 }
 
 /**
- * 400 for a routing preference in the body in lane mode: the lane sends the body as received with its
- * declared rewrites only (`gray-lane-rewrites-v1`, @gray/lane), and none takes a `provider` member out, which
- * the upstream would refuse. The `x-gray-routing` header carries the same preference and is never forwarded.
+ * 400 for a routing preference in a Gemini body in lane mode: the lane sends a Gemini body as received
+ * (`gray-lane-rewrites-v1` declares no Gemini op), so it cannot take a `provider` member out, which the upstream would
+ * refuse. The `x-gray-routing` header carries the same preference and is never forwarded. The other three APIs take
+ * `provider` in the body (`remove_member /provider`).
  */
 export function laneRoutingInBody(): ApiError {
   return new ApiError(400, "routing_invalid").withMessage(
-    "The confidential lane sends the request body as received and cannot take `provider` out of it: send the routing preference in the `x-gray-routing` header instead.",
+    "The confidential lane sends a Gemini request body as received and cannot take `provider` out of it: send the routing preference in the `x-gray-routing` header instead.",
   );
 }
 

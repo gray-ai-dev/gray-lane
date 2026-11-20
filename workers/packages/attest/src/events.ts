@@ -660,6 +660,13 @@ export const peerForwardedSchema = z
     envelope_sha256: hex32,
     /** The entry verified the peer against the environment's stack list before it sent the attempt (section 4.3). Always true. */
     peer_verified: z.literal(true),
+    /**
+     * The entry's declared ops on the body it sent the peer (docs/design/one-address.md), in order, under the published
+     * rewrite policy: the client's `request.received` bytes with them applied are the bytes the stack VM received (its
+     * inner `request.received`). Absent when the entry sent the client's bytes as they came. Today the one such op is
+     * `remove_member /provider`, the routing preference the client stated in the body.
+     */
+    modified: z.array(requestModifiedSchema).min(1).optional(),
   })
   .strict();
 
@@ -1099,9 +1106,18 @@ export function peerCommitment(facts: PeerCommitmentFacts): string {
   return sha256BareHex(jcsBytes(peerCommitmentPreimage(facts)));
 }
 
-/** `peer.forwarded`: the entry's attempt `n` went to a peer it verified, under the envelope `envelopeSha256` names. */
-export function peerForwardedEvent(input: { readonly n: bigint; readonly envelopeSha256: string }): JsonObject {
-  return shaped(peerForwardedSchema, { type: EVENT_PEER_FORWARDED, n: input.n, envelope_sha256: input.envelopeSha256, peer_verified: true });
+/**
+ * `peer.forwarded`: the entry's attempt `n` went to a peer it verified, under the envelope `envelopeSha256` names; with
+ * `modified`, the entry's declared ops on the body it sent (`request.modified` events, in order).
+ */
+export function peerForwardedEvent(input: { readonly n: bigint; readonly envelopeSha256: string; readonly modified?: readonly JsonObject[] }): JsonObject {
+  return shaped(peerForwardedSchema, {
+    type: EVENT_PEER_FORWARDED,
+    n: input.n,
+    envelope_sha256: input.envelopeSha256,
+    peer_verified: true,
+    ...(input.modified === undefined || input.modified.length === 0 ? {} : { modified: [...input.modified] }),
+  });
 }
 
 /** `peer.answered`: the hop's answer to attempt `n`. */

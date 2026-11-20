@@ -50,7 +50,7 @@
  * rewrite policy and no relay templates for Gemini, so Gray forwards the customer's bytes as they are, and step 1 is
  * the whole content check (a `request.modified` or `relay_policy` event fails it).
  */
-import { get, isObject, type Json } from "@gray/json";
+import { get, isObject, parseSerdeBytes, type Json } from "@gray/json";
 import {
   EVENT_ATTEMPT_REFUSED,
   EVENT_ATTEMPT_STARTED,
@@ -64,6 +64,7 @@ import {
   EVENT_REQUEST_RECEIVED,
   EVENT_RESPONSE_RETURNED,
   EVENT_UPSTREAM_RESPONSE,
+  EVENT_UPSTREAM_VERIFIED,
   StackEventsChain,
   adoptKeyset,
   eventType,
@@ -422,6 +423,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   }
   state.modified = modified;
   if (modified.length > 0) checks.push(pass("request_modified", `${modified.length} declared op(s)`));
+  if (modified.some((op) => op.op === "remove_member" && op.path === "/provider")) checks.push(routingPreferenceCheck(options.receivedBody, document.event_log));
 
   const appliedEvent = findEvent(document.event_log, EVENT_RELAY_POLICY_APPLIED);
   const refusedEvent = findEvent(document.event_log, EVENT_RELAY_POLICY_REFUSED);
@@ -823,6 +825,36 @@ function stringMember(event: Json | undefined, name: string): string | null {
 
 /** `@gray/attest`'s problems of the version and `arrival` rule. */
 const VERSION_PROBLEMS: readonly string[] = ["unsupported_api_version", "version_without_arrival", "arrival_without_version", "unsupported_arrival"];
+
+/** `upstream.verified`'s reason for an attempt at a provider's own API (gateway lane/hooks.ts `PROVIDER_NOT_TEE`). */
+const PROVIDER_API_NOT_TEE = "provider_api_not_tee";
+
+/**
+ * docs/design/one-address.md: the receipt says Gray took the customer's routing preference out of the body
+ * (`remove_member /provider`), so the preference is in the received bytes and the verifier reads it. Where it asked for
+ * verifiable routes (`provider.verifiable: true`), every attempt the receipt records must be at one: a route to an
+ * official vendor from inside the VM, never a provider's own API (`upstream.verified` with `provider_api_not_tee`).
+ * The preference's other members (`only`, `order`, ...) name routes the receipt does not, so they are not checked here,
+ * and neither is a preference sent in the `x-gray-routing` header or stored as a key's default, which the receipt does
+ * not carry.
+ */
+function routingPreferenceCheck(receivedBody: Uint8Array, events: readonly Json[]): ReceiptCheck {
+  let body: Json;
+  try {
+    body = parseSerdeBytes(receivedBody);
+  } catch {
+    return fail("routing_preference", "the receipt removed /provider, but the received body is not JSON");
+  }
+  const provider = isObject(body) ? get(body, "provider") : undefined;
+  if (provider === undefined) return fail("routing_preference", "the receipt removed /provider, but the received body has none");
+  if (!isObject(provider) || get(provider, "verifiable") !== true) return pass("routing_preference", "the body's routing preference asks for no verifiable route");
+  const unverifiable = findEvents(events, EVENT_UPSTREAM_VERIFIED).filter((event) => get(event, "reason") === PROVIDER_API_NOT_TEE);
+  if (unverifiable.length > 0) {
+    const host = get(unverifiable[0]!, "upstream_name");
+    return fail("routing_preference", `the body asked for verifiable routes, but an attempt went to a provider's API${typeof host === "string" ? ` (${host})` : ""}`);
+  }
+  return pass("routing_preference", "the body asked for verifiable routes, and every attempt the receipt records is at one");
+}
 
 function receiptChecks(
   verification: Awaited<ReturnType<typeof verifyReceipt>>,

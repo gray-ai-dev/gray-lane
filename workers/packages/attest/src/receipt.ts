@@ -380,7 +380,7 @@ export class ReceiptBuilder {
   }
 
   /** An entry's outer receipt (§4.8): attempt `n` went to a verified peer under the envelope `envelopeSha256` names. */
-  addPeerForwarded(input: { readonly n: bigint; readonly envelopeSha256: string }): void {
+  addPeerForwarded(input: { readonly n: bigint; readonly envelopeSha256: string; readonly modified?: readonly JsonObject[] }): void {
     this.#push(peerForwardedEvent(input));
   }
 

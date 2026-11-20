@@ -2873,6 +2873,26 @@ export const SETTINGS: readonly SettingSpec[] = [
       "model APIs stay on API_ORIGIN",
   },
   {
+    name: "CUSTOMER_API_ORIGIN",
+    key: "customerApiOrigin",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    shown: "API_ORIGIN",
+    textCheck: (v) => (v === "" ? null : originProblem(v)),
+    source:
+      "GRAY_CUSTOMER_API_ORIGIN of the server (crates/gray-gateway/src/config/origins.rs). The owner's direction of 2026-11-20: customers use " +
+      "one address for every path, the confidential entry's (LANE_STACK_ENTRY_ORIGIN, https://lane.usefallback.com in production), which " +
+      "serves the chat APIs itself and forwards every other path to the model API (docs/design/one-address.md). Empty: the setups name " +
+      "API_ORIGIN and CUSTOMER_CHAT_ORIGIN as before. The deploy session sets it once the entry image that forwards runs on every replica. " +
+      "The console checks it is API_ORIGIN or LANE_STACK_ENTRY_ORIGIN, https outside DEPLOY_ENV local (workers/console/src/settings.ts).",
+    doc:
+      "The one address customers are given for every path: the base URL of the chat APIs, the setup routes, /v1/key, images, embeddings, " +
+      "audio, video, rerank and the other model APIs in the agent setups (agent.md, the setup files, the console's setups) and the console's " +
+      "examples, which then name API_ORIGIN only as the older address. It overrides CUSTOMER_CHAT_ORIGIN. Unset: the setups name API_ORIGIN, " +
+      "and CUSTOMER_CHAT_ORIGIN for chat",
+  },
+  {
     name: "ADMIN_WALLETS",
     key: "adminWallets",
     workers: ["console"],
@@ -3037,11 +3057,11 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "operatorGrantMaxMicroUsd",
     workers: ["console"],
     type: "int",
-    default: "100000000",
+    default: "500000000",
     min: 1,
     max: 10_000_000_000,
     source:
-      "GRAY_OPERATOR_GRANT_MAX_MICROUSD of the server: $100 by default, the owner's per-grant bound of 2026-11-18 (an operator gives a " +
+      "GRAY_OPERATOR_GRANT_MAX_MICROUSD of the server: $500 by default, the owner's per-grant bound of 2026-11-20 (an operator gives a " +
       "friend in the internal beta credit to use the API). At most $10,000: it guards against a mistyped amount, and one grant above it is " +
       "a top-up, not a grant.",
     doc: "The most one operator grant gives a workspace (POST /api/v1/ops/ledger/grants); a larger one is refused",
@@ -3051,11 +3071,11 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "operatorGrantDailyLimitMicroUsd",
     workers: ["console"],
     type: "int",
-    default: "1000000000",
+    default: "5000000000",
     min: 1,
     max: 1_000_000_000_000,
     source:
-      "GRAY_OPERATOR_GRANT_DAILY_LIMIT_MICROUSD of the server: $1,000 by default, the owner's daily bound of 2026-11-18, all operators " +
+      "GRAY_OPERATOR_GRANT_DAILY_LIMIT_MICROUSD of the server: $5,000 by default, the owner's daily bound of 2026-11-20 ($1,000 from 2026-11-18), all operators " +
       "together. At most $1,000,000, the most the credit Workers' funder pays out in a day (FUND_DAILY_BUDGET_MICRO, " +
       "workers/credit/src/lib/config.ts): grants past that would wait for the funder's next day anyway.",
     doc: "The most all operator grants of one UTC day give together, all operators and workspaces; a grant past it is refused",
@@ -5803,6 +5823,8 @@ export interface ConsoleConfig {
   readonly apiOrigin: string;
   /** CUSTOMER_CHAT_ORIGIN: the chat address customers are given; empty: `apiOrigin`. */
   readonly customerChatOrigin: string;
+  /** CUSTOMER_API_ORIGIN: the one address customers are given for every path; empty: `apiOrigin`, and CUSTOMER_CHAT_ORIGIN for chat. */
+  readonly customerApiOrigin: string;
   /** Comma-separated; workers/console reads it as a list. */
   readonly adminWallets: string;
   readonly accessTeamDomain: string;

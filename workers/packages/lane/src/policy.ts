@@ -18,6 +18,10 @@
  *   Chat and Responses request is sent with (docs/relay-request-changes.md: no vendor-side storage under a relay's
  *   account).
  *
+ * `remove_member /provider` takes out the customer's routing preference stated in the body (docs/design/one-address.md),
+ * which the gateway reads and the vendor would refuse; it was added after gray-lane-verify 1.0.0, whose copy of this
+ * policy refuses it, so that verifier fails such a receipt rather than passing it.
+ *
  * The policy bounds the *shape* of a declaration, not which of two allowed ops the gateway chose
  * for a particular request: that choice is the request path's (for example, a cap is `set_member`
  * when the client wrote the field and `insert_member` when it did not). The signed event log says
@@ -73,6 +77,7 @@ const RAW_POLICY: unknown = {
       { op: "set_member", path: "/model", value: MODEL_STRING },
       { op: "insert_member", path: "/model", value: MODEL_STRING },
       { op: "remove_member", path: "/models" },
+      { op: "remove_member", path: "/provider" },
       { op: "set_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "insert_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "remove_member", path: "/metadata/user_id" },
@@ -81,6 +86,7 @@ const RAW_POLICY: unknown = {
       { op: "set_member", path: "/model", value: MODEL_STRING },
       { op: "insert_member", path: "/model", value: MODEL_STRING },
       { op: "remove_member", path: "/models" },
+      { op: "remove_member", path: "/provider" },
       { op: "set_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "insert_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "set_member", path: "/max_completion_tokens", value: OUTPUT_CAP },
@@ -97,6 +103,7 @@ const RAW_POLICY: unknown = {
       { op: "set_member", path: "/model", value: MODEL_STRING },
       { op: "insert_member", path: "/model", value: MODEL_STRING },
       { op: "remove_member", path: "/models" },
+      { op: "remove_member", path: "/provider" },
       { op: "set_member", path: "/max_output_tokens", value: OUTPUT_CAP },
       { op: "insert_member", path: "/max_output_tokens", value: OUTPUT_CAP },
       { op: "remove_member", path: "/user" },

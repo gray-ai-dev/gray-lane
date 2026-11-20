@@ -218,7 +218,7 @@ import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisi
 import { completedResponse, keptWeight } from "./lane/codex.ts";
 import type { LaneApiForward, LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
 import type { AppendedText, LaneProtocol } from "@gray/lane";
-import { checkOfficialUpstream, StackEventDigester, stackBodyDigest, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
+import { applyDeclaredChanges, checkOfficialUpstream, StackEventDigester, stackBodyDigest, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
 import {
   addStackReceipt,
@@ -1075,6 +1075,13 @@ export class InferenceRun {
   /** The body the request was received with, exactly as it arrived: what every lane op and hash covers. */
   private laneReceived: Uint8Array | null = null;
   /**
+   * The body an entry sends over the peer hop when the client stated its routing preference in the body
+   * (docs/design/one-address.md): the client's bytes with `/provider` removed under the published rewrite policy, and
+   * the op's `request.modified` event, which the outer receipt's `peer.forwarded` declares. Made at the first peer
+   * attempt; null until then, and for a request whose body states none (the hop then carries the client's bytes).
+   */
+  private peerHop: { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null = null;
+  /**
    * A lane decision per `(relayId, protocol, model)` (design v2 §C.5, M12): the module runs once per
    * relay and model within a request, and a model the customer listed after another runs it again.
    */
@@ -1825,7 +1832,7 @@ export class InferenceRun {
       for (const call of this.peerCalls) {
         if (call.envelopeSha256 === null) continue;
         const n = BigInt(call.n);
-        builder.addPeerForwarded({ n, envelopeSha256: call.envelopeSha256 });
+        builder.addPeerForwarded({ n, envelopeSha256: call.envelopeSha256, ...(this.peerHop === null ? {} : { modified: this.peerHop.events }) });
         if (call.head === null) {
           const failure = call.failure ?? { code: "peer_invalid" as const, sent: true };
           builder.addPeerFailed({ n, code: failure.code, sent: failure.sent, peer: call.commitment() });
@@ -2524,11 +2531,14 @@ export class InferenceRun {
     this.admission = "parse";
     // The customer's routing preference is read and removed from the body before the body is parsed or
     // forwarded (`Preference::take`): first-party APIs reject unknown body fields, so a preference left in
-    // place would become a provider-side 400. The body's `provider` member, or the `x-gray-routing` header.
+    // place would become a provider-side 400. The body's `provider` member, or the `x-gray-routing` header. At the lane
+    // the body's member goes out of the forwarded bytes as a declared rewrite (`remove_member /provider`,
+    // gray-lane-rewrites-v1; docs/design/one-address.md), which the receipt names; a Gemini body has no declared op, so
+    // there the preference is the header's alone.
     let preferenceRefused = false;
     const take = (value: Json): ApiError | null => {
       const stated = isObject(value) && Object.hasOwn(value, "provider");
-      if (stated && this.lane !== null) {
+      if (stated && this.lane !== null && protocol === "gemini") {
         preferenceRefused = true;
         return laneRoutingInBody();
       }
@@ -2613,8 +2623,9 @@ export class InferenceRun {
     // An older client's chat at this address, with no verifiable preference (refused just above, never forwarded), for a
     // model the confidential entry serves on this API (`entryServes`): the entry serves it, so it reaches every route
     // (docs/design/one-address.md). Not a model check, which the console sends for this gateway's own route, not a body
-    // that states `provider`, which the entry reads only from `x-gray-routing`, and not a model the entry has no route of
-    // here (the entry never forwards a request back): those are answered here as before.
+    // that states `provider` (the entry takes it out as a declared rewrite, but a relay stack's VM does so only from the
+    // stack release that has the rule, so until every stack VM runs one such a request stays here), and not a model the
+    // entry has no route of here (the entry never forwards a request back): those are answered here as before.
     const entry = this.deps.entryChat;
     if (this.lane === null && entry !== undefined && !this.stripProvider && ticketHeader(this.request.headers) === null && entryServesChain(snapshot, chain, protocol)) return this.forwardToEntry(entry, body);
     // docs/design/one-address.md: at the entry, the other direction. A request for models this entry has no route of on
@@ -5279,7 +5290,27 @@ export class InferenceRun {
     if (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses") return { ok: false, code: "protocol" };
     const usable = lane === undefined || lane === null ? [] : peers.registry.usable(lane.relayId);
     if (usable.length === 0) return { ok: false, code: "peer_unpinned" };
+    if (this.peerHopBody(protocol) === null) return { ok: false, code: "stack_rewrite_refused" };
     return { ok: true, config: null, route: null, vendor: laneVendor(official.vendor), peers: usable };
+  }
+
+  /**
+   * The bytes the peer hop carries (docs/design/one-address.md): the client's, or, when the client stated its routing
+   * preference in the body, the client's with `/provider` removed under the published rewrite policy, so no stack VM
+   * and no vendor sees it, whatever stack release the VM runs. The op is declared on each `peer.forwarded` of the outer
+   * receipt, and the customer's verifier replays it before it compares the bytes with the stack VM's inner receipt.
+   * Null when the removal does not apply (the route is passed over).
+   */
+  private peerHopBody(protocol: LaneProtocol): { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null {
+    const received = this.laneReceived;
+    if (received === null) return null;
+    if (!this.stripProvider) return { bytes: received, events: [] };
+    if (this.peerHop === null) {
+      const changed = applyDeclaredChanges(received, protocol, { grayOps: [{ op: "remove_member", path: "/provider" }], appends: [] });
+      if (!changed.ok) return null;
+      this.peerHop = { bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
+    }
+    return this.peerHop;
   }
 
   /**
@@ -5319,7 +5350,7 @@ export class InferenceRun {
       route: { endpoint: attempt.route.record.endpointId, protocol, model: attempt.route.record.model },
       path: query === "" ? this.path : `${this.path}?${query}`,
       headers: stackPeerHeaders(this.request.headers, protocol),
-      body: this.laneReceived!,
+      body: this.peerHopBody(protocol)!.bytes,
       budgetMs: this.deadline(o.bodyRead) - this.deps.clock(),
       // Relay standard v1.7: the conversation id at the route's relay, derived with this entry's boot key, since the
       // envelope names no workspace.

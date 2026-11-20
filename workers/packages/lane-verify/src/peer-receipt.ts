@@ -23,7 +23,11 @@
  * 5. its `peer.entry` names this outer receipt (the entry's keyset digest, the outer receipt id and the attempt number),
  *    so an inner receipt cannot be shown under another request;
  * 6. inner `request.received` equals outer `request.received`, and for the attempt that served the answer, inner
- *    `response.returned`'s `events_sha256` or `body_sha256` equals the outer one's (L6).
+ *    `response.returned`'s `events_sha256` or `body_sha256` equals the outer one's (L6). When the attempt's
+ *    `peer.forwarded` declares the entry's ops on the hop's body (`modified`, docs/design/one-address.md: the routing
+ *    preference the client stated in the body, `remove_member /provider`), the customer's bytes with those ops replayed
+ *    under the published rewrite policy are what the stack VM must have received: the inner receipt is checked against
+ *    them (step 4) and its `request.received` compared with their digest.
  *
  * A missing inner receipt fails where the stack VM must have made one: a hop that answered and dialed a vendor (or did
  * not say), and an attempt that may have reached the stack VM and was not refused by it before any frame. An attempt
@@ -33,9 +37,11 @@ import {
   EVENT_PEER_ANSWERED,
   EVENT_PEER_ENTRY,
   EVENT_PEER_FAILED,
+  EVENT_PEER_FORWARDED,
   EVENT_REQUEST_RECEIVED,
   EVENT_RESPONSE_RETURNED,
   adoptKeyset,
+  bodyHash,
   eventType,
   findEvent,
   isJcsValue,
@@ -44,11 +50,13 @@ import {
   reportKeysetValue,
   sha256BareHex,
   type RelayStackChanges,
+  type RequestModifiedEvent,
 } from "@gray/attest";
+import { isLaneProtocol, replayForwarded } from "@gray/lane";
 import { get, isObject, parseStrict, type Json } from "@gray/json";
 import type { QuoteVerifier } from "./attestation.ts";
 import { verifyPeerAttestation, type PeerReleaseList } from "./peer.ts";
-import { verifyResponseReceipt, type ReceiptCheck, type StackReceiptSummary, type TemplateText } from "./receipt.ts";
+import { protocolForEndpoint, verifyResponseReceipt, type ReceiptCheck, type StackReceiptSummary, type TemplateText } from "./receipt.ts";
 import { STACK_RELAY_ID_PATTERN } from "./stack-boot.ts";
 
 /** The stack VM's refusals before any frame (`@gray/lane-wire` PEER_REFUSAL_STATUS): it registered nothing, so it made no receipt. */
@@ -143,6 +151,8 @@ export interface OuterPeerAttempt {
   /** `peer.failed.code` and `sent`; null for `peer.answered`. */
   readonly code: string | null;
   readonly sent: boolean | null;
+  /** The entry's declared ops on the hop's body, from the `peer.forwarded` this event answers; null without any. */
+  readonly modified: readonly Json[] | null;
 }
 
 /** The outer receipt's peer attempts, in log order (empty for a receipt that forwarded nothing to a stack VM). */
@@ -150,8 +160,15 @@ export function outerPeerAttempts(outer: Json): OuterPeerAttempt[] {
   const log = get(outer, "event_log");
   if (!Array.isArray(log)) return [];
   const out: OuterPeerAttempt[] = [];
+  // Each answer event answers the `peer.forwarded` just before it (the outer grammar's `peer_order`).
+  let modified: readonly Json[] | null = null;
   for (const event of log as readonly Json[]) {
     const type = eventType(event);
+    if (type === EVENT_PEER_FORWARDED) {
+      const declared = get(event, "modified");
+      modified = Array.isArray(declared) ? (declared as readonly Json[]) : null;
+      continue;
+    }
     if (type !== EVENT_PEER_ANSWERED && type !== EVENT_PEER_FAILED) continue;
     const n = get(event, "n");
     const peer = get(event, "peer");
@@ -169,11 +186,12 @@ export function outerPeerAttempts(outer: Json): OuterPeerAttempt[] {
         peer,
         code: null,
         sent: null,
+        modified,
       });
     } else {
       const code = get(event, "code");
       const sent = get(event, "sent");
-      out.push({ n, outcome: "failed", dialed: null, inner: null, peer, code: typeof code === "string" ? code : null, sent: typeof sent === "boolean" ? sent : null });
+      out.push({ n, outcome: "failed", dialed: null, inner: null, peer, code: typeof code === "string" ? code : null, sent: typeof sent === "boolean" ? sent : null, modified });
     }
   }
   return out;
@@ -343,6 +361,20 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
     checks.push(pass(`${id}:inner_digest`, `${attempt.inner.receipt_id}, SHA-256 ${digest}`));
   }
 
+  // What the stack VM received: the customer's bytes, after the entry's declared ops on the hop's body when it has any.
+  let hopBody = options.receivedBody;
+  if (attempt.modified !== null) {
+    const protocol = protocolForEndpoint(String(get(options.outer, "endpoint")));
+    const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.receivedBody, protocol, attempt.modified as unknown as readonly RequestModifiedEvent[]) : null;
+    const ops = attempt.modified.map((op) => `${String(get(op, "op"))} ${String(get(op, "path"))}`).join(", ");
+    if (replayed === null) {
+      checks.push(fail(`${id}:entry_rewrite`, `the entry's declared op(s) on the hop's body (${ops}) do not replay on the received body under the published rewrite policy`));
+      return summary;
+    }
+    checks.push(pass(`${id}:entry_rewrite`, `the entry sent the received body with ${ops}: ${bodyHash(replayed)}`));
+    hopBody = replayed;
+  }
+
   // 4. The inner receipt under the attested stack keyset (with the relay's changes per attempt).
   const keysetValue = reportKeysetValue(served.report);
   const sealed = keysetValue === undefined ? null : adoptKeyset(keysetValue);
@@ -351,7 +383,7 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
     return summary;
   }
   const inner = await verifyResponseReceipt(receipt, {
-    receivedBody: options.receivedBody,
+    receivedBody: hopBody,
     templates: options.templates,
     keyset: sealed,
     expectedKeysetDigest: v.keysetDigest,
@@ -383,7 +415,12 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
   const outerEvents = get(options.outer, "event_log") as readonly Json[];
   const outerReceived = get(findEvent(outerEvents, EVENT_REQUEST_RECEIVED), "body_hash");
   const innerReceived = get(findEvent(events, EVENT_REQUEST_RECEIVED), "body_hash");
-  if (outerReceived === innerReceived) checks.push(pass(`${id}:request_received`, `the stack VM received the bytes the entry received (${String(outerReceived)})`));
+  if (attempt.modified !== null) {
+    // The outer receipt's own request.received is the customer's bytes (checked against them with the outer receipt).
+    const sent = bodyHash(hopBody);
+    if (innerReceived === sent) checks.push(pass(`${id}:request_received`, `the stack VM received the bytes the entry sent (${sent}): the entry's received ${String(outerReceived)} with its declared op(s)`));
+    else checks.push(fail(`${id}:request_received`, `the entry's received ${String(outerReceived)} with its declared op(s) is ${sent}, the inner request.received ${String(innerReceived)}`));
+  } else if (outerReceived === innerReceived) checks.push(pass(`${id}:request_received`, `the stack VM received the bytes the entry received (${String(outerReceived)})`));
   else checks.push(fail(`${id}:request_received`, `the outer request.received is ${String(outerReceived)}, the inner ${String(innerReceived)}`));
   const outerReturned = findEvent(outerEvents, EVENT_RESPONSE_RETURNED);
   if (get(outerReturned, "served_attempt") === attempt.n) {

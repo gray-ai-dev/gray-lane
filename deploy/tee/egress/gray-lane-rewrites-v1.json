@@ -6,6 +6,7 @@
       { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "remove_member", "path": "/models" },
+      { "op": "remove_member", "path": "/provider" },
       { "op": "set_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "insert_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "remove_member", "path": "/metadata/user_id" }
@@ -14,6 +15,7 @@
       { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "remove_member", "path": "/models" },
+      { "op": "remove_member", "path": "/provider" },
       { "op": "set_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "insert_member", "path": "/max_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "set_member", "path": "/max_completion_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
@@ -30,6 +32,7 @@
       { "op": "set_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "insert_member", "path": "/model", "value": { "kind": "string", "min_bytes": 1, "max_bytes": 512, "forbid_control": true } },
       { "op": "remove_member", "path": "/models" },
+      { "op": "remove_member", "path": "/provider" },
       { "op": "set_member", "path": "/max_output_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "insert_member", "path": "/max_output_tokens", "value": { "kind": "integer", "min": 1, "max": 4294967295 } },
       { "op": "remove_member", "path": "/user" },
