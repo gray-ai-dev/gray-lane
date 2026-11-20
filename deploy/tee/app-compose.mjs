@@ -19,6 +19,12 @@
 //
 // and, when the deployment measures its own pick budget (D109'), `--scheduler-pick-ms <ms>`.
 //
+// `--console-origin <https origin>` (default layout only; release.mjs passes the origin of environments.json's
+// `console_url`) adds lane's CONSOLE_ORIGIN under GATEWAY_FALLBACK_REGION: the console the entry's error help links
+// name (`Manage API keys at <console>/#/app/keys.`, @gray/errors `helpSentence`), and the one origin whose pages may
+// read the entry's answers (workers/gateway/src/cors.ts). The committed compose has no such line, so a render without
+// the flag measures what it did before, and the errors then name the entry's own origin.
+//
 // Routing PR 9 (docs/confidential-lane-stack-routing.md section 9.1): `--release-public-key <64 hex>` and
 // `--release-freshness-public-key <64 hex>` (the environment's, environments.json) set lane's list keys in either
 // layout, and `--lane-peers true|false` (default layout only) sets LANE_PEERS and adds or removes egress's `-peer` and
@@ -354,6 +360,8 @@ export const REPLICA_EXPRESSION = "${LANE_REPLICA:-}";
 export const REPLICA_MAX = 16;
 const REPLICA_PLACEHOLDER = "{n}";
 const REPLICA_ENVS = Object.freeze([REPLICA_PATTERN_ENV, REPLICA_ENV]);
+/** `--console-origin`, default layout only: the console's origin, a gateway var (@gray/config CONSOLE_ORIGIN). */
+const CONSOLE_ORIGIN_ENV = "CONSOLE_ORIGIN";
 /** Every lane setting of routing PR 9 only an entry may carry. */
 const ENTRY_ENVS = Object.freeze([PEERS_ENV, ...PEER_TUNABLES]);
 /** Go's flag package reads `-name`, `--name`, `-name=v` and `--name=v` alike; the gate reads every spelling. */
@@ -1632,6 +1640,7 @@ export function checkCompose(composeText, options = {}) {
     checkEntryRoutes(parsed.services, label, problems);
     checkEntryPeerlink(parsed.services, label, problems);
     replicas = checkEntryReplica(parsed.services, label, problems);
+    checkConsoleOrigin(parsed.services, label, problems);
     // The stack settings are what makes the entrypoint render the relay listener (S28); the default
     // layout has no relay network, so none of them belongs there.
     for (const [name, service] of parsed.services) {
@@ -1743,6 +1752,31 @@ function validateTlsDomain(domain) {
     throw new Error(`--tls-domain '${domain}' is reserved for documentation (RFC 2606) and cannot be certified`);
   }
   return domain;
+}
+
+/**
+ * `--console-origin` and the gate's lane CONSOLE_ORIGIN: an https origin written as one (scheme://host[:port], no
+ * trailing slash), the exact form the entry's CORS check compares a page's Origin with. Returns the problem, or null.
+ */
+function consoleOriginProblem(text) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return "is not a URL";
+  }
+  if (url.protocol !== "https:" || url.origin !== text) return "must be an https origin written as scheme://host[:port]";
+  if (url.hostname.endsWith(".invalid")) return "names a reserved .invalid host";
+  return null;
+}
+
+/** The default layout's lane CONSOLE_ORIGIN, when it sets one (`--console-origin`): in consoleOriginProblem's form. */
+function checkConsoleOrigin(services, label, problems) {
+  const lane = services.get("lane");
+  const value = isMap(lane) ? environmentOf(lane).get(CONSOLE_ORIGIN_ENV) : undefined;
+  if (value === undefined) return;
+  const problem = typeof value === "string" ? consoleOriginProblem(value) : "is not a string";
+  if (problem !== null) problems.push(`${label}: lane.${CONSOLE_ORIGIN_ENV} ${JSON.stringify(value)} ${problem}; it is the console the entry's errors link to (--console-origin)`);
 }
 
 /** `--bridge-url`: the same https-origin rule the entrypoint enforces at boot. */
@@ -2119,6 +2153,12 @@ function applyComposeFlags(composeText, options) {
   if (options.bridgeUrl !== undefined) {
     measured = setEnvLines(measured, "LANE_BRIDGE_URL", validateBridgeUrl(options.bridgeUrl), "--bridge-url", 1);
   }
+  if (options.consoleOrigin !== undefined) {
+    if (layoutSpec(options).name === "stack") throw new Error("--console-origin is not a stack compose value: it names the console in the entry's error help links");
+    const problem = consoleOriginProblem(options.consoleOrigin);
+    if (problem !== null) throw new Error(`--console-origin '${options.consoleOrigin}' ${problem}`);
+    measured = addEnvLineAfter(measured, "GATEWAY_FALLBACK_REGION", CONSOLE_ORIGIN_ENV, options.consoleOrigin, "--console-origin");
+  }
   if (options.keysetNotAfter !== undefined) {
     measured = setEnvLines(measured, "KEYSET_NOT_AFTER", validateKeysetNotAfter(options.keysetNotAfter, options.nowSeconds), "--keyset-not-after", 1);
   }
@@ -2388,6 +2428,7 @@ export function renderAppCompose(composeText, options = {}) {
 const USAGE = `usage: app-compose.mjs [--check] [--out <file>] [--compose <file>] [--layout default|stack]
   [--target dstack|phala] [--kms-ca-pubkey <182 hex>] [--deploy-env testnet|production]
   [--tls-domain <host> (default layout only)] [--bridge-url <https origin>] [--keyset-not-after <unix seconds>]
+  [--console-origin <https origin> (default layout only: the console the entry's errors link to)]
   [--tls-replica-domain-pattern <host with one {n}> (default layout only: the entry replicas' names, in --tls-domain's zone)]
   [--scheduler-pick-ms <ms>] [--release-public-key <64 hex>] [--release-freshness-public-key <64 hex>]
   [--lane-peers true|false (default layout only)] [--gateway-enabled true|false (default layout only; default true)]
@@ -2400,7 +2441,7 @@ const VALUE_OPTIONS = new Set([
   "--out", "--compose", "--image", "--target", "--kms-ca-pubkey", "--deploy-env", "--tls-domain", "--bridge-url",
   "--keyset-not-after", "--scheduler-pick-ms", "--layout", "--pre-launch", "--release-public-key",
   "--release-freshness-public-key", "--lane-peers", "--gateway-enabled", "--peer-entries", "--kms-url",
-  "--tls-replica-domain-pattern",
+  "--tls-replica-domain-pattern", "--console-origin",
 ]);
 const BOOLEAN_OPTIONS = new Set(["--check", "--allow-placeholders", "--help"]);
 
@@ -2454,6 +2495,7 @@ export function main(argv = process.argv.slice(2), log = console.log) {
     tlsDomain: values["--tls-domain"],
     tlsReplicaDomainPattern: values["--tls-replica-domain-pattern"],
     bridgeUrl: values["--bridge-url"],
+    consoleOrigin: values["--console-origin"],
     keysetNotAfter: values["--keyset-not-after"],
     schedulerPickMs: values["--scheduler-pick-ms"],
     releasePublicKey: values["--release-public-key"],

@@ -128,7 +128,6 @@ export function layeredOver(snapshot: PreferenceSnapshot, keyDefault: string | n
     const tags: Tags = {
       routes: snapshot.routes.flatMap((r) => (r.model === model && r.tag !== undefined ? [[providerRef(r.operator, r.endpointId), r.tag] as const] : [])),
       handles: snapshot.handles ?? {},
-      supplierRef,
     };
     preference = preference.resolved(tag, tags);
     key = key?.resolved(null, tags) ?? null;
@@ -173,13 +172,15 @@ export function laneServes(snapshot: Pick<GatewaySnapshot, "laneServed">, models
 
 /**
  * How a request a `verifiable` preference leaves no route is refused (inference.rs `unverifiable`): in lane mode
- * (`atLane`) as any other filter that leaves nothing (`routing_filter_excluded_all`); elsewhere, where no route is
- * verifiable, with where they are served (`verifiable_routes_at_lane`) only when a verifiable route serves a model the
- * request lists on its API there (`laneServed`, `laneServes`), else with `verifiable_routes_unavailable`: a model API,
- * Gemini, or a model no verifiable route serves on that API.
+ * (`atLane`) with `verifiable_routes_unavailable`, which names the preference that left nothing (it was
+ * `routing_filter_excluded_all`, whose text names `only` and `ignore`: the walk of 2026-11-19), the request's next
+ * listed model still tried there (`unadmitted`); elsewhere, where no route is verifiable, with where they are served
+ * (`verifiable_routes_at_lane`) only when a verifiable route serves a model the request lists on its API there
+ * (`laneServed`, `laneServes`), else with `verifiable_routes_unavailable`: a model API, Gemini, or a model no verifiable
+ * route serves on that API.
  */
 export function unverifiable(atLane: boolean, laneServed: boolean): Unverifiable {
-  if (atLane) return "routing_filter_excluded_all";
+  if (atLane) return "verifiable_routes_unavailable";
   return laneServed ? "verifiable_routes_at_lane" : "verifiable_routes_unavailable";
 }
 
@@ -257,7 +258,7 @@ export function verifiableRoute(route: { readonly auth: RouteRecord["auth"] }): 
  *
  * The `verifiable` preference keeps the verifiable routes alone (those `verifiable` admits: `verifiableRoute` at every
  * call), before the other filters. A request it leaves nothing is refused with `refused` (`unverifiable`: where they are
- * served, that none serves its API, or in lane mode as any other filter that leaves nothing). Outside lane mode a
+ * served, or that none serves this model on its API, in lane mode too). Outside lane mode a
  * `verifiable` request is answered before any route is looked at (`verifiableUpFront`), so there the filter meets none
  * but one for a model Gray does not know, which has no route either; it is kept correct for it, and serves lane mode.
  */
@@ -318,12 +319,14 @@ export function unreadableDefault(code: "routing_default_invalid"): ApiError {
 /**
  * How a generation request answers a preference `retainAdmitted` refused with `code` (`unadmitted`), 400
  * either way: filters that leave this model nothing are its lack of an eligible provider, so a model the
- * customer listed next may serve the request (`next`); a reference naming nothing registered is the
- * request's, which no other model would change, and so is a `verifiable` preference outside the lane, where no
+ * customer listed next may serve the request (`next`), and so is, in lane mode (`atLane`), a `verifiable`
+ * preference that leaves this model nothing (`verifiable_routes_unavailable`); a reference naming nothing registered
+ * is the request's, which no other model would change, and so is a `verifiable` preference outside the lane, where no
  * model has a verifiable route (`verifiable_routes_at_lane`, `verifiable_routes_unavailable`).
  */
-export function unadmitted(code: Unadmitted): { readonly next: boolean; readonly error: ApiError } {
-  return { next: code === "routing_filter_excluded_all", error: new ApiError(400, code) };
+export function unadmitted(code: Unadmitted, atLane = false): { readonly next: boolean; readonly error: ApiError } {
+  const next = code === "routing_filter_excluded_all" || (atLane && code === "verifiable_routes_unavailable");
+  return { next, error: new ApiError(400, code) };
 }
 
 /**

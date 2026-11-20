@@ -1,6 +1,6 @@
 import type { KeyedPublicKey, PeerFailedCode } from "@gray/attest";
 import type { Json } from "@gray/json";
-import type { BridgeSigner, PeerAttemptState, PeerEndDto, PeerHeadDto, PeerProtocol } from "@gray/lane-wire";
+import type { BridgeSigner, PeerAttemptState, PeerEndDto, PeerHeadDto, PeerProtocol, StackTraceDto } from "@gray/lane-wire";
 import type { StackTrace } from "@gray/request-index";
 import type { StreamTimers } from "../client.ts";
 import type { GatewaySnapshot } from "../snapshot.ts";
@@ -77,6 +77,8 @@ export interface PeerPin {
 export interface PeerAttemptsReply {
   readonly state: PeerAttemptState;
   readonly receipt: Json | null;
+  /** The attempt's trace once done, from a stack VM that serves it (`attempts_trace`); absent from an older one. */
+  readonly trace?: StackTraceDto;
 }
 
 /**
@@ -285,7 +287,12 @@ export interface LanePeerCall {
   /** The hop's `end`, waited for until `untilMs` by the entry's clock; null when none came by then (`PeerCall.endWithin`). */
   endWithin(untilMs: number): Promise<PeerEndDto | null>;
   send(): Promise<PeerSent>;
-  followUp(untilMs: number): Promise<{ readonly state: PeerAttemptState; readonly receipt: Json | null } | null>;
+  followUp(untilMs: number): Promise<PeerAttemptsReply | null>;
+  /**
+   * The attempt's trace from the follow-up when its hop ended without `end` (the entry let go of it first), asked until
+   * `untilMs`; then `trace` has it. Nothing to ask when `end` came or the attempt was never sent.
+   */
+  traceLate(untilMs: number): Promise<void>;
   close(): void;
   /** The commitment naming the peer in the outer receipt (`@gray/attest` `peerCommitment`). */
   commitment(): string;

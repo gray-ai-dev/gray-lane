@@ -104,6 +104,7 @@ __REPLICA_SERVICES__    # Nothing is reachable through this service: `allow` def
 
           # The gateway's own vars (workers/packages/config): the lane reads them through gatewayConfig.
           ( name = "GATEWAY_FALLBACK_REGION", text = "__GATEWAY_FALLBACK_REGION__" ),
+          ( name = "CONSOLE_ORIGIN", text = "__CONSOLE_ORIGIN__" ),
           ( name = "BODY_PARSE_MAX_BYTES", text = "__BODY_PARSE_MAX_BYTES__" ),
           ( name = "LANE_POLICY_STEP_MS", text = "__LANE_POLICY_STEP_MS__" ),
           ( name = "LANE_POLICY_FUEL_PER_MS", text = "__LANE_POLICY_FUEL_PER_MS__" ),

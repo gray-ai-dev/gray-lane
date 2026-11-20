@@ -1,7 +1,7 @@
 import type { GatewayConfig } from "@gray/config";
 import { parseStrict, type Json } from "@gray/json";
 import { requestLimit } from "@gray/limits";
-import { encodePeerAttemptsAnswer, encodePeerDebugAnswer, encodePeerDebugRefusal, PEER_DEBUG_PREFIX, PEER_DEBUG_REFUSAL_STATUS, PEER_HEADER, peerRequestIdOf, type PeerDebugRefusalCode } from "@gray/lane-wire";
+import { encodePeerAttemptsAnswer, encodePeerDebugAnswer, encodePeerDebugRefusal, PEER_DEBUG_PREFIX, PEER_DEBUG_REFUSAL_STATUS, PEER_HEADER, peerReadsOf, peerRequestIdOf, type PeerDebugRefusalCode } from "@gray/lane-wire";
 import { readBody } from "../body.ts";
 import { platformTimers, type StreamTimers } from "../client.ts";
 import { servedProtocol } from "../paths.ts";
@@ -107,7 +107,12 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
     if (!checked.ok) return peerRefusal(checked.code);
     if (checked.envelope.rid !== path.slice(PEER_ATTEMPTS_PREFIX.length)) return peerRefusal("peer_malformed");
     const answer = peer.attempts.answer(PeerAttempts.key(checked.envelope), state.now());
-    return new Response(encodePeerAttemptsAnswer({ state: answer.state, receipt: answer.receipt as Record<string, unknown> | null }), { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    // The trace goes only to an entry that reads it (`attempts_trace`): an older one parses the answer strictly.
+    const trace = answer.trace !== null && peerReadsOf(request.headers).has("attempts_trace") ? { trace: answer.trace } : {};
+    return new Response(encodePeerAttemptsAnswer({ state: answer.state, receipt: answer.receipt as Record<string, unknown> | null, ...trace }), {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
   }
   const served = servedProtocol(request.method, path);
   if (served === null || served.protocol === "gemini" || path.startsWith(PEER_PREFIX)) return peerRefusal("peer_malformed");

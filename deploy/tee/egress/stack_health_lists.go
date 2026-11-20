@@ -9,7 +9,8 @@ package main
 // to the code lists of @gray/errors (rests.ts, upstream.ts) the vendor codes come from.
 
 // The attempt classes (S34 STACK_ATTEMPT_CLASSES): how one relay call to egress ended, written as `class` on its
-// `end` or `refused` record. container_fault is the entry's own (a container call that made no attempt).
+// `end` or `refused` record. container_fault and relay_declined are gray-jobs' own (a container call that made no
+// attempt: declined by the relay's software, or failed by it); egress never writes them.
 const (
 	classOK                = "ok"
 	classStreamError       = "stream_error"
@@ -34,13 +35,14 @@ const (
 	classCooling           = "cooling"
 	classCredentialUnknown = "credential_unknown"
 	classContainerFault    = "container_fault"
+	classRelayDeclined     = "relay_declined"
 )
 
 var stackAttemptClasses = []string{
 	classOK, classStreamError, classVendorReset, classRelayClosed, classGrayEnded, classEgressLimit, classClientError,
 	classAuth, classForbidden, classBilling, classRestricted, classWindowExhausted, classRateLimit, classOverloaded,
 	classUnavailable, classVendor5xx, classChallenge, classConnect, classProxy, classRelayRefused, classCooling,
-	classCredentialUnknown, classContainerFault,
+	classCredentialUnknown, classContainerFault, classRelayDeclined,
 }
 
 // The vendor codes (S35 STACK_VENDOR_CODES): what egress read from a vendor error, by the S35 table's rows.

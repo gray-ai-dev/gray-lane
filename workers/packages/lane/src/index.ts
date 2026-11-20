@@ -104,6 +104,18 @@ export {
 } from "./policy.ts";
 export { StackEventDigester, stackBodyDigest, stackCanonical, stackEventDigest, stackJsonTree, stackTreeText, type StackJsonTree } from "./stack-digest.ts";
 export {
+  GRAY_LANE_RESPONSE_REWRITES_V1,
+  GRAY_LANE_RESPONSE_REWRITES_V1_ID,
+  stackBodyRewrite,
+  stackEventRewrite,
+  stackVendorBodyDigest,
+  stackVendorEventDigest,
+  stackVendorEventsSha256,
+  type LaneResponseRewrite,
+  type LaneResponseRewriteRule,
+  type StackRewritten,
+} from "./response-rewrites.ts";
+export {
   applyDeclaredChanges,
   changeValueSha256,
   type ApplyChangesOk,

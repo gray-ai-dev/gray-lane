@@ -88,11 +88,14 @@ import {
   isPositionForProtocol,
   replayForwarded,
   stackBodyDigest,
+  stackVendorBodyDigest,
+  stackVendorEventsSha256,
   textSha256Hex,
   verifyForwarded,
   verifyForwardedWithChanges,
   type AppliedAppend,
   type LaneProtocol,
+  type LaneResponseRewrite,
 } from "@gray/lane";
 import { applyRelayChanges } from "./relay-patch.ts";
 
@@ -199,6 +202,11 @@ export interface StackReceiptSummary {
   /** The attempt whose events, body or vendor error the client got (S32), or null for Gray's own error only. */
   readonly served_attempt: string | null;
   readonly served_as: string | null;
+  /**
+   * Gray's declared changes to the served attempt's answer (`response.returned.rewrites`, gray-lane-response-rewrites-v1):
+   * each event's seq (null for a body), the op and its path. Empty when the client got the vendor's answer as it was.
+   */
+  readonly rewrites: readonly { readonly seq: string | null; readonly op: string; readonly path: string }[];
   /**
    * Why Gray's record of the relay's calls stopped before egress's end (`relay_stack.feed_incomplete`):
    * `record_refused` or `feed_ended`; null when the record is whole.
@@ -633,6 +641,15 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
   const servedAttempt = typeof servedNumber === "bigint" ? servedNumber.toString() : null;
   const servedAs = stringMember(returned, "served_as");
   const served = servedAttempt === null ? undefined : attempts.find((attempt) => attempt.n === servedAttempt);
+  // The event-log check held each entry to its shape (op, path, policy, seq ascending); the rule itself is checked below.
+  const rewritesValue = returned === undefined ? undefined : get(returned, "rewrites");
+  const rewrites: LaneResponseRewrite[] = Array.isArray(rewritesValue)
+    ? rewritesValue.map((entry) => {
+        const seq = get(entry, "seq");
+        return { ...(typeof seq === "bigint" ? { seq: Number(seq) } : {}), op: "remove_member", path: String(get(entry, "path")), declaredIn: String(get(entry, "declared_in")) };
+      })
+    : [];
+  const rewritesText = rewrites.map((rewrite) => `${rewrite.seq === undefined ? "" : `event ${rewrite.seq}: `}${rewrite.op} ${rewrite.path}`).join(", ");
   // The event-log check already tied an un-replaced answer to `served` (S32); this reports the tie.
   if (servedAttempt === null && servedAs === "client_left") {
     checks.push(pass("served_attempt", "none: the client left before any answer (client_left)"));
@@ -648,6 +665,8 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     } else {
       checks.push(fail("served_attempt", `a codex_terminal_response answers a Responses request, not ${protocol}`));
     }
+  } else if (rewrites.length > 0) {
+    checks.push(pass("served_attempt", `attempt ${servedAttempt}: its upstream.response's answer with Gray's declared rewrites (gray-lane-response-rewrites-v1: ${rewritesText}); the bytes received tie it (response_served_attempt)`));
   } else {
     const member = eventsSha256 !== null ? "events_sha256" : "body_sha256";
     checks.push(pass("served_attempt", `attempt ${servedAttempt}: the client's ${member} and status ${String(status)} are its upstream.response's`));
@@ -656,6 +675,7 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
   const response = options.responseBytes;
   if (response === undefined) {
     checks.push(skip("response_stack_digest", "not checked: pass the raw response bytes (--response)"));
+    if (rewrites.length > 0) checks.push(skip("response_served_attempt", `not checked: the answer carries Gray's declared rewrites (${rewritesText}), which only the bytes received tie to attempt ${servedAttempt}`));
   } else {
     let received: string | null = null;
     if (eventsSha256 !== null) {
@@ -677,8 +697,22 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
         checks.push(skip("response_served_attempt", `not checked: the client left; partial answer, not tied to attempt ${servedAttempt} (client_left)`));
       } else {
         const vendor = eventsSha256 !== null ? served.upstream_events_sha256 : served.upstream_body_sha256;
-        if (vendor === received) checks.push(pass("response_served_attempt", `the bytes received are attempt ${servedAttempt}'s vendor answer`));
-        else checks.push(fail("response_served_attempt", `the bytes received digest to ${received}, attempt ${servedAttempt}'s vendor answer to ${String(vendor)}`));
+        if (rewrites.length === 0) {
+          if (vendor === received) checks.push(pass("response_served_attempt", `the bytes received are attempt ${servedAttempt}'s vendor answer`));
+          else checks.push(fail("response_served_attempt", `the bytes received digest to ${received}, attempt ${servedAttempt}'s vendor answer to ${String(vendor)}`));
+        } else {
+          // Each declared rewrite undone on the bytes received (the member put back as null), the vendor's digests again.
+          const undone =
+            eventsSha256 !== null
+              ? stackVendorEventsSha256(protocol, response, rewrites)
+              : (() => {
+                  const digest = rewrites.length === 1 ? stackVendorBodyDigest(protocol, rewrites[0]!, response) : null;
+                  return digest === null ? ({ ok: false, seq: null, why: "the body is not what the declared rewrite makes of a body" } as const) : ({ ok: true, sha256: digest } as const);
+                })();
+          if (!undone.ok) checks.push(fail("response_served_attempt", `Gray's declared rewrites do not undo on the bytes received: ${undone.why}`));
+          else if (undone.sha256 === vendor) checks.push(pass("response_served_attempt", `the bytes received are attempt ${servedAttempt}'s vendor answer with Gray's declared rewrites (${rewritesText})`));
+          else checks.push(fail("response_served_attempt", `the bytes received, the declared rewrites undone, digest to ${undone.sha256}, attempt ${servedAttempt}'s vendor answer to ${String(vendor)}`));
+        }
       }
     }
   }
@@ -692,6 +726,7 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     replaced_error: typeof replaced === "boolean" ? replaced : null,
     served_attempt: servedAttempt,
     served_as: servedAs,
+    rewrites: rewrites.map((rewrite) => ({ seq: rewrite.seq === undefined ? null : String(rewrite.seq), op: rewrite.op, path: rewrite.path })),
     feed_incomplete: feedIncomplete,
   };
 }

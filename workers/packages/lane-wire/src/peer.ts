@@ -22,11 +22,13 @@ import { stackTraceSchema } from "./stack-trace.ts";
  *   for the late-facts follow-up (`GET /v1/peer/attempts/<rid>`), so neither can be presented as the other.
  * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream}`), `data` (standard base64 of
  *   the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts, relay_account_id,
- *   usage, code, receipt, trace?, checks?}`). Between them the stack VM writes `PEER_COMMENT`, which is not a frame.
- *   `checks` goes only to an entry that named it in `PEER_READS_HEADER`.
+ *   usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?}`). Between them the stack VM writes
+ *   `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused` and `vendor_event` go only to an entry that named
+ *   them in `PEER_READS_HEADER`.
  * - **A refusal** of checks 1 to 6 (`peer_*`, `route_unconfigured`, `foreign_relay`): an HTTP 4xx whose body is
  *   `{code, dialed: false}`, before any frame; the status is `PEER_REFUSAL_STATUS`'s.
- * - **The attempts answer**: `{state, receipt}` from the stack VM's memory.
+ * - **The attempts answer**: `{state, receipt, trace?}` from the stack VM's memory (`trace` once done, to an entry
+ *   that named `attempts_trace`).
  *
  * The frame and answer documents follow the package's integer rule (ints.ts): integers are bigints, written by
  * `@gray/json`'s `toJsonString` and read by its serde reader. The envelope's integers are bigints too; JCS writes a
@@ -62,8 +64,20 @@ export const PEER_READS_HEADER = "x-gray-peer-reads";
  * `PEER_CHECKS_WORDS`. A read word names its member together with the member's words: `end` is strict on the entry, so
  * a word added to either check needs a new read word (`checks_v2`) that names the new lists, and to an entry that named
  * `checks` alone a stack VM sends a word outside `PEER_CHECKS_WORDS` as null.
+ *
+ * `receipt_refused`: why a dialed attempt's `end` has no receipt (the receipt grammar refused the one the stack VM wrote),
+ * so the entry still gets the attempt's outcome, usage and trace. To an entry that did not name it, such an `end` cannot
+ * be sent (a dialed attempt has its receipt), and the hop ends without one.
+ *
+ * `vendor_event`: the vendor's own error event that ended its stream before the stack VM's commit (an Anthropic `error`
+ * after `message_start`), so the entry answers it as the main gateway answers an upstream's in-band error, and does not
+ * count it against the relay.
+ *
+ * `attempts_trace`: named on the follow-up (`GET /v1/peer/attempts/<rid>`), the attempt's trace in the answer once it is
+ * done, for an entry that let go of the hop before `end` came (its own limit, the client gone): the entry's row keeps the
+ * relay's trace and its attempt.
  */
-export const PEER_END_READS = ["checks"] as const;
+export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace"] as const;
 export type PeerEndRead = (typeof PEER_END_READS)[number];
 
 /**
@@ -351,6 +365,22 @@ export const peerEndSchema = z
      * (`PEER_CHECKS_WORDS`), r14's, never a later word.
      */
     checks: z.object({ tool_call_check: z.enum(PEER_CHECKS_WORDS.tool_call_check).nullable(), output_check: z.enum(PEER_CHECKS_WORDS.output_check).nullable() }).strict().optional(),
+    /**
+     * Why a dialed attempt has no receipt: the receipt grammar's problem (`@gray/attest` `EventLogProblem`, e.g.
+     * `served_digest_mismatch`) or `receipt_failed`, a closed lower-case word, never content. Present exactly when a
+     * dialed attempt's `receipt` is null, and sent only to an entry that named it in PEER_READS_HEADER: an entry before it
+     * refuses an `end` that carries it, and one without a receipt.
+     */
+    receipt_refused: z
+      .string()
+      .regex(/^[a-z][a-z_]{0,63}$/)
+      .optional(),
+    /**
+     * The vendor's own error event that ended its stream before the stack VM's commit (`relay_failed`: nothing of it was
+     * released), as the vendor sent it: the entry classifies it as the main gateway classifies an upstream's in-band error.
+     * Sent only to an entry that named `vendor_event` in PEER_READS_HEADER.
+     */
+    vendor_event: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
   .superRefine((end, ctx) => {
@@ -362,7 +392,9 @@ export const peerEndSchema = z
     if (end.served_attempt !== null && end.served_attempt > end.attempts) issue("served_attempt", "the served attempt is one of the attempts dialed");
     if (!dialed && (end.attempts !== 0n || end.relay_account_id !== null || end.usage !== null)) issue("attempts", "an attempt not dialed has no attempts, account or usage");
     if ((end.code === null) !== (end.outcome === "served" || end.outcome === "vendor_error")) issue("code", "a code names why exactly when the answer is not the vendor's");
-    if (dialed && end.receipt === null) issue("receipt", "a dialed attempt has its receipt");
+    if (dialed && end.receipt === null && end.receipt_refused === undefined) issue("receipt", "a dialed attempt has its receipt, or says why not (receipt_refused)");
+    if (end.receipt_refused !== undefined && (!dialed || end.receipt !== null)) issue("receipt_refused", "receipt_refused names why a dialed attempt has no receipt");
+    if (end.vendor_event !== undefined && end.outcome !== "relay_failed") issue("vendor_event", "vendor_event names the vendor's error that ended an answer nothing of which was released");
   });
 export type PeerEndDto = z.infer<typeof peerEndSchema>;
 
@@ -425,9 +457,15 @@ export const PEER_ATTEMPT_STATES = ["unknown", "registered", "dialed", "done"] a
 export type PeerAttemptState = (typeof PEER_ATTEMPT_STATES)[number];
 
 export const peerAttemptsAnswerSchema = z
-  .object({ state: z.enum(PEER_ATTEMPT_STATES), receipt: receiptValue.nullable() })
+  .object({
+    state: z.enum(PEER_ATTEMPT_STATES),
+    receipt: receiptValue.nullable(),
+    /** The attempt's S43 trace once it is done, to an entry that named `attempts_trace` in PEER_READS_HEADER. */
+    trace: stackTraceSchema.optional(),
+  })
   .strict()
-  .refine((answer) => answer.receipt === null || answer.state === "done", { message: "only an attempt that is done has its receipt", path: ["receipt"] });
+  .refine((answer) => answer.receipt === null || answer.state === "done", { message: "only an attempt that is done has its receipt", path: ["receipt"] })
+  .refine((answer) => answer.trace === undefined || answer.state === "done", { message: "only an attempt that is done has its trace", path: ["trace"] });
 export type PeerAttemptsAnswerDto = z.infer<typeof peerAttemptsAnswerSchema>;
 
 /** The answer's body: `@gray/json` text of the checked document. */

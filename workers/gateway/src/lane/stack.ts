@@ -14,6 +14,7 @@ import {
   requestReceivedEvent,
   stackEventsSha256,
   stackHeadersSha256,
+  type StackResponseRewrite,
   stackRequestForwardedEvent,
   stackResponseReturnedEvent,
   upstreamResponseEvent,
@@ -31,7 +32,20 @@ import {
 } from "@gray/attest";
 import { ApiError, ERROR_BODY_LIMIT } from "@gray/errors";
 import { get, isObject, parseStrict, parseStrictBytes, type Json, type JsonObject } from "@gray/json";
-import { DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_REWRITES_V1, isPositionForProtocol, stackBodyDigest, stackEventDigest, stackStoreOff, type LaneProtocol } from "@gray/lane";
+import {
+  DEFAULT_MAX_ITEMS,
+  DEFAULT_MAX_TOTAL_BYTES,
+  GRAY_LANE_RESPONSE_REWRITES_V1_ID,
+  GRAY_LANE_REWRITES_V1,
+  isPositionForProtocol,
+  stackBodyDigest,
+  stackBodyRewrite,
+  stackEventDigest,
+  stackEventRewrite,
+  stackStoreOff,
+  type LaneProtocol,
+  type StackRewritten,
+} from "@gray/lane";
 import {
   STACK_ATTEMPT_CLASSES,
   STACK_FAULT_WHYS,
@@ -130,8 +144,7 @@ export function laneRelayFailed(): ApiError {
 /**
  * The lane's error for a relay whose answer failed Gray's check (S24): the container passed on an answer that is not
  * the one egress recorded from its provider. Not a break a repeat fixes: the same relay changes the same answer the same
- * way (production, 2026-11-19: a relay's software renamed the tool calls of a subscription account's stream back on
- * the way out), so `x-should-retry` is false, and the attempt counts against the relay's route as any failed answer.
+ * way, so `x-should-retry` is false, and the attempt counts against the relay's route as any failed answer.
  */
 export const UPSTREAM_ANSWER_REFUSED = "upstream_answer_refused";
 
@@ -1013,6 +1026,13 @@ export class StackCall {
   } | null = null;
   /** The S19 digest of a non-stream body that was not the record's (`body_mismatch`), for `violation`. */
   #unmatchedBody: string | null = null;
+  /**
+   * Gray's rule (gray-lane-response-rewrites-v1) on the served attempt's released events, by position, and on its body:
+   * the member the gate leaves out for the client and the digest without it. The receipt declares them when the client's
+   * chain or body is the vendor's with exactly those (`responseRewrites`).
+   */
+  readonly #rewritable = new Map<number, StackRewritten>();
+  #bodyRewrite: StackRewritten | null = null;
 
   constructor(input: StackCallInput) {
     this.rid = input.rid;
@@ -1359,6 +1379,36 @@ export class StackCall {
   }
 
   /**
+   * Gray's declared changes to the served attempt's answer for a receipt that ties the client's answer to it (S32,
+   * `response.returned.rewrites`): none when the client's chain (or body digest) is the vendor's; every change Gray's
+   * rule made when it is the vendor's with exactly those; null when it is neither, which no receipt ties (the request
+   * path changed the answer in a way no published rule declares).
+   */
+  responseRewrites(returned: { readonly eventsSha256: string | null; readonly bodySha256: string | null }): StackResponseRewrite[] | null {
+    const served = this.served;
+    if (served === null) return null;
+    const declared = (rewritten: StackRewritten, seq?: number): StackResponseRewrite => ({
+      ...(seq === undefined ? {} : { seq: BigInt(seq) }),
+      op: "remove_member",
+      path: rewritten.path,
+      declaredIn: GRAY_LANE_RESPONSE_REWRITES_V1_ID,
+    });
+    if (returned.eventsSha256 !== null) {
+      if (stackEventsSha256(served.events) === returned.eventsSha256) return [];
+      if (this.#rewritable.size === 0) return null;
+      const expected = served.events.map((digest, at) => this.#rewritable.get(at)?.digest ?? digest);
+      if (stackEventsSha256(expected) !== returned.eventsSha256) return null;
+      return [...this.#rewritable.entries()].sort(([left], [right]) => left - right).map(([seq, rewritten]) => declared(rewritten, seq));
+    }
+    if (returned.bodySha256 !== null) {
+      if (served.body?.digest === returned.bodySha256) return [];
+      const rewritten = this.#bodyRewrite;
+      return rewritten !== null && rewritten.digest === returned.bodySha256 ? [declared(rewritten)] : null;
+    }
+    return null;
+  }
+
+  /**
    * Ends the call: the rid at egress first (S32), which cancels its vendor calls and writes `end`
    * (`entry_closed`, Gray's own ending) for each attempt still in flight before `done`; then the
    * container's connection (the relay standard promises relays that Gray closes it when it ends an
@@ -1608,10 +1658,16 @@ export class StackCall {
         if (this.released > 0) unmatched("attempt_after_release");
         this.#matching = current;
         this.#position = 0;
+        this.#rewritable.clear();
       }
       const recorded = current?.events[this.#position];
       if (current !== null && recorded !== undefined) {
         if (recorded === digest) {
+          // A text without the member's name is none the rule rewrites: most events are not parsed a second time.
+          if (event.data.includes('"iterations"')) {
+            const rewritten = stackEventRewrite(protocol, utf8.encode(event.event ?? ""), utf8.encode(event.data));
+            if (rewritten !== null) this.#rewritable.set(this.#position, rewritten);
+          }
           this.#position += 1;
           this.released += 1;
           this.served = current;
@@ -1690,6 +1746,7 @@ export class StackCall {
       throw new StackFaultError({ by: "relay", why: "body_mismatch" });
     }
     this.served = target;
+    this.#bodyRewrite = stackBodyRewrite(this.#input.protocol, bytes);
     if (target.response.status < 200 || target.response.status > 299) {
       this.fault ??= { by: "relay", why: "relay_error_as_success" };
       return { kind: "failed", outcome: { kind: "vendor_error", attempt: target, status: target.response.status, body: target.errorBody ?? bytes, headers: target.response.headers } };
@@ -1908,6 +1965,11 @@ export function addStackReceipt(
     if (incomplete !== null) builder.addRelayStackFeedIncomplete({ reason: incomplete });
   }
   const returned = input.returned;
+  // An answer tied to its attempt (S32) declares Gray's own changes to it (`rewrites`, gray-lane-response-rewrites-v1);
+  // one the request path changed otherwise is left as it is, which the grammar refuses (the stack VM's `end` then says so).
+  const tied =
+    servedAttempt !== null && !returned.replacedError && returned.servedAs === undefined && returned.leftBeforeAnswer !== true && returned.grayErrorOnly !== true;
+  const rewrites = tied && last !== undefined ? (last.responseRewrites(returned) ?? []) : [];
   builder.addStackResponseReturned({
     bodyHash: returned.bodyHash,
     status: BigInt(returned.status),
@@ -1916,6 +1978,7 @@ export function addStackReceipt(
     replacedError: returned.replacedError,
     servedAttempt: returned.leftBeforeAnswer === true || returned.grayErrorOnly === true ? null : servedAttempt,
     ...(returned.servedAs === undefined ? {} : { servedAs: returned.servedAs }),
+    ...(rewrites.length === 0 ? {} : { rewrites }),
   });
 }
 

@@ -4317,11 +4317,14 @@ export const SETTINGS: readonly SettingSpec[] = [
     source:
       "docs/design/relay-release-zero-downtime.md: a failed move cost about 5 minutes of a second VM (Phala's replica after about 82 s and " +
       "an instance's compose update in about 117 s, measured 2026-11-09, then the boot watch); every 6 hours is 20 minutes of a VM a day " +
-      "for a release that cannot boot, and a transient refusal (capacity) waits at most that long. At least 10 minutes (two moves never " +
-      "overlap a relay's drain bound of 15), at most a week.",
+      "for a release that cannot boot. At least 10 minutes (two moves never overlap a relay's drain bound of 15), at most a week. A move " +
+      "that made no VM costs nothing of the kind: on 2026-11-19 (production) the node KMS answered 525 for the app env public key for " +
+      "minutes, both relays' moves failed at `replicate` before Phala made a replica, and they then waited 6 hours on the old release; " +
+      "such a failure now waits the minimum, doubling, up to an hour (it costs no VM).",
     doc:
-      "How long after a failed move of a relay's VM to a Gray release (LANE_STACK_RELEASE_MOVES) the console tries that release again. A " +
-      "newer release the relay accepts is moved to at once.",
+      "How long after a failed move of a relay's VM to a Gray release (LANE_STACK_RELEASE_MOVES) that made a VM the console tries that " +
+      "release again. After a move that failed before Phala made its VM, 10 minutes (this setting's minimum), twice as long after each " +
+      "such failure in a row, at most an hour (and never longer than this). A newer release the relay accepts is moved to at once.",
   },
   {
     name: "LANE_STACK_RELEASE_LIST",
@@ -5809,7 +5812,7 @@ export interface ConsoleConfig {
   readonly laneStackPhase2MinKit: string;
   /** LANE_STACK_RELEASE_MOVES: whether the console moves running VMs to the relay's newest accepted release. */
   readonly laneStackReleaseMoves: LaneStackReleaseMoveMode;
-  /** LANE_STACK_RELEASE_MOVE_RETRY_MS: how long after a failed move to a release the console tries it again. */
+  /** LANE_STACK_RELEASE_MOVE_RETRY_MS: how long after a failed move to a release that made a VM the console tries it again. */
   readonly laneStackReleaseMoveRetryMs: number;
   /** LANE_STACK_RELEASE_LIST (S57): the relay stacks' signed release list the pairing answers; empty: none. */
   readonly laneStackReleaseList: string;

@@ -42,6 +42,7 @@ import {
   type StackRefusalCode,
   type PeerFailedCode,
   type StackServedAs,
+  type StackResponseRewrite,
 } from "./events.ts";
 import { ACI_API_VERSION, ALGO_ED25519, type KeyedPublicKey, type SealedKeyset } from "./identity.ts";
 import { isU64, u64Schema } from "./integers.ts";
@@ -440,6 +441,7 @@ export class ReceiptBuilder {
     readonly replacedError: boolean;
     readonly servedAttempt: bigint | null;
     readonly servedAs?: StackServedAs;
+    readonly rewrites?: readonly StackResponseRewrite[];
   }): void {
     this.#push(stackResponseReturnedEvent(input));
   }

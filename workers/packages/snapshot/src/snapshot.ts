@@ -1180,8 +1180,9 @@ export async function buildSnapshot(
   const handleRows = reader.handles === undefined ? [] : [...(await reader.handles())].sort((a, b) => byText(a.handle, b.handle));
   const handleOf = new Map(handleRows.map((r) => [r.workspace_id, r.handle]));
   const traffic = published.some(({ e }) => e.config.lane?.mode === "stack") && reader.stackTraffic ? await reader.stackTraffic() : new Map<string, { readonly untilMs: number }>();
-  // A relay stack's route is published only while an account of its relay can serve its upstream model (`stackCoverage`):
-  // the lane's entry, the main view's `laneServed` and `laneOffers` and the catalog all read these routes.
+  // A relay stack's route takes traffic only while an account of its relay can serve its upstream model (`stackCoverage`);
+  // one that none can is published to name its relay alone (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`): the lane's entry and the
+  // relay's VM keep the relay, the main view's `laneServed` and `laneOffers` and the catalog leave the route out.
   const stackRelays = [...new Set(published.flatMap(({ e }) => (e.config.lane?.mode === "stack" ? [e.config.lane.relay_id] : [])))].sort(byText);
   const covered = stackRelays.length > 0 && reader.stackCoverage ? await reader.stackCoverage(stackRelays, nowMs) : null;
   const routes: SnapshotRoute[] = [];
@@ -1205,8 +1206,8 @@ export async function buildSnapshot(
       const quote = quoteOf.get(key) ?? null;
       // A lane relay earns its route by an approved offer alone; a direct route also by its current pass.
       if (lane && quote === null) continue;
-      // A relay stack's route also by an account that can serve it.
-      if (covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model)) continue;
+      // A relay stack's route takes traffic by an account that can serve it too; without one it only names its relay.
+      const uncovered = covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model);
       routes.push({
         capacityKey: capacityKey(e.id, m.requested_model, m.protocol),
         endpointId: e.id,
@@ -1231,7 +1232,7 @@ export async function buildSnapshot(
         supplierRef: supplierRef(e.workspace_id),
         // A lane relay has no verification, so nothing it proved is being checked again.
         ...((recovering) => (recovering === null ? {} : { recovering }))(lane ? null : routeRecovering(e, m.protocol, v!, proofs.get(v!.id), nowMs)),
-        ...(trafficUntilMs === undefined ? {} : { trafficUntilMs }),
+        ...(uncovered ? { trafficUntilMs: STACK_UNCOVERED_TRAFFIC_UNTIL_MS } : trafficUntilMs === undefined ? {} : { trafficUntilMs }),
         ...((tag) => (tag === null ? {} : { tag }))(routeTag(handleOf.get(e.workspace_id) ?? null, lane, quote?.terms ?? null)),
       });
     }
@@ -1290,6 +1291,25 @@ export async function buildSnapshot(
       handleRows.filter((r) => r.show_name === true).sort((a, b) => byText(a.workspace_id, b.workspace_id)),
     ),
   };
+}
+
+/**
+ * The `trafficUntilMs` of a relay stack's route no account of its relay can serve now (`SnapshotReader.stackCoverage`):
+ * a traffic limit long past, so every entry leaves the route out of routing as it does a route past its release traffic
+ * window (gateway routes.ts `releaseOutdated`, in every entry release since that window), and the route is published
+ * only so that the snapshot still names its relay. Both readers of the relay know a stack relay only by its routes'
+ * lane records: the entry, whose peer routes (attach, tunnel, boots, healthz) refuse a relay no route names (gateway
+ * peer-client.ts `stackRelayKeysOf`), and the relay's VM, whose accounts are usable only while the snapshot names its
+ * relay (lane/remote/snapshot.ts `stackRelayOf`). A relay none of whose routes was published was cut off from both:
+ * its VM reported no account it could use, so no route was covered again, and a release move's new boot was never
+ * found at the entry (production 2026-11-20, roteo and opensand). The main view's `laneServed` and `laneOffers` and
+ * the catalog leave such a route out (`stackRouteNamesOnly`).
+ */
+export const STACK_UNCOVERED_TRAFFIC_UNTIL_MS = 0;
+
+/** Whether `r` is a relay stack's route published only to name its relay (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`): nothing offers, counts or lists it. */
+export function stackRouteNamesOnly(r: Pick<SnapshotRoute, "trafficUntilMs">): boolean {
+  return r.trafficUntilMs === STACK_UNCOVERED_TRAFFIC_UNTIL_MS;
 }
 
 /** Every route of `content`, those that serve streamed requests only (`streamedOnlyRoutes`) after the rest. */

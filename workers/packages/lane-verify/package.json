@@ -2,6 +2,7 @@
   "name": "@gray/lane-verify",
   "private": true,
   "version": "0.0.0",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

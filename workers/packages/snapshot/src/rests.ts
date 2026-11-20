@@ -13,6 +13,34 @@ export const BUDGET_DEFERRAL_PREFIX = "budget-deferral-v1/";
 export const ACCOUNT_BLOCK_DEFERRAL_PREFIX = "account-block-deferral-v1/";
 /** `TRAFFIC_RENEWAL_PREFIX`: the evaluator version prefix of a pass customer traffic carried. */
 export const TRAFFIC_RENEWAL_PREFIX = "traffic-renewal-v1/";
+/**
+ * `INCONCLUSIVE_HOLD_MARKER`: the evaluator version marker of a pass held in force through a check that got no verdict
+ * (console verification/records.ts `recordEvaluatorReport`). It goes after the carry prefixes of the record it holds,
+ * so every reader of those prefixes reads a hold as the record it holds.
+ */
+export const INCONCLUSIVE_HOLD_MARKER = "inconclusive-hold-v1/";
+
+/** `version` without its carry prefixes (budget, account block, traffic). */
+function uncarried(version: string): string {
+  let rest = version;
+  for (;;) {
+    const prefix = [TRAFFIC_RENEWAL_PREFIX, BUDGET_DEFERRAL_PREFIX, ACCOUNT_BLOCK_DEFERRAL_PREFIX].find((p) => rest.startsWith(p));
+    if (prefix === undefined) return rest;
+    rest = rest.slice(prefix.length);
+  }
+}
+
+/** `is_hold`: whether `version` names a hold (`INCONCLUSIVE_HOLD_MARKER` after its carry prefixes). */
+export function isHold(version: string): boolean {
+  return uncarried(version).startsWith(INCONCLUSIVE_HOLD_MARKER);
+}
+
+/** `held_version`: the evaluator version of a hold of a record of `version`: the marker after its carry prefixes, once. */
+export function heldVersion(version: string): string {
+  const rest = uncarried(version);
+  if (rest.startsWith(INCONCLUSIVE_HOLD_MARKER)) return version;
+  return `${version.slice(0, version.length - rest.length)}${INCONCLUSIVE_HOLD_MARKER}${rest}`;
+}
 
 /** `Deferral::carried`: whether `evaluatorVersion` names a record a deferral of any kind carried. */
 export function carriedByDeferral(evaluatorVersion: string): boolean {

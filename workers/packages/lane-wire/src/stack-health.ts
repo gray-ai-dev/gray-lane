@@ -12,8 +12,10 @@
 
 /**
  * How one relay call to egress ended (S34's table, in its row order, which is the order the class is decided in):
- * written by egress as `class` on `end` and `refused`; `container_fault` is the entry's alone (a container call that
- * made no attempt and whose fault is the relay's, account `''`).
+ * written by egress as `class` on `end` and `refused`. The last two are gray-jobs' alone, of a container call that made
+ * no attempt and whose fault is the relay's (account `''`): `relay_declined` when the relay's software declined it
+ * (the trace's `fault.why`; relay integration standard rule 1, which counts it against nothing), `container_fault`
+ * otherwise. Egress never writes either.
  */
 export const STACK_ATTEMPT_CLASSES = [
   "ok",
@@ -39,6 +41,7 @@ export const STACK_ATTEMPT_CLASSES = [
   "cooling",
   "credential_unknown",
   "container_fault",
+  "relay_declined",
 ] as const;
 export type StackAttemptClass = (typeof STACK_ATTEMPT_CLASSES)[number];
 
@@ -287,6 +290,7 @@ export const STACK_ACCOUNT_STATE_REASONS = [
   "cooling",
   "credential_unknown",
   "container_fault",
+  "relay_declined",
   "proxy_failing",
   "credential_expiring",
   "credential_expired",

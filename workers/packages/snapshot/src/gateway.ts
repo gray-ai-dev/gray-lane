@@ -4,7 +4,7 @@ import { capabilityWords, type Capabilities } from "./capabilities.ts";
 import { ENTRY_ENDPOINT_PROTOCOLS, entryEndpointRoute } from "./endpoint-route.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
 import type { RouteTag } from "./offers.ts";
-import { snapshotRoutes, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
+import { snapshotRoutes, stackRouteNamesOnly, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
 
 /** A recipient record as the gateway reads it (@gray/content `RecipientRecord`). */
 export interface GatewayRecipient {
@@ -447,7 +447,7 @@ export function laneServedKey(model: string, protocol: Protocol): string {
 export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): Record<string, number> {
   const served: Record<string, number> = {};
   for (const r of snapshotRoutes(snapshot)) {
-    if (r.config.auth !== "lane_relay" || r.offer === null || !LANE_PROTOCOLS.includes(r.mapping.protocol)) continue;
+    if (r.config.auth !== "lane_relay" || r.offer === null || !LANE_PROTOCOLS.includes(r.mapping.protocol) || stackRouteNamesOnly(r)) continue;
     const key = laneServedKey(r.mapping.requested_model, r.mapping.protocol);
     served[key] = Math.max(served[key] ?? 0, Math.min(r.expires, r.offer.eligible_until) * 1000);
   }
@@ -462,7 +462,7 @@ export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
 export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): GatewayLaneOffer[] {
   const offers: GatewayLaneOffer[] = [];
   for (const r of snapshotRoutes(snapshot)) {
-    if (r.config.auth !== "lane_relay" || !LANE_PROTOCOLS.includes(r.mapping.protocol)) continue;
+    if (r.config.auth !== "lane_relay" || !LANE_PROTOCOLS.includes(r.mapping.protocol) || stackRouteNamesOnly(r)) continue;
     const record = routeRecord(r);
     if (record === null) continue;
     offers.push({

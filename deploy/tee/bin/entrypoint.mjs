@@ -1476,6 +1476,10 @@ export async function main({
     LANE_RECEIPT_KEY_ID: env.LANE_RECEIPT_KEY_ID ?? "",
     LANE_BRIDGE_KEY_SEED: seed,
     GATEWAY_FALLBACK_REGION: fromEnvironment(env, "GATEWAY_FALLBACK_REGION", "wnam"),
+    // The console the entry's error help links name, and the one origin whose pages may read its answers: the compose
+    // literal (app-compose.mjs --console-origin, environments.json console_url). No default here: an empty binding is
+    // unset to `@gray/config`, and the errors then name the entry's own origin.
+    CONSOLE_ORIGIN: env.CONSOLE_ORIGIN ?? "",
     BODY_PARSE_MAX_BYTES: fromEnvironment(env, "BODY_PARSE_MAX_BYTES", "4194304"),
     LANE_POLICY_STEP_MS: fromEnvironment(env, "LANE_POLICY_STEP_MS", "1500"),
     // D128: the compose literals (D128': the build box's measurement). No default here: an empty

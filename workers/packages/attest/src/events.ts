@@ -248,7 +248,7 @@ export const EVENT_PEER_FAILED = "peer.failed";
 export const STACK_FORWARDED_MEMBERS = Object.freeze(["method", "path", "query_sha256", "body_jcs_sha256"] as const);
 
 /** The members that make a `response.returned` the stack form. */
-export const STACK_RETURNED_MEMBERS = Object.freeze(["status", "events_sha256", "body_sha256", "dropped", "replaced_error", "served_attempt", "served_as"] as const);
+export const STACK_RETURNED_MEMBERS = Object.freeze(["status", "events_sha256", "body_sha256", "dropped", "replaced_error", "served_attempt", "served_as", "rewrites"] as const);
 
 /**
  * How the served attempt's answer reached the client when it is not the vendor's events or body as
@@ -337,6 +337,25 @@ export type StackRefusalCode = (typeof STACK_CHECK_REFUSAL_CODES)[number] | (typ
 export const STACK_DROPPED_KINDS = Object.freeze(["usage", "unmatched"] as const);
 
 export type StackDroppedKind = (typeof STACK_DROPPED_KINDS)[number];
+
+/**
+ * Gray's own changes to a served answer (`response.returned.rewrites`): the ops a response policy may declare, and the
+ * published response policies (@gray/lane `GRAY_LANE_RESPONSE_REWRITES_V1`, the answer's counterpart of
+ * `gray-lane-rewrites-v1` on `request.modified`).
+ */
+export const STACK_RESPONSE_REWRITE_OPS = Object.freeze(["remove_member"] as const);
+export type StackResponseRewriteOp = (typeof STACK_RESPONSE_REWRITE_OPS)[number];
+export const STACK_RESPONSE_REWRITE_POLICIES = Object.freeze(["gray-lane-response-rewrites-v1"] as const);
+/** The most rewrites one `response.returned` declares (a rule rewrites at most a couple of events of an answer). */
+export const STACK_RESPONSE_REWRITES_MAX = 64;
+
+/** One declared rewrite (`response.returned.rewrites`): the event's 0-based position (absent for a body), the op, its path, the policy. */
+export interface StackResponseRewrite {
+  readonly seq?: bigint;
+  readonly op: StackResponseRewriteOp;
+  readonly path: string;
+  readonly declaredIn: (typeof STACK_RESPONSE_REWRITE_POLICIES)[number];
+}
 
 /** The seven methods egress forwards (`routes.go`; design §12.1). */
 export const STACK_FORWARDED_METHODS = Object.freeze(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const);
@@ -697,6 +716,9 @@ export const attemptRefusedSchema = z
   });
 
 const droppedSchema = z.object({ seq: u64Schema, kind: z.enum(STACK_DROPPED_KINDS) });
+const responseRewriteSchema = z
+  .object({ seq: u64Schema.optional(), op: z.enum(STACK_RESPONSE_REWRITE_OPS), path: modifiedPathSchema, declared_in: z.enum(STACK_RESPONSE_REWRITE_POLICIES) })
+  .strict();
 
 // What a client that left before any answer received: no event (the chain's h_0; keep-alive comments are
 // not events) or no body (S19's digest of zero bytes, which are not JSON).
@@ -729,6 +751,7 @@ export const stackResponseReturnedSchema = z
     replaced_error: z.boolean(),
     served_attempt: attemptNumberSchema.nullable(),
     served_as: z.enum(STACK_SERVED_AS).optional(),
+    rewrites: z.array(responseRewriteSchema).min(1).max(STACK_RESPONSE_REWRITES_MAX).optional(),
   })
   .superRefine((event, ctx) => {
     if ((event.events_sha256 === undefined) === (event.body_sha256 === undefined)) {
@@ -763,6 +786,21 @@ export const stackResponseReturnedSchema = z
         ctx.addIssue({ code: "custom", path: ["dropped", index, "seq"], message: "dropped events are listed once each, in ascending seq" });
       }
     });
+    if (event.rewrites !== undefined) {
+      // Gray's declared changes to the served attempt's answer: only an answer the receipt ties to that attempt has any.
+      if (event.served_attempt === null || event.replaced_error || event.served_as !== undefined) {
+        ctx.addIssue({ code: "custom", path: ["rewrites"], message: "rewrites name Gray's changes to the served attempt's answer: the answer is not replaced, served_as is absent" });
+      }
+      const stream = event.events_sha256 !== undefined;
+      event.rewrites.forEach((entry, index) => {
+        if ((entry.seq !== undefined) !== stream) ctx.addIssue({ code: "custom", path: ["rewrites", index, "seq"], message: "a stream's rewrite names its event's seq, a body's none" });
+        const previous = event.rewrites![index - 1];
+        if (stream && previous !== undefined && entry.seq !== undefined && previous.seq !== undefined && entry.seq <= previous.seq) {
+          ctx.addIssue({ code: "custom", path: ["rewrites", index, "seq"], message: "rewrites are listed in ascending seq, one an event" });
+        }
+      });
+      if (!stream && event.rewrites.length > 1) ctx.addIssue({ code: "custom", path: ["rewrites"], message: "a body's rewrites are one change" });
+    }
   });
 
 /** The §7.5 verified form: a session carries every verification detail. */
@@ -1098,6 +1136,8 @@ export function stackResponseReturnedEvent(input: {
   readonly replacedError: boolean;
   readonly servedAttempt: bigint | null;
   readonly servedAs?: StackServedAs;
+  /** Gray's declared changes to the served attempt's answer (`STACK_RESPONSE_REWRITE_POLICIES`); absent or empty for none. */
+  readonly rewrites?: readonly StackResponseRewrite[];
 }): JsonObject {
   const event: JsonObject = {
     type: EVENT_RESPONSE_RETURNED,
@@ -1110,6 +1150,13 @@ export function stackResponseReturnedEvent(input: {
   if (input.eventsSha256 !== undefined) setMember(event, "events_sha256", input.eventsSha256);
   if (input.bodySha256 !== undefined) setMember(event, "body_sha256", input.bodySha256);
   if (input.servedAs !== undefined) setMember(event, "served_as", input.servedAs);
+  if (input.rewrites !== undefined && input.rewrites.length > 0) {
+    setMember(
+      event,
+      "rewrites",
+      input.rewrites.map((entry) => ({ ...(entry.seq === undefined ? {} : { seq: entry.seq }), op: entry.op, path: entry.path, declared_in: entry.declaredIn })),
+    );
+  }
   return shaped(stackResponseReturnedSchema, event);
 }
 
@@ -1676,7 +1723,11 @@ function checkServedAttempt(
     }
   } else {
     const member = get(returned, "events_sha256") !== undefined ? "events_sha256" : "body_sha256";
-    if (get(upstream, member) === undefined || get(upstream, member) !== get(returned, member)) {
+    // With Gray's declared rewrites (`rewrites`) the client's digest is not the vendor's: the tie is the vendor's digest
+    // recomputed from the bytes the client received with each rewrite undone, which only a verifier holding them can do
+    // (@gray/lane-verify). The attempt must still have that digest to tie to.
+    const rewritten = Array.isArray(get(returned, "rewrites"));
+    if (get(upstream, member) === undefined || (!rewritten && get(upstream, member) !== get(returned, member))) {
       push("served_digest_mismatch", `response.returned's ${member} is not attempt ${served}'s upstream.response ${member}`);
     }
   }

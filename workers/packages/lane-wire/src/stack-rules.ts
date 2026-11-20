@@ -54,7 +54,12 @@ export const STACK_RESTORE_MAX = 2048;
 /** The most accounts a relay's VM serves (`@gray/relay-connector` DEFAULT_MAX_ACCOUNTS_PER_RELAY, S42). */
 export const STACK_ACCOUNTS_MAX = 1000;
 /** The name of Gray's default rules (S39). */
-export const GRAY_COOLING_DEFAULTS = "gray-cooling-v1";
+export const GRAY_COOLING_DEFAULTS = "gray-cooling-v2";
+/**
+ * The earlier names of Gray's defaults, which a `PUT …/cooling` may still send: each meant "Gray's defaults as Gray
+ * updates them" (the relay's `cooling_rules` stored null), so each serves the current set.
+ */
+export const GRAY_COOLING_EARLIER_DEFAULTS = ["gray-cooling-v1"] as const;
 
 /** An account, proxy or relay id: the lane's relay-id pattern (`@gray/control` LANE_RELAY_ID_PATTERN). */
 export const STACK_WIRE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -130,7 +135,7 @@ function idsUnique(value: { readonly rules: readonly { readonly id: string }[]; 
 export const stackCoolingInputSchema = z
   .object({
     mode: z.enum(STACK_COOLING_MODES),
-    defaults: z.literal(GRAY_COOLING_DEFAULTS).nullable(),
+    defaults: z.enum([GRAY_COOLING_DEFAULTS, ...GRAY_COOLING_EARLIER_DEFAULTS]).nullable(),
     rules: ruleListsOf(numberInt).rules.optional(),
     windows: ruleListsOf(numberInt).windows.optional(),
   })
@@ -215,9 +220,8 @@ const stated = (id: string, status: number[], codes: StackVendorCode[], seconds:
 });
 
 /**
- * Gray's default rules, `gray-cooling-v1` (S39's table, in its order; first match wins): sub2api's behaviour with
- * nothing configured (`ratelimit_service.go`), the research's challenge detection and 403 pause. No window rule: S38's
- * "rest at 90 %" is off by default. A relay whose `cooling_rules` is null is served these.
+ * Gray's default rules until 2026-11-19, `gray-cooling-v1`: sub2api's behaviour with nothing configured
+ * (`ratelimit_service.go`), the research's challenge detection and 403 pause. Kept as it was, for what v2 changed.
  */
 export const GRAY_COOLING_V1: StackRuleLists = Object.freeze({
   rules: Object.freeze([
@@ -237,6 +241,32 @@ export const GRAY_COOLING_V1: StackRuleLists = Object.freeze({
     hold("forbidden", [403], [], "model", ["test"]),
     stated("rate_limit", [429], [], 5, 3600, "account", []),
     fixed("overloaded", [529], [], 600, "account", []),
+  ]),
+  windows: Object.freeze([]),
+});
+
+/**
+ * Gray's default rules, `gray-cooling-v2` (S39's table, in its order; first match wins). A relay whose `cooling_rules`
+ * is null is served these. No window rule: S38's "rest at 90 %" is off by default.
+ *
+ * v1's rules, but two that cooled an account for 10 min on one answer that is often a moment's (the owner, 2026-11-19:
+ * one transient failure pauses nothing):
+ *
+ * - `overloaded`: a 529 is Anthropic's service overloaded, not the account. It cools the account only long enough for
+ *   the relay's own retry of that request to go to another account: the vendor's stated delay, else 5 s
+ *   (STACK_RULE_SECONDS_MIN, the fallback a 429 that states none gets), at most 60 s. A relay that keeps getting 529s
+ *   fails its route's attempts at the entry, whose circuit opens after three in a row (ENDPOINT_BREAKER_FAILURE_THRESHOLD).
+ * - `challenge`: an HTML page on a 403 only, the vendor's edge refusing the client (cool 10 min, as before). On a 503 an
+ *   HTML page is as often an edge's or an origin's error page as a challenge, and cools nothing, as any other 503; on a
+ *   429 it is a rate limit, `rate_limit`'s.
+ */
+export const GRAY_COOLING_V2: StackRuleLists = Object.freeze({
+  rules: Object.freeze([
+    ...GRAY_COOLING_V1.rules.slice(0, 6),
+    fixed("challenge", [403], ["html_challenge"], 600, "account", ["test"]),
+    hold("forbidden", [403], [], "model", ["test"]),
+    stated("rate_limit", [429], [], 5, 3600, "account", []),
+    stated("overloaded", [529], [], STACK_RULE_SECONDS_MIN, 60, "account", []),
   ]),
   windows: Object.freeze([]),
 });

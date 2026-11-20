@@ -723,40 +723,44 @@ export function stackAccountSettingsMessage(r: StackAccountSettingsRequest): Uin
   return new TextEncoder().encode([STACK_ACCOUNT_SETTINGS_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, models, value(r.weight), value(r.max_concurrency), value(r.paused), ...r.account_ids].join("\n"));
 }
 
-// ------------------------------------------------------------------------------------- the relay's public name
+// ------------------------------------------------------------------------------------------ the relay's own account test
+
+/** A test's id as the console makes it: 32 lower-case hex digits. */
+export const STACK_TEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 /**
- * A relay's own read or change of its workspace's public name (`POST /v1/lane-stack/public-name`; docs/api-contract.md,
- * "Provider handle"): what the provider pages' Public name panel does, signed by the relay key as the settings change is,
- * so `gray-assistant public-name [set <name> | show | hide]` offer what the panel offers. `handle` claims the name (once:
- * the console's claim rules), `show_name` chooses whether the Models page shows it; neither: a read.
+ * A relay's own test of one account (`POST /v1/lane-stack/account-test`): what the panel's Test does, signed by the
+ * relay key as the settings change is, so `gray-assistant accounts test` offers what the panel offers. Without
+ * `test_id` it queues a test of `model` (one of the account's models; the console picks one when absent); with
+ * `test_id` it reads that test of the relay's, queued before, and queues nothing.
  */
-export const stackPublicNameRequestSchema = z
+export const stackAccountTestRequestSchema = z
   .object({
     relay_id: z.string().regex(LANE_RELAY_ID_PATTERN),
     issued_ms: u64,
     nonce: z.string().regex(STACK_PANEL_VIEW_NONCE_PATTERN),
-    // The console checks the grammar and the reserved names; here only that the signed message reads one way.
-    handle: z.string().regex(/^[a-z0-9-]{1,64}$/).optional(),
-    show_name: z.boolean().optional(),
+    account_id: z.string().regex(STACK_ID_PATTERN),
+    // A model ID holds no line break (validModelId), so the signed message reads one way.
+    model: z.string().refine(validModelId, STACK_MODELS_RULE).optional(),
+    test_id: z.string().regex(STACK_TEST_ID_PATTERN).optional(),
   })
   .strict()
-  .refine((r) => r.handle === undefined || r.show_name === undefined, { message: "a request names handle or show_name, or neither (a read)" });
-export type StackPublicNameRequest = z.infer<typeof stackPublicNameRequestSchema>;
+  .refine((r) => r.model === undefined || r.test_id === undefined, { message: "a request queues a test of a model, or reads a test by its test_id" });
+export type StackAccountTestRequest = z.infer<typeof stackAccountTestRequestSchema>;
 
-/** The request and the relay's Ed25519 signature over `stackPublicNameMessage`, 128 lower-case hex digits. */
-export const stackPublicNameReportSchema = z.object({ request: stackPublicNameRequestSchema, signature: z.string().regex(/^[0-9a-f]{128}$/) }).strict();
-export type StackPublicNameReport = z.infer<typeof stackPublicNameReportSchema>;
+/** The request and the relay's Ed25519 signature over `stackAccountTestMessage`, 128 lower-case hex digits. */
+export const stackAccountTestReportSchema = z.object({ request: stackAccountTestRequestSchema, signature: z.string().regex(/^[0-9a-f]{128}$/) }).strict();
+export type StackAccountTestReport = z.infer<typeof stackAccountTestReportSchema>;
 
-/** The first line of the signed public-name request. */
-export const STACK_PUBLIC_NAME_DOMAIN = "gray-relay-public-name/v1";
+/** The first line of the signed account test. */
+export const STACK_ACCOUNT_TEST_DOMAIN = "gray-relay-account-test/v1";
 
 /**
- * The bytes the relay signs: the domain, `relay_id`, `issued_ms`, `nonce`, then `handle` (`=` and the name) and
- * `show_name` (`true`, `false`), `-` for one the request does not name, each on a line of its own.
+ * The bytes the relay signs: the domain, `relay_id`, `issued_ms`, `nonce`, `account_id`, then the model (`=` and its ID,
+ * or `-`) and the test id (or `-`), each on a line of its own.
  */
-export function stackPublicNameMessage(r: StackPublicNameRequest): Uint8Array {
-  return new TextEncoder().encode([STACK_PUBLIC_NAME_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, r.handle === undefined ? "-" : `=${r.handle}`, r.show_name === undefined ? "-" : String(r.show_name)].join("\n"));
+export function stackAccountTestMessage(r: StackAccountTestRequest): Uint8Array {
+  return new TextEncoder().encode([STACK_ACCOUNT_TEST_DOMAIN, r.relay_id, String(r.issued_ms), r.nonce, r.account_id, r.model === undefined ? "-" : `=${r.model}`, r.test_id ?? "-"].join("\n"));
 }
 
 /** Where a restart request stands: recorded and waiting, or settled by the provisioner or Gray's operator. */

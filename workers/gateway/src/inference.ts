@@ -1150,6 +1150,12 @@ export class InferenceRun {
    * charge settles, or the attempt's whose vendor error the client was served.
    */
   private stackAnsweredAccount: string | null = null;
+  /**
+   * A stack relay's vendor error the dispatcher passed over for another route (`stackVendorPassedOver`): the client's
+   * answer (its status and body, `passthrough`, when the vendor answered with a status; its classification for an
+   * in-band error event) when the request ends on it with no later attempt that reached an upstream; null otherwise.
+   */
+  private stackVendorAnswer: { readonly attempt: Attempt; readonly error: ApiError; readonly passthrough: StackPassthrough | null; readonly serve: () => void } | null = null;
   /** A charged answer's client left before it was all delivered (`recordCharged`). */
   private stackUndelivered = false;
   /** The status the request's record gives the client: a stack receipt's `response.returned.status`. */
@@ -1608,6 +1614,11 @@ export class InferenceRun {
    * (`lane_stack_traces`, `lane_stack_attempts`) through this row alone. Each hop's answer is waited for as a stack
    * call's close is, ERROR_BODY_WAIT_MS at most; an `end` not in by then is left out.
    *
+   * A hop the entry let go of before its `end` came (its own limit before the commit, the client gone, the bound after
+   * a failed stream) still had its attempt ended by the stack VM, which keeps the trace and answers it on the follow-up
+   * once the attempt is done (`traceLate`). That is asked within the same ERROR_BODY_WAIT_MS, so the record waits no
+   * longer than before; the outer receipt (`finishPeer`) does not wait for it.
+   *
    * Each peer attempt's two answer checks are read again from its `end` then (`peerEnded`, `peerAttemptChecks`): a
    * stream that failed after its commit closed its attempt before the stack VM's `end` was in, which the hop still had
    * on its way (`endKept`), and the record takes its checks from it as the attempt's own end would have (review r14
@@ -1615,7 +1626,9 @@ export class InferenceRun {
    */
   private async withPeerTrace(record: RequestRecord): Promise<RequestRecord> {
     try {
+      const until = this.deps.clock() + ERROR_BODY_WAIT_MS;
       await this.peersEnded();
+      await Promise.all(this.peerCalls.map((call) => call.traceLate(until)));
       const attempts = record.attempts.map((attempt, at) => {
         const closed = this.peerEnded.get(at);
         if (closed === undefined) return attempt;
@@ -2808,7 +2821,7 @@ export class InferenceRun {
     // lists on its API there (`laneServed`), but in lane mode.
     const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf, verifiableRoute, unverifiable(this.lane !== null, this.laneServed));
     if (!admitted.ok) {
-      const refused = unadmitted(admitted.code);
+      const refused = unadmitted(admitted.code, this.lane !== null);
       return refused.next ? this.unserved(refused.error, "routes") : { kind: "response", response: this.refuse(refused.error, "routes") };
     }
     records = [...admitted.routes];
@@ -2927,7 +2940,7 @@ export class InferenceRun {
           const verifiable = preference.verifiable ? able.filter(verifiableRoute) : able;
           if (verifiable.length === 0) {
             const code = unverifiable(this.lane !== null, this.laneServed);
-            if (code === "routing_filter_excluded_all") return { kind: "excluded" };
+            if (unadmitted(code, this.lane !== null).next) return { kind: "excluded" };
             return { kind: "failed", error: new ApiError(400, code) };
           }
           const admitted = preference.isDefault()
@@ -4157,7 +4170,8 @@ export class InferenceRun {
       if (chosen.kind === "stop") {
         // A route a cold path passed over before anything was sent is asked once more (F2 D131, every route).
         if (chosen.error === undefined && this.coldRepeat(d, answerDeadline)) continue;
-        return { kind: "stopped", stop: chosen.stop, ...(chosen.error === undefined ? {} : { error: chosen.error }) };
+        const answered = this.stackVendorAnswered(d, chosen.stop);
+        return { kind: "stopped", stop: chosen.stop, ...(chosen.error === undefined ? (answered ?? {}) : { error: chosen.error }) };
       }
       const failure = d.last?.outcome.class;
       if (failure !== undefined && chosen.next !== "none") this.retryEvents.push({ kind: "retry", next: chosen.next, cls: failure });
@@ -5304,9 +5318,11 @@ export class InferenceRun {
   /**
    * An entry's peer attempt that ended without an answer the request path relays (section 4.7): not dialed is closed
    * as a connection that never reached an upstream, and the next route may go (with none left, the client gets a
-   * connection's `upstream_unavailable`; the attempt's record keeps the stack VM's code); the vendor's error ends the
-   * request with it (`passthrough`), unless it refused the relay's own account (`relayAccountRefused`: Gray's error, and
-   * the next route may go); anything else is `lane_relay_failed`, no other route, nothing charged.
+   * connection's `upstream_unavailable`; the attempt's record keeps the stack VM's code); the vendor's error that is the
+   * supplier's (a rate limit, an overload, a server error, a timeout) lets the next route go as the main gateway's does
+   * and is the client's answer if none serves (`stackVendorPassedOver`), one that refused the relay's own account does
+   * too but is never the client's answer (`relayAccountRefused`: Gray's error), and any other (a refusal of the request)
+   * ends the request with it (`passthrough`); anything else is `lane_relay_failed`, no other route, nothing charged.
    */
   private peerFailed(d: Dispatcher, attempt: Attempt, model: string, outcome: PeerOutcome): { readonly kind: "continue" } | Stopped {
     const { clock } = this.deps;
@@ -5324,9 +5340,28 @@ export class InferenceRun {
       this.noteAgentRefusal(attempt, classified.outcome, { status: outcome.status, body: outcome.body });
       this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_attempt_failed", false, false, outcome.body);
       if (refusedTheRelaysAccount(classified.outcome)) return this.relayAccountRefused(outcome.accountId);
-      // The vendor's error is the served attempt's answer (S32), as the stack VM's receipt says it.
-      if (attempt.peer !== undefined) attempt.peer.served = true;
-      return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: {}, accountId: outcome.accountId } };
+      const passthrough: StackPassthrough = { status: outcome.status, body: outcome.body, headers: {}, accountId: outcome.accountId };
+      // The vendor's error is the served attempt's answer (S32), as the stack VM's receipt says it, once the client gets it.
+      const peer = attempt.peer;
+      const served = (): void => {
+        if (peer !== undefined) peer.served = true;
+      };
+      if (passesToNextRoute(classified.outcome)) return this.stackVendorPassedOver(attempt, classified.error, outcome.accountId, passthrough, served);
+      served();
+      return { kind: "stopped", stop: null, error: classified.error, passthrough };
+    }
+    if (outcome.kind === "vendor_event") {
+      // The vendor's own error event before the stack VM's commit: answered as the main gateway answers an upstream's
+      // in-band error before its commit (`streamFailure`: the status it maps to, `classifyEvent`), and counted as the
+      // vendor's, not the relay's.
+      const classified = classifyEvent(attempt.route.record.protocol, outcome.event, this.classifyContext(model, attempt.route), elapsed, clock());
+      this.noteAgentRefusal(attempt, classified.outcome, { inBand: outcome.event });
+      this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_error", false);
+      if (refusedTheRelaysAccount(classified.outcome)) return this.relayAccountRefused(outcome.accountId);
+      // A rate limit, an overload or a server error of the vendor's goes to the next route as the main gateway's does
+      // (`passesToNextRoute`); with none left the client gets its classification (`stopError`).
+      if (passesToNextRoute(classified.outcome)) return this.stackVendorPassedOver(attempt, classified.error, outcome.accountId, null, () => {});
+      return { kind: "stopped", stop: null, error: classified.error };
     }
     // The stack VM's verdict (its trace's fault, else `end.code`): an answer that failed Gray's check is the relay's
     // `upstream_answer_refused`, any other fault of its container `lane_relay_failed`; either counts against its route.
@@ -5373,9 +5408,11 @@ export class InferenceRun {
    *   route may go (with none left, the request's last error is a connection's, `upstream_unavailable`:
    *   nothing reached a vendor, so no answer was withheld; the attempt's record names the fault, as the
    *   stack VM's `end.code` does);
-   * - the vendor answered an error: the request ends with it (`passthrough`), its classification for the
-   *   record and for a stream whose headers went; an error that refused the relay's own account is not
-   *   passed on, and the next route may go (`relayAccountRefused`);
+   * - the vendor answered an error: a rate limit, an overload, a server error or a timeout lets the next route go
+   *   as the main gateway's does, and is the client's answer (`passthrough`) if none serves (`stackVendorPassedOver`);
+   *   an error that refused the relay's own account is not passed on, and the next route may go
+   *   (`relayAccountRefused`); any other (a refusal of the request) ends the request with it (`passthrough`), its
+   *   classification for the record and for a stream whose headers went;
    * - a vendor attempt was dialed and nothing of it can be released: `upstream_answer_refused` when the container's
    *   answer failed Gray's check (an event or a body that is not the vendor's), else `lane_relay_failed` (the bound's
    *   own error when the bound ended it), and no other route;
@@ -5411,7 +5448,17 @@ export class InferenceRun {
         if (attempt.stack !== undefined) attempt.stack.served = null;
         return this.relayAccountRefused(accountId);
       }
-      return { kind: "stopped", stop: null, error: classified.error, passthrough: { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId } };
+      const passthrough: StackPassthrough = { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId };
+      if (passesToNextRoute(classified.outcome)) {
+        // Nothing of the vendor's reaches the client unless the request ends on it (S32 `served_attempt`).
+        const call = attempt.stack;
+        const vendorAttempt = call?.served ?? null;
+        if (call !== undefined) call.served = null;
+        return this.stackVendorPassedOver(attempt, classified.error, accountId, passthrough, () => {
+          if (call !== undefined) call.served = vendorAttempt;
+        });
+      }
+      return { kind: "stopped", stop: null, error: classified.error, passthrough };
     }
     const timedOut = bound && !limited;
     // An answer that failed Gray's check is the relay's `upstream_answer_refused`; any other fault of its container, or
@@ -5448,6 +5495,33 @@ export class InferenceRun {
   private relayAccountRefused(accountId: string | null): { readonly kind: "continue" } {
     this.stackAnsweredAccount = accountId;
     return { kind: "continue" };
+  }
+
+  /**
+   * A stack relay's vendor error that is the supplier's, not the request's (`passesToNextRoute`: a rate limit, an
+   * overload, a server error, a timeout), as any route's: the attempt failed with its classification, and the
+   * dispatcher's rules for its class decide the next route, another operator's first (tier A), as the main gateway
+   * decides after an endpoint route's 429 or 5xx. Production, 2026-11-20: a relay's subscription account answered 429
+   * and the request ended with it, though another relay's route could serve it. The vendor's own status and body stay
+   * the client's answer should the request end on it (`stackVendorAnswered`), as before; nothing of it was released.
+   * The account stays named on the request's row (S27) unless a later attempt's answer ends the request.
+   */
+  private stackVendorPassedOver(attempt: Attempt, error: ApiError, accountId: string | null, passthrough: StackPassthrough | null, served: () => void): { readonly kind: "continue" } {
+    this.stackVendorAnswer = { attempt, error, passthrough, serve: served };
+    this.stackAnsweredAccount = accountId;
+    return { kind: "continue" };
+  }
+
+  /**
+   * The stack relay's vendor error the dispatcher's stop ends the request on (`stackVendorPassedOver`): its error, its
+   * status and body for the client (`passthrough`) and the mark of its attempt as served; none when the client left or
+   * a refusal is held (that refusal is told). Taken once: a model the customer listed next starts without it.
+   */
+  private stackVendorAnswered(d: Dispatcher, stop: Stop | null): Pick<Stopped, "error" | "passthrough" | "served" | "vendorAnswer"> | null {
+    const answer = this.stackVendorAnswer;
+    this.stackVendorAnswer = null;
+    if (answer === null || stop === "client_left" || d.heldToTell() !== null) return null;
+    return { error: answer.error, vendorAnswer: true, ...(answer.passthrough === null ? {} : { passthrough: answer.passthrough, served: answer.serve }) };
   }
 
   /**
@@ -5708,6 +5782,10 @@ export class InferenceRun {
    * read, for the attempt's record in the content.
    */
   private failAttempt(d: Dispatcher, attempt: Attempt, outcome: RetryOutcome, error: ApiError, code: string, upstreamMayStillWork: boolean, answered = false, errorBody?: Uint8Array, unsent = false, declined = false): void {
+    // A later attempt that reached an upstream is the request's last answer in place of a stack relay's vendor error
+    // passed over (`stackVendorPassedOver`); one that reached none (a connection, a relay's decline, Gray's own wait)
+    // leaves it the answer.
+    if (this.stackVendorAnswer !== null && this.stackVendorAnswer.attempt !== attempt && outcome.class !== "connect" && !unsent) this.stackVendorAnswer = null;
     const previous = d.held;
     // A block on the supplier's account pauses its gate for this request's client and tool shape: later
     // requests of the shape go to other suppliers first (`admit`).
@@ -5986,6 +6064,9 @@ export class InferenceRun {
       } else {
         error = noRouteRetryAfter(new ApiError(none.status, none.code), d, this.deps.cfg, this.rebuildingEnds === null ? null : Math.max(0, this.rebuildingEnds - this.deps.clock()));
       }
+    } else if (s.vendorAnswer === true && s.error !== undefined) {
+      // A stack relay's vendor error the request ended on after the other routes (`stackVendorAnswered`): its own.
+      error = s.error;
     } else if (this.lane !== null && s.stop === "no_route" && d.tried.lastSkip?.startsWith("lane_account_unavailable") === true && !(d.last.outcome.class === "credential" && d.passedAtFailedPool())) {
       // F2 D30: a lane relay whose scheduler answered "no account" is passed over terminally. When no
       // other route is left, the request is the lane's 503 (as `openAttempt` says), not the supplier
@@ -6059,7 +6140,10 @@ export class InferenceRun {
     const reason = left ? (this.leftUnread ? "client_left_unread" : "client_left") : !held && d.last !== null && this.lastFailureReason !== null && error.code === d.last.error.code ? this.lastFailureReason : error.code;
     // A stack relay's vendor error is the client's answer while no headers went (S24); after them, the
     // stream ends with the error event of its classification, as any failure after the headers does.
-    if (s.passthrough !== undefined && !this.headersSent) {
+    // A model the customer listed next goes first (`deferRecord`: this model is not the last); the vendor's error is the
+    // answer of the last one.
+    if (s.passthrough !== undefined && !this.headersSent && !(next && this.deferRecord)) {
+      s.served?.();
       const passed = this.stackPassthrough(s.passthrough, error, reason);
       return { kind: "response", response: passed.response!, code: passed.code, outcome: passed.outcome };
     }
@@ -8007,6 +8091,10 @@ type Stopped = {
    * recorded them while no headers went, `error` (its classification) after.
    */
   readonly passthrough?: StackPassthrough;
+  /** Marks the attempt whose vendor error `passthrough` is as the served one (S32), once the client gets it. */
+  readonly served?: () => void;
+  /** `error` is a stack relay's vendor error the request ends on after the other routes (`stackVendorAnswered`). */
+  readonly vendorAnswer?: true;
 };
 
 /** A stream's attempt whose answer committed (`prime`): its reader, the frames priming held first, for the relay. */
@@ -8063,6 +8151,8 @@ type SendResult =
 type PeerOutcome =
   | { readonly kind: "not_dialed"; readonly code: string }
   | { readonly kind: "vendor_error"; readonly status: number; readonly body: Uint8Array; readonly accountId: string | null }
+  /** The vendor's own error event ended its stream before the stack VM's commit (`end.vendor_event`): nothing released. */
+  | { readonly kind: "vendor_event"; readonly event: Json; readonly accountId: string | null }
   | { readonly kind: "relay_failed"; readonly code: string };
 
 /**
@@ -8175,6 +8265,7 @@ function peerChecks(end: PeerEndDto | null): AnswerChecks {
 function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): PeerOutcome {
   if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid" };
   if (end.outcome === "vendor_error") return { kind: "vendor_error", status, body, accountId: end.relay_account_id };
+  if (end.vendor_event !== undefined) return { kind: "vendor_event", event: end.vendor_event as Json, accountId: end.relay_account_id };
   return { kind: "relay_failed", code: end.code ?? "peer_invalid" };
 }
 
@@ -8183,6 +8274,15 @@ function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): Pe
  * classes the request log records as `credential` (@gray/errors `classDisposition`: `credential` and
  * `account_request`).
  */
+/**
+ * Whether a stack relay's vendor error is one the main gateway tries another route after, the supplier's and not the
+ * request's: a rate limit (`throttled`, a 429 or an overload), a server error, a timeout. A refusal of the request (a
+ * 400, a 404, a context overflow) stays the client's answer at once, the vendor's words, as before.
+ */
+function passesToNextRoute(outcome: RetryOutcome): boolean {
+  return outcome.class === "throttled" || outcome.class === "server_error" || outcome.class === "timeout";
+}
+
 function refusedTheRelaysAccount(outcome: RetryOutcome): boolean {
   return classDisposition(outcome.class, outcome.status, outcome.serverCode) === "credential";
 }

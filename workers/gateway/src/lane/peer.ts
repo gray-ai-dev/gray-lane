@@ -15,6 +15,7 @@ import {
   type PeerEnvelopeUse,
   type PeerRefusalCode,
   type ReleaseListsAnswer,
+  type StackTraceDto,
 } from "@gray/lane-wire";
 
 /**
@@ -161,6 +162,8 @@ export type PeerHelloRefusal = keyof typeof PEER_HELLO_REFUSAL_STATUS;
 interface PeerAttempt {
   state: PeerAttemptState;
   receipt: Json | null;
+  /** The attempt's S43 trace once done (`end.trace`), for a follow-up that names `attempts_trace`. */
+  trace: StackTraceDto | null;
   readonly expiresAt: number;
 }
 
@@ -197,7 +200,7 @@ export class PeerAttempts {
   /** The attempt starts: `registered` until the feed shows a vendor dialed. */
   take(key: string, now: number): void {
     this.#sweep(now);
-    this.#entries.set(key, { state: "registered", receipt: null, expiresAt: now + this.#ttlMs });
+    this.#entries.set(key, { state: "registered", receipt: null, trace: null, expiresAt: now + this.#ttlMs });
     while (this.#entries.size > this.#max) {
       const oldest = this.#entries.keys().next();
       if (oldest.done === true) break;
@@ -210,18 +213,20 @@ export class PeerAttempts {
     if (entry !== undefined && entry.state === "registered") entry.state = "dialed";
   }
 
-  /** The attempt ended; its inner receipt, when it made one. */
-  done(key: string, receipt: Json | null): void {
+  /** The attempt ended; its inner receipt, when it made one, and its trace. */
+  done(key: string, receipt: Json | null, trace: StackTraceDto | null = null): void {
     const entry = this.#entries.get(key);
     if (entry === undefined) return;
     entry.state = "done";
     entry.receipt = receipt;
+    entry.trace = trace;
   }
 
-  answer(key: string, now: number): { readonly state: PeerAttemptState; readonly receipt: Json | null } {
+  answer(key: string, now: number): { readonly state: PeerAttemptState; readonly receipt: Json | null; readonly trace: StackTraceDto | null } {
     this.#sweep(now);
     const entry = this.#entries.get(key);
-    return entry === undefined ? { state: "unknown", receipt: null } : { state: entry.state, receipt: entry.state === "done" ? entry.receipt : null };
+    if (entry === undefined) return { state: "unknown", receipt: null, trace: null };
+    return entry.state === "done" ? { state: "done", receipt: entry.receipt, trace: entry.trace } : { state: entry.state, receipt: null, trace: null };
   }
 }
 

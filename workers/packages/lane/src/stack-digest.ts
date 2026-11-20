@@ -169,6 +169,12 @@ export class StackEventDigester {
   private bomChecked = false;
   private type: Uint8Array = new Uint8Array(0);
   private data: Uint8Array[] = [];
+  /** Hears each dispatched event (its `event` field, its data lines joined, its digest) as it is digested. */
+  private readonly onEvent: ((type: Uint8Array, data: Uint8Array, digest: string) => void) | undefined;
+
+  constructor(onEvent?: (type: Uint8Array, data: Uint8Array, digest: string) => void) {
+    this.onEvent = onEvent;
+  }
 
   write(chunk: Uint8Array): string[] {
     this.frames.push(chunk);
@@ -210,7 +216,12 @@ export class StackEventDigester {
 
   private line(line: Uint8Array, digests: string[]): void {
     if (line.length === 0) {
-      if (this.data.length > 0) digests.push(stackEventDigest(this.type, joinLines(this.data)));
+      if (this.data.length > 0) {
+        const data = joinLines(this.data);
+        const digest = stackEventDigest(this.type, data);
+        this.onEvent?.(this.type, data, digest);
+        digests.push(digest);
+      }
       this.type = new Uint8Array(0);
       this.data = [];
       return;

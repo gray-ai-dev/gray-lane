@@ -112,18 +112,18 @@ export function tagSentinel(pattern: string): string {
 
 /**
  * What a request's patterns are resolved against (`Tags`): the tagged routes of the model it asks for, each by
- * its `provider_ref`, the registered handles with their supplier's workspace, and a supplier's reference.
+ * its `provider_ref`, and the registered handles with their supplier's workspace.
  */
 export interface Tags {
   readonly routes: readonly (readonly [provider: string, tag: RouteTag])[];
   readonly handles: Readonly<Record<string, string>>;
-  supplierRef(workspace: string): string;
 }
 
 /**
- * Writes what `entry` names into `out` (`Tags::resolve`). A 64-hex reference stays. A bare handle becomes its
- * supplier's reference; a pattern with segments the references of the routes it matches, in its place, or its
- * sentinel when it matches none: each `known` to this request. A pattern whose handle is not registered becomes
+ * Writes what `entry` names into `out` (`Tags::resolve`). A 64-hex reference stays. A pattern, a bare handle included,
+ * becomes the references of the tagged routes it matches, in its place, or its sentinel when it matches none: each
+ * `known` to this request. Never the supplier's reference, which would also name its untagged routes: a lane relay's
+ * route is never tagged, so it is never selected by a name (owner, 2026-11-20). A pattern whose handle is not registered becomes
  * its sentinel and is not known. `opted` (a selection's) takes the routes the entry opts in to: the reference
  * itself, and the matched routes whose tier the pattern names.
  */
@@ -134,20 +134,16 @@ function resolveEntry(tags: Tags, entry: string, out: string[], known: string[],
     out.push(entry);
     return;
   }
-  const workspace = Object.hasOwn(tags.handles, pattern.handle) ? tags.handles[pattern.handle] : undefined;
-  if (workspace === undefined) {
+  if (!Object.hasOwn(tags.handles, pattern.handle)) {
     out.push(tagSentinel(entry));
     return;
   }
   const from = out.length;
-  if (pattern.segments.length === 0) {
-    out.push(tags.supplierRef(workspace));
-  } else {
-    for (const [provider, tag] of tags.routes) {
-      if (!tagMatches(pattern, tag) || out.indexOf(provider, from) >= 0) continue;
-      if (opted !== null && tag.tier !== null && pattern.segments.includes(tag.tier)) opted.push(provider);
-      out.push(provider);
-    }
+  // A route's tag carries its own workspace's handle, one a workspace.
+  for (const [provider, tag] of tags.routes) {
+    if (!tagMatches(pattern, tag) || out.indexOf(provider, from) >= 0) continue;
+    if (opted !== null && tag.tier !== null && pattern.segments.includes(tag.tier)) opted.push(provider);
+    out.push(provider);
   }
   if (out.length === from) out.push(tagSentinel(entry));
   known.push(...out.slice(from));

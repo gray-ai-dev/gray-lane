@@ -19,6 +19,7 @@ import {
   signPeerEnvelope,
   stackTraceOf,
   type BridgeSigner,
+  type StackTraceDto,
   type PeerAttemptState,
   type PeerEndDto,
   type PeerEnvelopeDto,
@@ -168,6 +169,9 @@ const PEER_JOB_CALLS = 8;
 
 /** SHA-256 of the empty body: the follow-up's `received_sha256` (`@gray/lane-wire` peer.ts). */
 const EMPTY_SHA256 = sha256BareHex(new Uint8Array(0));
+
+/** How often an entry asks the follow-up again for the trace of an attempt still running (`LanePeerCall.traceLate`). */
+const LATE_TRACE_POLL_MS = 250;
 
 /** The verifier of a stack peer's report: the stack list and a quote verifier over the bridge's collateral (`peer.ts` BridgePeerVerifier). */
 export interface StackListVerifier {
@@ -970,10 +974,40 @@ export class PeerCall implements LanePeerCall {
     return this.end?.relay_account_id ?? null;
   }
 
-  /** The relay's trace of the attempt (`end.trace`, S43) with JS numbers, or null. */
+  /** The relay's trace of the attempt (`end.trace`, S43, or the follow-up's when no `end` came) with JS numbers, or null. */
   get trace(): StackTrace | null {
-    const trace = this.end?.trace;
+    const trace = this.end?.trace ?? this.#lateTrace ?? undefined;
     return trace === undefined ? null : stackTraceOf(trace);
+  }
+
+  /** The follow-up's trace of an attempt whose hop ended without `end` (`followUp`, `traceLate`). */
+  #lateTrace: StackTraceDto | null = null;
+
+  /**
+   * The envelope went and the hop then broke or was cancelled before an answer (`#unknown`, `#aborted`): the stack VM may
+   * hold the attempt. Not so for a refusal it answered (`#failed`), which registered nothing.
+   */
+  #mayHold = false;
+
+  /**
+   * The attempt's trace from the follow-up, for a hop the entry let go of before `end` came (its own limit before the
+   * commit, the client gone, `closeAfterEnd`'s bound): the stack VM still closes its rid and keeps the attempt's facts
+   * and trace (`PeerAttempts.done`), which the follow-up answers once it is done. Asked again every LATE_TRACE_POLL_MS
+   * while the attempt is still running, until `untilMs`. Nothing to ask when `end` came, a follow-up already had the
+   * trace, no envelope went to a pinned peer, or the stack VM cannot hold the attempt (no head and the hop did not break
+   * after the envelope went, or a follow-up found it unknown); a stack VM before `attempts_trace` answers none.
+   */
+  async traceLate(untilMs: number): Promise<void> {
+    const input = this.#input;
+    if (this.end !== null || this.#lateTrace !== null || this.pin === null || this.envelopeSha256 === null) return;
+    if ((this.head === null && !this.#mayHold) || this.followed === "unknown") return;
+    while (input.clock() < untilMs) {
+      const answer = await this.followUp(untilMs);
+      if (answer === null || answer.state === "unknown" || answer.state === "done") return;
+      const left = untilMs - input.clock();
+      if (left <= 0) return;
+      await new Promise<void>((resolve) => input.timers.setTimeout(resolve, Math.min(LATE_TRACE_POLL_MS, left)));
+    }
   }
 
   /** Whether a vendor was dialed, as `end` or the follow-up said; null when neither did. */
@@ -1038,6 +1072,17 @@ export class PeerCall implements LanePeerCall {
     return toJsonString((read ?? null) as unknown as Json) === toJsonString((this.end.usage ?? null) as unknown as Json);
   }
 
+  /**
+   * The hop's `end`, as it came. One without the inner receipt (`receipt_refused`: the stack VM's receipt grammar refused
+   * the receipt it wrote) is logged: the attempt's outcome, usage and trace stand, and the outer receipt names no inner one.
+   */
+  #took(end: PeerEndDto): void {
+    this.end = end;
+    if (end.receipt_refused !== undefined) {
+      console.warn(JSON.stringify({ level: "warn", event: "lane_peer_receipt_refused", relay_id: this.peer.target.relayId, rid: this.#input.rid, n: this.#input.n, problem: end.receipt_refused }));
+    }
+  }
+
   /** Ends the hop (the request path is done with the answer, or left it). */
   close(): void {
     this.#reader?.cancel();
@@ -1075,6 +1120,7 @@ export class PeerCall implements LanePeerCall {
     const header = await signPeerEnvelope("request", envelope, input.signer);
     this.envelopeSha256 = sha256BareHex(peerEnvelopeBytes(envelope));
     this.failure = null;
+    this.#mayHold = false;
     let response: Response;
     try {
       response = await input.egress(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}${input.path}`, {
@@ -1137,7 +1183,7 @@ export class PeerCall implements LanePeerCall {
       if (next === "eof") return this.#unknown("peer_failed_after_send", true);
       if (next.event === "data") body.push(next.bytes);
       else if (next.event === "end") {
-        this.end = next.end;
+        this.#took(next.end);
         return { kind: "ended", head: frame.head, end: next.end, body: joined(body) };
       } else return this.#unknown("peer_invalid", true);
     }
@@ -1151,11 +1197,13 @@ export class PeerCall implements LanePeerCall {
 
   #unknown(code: PeerFailedCode, sent: boolean): PeerSent {
     this.failure = { code, sent };
+    this.#mayHold = sent;
     return { kind: "unknown", code };
   }
 
   #aborted(): PeerSent {
     this.failure = { code: "peer_aborted", sent: true };
+    this.#mayHold = true;
     return { kind: "aborted" };
   }
 
@@ -1206,7 +1254,7 @@ export class PeerCall implements LanePeerCall {
             controller.enqueue(frame.bytes);
             return;
           }
-          this.end = frame.end;
+          this.#took(frame.end);
           this.#resolveEnded(frame.end);
           controller.close();
           return;
@@ -1235,6 +1283,8 @@ export class PeerCall implements LanePeerCall {
       input.budgetMs,
     );
     if (answer !== null) this.followed = answer.state;
+    // A done attempt's trace, whichever follow-up asked (`trace` reads it when no `end` came).
+    if (answer?.trace !== undefined) this.#lateTrace = answer.trace;
     return answer;
   }
 }
@@ -1279,10 +1329,12 @@ async function peerFollowUp(target: FollowUpTarget, deps: FollowUpDeps, untilMs:
   const timer = deps.timers.setTimeout(() => controller.abort("peer_follow_up_timeout"), Math.max(0, untilMs - deps.clock()));
   try {
     const header = await signPeerEnvelope("attempts", envelope, deps.signer);
-    const response = await deps.egress(`${PEER_EGRESS_ORIGIN}/peer/${target.pin.digest}/v1/peer/attempts/${target.rid}`, { method: "GET", headers: { [PEER_HEADER]: header }, signal: controller.signal });
+    // `attempts_trace` among the reads: a stack VM that serves it adds the attempt's trace once it is done.
+    const headers = { [PEER_HEADER]: header, [PEER_READS_HEADER]: PEER_END_READS.join(",") };
+    const response = await deps.egress(`${PEER_EGRESS_ORIGIN}/peer/${target.pin.digest}/v1/peer/attempts/${target.rid}`, { method: "GET", headers, signal: controller.signal });
     if (response.status !== 200 || response.headers.has("x-gray-peer-sent")) return null;
     const answer = parsePeerAttemptsAnswer(new Uint8Array(await response.arrayBuffer()));
-    return { state: answer.state, receipt: (answer.receipt ?? null) as Json | null };
+    return { state: answer.state, receipt: (answer.receipt ?? null) as Json | null, ...(answer.trace === undefined ? {} : { trace: answer.trace }) };
   } catch {
     return null;
   } finally {

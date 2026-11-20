@@ -1,7 +1,7 @@
 import { ReceiptBuilder, StackEventsChain, type SignedReceipt } from "@gray/attest";
 import type { GatewayConfig } from "@gray/config";
 import { ApiError, ERROR_BODY_WAIT_MS, isErrorBody } from "@gray/errors";
-import { isObject, type Json } from "@gray/json";
+import { isObject, toJsonString, type Json } from "@gray/json";
 import { stackBodyDigest, StackEventDigester, type LaneProtocol } from "@gray/lane";
 import {
   encodePeerFrame,
@@ -278,6 +278,14 @@ class BackendRun {
   #call: StackCall | null = null;
   /** The entry named `checks` in `x-gray-peer-reads`: its `end` reads them (an entry before r14 refuses them). */
   readonly #readsChecks: boolean;
+  /** The entry named `receipt_refused`: it reads a dialed attempt's `end` without a receipt, and why. */
+  readonly #readsReceiptRefused: boolean;
+  /** The entry named `vendor_event`: it reads the vendor's own error event that ended an answer before the commit. */
+  readonly #readsVendorEvent: boolean;
+  /** The vendor's own error event that ended its stream before the commit (`primeStream`'s `event`), as it came. */
+  #vendorEvent: Json | null = null;
+  /** Why the receipt was not signed (a closed word, `receiptProblem`), once `#receipt` failed. */
+  #receiptRefused: string | null = null;
   /** The gate's reading of the answer, once a path made it: none until then. */
   #checks: AnswerChecks = UNCOUNTED_CHECKS;
   /** How the stack VM itself ended the answer, for `countedChecks`: its own limit or failure, the entry gone, its deadline. */
@@ -289,7 +297,10 @@ class BackendRun {
     this.#route = route;
     this.#key = key;
     this.#hop = hop;
-    this.#readsChecks = peerReadsOf(input.request.headers).has("checks");
+    const reads = peerReadsOf(input.request.headers);
+    this.#readsChecks = reads.has("checks");
+    this.#readsReceiptRefused = reads.has("receipt_refused");
+    this.#readsVendorEvent = reads.has("vendor_event");
     this.#presence = new ClientPresence(null, input.clock, 0);
     hop.onLeave(() => this.#presence.leave("client_left"));
     this.#presence.onLeave(() => {
@@ -315,15 +326,18 @@ class BackendRun {
     await call?.close();
     if (call !== null) reportViolation(call, this.#input.violation, this.#input.envelope.rid);
     const receipt = call === null ? null : await this.#receipt(call, ended);
-    this.#input.peer.attempts.done(this.#key, receipt === null ? null : receiptDocument(receipt));
+    // The trace goes with the attempt's facts too: an entry that let go of the hop before `end` asks the follow-up for it.
+    const trace = this.#trace(call);
+    this.#input.peer.attempts.done(this.#key, receipt === null ? null : receiptDocument(receipt), trace);
     if (call !== null) this.#capture(call, ended);
     if (!this.#headed) await this.#head(this.#status, false);
     let frame: Uint8Array | null = null;
     try {
-      frame = encodePeerFrame({ event: "end", end: this.#end(call, ended, receipt) });
+      frame = encodePeerFrame({ event: "end", end: this.#end(call, ended, receipt, trace) });
     } catch (error) {
-      // An `end` the wire refuses (a dialed attempt whose receipt could not be signed): the hop ends without it, which the
-      // entry reads as a broken answer and asks the follow-up about.
+      // An `end` the wire refuses (a dialed attempt whose receipt could not be signed, to an entry that does not read
+      // `receipt_refused`): the hop ends without it, which the entry reads as a broken answer (after its commit,
+      // `upstream_stream_interrupted`), with no inner receipt, trace or attempt row (production 2026-11-19/20).
       console.error(JSON.stringify({ level: "error", event: "lane_backend_end_refused", rid: this.#input.envelope.rid, error: error instanceof Error ? error.name : "error" }));
     }
     if (frame !== null) await this.#hop.write(frame);
@@ -363,12 +377,12 @@ class BackendRun {
   }
 
   /** The `end` frame, held to `peerEndSchema`'s rules by its outcome. */
-  #end(call: StackCall | null, ended: Ended, receipt: SignedReceipt | null): PeerEndDto {
+  #end(call: StackCall | null, ended: Ended, receipt: SignedReceipt | null, trace: StackTraceDto | null): PeerEndDto {
     const dialed = ended.outcome !== "not_dialed";
     const attempts = call?.feed.dialed() ?? [];
     const served = ended.outcome === "served" || ended.outcome === "vendor_error" || ended.outcome === "cut" ? (call?.served?.n ?? attempts.at(-1)?.n ?? null) : null;
     const usage = this.#rawUsage === null ? null : peerUsageOf(this.#rawUsage);
-    const trace = this.#trace(call);
+    const vendorEvent = this.#vendorEvent;
     return {
       outcome: ended.outcome,
       dialed,
@@ -381,6 +395,14 @@ class BackendRun {
       receipt: receipt === null ? null : (receiptDocument(receipt) as Record<string, unknown>),
       ...(trace === null ? {} : { trace }),
       ...(this.#readsChecks ? { checks: this.#endChecks(ended) } : {}),
+      // A dialed attempt without its receipt: why, to an entry that reads it, which then still has the attempt's outcome,
+      // usage and trace (an older entry gets no `end`: `run`).
+      ...(dialed && receipt === null && this.#readsReceiptRefused ? { receipt_refused: this.#receiptRefused ?? "receipt_failed" } : {}),
+      // The vendor's error that ended the answer before the commit, to an entry that reads it; one past VENDOR_EVENT_MAX_BYTES
+      // (no vendor error is) goes without it, and the entry answers as before.
+      ...(ended.outcome === "relay_failed" && this.#readsVendorEvent && isObject(vendorEvent) && toJsonString(vendorEvent).length <= VENDOR_EVENT_MAX_BYTES
+        ? { vendor_event: vendorEvent as Record<string, unknown> }
+        : {}),
     };
   }
 
@@ -566,6 +588,9 @@ class BackendRun {
       this.#checks = primer.checks(false);
       if (primed.cutByDeadline === true) this.#deadlineCut = true;
     }
+    // The vendor's own error event before the commit (an Anthropic `error` after `message_start`): nothing was released,
+    // and the entry answers it as the vendor's error, as the main gateway answers an upstream's in-band error (`end`).
+    if (primed.kind === "uncommitted" && primed.event !== null) this.#vendorEvent = primed.event;
     if (primed.kind !== "committed") return this.#uncommitted(call);
     await this.#head(200, true);
     const client = new ClientStream(this.#presence, clock, cfg.streamClientStallMs, undefined, (bytes) => this.#tap(bytes), this.#input.timers);
@@ -841,7 +866,9 @@ class BackendRun {
       });
       return await builder.finalize(input.state.receiptKey, input.state.receiptKeyId);
     } catch (error) {
-      console.error(JSON.stringify({ level: "error", event: "lane_backend_receipt_failed", rid: envelope.rid, error: error instanceof Error ? error.name : "error" }));
+      // What the grammar refused, a closed word: `end` names it to an entry that reads it (`receipt_refused`).
+      this.#receiptRefused = receiptProblem(error);
+      console.error(JSON.stringify({ level: "error", event: "lane_backend_receipt_failed", rid: envelope.rid, error: error instanceof Error ? error.name : "error", problem: this.#receiptRefused }));
       return null;
     }
   }
@@ -884,6 +911,24 @@ class BackendRun {
       ...(served && left ? { servedAs: "client_left" as const } : served && call.streamed ? { servedAs: "codex_terminal_response" as const } : {}),
     };
   }
+}
+
+/** The largest vendor error event `end.vendor_event` carries: a vendor's in-band error is a few hundred bytes. */
+const VENDOR_EVENT_MAX_BYTES = 16 * 1024;
+
+/**
+ * The word `end.receipt_refused` gives for a receipt that was not signed: the receipt grammar's first problem (a
+ * `ReceiptError` `invalid_event_log`, whose message is each problem's code and description, `; `-separated), else the
+ * error's own code (`ReceiptError.code`), else `receipt_failed`. A closed lower-case word, never content.
+ */
+function receiptProblem(error: unknown): string {
+  if (error instanceof Error && error.name === "ReceiptError") {
+    const code = (error as Error & { readonly code?: unknown }).code;
+    const first = /^([a-z][a-z_]{0,63}):/.exec(error.message)?.[1];
+    if (code === "invalid_event_log" && first !== undefined) return first;
+    if (typeof code === "string" && /^[a-z][a-z_]{0,63}$/.test(code)) return code;
+  }
+  return "receipt_failed";
 }
 
 /**
