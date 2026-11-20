@@ -704,6 +704,12 @@ export class Dispatcher {
   stopped: Stop | null = null;
   /** A refusal held while another attempt may still take the request. */
   held: HeldRefusal | null = null;
+  /**
+   * The next attempt goes to another operator (tier A, or its steered last resort) or none does: no repeat at an
+   * operator already tried, not even a second opinion. Set by the lane entry for the one attempt after a vendor's 400
+   * of a body a relay's software changed (`InferenceRun.relayChangeRefused`).
+   */
+  otherOperatorsOnly = false;
   /** The attempt in flight is a second opinion through its refusal's gate. */
   private gated = false;
   /** The operator of the last failed attempt. */
@@ -1185,6 +1191,8 @@ export class Dispatcher {
     // out the operators already tried; unless a repeat that could not go was chosen after it.
     const skip = tried.skipReason();
     const reason = otherStop ?? this.stall ?? (skip === null ? null : stopOfSkip(skip));
+    // No repeat at an operator already tried: the last failure's class allows none here.
+    if (this.otherOperatorsOnly) return steeredLeft ? { kind: "steered" } : { kind: "stop", stop: reason ?? "class" };
     const chosen = this.repeat(reason);
     return chosen.kind === "stop" && steeredLeft ? { kind: "steered" } : chosen;
   }

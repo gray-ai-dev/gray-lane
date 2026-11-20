@@ -1,4 +1,6 @@
 import {
+  EVENT_RELAY_STACK_APPENDED,
+  EVENT_RELAY_STACK_CHANGED,
   RELAY_APPEND_POSITIONS,
   RELAY_CHANGE_OPS,
   RELAY_CHANGE_VALUES,
@@ -133,6 +135,12 @@ export const LANE_RELAY_FAILED = "lane_relay_failed";
 
 /** The fault word, and the attempt's recorded code, of a container's decline before any vendor call (`relayDeclined`). */
 export const RELAY_DECLINED = "relay_declined";
+
+/**
+ * The recorded code of an attempt whose vendor answered 400 to the body the relay's software changed, when another
+ * operator's route then served the request (`InferenceRun.relayChangeRefused`): its route's failure.
+ */
+export const RELAY_CHANGE_REFUSED = "relay_change_refused";
 
 /** 502 `lane_relay_failed`: the container's answer broke off (its connection, its status, egress's budget), as an upstream's may. */
 export function laneRelayFailed(): ApiError {
@@ -2077,6 +2085,34 @@ function checkReceiptGroup(attempt: StackFeedAttempt): void {
   const returned = stackResponseReturnedEvent({ bodyHash: EMPTY_BODY_HASH, status: 502n, bodySha256: "0".repeat(64), dropped: [], replacedError: true, servedAttempt: null });
   const issues = checkEventLog([requestReceivedEvent(EMPTY_BODY_HASH), ...events, returned]);
   if (issues.length > 0) throw new Error(`the receipt cannot carry attempt ${attempt.n}: ${issues[0]!.code}`);
+}
+
+/**
+ * Whether the relay's own software changed the request body in attempt `n` of a stack VM's inner receipt (S26, the hop's
+ * `end.receipt`): the attempt has a `relay_stack.appended` (the relay's registered texts) or a `relay_stack.changed` that
+ * changes the body (a body entry, or body bytes added or removed: docs/relay-request-changes.md). Neither the declared
+ * ops (`request.modified`: the route's upstream model, its cap, the sets and removals of the published policy) nor a
+ * change of headers alone counts. False when the receipt cannot tell: none (`receipt_refused`), no attempt `n`, or a
+ * stack VM before `relay_stack.changed`, whose egress forwarded no change of the relay's.
+ */
+export function receiptChangedBody(receipt: Readonly<Record<string, unknown>> | null | undefined, n: bigint | null): boolean {
+  if (receipt === null || receipt === undefined || n === null) return false;
+  const log = receipt.event_log;
+  if (!Array.isArray(log)) return false;
+  return (log as readonly Json[]).some((event) => {
+    if (!isObject(event) || receiptInteger(get(event, "n")) !== n) return false;
+    const type = get(event, "type");
+    if (type === EVENT_RELAY_STACK_APPENDED) return true;
+    if (type !== EVENT_RELAY_STACK_CHANGED) return false;
+    const body = get(event, "body");
+    return (Array.isArray(body) && body.length > 0) || (receiptInteger(get(event, "added_bytes")) ?? 0n) > 0n || (receiptInteger(get(event, "removed_bytes")) ?? 0n) > 0n;
+  });
+}
+
+/** A receipt's integer as `@gray/json` reads it (a bigint, or a number from a plain parse), else null. */
+function receiptInteger(value: Json | undefined): bigint | null {
+  if (typeof value === "bigint") return value;
+  return typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : null;
 }
 
 /** One `request.modified` op of egress's `attempt` record (S18), as the builder takes it. */

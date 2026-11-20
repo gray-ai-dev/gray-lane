@@ -490,6 +490,13 @@ export interface SnapshotReader {
    * reader without it publishes every stack route by its offer alone.
    */
   stackCoverage?(relayIds: readonly string[], nowMs: number): Promise<(relayId: string, baseUrl: string, upstreamModel: string) => boolean>;
+  /**
+   * What the VM deployments of the relay stacks `relayIds` serve (`StackDeploymentStanding`, gray-jobs
+   * src/stack-coverage.ts `stackDeploymentStanding` over the console's lane_stack_deployments): a relay whose deployment
+   * is gone publishes no route, one whose VM is starting or failed publishes its routes to name it alone. A relay it
+   * leaves out (no deployment on record), and every relay for a reader without it, is judged by `stackCoverage` alone.
+   */
+  stackDeployments?(relayIds: readonly string[]): Promise<ReadonlyMap<string, StackDeploymentStanding>>;
   /** Every registered public handle and its workspace (control_provider_handles); a reader without it reads none. */
   handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string; readonly show_name?: boolean }[]>;
 }
@@ -1185,8 +1192,15 @@ export async function buildSnapshot(
   // relay's VM keep the relay, the main view's `laneServed` and `laneOffers` and the catalog leave the route out.
   const stackRelays = [...new Set(published.flatMap(({ e }) => (e.config.lane?.mode === "stack" ? [e.config.lane.relay_id] : [])))].sort(byText);
   const covered = stackRelays.length > 0 && reader.stackCoverage ? await reader.stackCoverage(stackRelays, nowMs) : null;
+  // And only while its relay's VM serves (`stackDeployments`): a relay whose VM is gone publishes nothing, so nothing
+  // offers, lists or routes to it and neither its entry nor a VM knows it (production 2026-11-20: the catalog and the
+  // agent setups offered a deleted relay's Claude models, its account still active and its last report still served,
+  // and the entry answered 503); one whose VM is starting or failed publishes its routes to name it alone.
+  const deployments = stackRelays.length > 0 && reader.stackDeployments ? await reader.stackDeployments(stackRelays) : new Map<string, StackDeploymentStanding>();
   const routes: SnapshotRoute[] = [];
   for (const { e, snapshot } of published) {
+    const deployment = e.config.lane?.mode === "stack" ? (deployments.get(e.config.lane.relay_id) ?? "serving") : "serving";
+    if (deployment === "gone") continue;
     const trafficUntilMs = e.config.lane?.mode === "stack" ? traffic.get(e.config.lane.relay_id)?.untilMs : undefined;
     const credential = credentials.get(`${e.id}\u0000${e.workspace_id}\u0000${e.credential_generation}`);
     if (credential === undefined) continue;
@@ -1207,7 +1221,7 @@ export async function buildSnapshot(
       // A lane relay earns its route by an approved offer alone; a direct route also by its current pass.
       if (lane && quote === null) continue;
       // A relay stack's route takes traffic by an account that can serve it too; without one it only names its relay.
-      const uncovered = covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model);
+      const uncovered = deployment === "named" || (covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model));
       routes.push({
         capacityKey: capacityKey(e.id, m.requested_model, m.protocol),
         endpointId: e.id,
@@ -1306,6 +1320,14 @@ export async function buildSnapshot(
  * the catalog leave such a route out (`stackRouteNamesOnly`).
  */
 export const STACK_UNCOVERED_TRAFFIC_UNTIL_MS = 0;
+
+/**
+ * What a relay stack's VM deployment serves, as the rebuild publishes its routes (`SnapshotReader.stackDeployments`):
+ * `serving`, its routes take traffic by their accounts' coverage; `named`, its VM is starting, restarting or failed, so
+ * its routes only name the relay (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`) and the VM, once one runs, attaches and reports;
+ * `gone`, it has no VM (deleted, being deleted, never made), and none of its routes is published.
+ */
+export type StackDeploymentStanding = "serving" | "named" | "gone";
 
 /** Whether `r` is a relay stack's route published only to name its relay (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`): nothing offers, counts or lists it. */
 export function stackRouteNamesOnly(r: Pick<SnapshotRoute, "trafficUntilMs">): boolean {

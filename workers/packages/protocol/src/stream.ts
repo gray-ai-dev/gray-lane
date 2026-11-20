@@ -625,6 +625,8 @@ export class ProtocolStreamDecoder {
   private readonly items = new Map<bigint, ItemState>();
   private readonly tools = new Map<bigint, ToolState>();
   private readonly alternatives = new Map<bigint, boolean>();
+  /** Each Chat choice's finish reason, from its finish on (`alternativeOrder`). */
+  private readonly chatFinishes = new Map<bigint, string>();
   private sequence: bigint | null = null;
   private nextGeminiPart = 0n;
   /** What the decoder keeps of the stream so far, in heap bytes (`retainedBytes`). */
@@ -861,19 +863,33 @@ export class ProtocolStreamDecoder {
   }
 
   private chatOrder(native: Json | undefined, events: CanonicalEvent[]): void {
-    if (native !== undefined) this.alternativeOrder(native);
+    // The primary choice's repeated finish (`alternativeOrder`) is not a second finish: the answer finished once.
+    if (native !== undefined && this.alternativeOrder(native)) {
+      const at = events.findIndex((e) => e.type === "finish");
+      if (at >= 0) events.splice(at, 1);
+    }
     if (events.some((e) => e.type === "done") && (this.alternatives.size === 0 || [...this.alternatives.values()].some((f) => !f))) {
       throw this.stateError("Chat [DONE] before every observed choice finished");
     }
   }
 
-  private alternativeOrder(v: Json): void {
+  /**
+   * `alternative_order`: each choice or candidate finishes once, and nothing follows its finish. One exception, Chat's
+   * only: OpenRouter ends every Chat Completions stream with a usage chunk that repeats the finished choice's
+   * `finish_reason` with a content-free delta (`{"content":"","role":"assistant"}`) instead of OpenAI's empty `choices`,
+   * and documents it as an accounting frame, not a second terminal event (openrouter.ai/docs/api-reference/streaming,
+   * "The final usage chunk", read 2026-11-20). A Chat choice's `role` is not content, and a repeat of the same finish
+   * reason without content is accepted. Returns whether the primary choice (index 0, the one `parseStreamEvent` reads)
+   * repeated its finish, so the caller drops the repeat's finish event.
+   */
+  private alternativeOrder(v: Json): boolean {
     const chat = this.protocol === "open_ai_chat";
+    let repeated = false;
     const key = chat ? "choices" : "candidates";
     const reasonKey = chat ? "finish_reason" : "finishReason";
     const contentKey = chat ? "delta" : "content";
     const values = chat ? get(v, key) : geminiFieldOr(v, key, this.protocol);
-    if (values === undefined) return;
+    if (values === undefined) return false;
     if (!isArray(values)) throw invalid(this.protocol, `${key} must be an array`);
     for (const [i, choice] of alternatives(values, this.protocol)) {
       const reason = optionalFinishReason(choice, reasonKey, this.protocol);
@@ -882,14 +898,21 @@ export class ProtocolStreamDecoder {
       const hasContent =
         isObject(content) &&
         Object.keys(content).some((k) => {
+          if (chat && k === "role") return false;
           const member = content[k] as Json;
           return member !== null && member !== "" && (!isArray(member) || member.length > 0);
         });
-      if (this.alternatives.get(i) === true && (finished || hasContent)) {
-        throw this.stateError(`content or repeated finish after choice/candidate ${i} finished`);
+      if (this.alternatives.get(i) === true) {
+        const repeat = chat && finished && !hasContent && this.chatFinishes.get(i) === reason;
+        if (!repeat && (finished || hasContent)) {
+          throw this.stateError(`content or repeated finish after choice/candidate ${i} finished`);
+        }
+        if (repeat && i === 0n) repeated = true;
       }
+      if (chat && finished && reason !== null && !this.chatFinishes.has(i)) this.chatFinishes.set(i, reason);
       this.alternatives.set(i, (this.alternatives.get(i) ?? false) || finished);
     }
+    return repeated;
   }
 
   private anthropicOrder(v: Json, events: CanonicalEvent[]): void {

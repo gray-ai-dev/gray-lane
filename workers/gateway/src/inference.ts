@@ -226,6 +226,8 @@ import {
   newStackRid,
   RELAY_DECLINED,
   peerTraceOf,
+  receiptChangedBody,
+  RELAY_CHANGE_REFUSED,
   reportViolation,
   StackCall,
   stackAppendReserveBytes,
@@ -1156,6 +1158,16 @@ export class InferenceRun {
    * in-band error event) when the request ends on it with no later attempt that reached an upstream; null otherwise.
    */
   private stackVendorAnswer: { readonly attempt: Attempt; readonly error: ApiError; readonly passthrough: StackPassthrough | null; readonly serve: () => void } | null = null;
+  /**
+   * A vendor's 400 of a body the relay's software changed, held while one other operator's route is tried
+   * (`relayChangeRefused`): the client's answer, as before, unless that route serves the request or refuses it too.
+   */
+  private relayChangeHeld: { readonly attempt: Attempt; readonly error: ApiError; readonly passthrough: StackPassthrough; readonly serve: () => void } | null = null;
+  /**
+   * The permit (`permitKey`) of the request's one attempt whose vendor 400 of a relay's change was held for another
+   * operator's route (`relayChangeRefused`): no second such attempt goes, and served elsewhere its record says why it failed.
+   */
+  private relayChangePermit: string | null = null;
   /** A charged answer's client left before it was all delivered (`recordCharged`). */
   private stackUndelivered = false;
   /** The status the request's record gives the client: a stack receipt's `response.returned.status`. */
@@ -4177,6 +4189,12 @@ export class InferenceRun {
       if (failure !== undefined && chosen.next !== "none") this.retryEvents.push({ kind: "retry", next: chosen.next, cls: failure });
       this.budget.pause();
       const opened = await this.openAttempt(d, o, prepared, chosen.route, chosen.acquired, chosen.next, chosen.selection, chosen.backoffMs, answerDeadline, chosen.retest);
+      // The attempt after a vendor's 400 of a relay's change ended the request without an answer of a vendor's (a fault
+      // of its relay's, Gray's check of its answer): that 400 is the client's, as before (`relayChangeAnswer`).
+      if (opened.kind === "stopped" && opened.gray !== true && opened.passthrough === undefined && this.relayChangeHeld !== null) {
+        const changed = this.relayChangeAnswer(d, opened.stop);
+        if (changed !== null) return { ...opened, ...changed };
+      }
       if (opened.kind !== "continue") return opened;
     }
   }
@@ -5321,8 +5339,9 @@ export class InferenceRun {
    * connection's `upstream_unavailable`; the attempt's record keeps the stack VM's code); the vendor's error that is the
    * supplier's (a rate limit, an overload, a server error, a timeout) lets the next route go as the main gateway's does
    * and is the client's answer if none serves (`stackVendorPassedOver`), one that refused the relay's own account does
-   * too but is never the client's answer (`relayAccountRefused`: Gray's error), and any other (a refusal of the request)
-   * ends the request with it (`passthrough`); anything else is `lane_relay_failed`, no other route, nothing charged.
+   * too but is never the client's answer (`relayAccountRefused`: Gray's error), a 400 of a body the relay's software
+   * changed lets one other operator's route go (`relayChangeRefused`), and any other (a refusal of the request) ends the
+   * request with it (`passthrough`); anything else is `lane_relay_failed`, no other route, nothing charged.
    */
   private peerFailed(d: Dispatcher, attempt: Attempt, model: string, outcome: PeerOutcome): { readonly kind: "continue" } | Stopped {
     const { clock } = this.deps;
@@ -5347,6 +5366,7 @@ export class InferenceRun {
         if (peer !== undefined) peer.served = true;
       };
       if (passesToNextRoute(classified.outcome)) return this.stackVendorPassedOver(attempt, classified.error, outcome.accountId, passthrough, served);
+      if (outcome.changedBody && this.relayChangeRefused(d, attempt, outcome.status, classified.outcome, classified.error, outcome.accountId, passthrough, served)) return { kind: "continue" };
       served();
       return { kind: "stopped", stop: null, error: classified.error, passthrough };
     }
@@ -5518,10 +5538,52 @@ export class InferenceRun {
    * a refusal is held (that refusal is told). Taken once: a model the customer listed next starts without it.
    */
   private stackVendorAnswered(d: Dispatcher, stop: Stop | null): Pick<Stopped, "error" | "passthrough" | "served" | "vendorAnswer"> | null {
+    const changed = this.relayChangeAnswer(d, stop);
+    if (changed !== null) {
+      this.stackVendorAnswer = null;
+      return changed;
+    }
     const answer = this.stackVendorAnswer;
     this.stackVendorAnswer = null;
     if (answer === null || stop === "client_left" || d.heldToTell() !== null) return null;
     return { error: answer.error, vendorAnswer: true, ...(answer.passthrough === null ? {} : { passthrough: answer.passthrough, served: answer.serve }) };
+  }
+
+  /**
+   * A vendor's 400 at a stack route whose body the relay's software changed (`changedBody`, from the attempt's inner
+   * receipt), refused as the main gateway refuses one (`Dispatcher.fail` holds it): one other operator's route is tried
+   * when one could take the request (`sendableElsewhere`), once per request, and no repeat at the same relay
+   * (`otherOperatorsOnly`). Production, 2026-11-19: a relay's software moved a client's system prompt and added a
+   * 1-hour cache mark after the client's 5-minute one, and Anthropic answered 400 to a request the customer sent
+   * correctly. Served there, the held refusal is the first route's failure (`settleHeld`: its breaker and its error
+   * rate, the record's code `relay_change_refused`). Refused there too, the request was at fault: the client gets that
+   * last 400, the vendor's answer to the latest attempt (the dispatcher holds the later refusal and drops the first, as
+   * the main gateway does), and neither relay is held to it. Ended there any other way, or with no other route, the
+   * client gets this 400 as before (`relayChangeAnswer`), held against no one. True when the request goes on.
+   */
+  private relayChangeRefused(d: Dispatcher, attempt: Attempt, status: number, outcome: RetryOutcome, error: ApiError, accountId: string | null, passthrough: StackPassthrough, serve: () => void): boolean {
+    if (status !== 400 || outcome.class !== "refusal" || this.relayChangePermit !== null) return false;
+    if (!d.refused || d.held?.attempt !== attempt.index || !d.sendableElsewhere()) return false;
+    this.relayChangePermit = InferenceRun.permitKey(attempt.permit);
+    d.otherOperatorsOnly = true;
+    this.relayChangeHeld = { attempt, error, passthrough, serve };
+    this.stackAnsweredAccount = accountId;
+    console.log(JSON.stringify({ level: "info", event: "relay_change_refused", request_id: this.requestId, endpoint: attempt.route.record.endpointId, attempt: attempt.index }));
+    return true;
+  }
+
+  /**
+   * The request ends on the vendor's 400 of a relay's change (`relayChangeRefused`): the attempt after it served
+   * nothing and refused nothing, so its refusal is still the one held (`heldToTell`). Its status and body are the
+   * client's, and its attempt the served one (S32), as before the rule; nothing when the client left. Taken once.
+   */
+  private relayChangeAnswer(d: Dispatcher, stop: Stop | null): Pick<Stopped, "error" | "passthrough" | "served" | "vendorAnswer"> | null {
+    const held = this.relayChangeHeld;
+    this.relayChangeHeld = null;
+    d.otherOperatorsOnly = false;
+    if (held === null || stop === "client_left" || d.heldToTell()?.attempt !== held.attempt.index) return null;
+    this.stackAnsweredAccount = held.passthrough.accountId;
+    return { error: held.error, vendorAnswer: true, passthrough: held.passthrough, served: held.serve };
   }
 
   /**
@@ -5857,6 +5919,8 @@ export class InferenceRun {
   private commit(d: Dispatcher, attempt: Attempt): void {
     d.commit();
     attempt.committed = true;
+    // A vendor's 400 of a relay's change held for this attempt is settled with the answer (`settleHeld`), not told.
+    this.relayChangeHeld = null;
     this.deferRecord = false;
     if (attempt.next !== "none") this.retryEvents.push({ kind: "retry_outcome", next: attempt.next, outcome: "served" });
     if (d.last !== null) {
@@ -6003,7 +6067,10 @@ export class InferenceRun {
     // Its attempt's record names the failure it counts as, served at its own operator too (capture.rs
     // `refusal_served_elsewhere`): the request log says what the refusal was held against.
     const at = this.attemptAt.get(key);
-    if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, failure: failure.reason };
+    // A vendor's 400 of the body a relay's software changed, served by another operator's route: the change was refused
+    // (`relayChangeRefused`), and the record says so.
+    const code = key === this.relayChangePermit ? { code: RELAY_CHANGE_REFUSED } : {};
+    if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, failure: failure.reason, ...code };
     // Its sample's measures: the refusing attempt's latency, no first token, no tokens, the failure it counts as
     // (`refusal_served_later`); its record's route attempt takes them (r15, docs/live-speed.md).
     const measure: OutcomeMeasure = [at === undefined ? 0 : this.attempts[at]!.durationMs, null, 0, later.failure];
@@ -8150,7 +8217,14 @@ type SendResult =
  */
 type PeerOutcome =
   | { readonly kind: "not_dialed"; readonly code: string }
-  | { readonly kind: "vendor_error"; readonly status: number; readonly body: Uint8Array; readonly accountId: string | null }
+  | {
+      readonly kind: "vendor_error";
+      readonly status: number;
+      readonly body: Uint8Array;
+      readonly accountId: string | null;
+      /** The relay's software changed the body of the attempt whose error this is, as its inner receipt says (`receiptChangedBody`). */
+      readonly changedBody: boolean;
+    }
   /** The vendor's own error event ended its stream before the stack VM's commit (`end.vendor_event`): nothing released. */
   | { readonly kind: "vendor_event"; readonly event: Json; readonly accountId: string | null }
   | { readonly kind: "relay_failed"; readonly code: string };
@@ -8264,9 +8338,21 @@ function peerChecks(end: PeerEndDto | null): AnswerChecks {
  */
 function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): PeerOutcome {
   if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid" };
-  if (end.outcome === "vendor_error") return { kind: "vendor_error", status, body, accountId: end.relay_account_id };
+  // The stack VM's attempt whose error it released is `served_attempt`; its group in the inner receipt lists what the
+  // relay's software changed (S26). A stack VM that sends no receipt, or one before `relay_stack.changed`, changed nothing.
+  if (end.outcome === "vendor_error") return { kind: "vendor_error", status, body, accountId: end.relay_account_id, changedBody: receiptChangedBody(end.receipt, end.served_attempt) };
   if (end.vendor_event !== undefined) return { kind: "vendor_event", event: end.vendor_event as Json, accountId: end.relay_account_id };
   return { kind: "relay_failed", code: end.code ?? "peer_invalid" };
+}
+
+/**
+ * Whether a stack relay's vendor error is one the main gateway tries another route after, the supplier's and not the
+ * request's: a rate limit (`throttled`, a 429 or an overload), a server error, a timeout. A refusal of the request (a
+ * 400, a 404, a context overflow) stays the client's answer at once, the vendor's words, as before, but a 400 of a body
+ * the relay's software changed (`relayChangeRefused`).
+ */
+function passesToNextRoute(outcome: RetryOutcome): boolean {
+  return outcome.class === "throttled" || outcome.class === "server_error" || outcome.class === "timeout";
 }
 
 /**
@@ -8274,15 +8360,6 @@ function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): Pe
  * classes the request log records as `credential` (@gray/errors `classDisposition`: `credential` and
  * `account_request`).
  */
-/**
- * Whether a stack relay's vendor error is one the main gateway tries another route after, the supplier's and not the
- * request's: a rate limit (`throttled`, a 429 or an overload), a server error, a timeout. A refusal of the request (a
- * 400, a 404, a context overflow) stays the client's answer at once, the vendor's words, as before.
- */
-function passesToNextRoute(outcome: RetryOutcome): boolean {
-  return outcome.class === "throttled" || outcome.class === "server_error" || outcome.class === "timeout";
-}
-
 function refusedTheRelaysAccount(outcome: RetryOutcome): boolean {
   return classDisposition(outcome.class, outcome.status, outcome.serverCode) === "credential";
 }
