@@ -33,6 +33,7 @@ import { backendOf, isPeerRequest, peerRoute } from "./peer-routes.ts";
 import { serveReceipt } from "./receipt-route.ts";
 import { DEBUG_REQUESTS_PREFIX, debugCorsOrigin, debugGrantsOf, debugRequestIdOf, serveDebugGrant } from "./debug-route.ts";
 import { answerRelayDebug, stackDebugOf } from "./stack-debug.ts";
+import { apiArrival } from "./api-arrival.ts";
 import { readLoginCallback, readLoginInput, RELAY_DEBUG_PATH, RELAY_LOGIN_KEY_HEADER, RELAY_LOGIN_PATH, RELAY_LOGIN_SESSION_PATTERN } from "@gray/relay-connector";
 import { LaneLoginSessions, MemoryLoginPins, UNKNOWN_SESSION, type LoginAnswer } from "./login-session.ts";
 import { BOOT_BOX_DELIVERY_PATH } from "@gray/relay-connector/boot-box";
@@ -45,6 +46,8 @@ import { BackgroundClient } from "./remote/background.ts";
 import { setLaneNonceReplica } from "./remote/nonces.ts";
 import { platformTimers } from "../client.ts";
 import { EntryRoleClient, entryReadiness, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
+import { API_FORWARD_HEADER } from "@gray/lane-wire";
+import { apiForwardOf, entryOwnPath, forwardToApi, laneApiForward, mergedListing, MODELS_PARTIAL_HEADER, SERVED_BY_HEADER, type ApiForward, type ForwardSigner } from "./api-forward.ts";
 import type { LanePeers } from "./types.ts";
 
 /**
@@ -73,6 +76,9 @@ import type { LanePeers } from "./types.ts";
  *   in-flight count (`entry-role.ts`).
  * - `GET /readyz` → 200 when the entry may take new connections from the load balancer, 503 otherwise
  *   (docs/design/entry-replicas.md §13, `entryReadiness`).
+ * - with `API_ORIGIN` (docs/design/one-address.md; default layout only): every other public path but the entry's own
+ *   namespaces (`/v1/aci/*`, `/v1/peer/*`) → forwarded to the API Worker (`api-forward.ts`), and `/v1/models` merged
+ *   with the API's list. Without it those paths answer the 404, as before.
  *
  * The relay-stack layout adds a second entrypoint, `relayConfig` below, on its own socket (S28): the
  * relay's two config GETs and nothing else. This one never serves them.
@@ -105,13 +111,17 @@ export const READY_PATH = "/readyz";
  */
 export const LANE_EXPOSED = `${EXPOSED}, ${ACI_VERSION_HEADER}, ${ACI_KEYSET_DIGEST_HEADER}, ${WORKLOAD_KEYSET_DIGEST_HEADER}, ${RECEIPT_ID_HEADER}`;
 
+/** `LANE_EXPOSED` at an entry that forwards (docs/design/one-address.md): also which origin served the answer, and a partial model list. */
+export const LANE_FORWARD_EXPOSED = `${LANE_EXPOSED}, ${SERVED_BY_HEADER}, ${MODELS_PARTIAL_HEADER}`;
+
 /**
  * `LANE_EXPOSED` for a boot: an entry replica also lets the page read the origin header it sends
  * (docs/design/entry-replicas.md ER6), which names where the receipt is. Without a replica index the list is
  * `LANE_EXPOSED` itself.
  */
-function laneExposed(laneOrigin: string | null): string {
-  return laneOrigin === null ? LANE_EXPOSED : `${LANE_EXPOSED}, ${LANE_ORIGIN_HEADER}`;
+function laneExposed(laneOrigin: string | null, forwards = false): string {
+  const base = forwards ? LANE_FORWARD_EXPOSED : LANE_EXPOSED;
+  return laneOrigin === null ? base : `${base}, ${LANE_ORIGIN_HEADER}`;
 }
 
 /**
@@ -195,6 +205,20 @@ export interface LaneGatewayEnv extends LaneEnv {
   readonly LANE_STACK_RELAY_KEY?: unknown;
   /** `true`: this default-layout lane is an entry that routes stack routes over the peer hop (`peersOf`); off otherwise. */
   readonly LANE_PEERS?: unknown;
+  /**
+   * docs/design/one-address.md, default layout only: the API Worker's origin (app-compose.mjs `--api-origin`, a measured
+   * literal), where the entry forwards every public path it does not serve itself (`api-forward.ts`). Unset or empty: those
+   * paths answer the 404, as before.
+   */
+  readonly API_ORIGIN?: unknown;
+  /** The entrypoint's `api` external service, rendered with API_ORIGIN: HTTPS to the API's host, the browser roots. */
+  readonly API?: unknown;
+  /**
+   * docs/design/one-address.md: the API Worker's forward key, `<key id>:<64 lowercase hex>` (app-compose.mjs
+   * `--api-forward-public-key`, a measured literal), whose `x-gray-api-forward` mark the entry accepts on a chat request
+   * the API Worker forwarded.
+   */
+  readonly LANE_API_FORWARD_PUBLIC_KEY?: unknown;
   readonly [name: string]: unknown;
 }
 
@@ -746,8 +770,11 @@ const ENTRY_STOP_URL = "http://entry-stop/stop";
 /** The entrypoint's stop socket is local and answers at once (`serveEntryStop`); a call past this is a failed one. */
 const ENTRY_STOP_CALL_MS = 5_000;
 
-/** The generation path's answers, which may still be streaming when `route` returns them (`LaneEntryRole.answer`'s `live`). */
-const generationAnswers = new WeakSet<Response>();
+/**
+ * The generation path's answers and the forwarded ones (docs/design/one-address.md), which may still be streaming when
+ * `route` returns them (`LaneEntryRole.answer`'s `live`).
+ */
+const liveAnswers = new WeakSet<Response>();
 
 function entryRoleOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, index: number | null): LaneEntryRole | null {
   const known = entryRoles.get(state);
@@ -1050,7 +1077,10 @@ export default {
     const origin = allowedOrigin(request, cfg.consoleOrigin) ?? debugCorsOrigin(request, declaredPath(url.pathname)?.path ?? url.pathname);
     // §D/M23: every Cloudflare-bound path of a deployed lane is a binding. `local` (a test) may use the
     // platform's `fetch`; anywhere else a missing binding is a boot error the entry answers itself.
-    const missing = deployed ? [...identityRead.missing, ...missingLaneBindings(env)] : [];
+    // docs/design/one-address.md: an API_ORIGIN the entry cannot forward to (not an https origin, the relay-stack layout,
+    // no API service) is the same fixed misconfiguration, in every environment: never a silent 404 for every forwarded path.
+    const api = apiForwardOf(env, typeof env.LANE_STACK_RELAY_ID === "string" && env.LANE_STACK_RELAY_ID !== "");
+    const missing = [...(deployed ? [...identityRead.missing, ...missingLaneBindings(env)] : []), ...(api.problem === null ? [] : [api.problem])];
     const peers = missing.length === 0 ? peersOf(state, env, cfg, identity) : null;
     // M13: whatever this fetch is, the lane's routes are warmed behind it when due (the first one also primes the snapshot).
     if (missing.length === 0) warmLane(state, env, cfg, ctx, undefined, peers);
@@ -1082,7 +1112,7 @@ export default {
       if (missing.length > 0) {
         answer = misconfigured(request, url, state, missing);
       } else {
-        const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica);
+        const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward);
         end?.hold(routed);
         answer = await routed;
       }
@@ -1091,9 +1121,10 @@ export default {
       throw thrown;
     }
     // docs/design/entry-replicas.md ER6: an entry replica names its own origin wherever it names its keyset digest.
-    const served = withCors(withAciHeaders(answer, state.keysetDigest, state.laneOrigin), origin, laneExposed(state.laneOrigin));
-    // ER9 as revised: `Connection: close` while draining, and the count ends with the body (a generation answer's) or now.
-    const live = generationAnswers.has(answer) && answer.status >= 200 && answer.status < 300;
+    const served = withCors(withAciHeaders(answer, state.keysetDigest, state.laneOrigin), origin, laneExposed(state.laneOrigin, api.forward !== null));
+    // ER9 as revised: `Connection: close` while draining, and the count ends with the body (a generation or a forwarded
+    // answer's) or now.
+    const live = liveAnswers.has(answer) && answer.status >= 200 && answer.status < 300;
     return replica === null ? served : replica.answer(served, end, live);
   },
 } satisfies ExportedHandler<LaneGatewayEnv>;
@@ -1145,6 +1176,7 @@ async function route(
   origin: string | null,
   peers: EntryPeers | null,
   replica: LaneEntryRole | null,
+  api: ApiForward | null = null,
 ): Promise<Response> {
   const preflighted = preflight(request, origin);
   if (preflighted !== null) return preflighted;
@@ -1180,8 +1212,23 @@ async function route(
   // the lane's view holds (docs/design/lane-provider-routes.md sections 2 and 7; a lane relay maps no Gemini route).
   const listing = catalogRoute(request.method, path);
   const served = servedProtocol(request.method, path);
-  if (listing === null && served === null) return unmatched(request, cfg, url, path);
-  if (listing !== null && listing.kind === "key") return unmatched(request, cfg, url, path);
+  // docs/design/one-address.md: with API_ORIGIN every other public path is the API Worker's (`/v1/key`, the media and
+  // model APIs, the setup routes, paths no API serves), never one of the entry's own namespaces, and never a request the
+  // API Worker forwarded here (its mark): neither side forwards the other's request again.
+  const forwardable = api !== null && !entryOwnPath(path) && !request.headers.has(API_FORWARD_HEADER);
+  const sign: ForwardSigner = { keyId: state.laneKeyId, signer: state.bridgeSigner, now: state.now };
+  const forwarded = async (): Promise<Response> => {
+    const answer = await forwardToApi(request, url, api!, sign, { cfg, url, path });
+    liveAnswers.add(answer);
+    return answer;
+  };
+  if (listing === null && served === null) return forwardable ? forwarded() : unmatched(request, cfg, url, path);
+  if (listing !== null && listing.kind === "key") return forwardable ? forwarded() : unmatched(request, cfg, url, path);
+  // docs/design/one-address.md: a chat request the API Worker forwarded is marked; the mark is checked and taken off
+  // (`api-arrival.ts`), an invalid one refused, and a request without one served as before.
+  const arrival = served === null ? null : await apiArrival(request, env["LANE_API_FORWARD_PUBLIC_KEY"], url, path, state.now(), originsOf(cfg, url));
+  if (arrival?.kind === "refused") return arrival.response;
+  if (arrival?.kind === "gray_api") request = arrival.request;
   // The generation path: the same `InferenceRun` the main lane runs, with the lane's dependencies.
   const lane: LaneRequestState = {
     cfg,
@@ -1190,15 +1237,26 @@ async function route(
     bridge: { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv) },
     ...(peers === null ? {} : { peers }),
     ...endpointRoutesField(endpointRoutesOf(state, env, cfg)),
+    ...(arrival?.kind === "gray_api" ? { arrival: "gray_api" as const } : {}),
+    // docs/design/one-address.md: a request for a model this entry has no route of on its API, which Gray's API serves,
+    // goes there (InferenceRun `forwardToApi`); never one that arrived through the API.
+    ...(forwardable && served !== null && arrival?.kind !== "gray_api" ? { apiForward: laneApiForward(api!, sign, url, (p) => ctx.waitUntil(p)) } : {}),
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
-  if (listing !== null) return serveCatalog(request, listing, path, { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => ctx.waitUntil(p) });
+  if (listing !== null) {
+    const catalog = { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p: Promise<unknown>) => ctx.waitUntil(p) };
+    if (!forwardable) return serveCatalog(request, listing, path, catalog);
+    // docs/design/one-address.md "/v1/models": the entry's own listing (OpenAI's or Gemini's), asked as a GET so a HEAD
+    // is merged the same way.
+    const asGet = request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
+    return mergedListing(request, url, listing, await serveCatalog(asGet, listing, path, catalog), api!, sign, { cfg, url, path });
+  }
   if (served === null) return unmatched(request, cfg, url, path);
   // The sinks' buffered points flush at the request's end, from inside `InferenceRun`'s own
   // `waitUntil` block, after the record is emitted (F2 bridge-1, design v2 §C.10): a flush scheduled
   // here would run before `serve()` buffered anything. A slow record never delays the answer.
   const generated = await new InferenceRun(request, served, deps, ctx, declared).serve();
-  generationAnswers.add(generated);
+  liveAnswers.add(generated);
   return generated;
 }
 

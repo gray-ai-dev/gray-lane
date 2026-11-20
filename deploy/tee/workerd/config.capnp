@@ -13,17 +13,19 @@
 # - One listener, on 443, and it terminates TLS inside the CVM. The certificate's private key is made in
 #   the CVM, so the keyset's TLS entry binds the key a client actually talks to.
 # - `globalOutbound` is a network service that allows nothing. The only paths out of the Worker are the
-#   three service bindings below: the dstack guest agent (a Unix socket), the bridge (HTTPS with a
+#   service bindings below: the dstack guest agent (a Unix socket), the bridge (HTTPS with a
 #   certificate host and the browser roots), and EGRESS (the gray-egress sidecar on a Unix socket,
 #   plain HTTP). D18: EGRESS replaces the three per-vendor external services; the gateway consumes it
 #   for every vendor request (laneFetch maps the official URL to /anthropic, /openai or /chatgpt).
+#   docs/design/one-address.md adds `api` (HTTPS to the API Worker, as the bridge is) when the compose sets
+#   API_ORIGIN; without it the entrypoint renders no such service.
 # - LANE_BRIDGE_KEY_SEED is a secret from the dstack encrypted env: the entrypoint renders it into the
 #   workerd config on the tmpfs, never into a log line, an error or the image.
 using Workerd = import "/workerd/workerd.capnp";
 
 const config :Workerd.Config = (
   services = [
-    # The dstack guest agent, which the dstack guest mounts at /var/run/dstack.sock. `http = ()` selects
+__API_SERVICES__    # The dstack guest agent, which the dstack guest mounts at /var/run/dstack.sock. `http = ()` selects
     # plain HTTP over the socket (the agent speaks HTTP over it; there is no TLS on the host socket).
     ( name = "guest-agent",
       external = (
@@ -104,7 +106,7 @@ __REPLICA_SERVICES__    # Nothing is reachable through this service: `allow` def
 
           # The gateway's own vars (workers/packages/config): the lane reads them through gatewayConfig.
           ( name = "GATEWAY_FALLBACK_REGION", text = "__GATEWAY_FALLBACK_REGION__" ),
-          ( name = "CONSOLE_ORIGIN", text = "__CONSOLE_ORIGIN__" ),
+          ( name = "CONSOLE_ORIGIN", text = "__CONSOLE_ORIGIN__" ),__API_BINDINGS__
           ( name = "BODY_PARSE_MAX_BYTES", text = "__BODY_PARSE_MAX_BYTES__" ),
           ( name = "LANE_POLICY_STEP_MS", text = "__LANE_POLICY_STEP_MS__" ),
           ( name = "LANE_POLICY_FUEL_PER_MS", text = "__LANE_POLICY_FUEL_PER_MS__" ),

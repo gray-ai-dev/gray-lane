@@ -40,6 +40,12 @@
  * `:streamGenerateContent`), or an explicit override. Templates are supplied by id: the receipt deliberately
  * carries digests, not text (review.md §2.5).
  *
+ * A receipt of a request that reached the VM through Gray's API (docs/design/one-address.md: `api_version`
+ * `aci/1+gray-api` with `arrival: "gray_api"`, both signed) is genuine, and the client's TLS ended at Cloudflare there,
+ * not in the VM. Every check runs as for an `aci/1` receipt, and one more, `client_connection`, fails: the client-to-VM
+ * leg is not covered. `verdict` is then `not_end_to_end` when that is the only failure (`ok` stays false), so a caller
+ * that reads `ok` alone fails closed and one that reads `verdict` can say what was and was not covered.
+ *
  * A Gemini receipt is an entry's endpoint route's (docs/design/lane-provider-routes.md section 5): the lane has no
  * rewrite policy and no relay templates for Gemini, so Gray forwards the customer's bytes as they are, and step 1 is
  * the whole content check (a `request.modified` or `relay_policy` event fails it).
@@ -68,6 +74,7 @@ import {
   isJcsValue,
   isStackEventLog,
   parseReceiptText,
+  RECEIPT_ARRIVAL_GRAY_API,
   relayPolicyAppliedSchema,
   relayStackAppendedSchema,
   relayStackChangedSchema,
@@ -140,8 +147,26 @@ export interface AppendedTextRecord {
   readonly text_sha256: string;
 }
 
+/** The check that fails for a receipt of a request that arrived through Gray's API, and only for it. */
+export const CLIENT_CONNECTION_CHECK = "client_connection";
+
+/**
+ * `pass`: every check passed. `not_end_to_end`: the receipt is valid and every check but `client_connection` passed:
+ * the request arrived through Gray's API, so the client's connection did not end in the attested VM. `fail`: any other.
+ */
+export type ResponseReceiptVerdict = "pass" | "not_end_to_end" | "fail";
+
+/** The verdict of a list of checks (`ResponseReceiptVerdict`). */
+export function receiptVerdictOf(checks: readonly ReceiptCheck[]): ResponseReceiptVerdict {
+  const failed = checks.filter((check) => check.status === "fail");
+  if (failed.length === 0) return "pass";
+  return failed.every((check) => check.id === CLIENT_CONNECTION_CHECK) ? "not_end_to_end" : "fail";
+}
+
 export interface ResponseReceiptVerification {
+  /** Every check passed; false for a receipt of a request that arrived through Gray's API (see `verdict`). */
   readonly ok: boolean;
+  readonly verdict: ResponseReceiptVerdict;
   readonly checks: readonly ReceiptCheck[];
   readonly receiptId: string | null;
   readonly keysetDigest: string | null;
@@ -157,6 +182,8 @@ export interface ResponseReceiptVerification {
   readonly stack: StackReceiptSummary | null;
   /** S52: the receipt's `relay_image` (the stack boot's relay image), or null when it names none. */
   readonly relayImage: string | null;
+  /** The receipt's `arrival` (`gray_api`: the request reached the VM through Gray's API), or null when it names none. */
+  readonly arrival: string | null;
 }
 
 /** One upstream attempt of a relay-stack receipt, as the receipt records it. */
@@ -247,6 +274,7 @@ export async function verifyResponseReceiptText(text: string, options: VerifyRes
   if (!parsed.ok) {
     return {
       ok: false,
+      verdict: "fail",
       checks: [fail("receipt_parse", parsed.message)],
       receiptId: null,
       keysetDigest: null,
@@ -259,6 +287,7 @@ export async function verifyResponseReceiptText(text: string, options: VerifyRes
       modified: [],
       stack: null,
       relayImage: null,
+      arrival: null,
     };
   }
   return verifyResponseReceipt(parsed.value, options);
@@ -286,9 +315,11 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     modified: [] as RequestModifiedEvent[],
     stack: null as StackReceiptSummary | null,
     relayImage: null as string | null,
+    arrival: null as string | null,
   };
   const result = (): ResponseReceiptVerification => ({
     ok: checks.every((check) => check.status !== "fail"),
+    verdict: receiptVerdictOf(checks),
     checks,
     ...state,
   });
@@ -341,6 +372,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     state.forwardedBodyHash = bodyHashOf(document, EVENT_REQUEST_FORWARDED);
     state.responseBodyHash = bodyHashOf(document, EVENT_RESPONSE_RETURNED);
     state.relayImage = document.relay_image;
+    state.arrival = document.arrival ?? null;
     const implied = protocolForEndpoint(document.endpoint);
     state.protocol = options.protocol ?? implied;
   }
@@ -789,6 +821,9 @@ function stringMember(event: Json | undefined, name: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
+/** `@gray/attest`'s problems of the version and `arrival` rule. */
+const VERSION_PROBLEMS: readonly string[] = ["unsupported_api_version", "version_without_arrival", "arrival_without_version", "unsupported_arrival"];
+
 function receiptChecks(
   verification: Awaited<ReturnType<typeof verifyReceipt>>,
   document: ReceiptDocument | null,
@@ -812,8 +847,14 @@ function receiptChecks(
     return checks;
   }
 
-  if (has("unsupported_api_version")) checks.push(fail("receipt_version", problemOf("unsupported_api_version")));
+  // docs/design/one-address.md: `aci/1`, or `aci/1+gray-api` with `arrival: "gray_api"`; anything else fails here.
+  const versionProblem = verification.problems.find((problem) => VERSION_PROBLEMS.includes(problem.code));
+  if (versionProblem !== undefined) checks.push(fail("receipt_version", versionProblem.message));
   else checks.push(pass("receipt_version", document.api_version));
+  // A genuine receipt of a request that arrived through Gray's API: the client's TLS ended at Cloudflare.
+  if (versionProblem === undefined && document.arrival === RECEIPT_ARRIVAL_GRAY_API) {
+    checks.push(fail(CLIENT_CONNECTION_CHECK, "the request arrived through Gray's API: the client's TLS ended at Cloudflare, not in the attested VM, so the client-to-VM leg is not covered"));
+  }
 
   if (has("keyset_digest_mismatch")) checks.push(fail("keyset_digest", problemOf("keyset_digest_mismatch")));
   else checks.push(pass("keyset_digest", document.workload_keyset_digest));

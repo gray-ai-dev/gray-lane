@@ -78,7 +78,20 @@ import { readJsonText } from "./wire.ts";
  * A relay-stack receipt also names the image the relay chose for the boot that served it (plan S52):
  * a top-level `relay_image`, set only on such receipts and covered by the signature like every other
  * member. A verifier that predates the member ignores it and still verifies the document.
+ *
+ * A receipt of a request that reached the VM through Gray's API (docs/design/one-address.md) says so twice, both under
+ * the signature: `api_version` is `aci/1+gray-api` instead of `aci/1`, and the top-level `arrival` is `gray_api`. The
+ * client's TLS ended at Cloudflare there, not in the VM, so the client-to-VM leg is not covered by the attestation. The
+ * version is what keeps a verifier that predates it honest: it refuses any version but `aci/1`
+ * (`unsupported_api_version`), so it can never pass such a receipt as end to end. [`verifyReceipt`] accepts the version
+ * only with `arrival: "gray_api"` and `arrival` only with that version; a caller tells the two kinds apart by
+ * `document.arrival`.
  */
+
+/** The `api_version` of a receipt whose request arrived through Gray's API (docs/design/one-address.md). */
+export const RECEIPT_API_VERSION_GRAY_API = "aci/1+gray-api";
+/** The `arrival` of such a receipt: the request reached the VM through Gray's API, its TLS ended at Cloudflare. */
+export const RECEIPT_ARRIVAL_GRAY_API = "gray_api";
 
 /**
  * S52: a relay image reference, `<registry host[:port]>/<repository>@sha256:<64 hex>` (@gray/lane-verify
@@ -111,6 +124,12 @@ export interface ReceiptDocument {
   readonly signature: string;
   /** S52: the relay image of the stack boot that served the request; null on every other receipt (absent reads as null). */
   readonly relay_image: string | null;
+  /**
+   * `gray_api` when the request reached the VM through Gray's API (`RECEIPT_ARRIVAL_GRAY_API`, with `api_version`
+   * `aci/1+gray-api`); absent on every other receipt, and absent from the parsed document too, so a document parsed and
+   * written again is the one that was signed. [`verifyReceipt`] refuses any other value.
+   */
+  readonly arrival?: string;
 }
 
 /** What the producer knows when it opens a receipt. */
@@ -126,6 +145,11 @@ export interface ReceiptMetadata {
   readonly servedAt: bigint;
   /** S52: the relay image of the stack boot serving the request; only a relay-stack lane sets it. */
   readonly relayImage?: string;
+  /**
+   * docs/design/one-address.md: the request reached the VM through Gray's API. The receipt then has `api_version`
+   * `aci/1+gray-api` and `arrival: "gray_api"`; absent, the document is exactly what it was before.
+   */
+  readonly arrival?: typeof RECEIPT_ARRIVAL_GRAY_API;
 }
 
 /** A finalized receipt: the served document bytes and the ids a store needs without parsing it. */
@@ -189,6 +213,7 @@ export const receiptDocumentSchema = z.object({
     .refine(isReceiptRelayImage, "relay_image is <registry>/<repository>@sha256:<64 hex>")
     .nullish()
     .transform((value) => value ?? null),
+  arrival: z.string().optional(),
 });
 
 export type ParseReceiptResult =
@@ -480,6 +505,9 @@ export class ReceiptBuilder {
     if (metadata.relayImage !== undefined && !isReceiptRelayImage(metadata.relayImage)) {
       throw new ReceiptError("invalid_metadata", "relay_image is <registry>/<repository>@sha256:<64 hex> (S52)");
     }
+    if (metadata.arrival !== undefined && metadata.arrival !== RECEIPT_ARRIVAL_GRAY_API) {
+      throw new ReceiptError("invalid_metadata", `arrival is ${RECEIPT_ARRIVAL_GRAY_API} or absent`);
+    }
     if (this.#events.length === 0) throw new ReceiptError("empty_receipt", "cannot finalize a receipt with no events");
     const first = this.#events[0];
     if (first === undefined || eventType(first) !== EVENT_REQUEST_RECEIVED) {
@@ -493,7 +521,7 @@ export class ReceiptBuilder {
     if (key.algo !== ALGO_ED25519) throw new ReceiptError("unsupported_algo", `unsupported receipt key algorithm: ${key.algo}`);
 
     const payload: JsonObject = {
-      api_version: ACI_API_VERSION,
+      api_version: metadata.arrival === undefined ? ACI_API_VERSION : RECEIPT_API_VERSION_GRAY_API,
       receipt_id: metadata.receiptId,
       chat_id: metadata.chatId,
       model: metadata.model,
@@ -504,6 +532,7 @@ export class ReceiptBuilder {
       event_log: this.#events.map((event) => ({ ...event })),
       key_id: key.key_id,
       ...(metadata.relayImage === undefined ? {} : { relay_image: metadata.relayImage }),
+      ...(metadata.arrival === undefined ? {} : { arrival: metadata.arrival }),
     };
     const signature = await keys.signReceipt(key.key_id, jcsBytes(payload));
     const signatureHex = bytesToLowerHex(signature);
@@ -543,6 +572,12 @@ export interface ReceiptExpectations {
 export type ReceiptProblemCode =
   | "invalid_document"
   | "unsupported_api_version"
+  /** `aci/1+gray-api` without `arrival: "gray_api"`. */
+  | "version_without_arrival"
+  /** `arrival: "gray_api"` on a receipt whose version is not `aci/1+gray-api`. */
+  | "arrival_without_version"
+  /** An `arrival` other than `gray_api`. */
+  | "unsupported_arrival"
   | "keyset_digest_mismatch"
   | "unknown_receipt_key"
   | "unsupported_signature_algo"
@@ -577,9 +612,7 @@ export async function verifyReceipt(
   const parsed = parseReceipt(value);
   if (!parsed.ok) return { ok: false, problems: [{ code: "invalid_document", message: parsed.message }], document: null };
   const document = parsed.document;
-  if (document.api_version !== ACI_API_VERSION) {
-    problems.push({ code: "unsupported_api_version", message: `not ${ACI_API_VERSION}: ${document.api_version}` });
-  }
+  problems.push(...versionProblems(document));
   if (expect.workloadKeysetDigest !== undefined && document.workload_keyset_digest !== expect.workloadKeysetDigest) {
     problems.push({
       code: "keyset_digest_mismatch",
@@ -621,6 +654,26 @@ export async function verifyReceipt(
     }
   }
   return { ok: problems.length === 0, problems, document };
+}
+
+/**
+ * The version and `arrival` rule (docs/design/one-address.md): `aci/1` with no `arrival`, or `aci/1+gray-api` with
+ * `arrival: "gray_api"`. Each half without the other is its own problem, so a document cannot claim the one without
+ * the other.
+ */
+function versionProblems(document: ReceiptDocument): ReceiptProblem[] {
+  const version = document.api_version;
+  const arrival = document.arrival ?? null;
+  if (arrival !== null && arrival !== RECEIPT_ARRIVAL_GRAY_API) {
+    return [{ code: "unsupported_arrival", message: `arrival is ${RECEIPT_ARRIVAL_GRAY_API} or absent, not ${arrival}` }];
+  }
+  if (version === ACI_API_VERSION) {
+    return arrival === null ? [] : [{ code: "arrival_without_version", message: `arrival ${arrival} needs api_version ${RECEIPT_API_VERSION_GRAY_API}, not ${version}` }];
+  }
+  if (version === RECEIPT_API_VERSION_GRAY_API) {
+    return arrival === null ? [{ code: "version_without_arrival", message: `api_version ${version} needs arrival ${RECEIPT_ARRIVAL_GRAY_API}` }] : [];
+  }
+  return [{ code: "unsupported_api_version", message: `not ${ACI_API_VERSION}: ${version}` }];
 }
 
 /**

@@ -1,4 +1,5 @@
 import { identify, withDeclared } from "@gray/client-apps";
+import { VIA_ENTRY_HEADER } from "@gray/lane-wire";
 import { IMAGE_USAGE_UNSPLIT_POLICIES } from "@gray/config";
 import { attemptRecord, type AttemptRecord as ContentAttempt, type AttemptToolCallIds, type ContentReason, type WriterResult } from "@gray/content";
 import { ACCOUNT_BLOCKS, errorCategory } from "@gray/errors";
@@ -855,7 +856,9 @@ export function clientFields(headers: Headers, declared: string | null = null): 
   const cut = (value: string | null, limit: number) => (value === null ? null : bounded(value, limit));
   const app = identify(declared === null ? headers : withDeclared(headers, declared));
   return {
-    clientIp: headerText(headers, ["cf-connecting-ip"]),
+    // A request the confidential entry forwarded (`x-gray-via-entry`, entry-forward.ts) has no client address here: the
+    // one Cloudflare states is the entry VM's own, and the entry has none to give (docs/design/one-address.md).
+    clientIp: headers.has(VIA_ENTRY_HEADER) ? null : headerText(headers, ["cf-connecting-ip"]),
     userAgent: cut(headerText(headers, ["user-agent"]), MAX_USER_AGENT),
     sessionId: cut(headerText(headers, SESSION_HEADERS), MAX_SESSION_ID),
     parentSessionId: cut(headerText(headers, PARENT_SESSION_HEADERS), MAX_SESSION_ID),

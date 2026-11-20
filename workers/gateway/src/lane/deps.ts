@@ -26,7 +26,7 @@ import { remoteModelCheckTickets } from "./remote/tickets.ts";
 import { LaneFetchRefusal } from "./fetch-refusal.ts";
 import { gatedUpstreamAuth } from "./kms-lease.ts";
 import { endpointRowsOfSnapshot, type EntryEndpointRoutes } from "./endpoint-routes.ts";
-import type { LaneDeps, LaneGatewayDeps, LanePeers, StackTransport } from "./types.ts";
+import type { LaneApiForward, LaneDeps, LaneGatewayDeps, LanePeers, StackTransport } from "./types.ts";
 import type { LaneProcessState } from "./state.ts";
 
 /**
@@ -164,6 +164,13 @@ export interface LaneRequestState {
    * layout's; absent on a relay stack VM, whose egress has no `/route/` kind, and then an endpoint route is passed over.
    */
   readonly endpointRoutes?: EntryEndpointRoutes;
+  /**
+   * docs/design/one-address.md: `gray_api` when the request carries a valid mark of the API Worker (`api-arrival.ts`):
+   * it reached this VM through Gray's API. Absent for a client's own connection.
+   */
+  readonly arrival?: "gray_api";
+  /** docs/design/one-address.md: the entry's forward of a request for a model only Gray's API serves (`LaneDeps.apiForward`). */
+  readonly apiForward?: LaneApiForward;
 }
 
 /** The process's per-isolate tables and load, bounded as the main lane bounds them. */
@@ -294,6 +301,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     ...stackTransportOf(env.RELAY, egressBinding),
     ...(state.peers === undefined ? {} : { peers: state.peers }),
     ...endpointRouteDeps(state.endpointRoutes),
+    ...(state.arrival === undefined ? {} : { arrival: state.arrival }),
+    ...(state.apiForward === undefined ? {} : { apiForward: state.apiForward }),
   };
   return { ...deps, lane };
 }

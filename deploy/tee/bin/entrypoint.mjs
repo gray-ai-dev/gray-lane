@@ -572,6 +572,75 @@ export function peerFragments(peers) {
 }
 
 /**
+ * docs/design/one-address.md: the entry's forward to the API Worker, or null when the compose sets neither of its
+ * literals. `API_ORIGIN` (app-compose.mjs `--api-origin`) is an https origin written as one, where the entry forwards
+ * every path it does not serve itself; the entrypoint renders it as the `api` external service (HTTPS verified against
+ * the browser roots for its host, as the bridge is) and the API binding. `LANE_API_FORWARD_PUBLIC_KEY`
+ * (`--api-forward-public-key`) is `<key id>:<64 lowercase hex>`, the key of the API Worker's forward mark. Neither is
+ * set in the relay-stack layout: only the entry forwards to and from the API Worker. app-compose.mjs's gate holds the
+ * measured compose to the same rules; this is the boot's own check.
+ */
+export function apiForwardLayout(env, stack) {
+  const origin = env.API_ORIGIN ?? "";
+  const key = env.LANE_API_FORWARD_PUBLIC_KEY ?? "";
+  if (origin === "" && key === "") return null;
+  if (stack !== null) fail("API_ORIGIN and LANE_API_FORWARD_PUBLIC_KEY are an entry's settings, never set in the relay-stack layout");
+  let address = null;
+  let certificateHost = null;
+  if (origin !== "") {
+    let url;
+    try {
+      url = new URL(origin);
+    } catch {
+      fail("API_ORIGIN is not a URL");
+    }
+    if (url.protocol !== "https:" || url.origin !== origin) fail("API_ORIGIN is an https origin written as scheme://host[:port]");
+    if (url.hostname.endsWith(".invalid") || !SAFE.test(origin)) fail("API_ORIGIN names a host this entry can dial");
+    certificateHost = url.hostname.replace(/^\[|\]$/g, "");
+    address = `${url.hostname}:${url.port === "" ? "443" : url.port}`;
+  }
+  if (key !== "" && !/^[A-Za-z0-9._-]{1,64}:[0-9a-f]{64}$/.test(key)) fail("LANE_API_FORWARD_PUBLIC_KEY is one <key id>:<64 lowercase hex> (the API Worker's forward key)");
+  return { origin, key, address, certificateHost };
+}
+
+/**
+ * The template fragments of the entry's forward to the API Worker: the `api` external service and the bindings, empty
+ * when the compose sets neither literal (null), so such a boot renders the template's own text. Exported for the host
+ * e2e's renderers, as `stackFragments` is.
+ */
+export function apiForwardFragments(api) {
+  if (api === null) return { API_BINDINGS: "", API_SERVICES: "" };
+  const lines = [
+    "",
+    "",
+    "          # docs/design/one-address.md: the API Worker the entry forwards every path it does not serve to, and the key",
+    "          # of the API Worker's forward mark (both literals of the measured compose).",
+  ];
+  if (api.origin !== "") lines.push('          ( name = "API", service = "api" ),', `          ( name = "API_ORIGIN", text = "${api.origin}" ),`);
+  if (api.key !== "") lines.push(`          ( name = "LANE_API_FORWARD_PUBLIC_KEY", text = "${api.key}" ),`);
+  if (api.origin === "") return { API_BINDINGS: lines.join("\n"), API_SERVICES: "" };
+  const services = [
+    "    # docs/design/one-address.md: the API Worker. TLS is verified against the browser roots and the certificate must",
+    "    # authenticate the API's host, as the bridge's; only the paths the entry forwards reach it.",
+    '    ( name = "api",',
+    "      external = (",
+    `        address = "${api.address}",`,
+    "        https = (",
+    "          options = (),",
+    "          tlsOptions = (",
+    "            trustBrowserCas = true",
+    "          ),",
+    `          certificateHost = "${api.certificateHost}"`,
+    "        )",
+    "      )",
+    "    ),",
+  ];
+  // The template's placeholder starts the guest agent's comment line: the service and a blank line go before it, and a
+  // boot without API_ORIGIN renders the template's own text.
+  return { API_BINDINGS: lines.join("\n"), API_SERVICES: `${services.join("\n")}\n\n` };
+}
+
+/**
  * docs/design/entry-replicas.md ER2, EI3, EI4: this boot's replica name, or null for a single entry. The pattern
  * (TLS_REPLICA_DOMAIN_PATTERN) is a literal of the measured compose and holds `{n}` exactly once; the index
  * (LANE_REPLICA) is the instance's own, from the encrypted env, a whole number from 1 to REPLICA_MAX. No index is a
@@ -1391,6 +1460,7 @@ export async function main({
   if (!egressSocket.startsWith("/")) fail("EGRESS_SOCKET is an absolute path");
   const stack = stackLayout(env);
   const replica = replicaLayout(env, stack);
+  const api = apiForwardLayout(env, stack);
   const peers = peerLayout(env, stack);
   const peerlink = peerlinkLayout(env, stack);
   const kmsLease = kmsLeaseLayout(env, stack);
@@ -1531,6 +1601,7 @@ export async function main({
     WASM_MODULES: wasmModules,
     ...stackFragments(stack),
     ...replicaFragments(replica, entryStopSocket),
+    ...apiForwardFragments(api),
     ...peerFragments(peers),
     ...peerlinkFragments(peerlink),
     ...kmsLeaseFragments(kmsLease, kmsLeaseSocket),

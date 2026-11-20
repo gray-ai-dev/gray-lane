@@ -113,8 +113,11 @@ export {
   type VerifyPeerAttestationOptions,
 } from "./peer.ts";
 export {
+  CLIENT_CONNECTION_CHECK,
   protocolForEndpoint,
+  receiptVerdictOf,
   type ReceiptProtocol,
+  type ResponseReceiptVerdict,
   verifyResponseReceipt,
   verifyResponseReceiptText,
   type AppendedTextRecord,

@@ -2,8 +2,9 @@ import { releaseWithRetry, settleWithRetry, shardName, UNROUTED, type AdmitRefus
 import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type LocationHint } from "@gray/config";
 import { workspaceHome } from "./account.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
+import { endingWith, entryServesChain, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
-import { LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
+import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
 import { type ContinuationLocator, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
 import { answeredFailure, FREE_DELIVERY, type AccountBlockGates, type OutcomeMeasure, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type Pattern, type PermitToken } from "@gray/endpoint";
 import {
@@ -209,11 +210,13 @@ import {
 } from "./lane/hooks.ts";
 import { checkEventLog, ReceiptBuilder } from "@gray/attest";
 import { addReceiptEvents } from "./lane/hooks.ts";
+import { verifiableViaApi } from "./lane/api-arrival.ts";
+import { apiUnreachable } from "./lane/api-forward.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
 import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, type RewriteDecisions } from "./lane/plan.ts";
 import { completedResponse, keptWeight } from "./lane/codex.ts";
-import type { LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
+import type { LaneApiForward, LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
 import type { AppendedText, LaneProtocol } from "@gray/lane";
 import { checkOfficialUpstream, StackEventDigester, stackBodyDigest, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
@@ -449,6 +452,12 @@ export interface GatewayDeps {
   readonly fingerprintKey: Uint8Array | null;
   readonly meter?: TransferMeter;
   /**
+   * The main gateway's forward of an older client's chat request to the confidential entry (LANE_ENTRY_ORIGIN,
+   * entry-forward.ts, docs/design/one-address.md); absent when the setting is empty or the request came through the
+   * entry. Never on the lane.
+   */
+  readonly entryChat?: EntryChatForward;
+  /**
    * The confidential lane's per-request members (design v2 §C.2, §E module L2; lane/types.ts).
    * Absent on the main lane, and then every lane branch is a no-op: the main lane's behaviour does
    * not change, and a build that passes no lane object carries none of it.
@@ -683,6 +692,11 @@ function laneRouteFilesNoRest(lane: LaneDeps | null, route: RouteRecord): boolea
   return lane !== null && route.auth === "lane_relay";
 }
 
+/** docs/design/one-address.md: a receipt of a request that reached the VM through Gray's API says so (`aci/1+gray-api`). */
+function laneArrival(lane: LaneDeps): { readonly arrival?: "gray_api" } {
+  return lane.arrival === "gray_api" ? { arrival: "gray_api" } : {};
+}
+
 function hexDigest(bytes: Uint8Array): Promise<string> {
   return crypto.subtle.digest("SHA-256", bytes).then((d) => [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join(""));
 }
@@ -702,6 +716,14 @@ function laneFailureCode(error: unknown): string {
 }
 
 /** A Gemini request streams by its path's method, whatever its body says (forward_traced). */
+/**
+ * Whether the lane's view has a route of one of `models` on `protocol` (docs/design/one-address.md): its existence, not
+ * whether it serves now. The lane does not translate, so only a route of exactly that API counts.
+ */
+function entryRouted(snapshot: Pick<GatewaySnapshot, "routes">, models: readonly string[], protocol: Protocol): boolean {
+  return snapshot.routes.some((r) => r.protocol === protocol && models.includes(r.model));
+}
+
 function geminiStream(path: string): boolean {
   return path.endsWith(":streamGenerateContent");
 }
@@ -1714,6 +1736,7 @@ export class InferenceRun {
             endpoint: this.path,
             method: this.request.method,
             servedAt: BigInt(Math.floor(this.deps.clock() / 1000)),
+            ...laneArrival(lane),
           });
           addReceiptEvents(builder, { receivedHash: bodyHashOf(received), draft, responseHash: this.laneResponse?.bodyHash() ?? bodyHashOf(new Uint8Array(0)) });
           const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
@@ -1755,6 +1778,7 @@ export class InferenceRun {
         method: this.request.method,
         servedAt: BigInt(Math.floor(this.deps.clock() / 1000)),
         ...(relayImage === null ? {} : { relayImage }),
+        ...laneArrival(lane),
       });
       addStackReceipt(builder, { receivedHash: bodyHashOf(received), calls: this.stackCalls, returned: this.stackReturned() });
       const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
@@ -1794,6 +1818,7 @@ export class InferenceRun {
         endpoint: this.path,
         method: this.request.method,
         servedAt: BigInt(Math.floor(this.deps.clock() / 1000)),
+        ...laneArrival(lane),
       });
       builder.addRequestReceivedHash(bodyHashOf(received));
       let servedAttempt: bigint | null = null;
@@ -1868,7 +1893,7 @@ export class InferenceRun {
    * so a stalled binding never holds the record past the platform's 30 s.
    */
   private async keylessAllowed(keyless: KeylessLimits): Promise<boolean> {
-    const asked = this.outbound.run(() => keyless.allow(this.client.clientIp), false);
+    const asked = this.outbound.run(() => keyless.allow(this.client.clientIp, viaEntryOf(this.request.headers)), false);
     try {
       return await withinPhase(asked, this.deps.cfg.requestPostBudgetMs, this.deps.waitTimers ?? this.deps.timers ?? platformTimers);
     } catch {
@@ -2568,6 +2593,9 @@ export class InferenceRun {
     if (!layered.ok) return this.refuse(unreadableDefault(layered.code), "preference");
     this.preference = layered.preference;
     this.preferenceRecord = preferenceFacts(layered.preference, layered.sources);
+    // docs/design/one-address.md: a request that reached the VM through Gray's API had its TLS ended at Cloudflare, so
+    // nothing here verifies it end to end; a verifiable preference is refused before anything is admitted or sent.
+    if (this.lane?.arrival === "gray_api" && layered.preference.verifiable) return this.refuse(verifiableViaApi(new URL(this.request.url).origin), "preference");
     // Patterns are resolved against one model's routes: a request that states any is layered again for each
     // later model it lists.
     const preferences = [layered.preference];
@@ -2581,7 +2609,24 @@ export class InferenceRun {
     // No route of this gateway is verifiable but in lane mode: a `verifiable` request is answered here, before any
     // route is looked at, translated or admitted (`verifiableUpFront`), and tries no next model.
     const upFront = verifiableUpFront(this.lane !== null, snapshot, registeredOf(snapshot), layered.preference, chain, protocol, true, this.deps.clock());
-    if (upFront !== null) return this.refuse(unadmitted(upFront).error, "preference");
+    if (upFront !== null) return this.refuse(this.atEntry(unadmitted(upFront).error), "preference");
+    // An older client's chat at this address, with no verifiable preference (refused just above, never forwarded), for a
+    // model the confidential entry serves on this API (`entryServes`): the entry serves it, so it reaches every route
+    // (docs/design/one-address.md). Not a model check, which the console sends for this gateway's own route, not a body
+    // that states `provider`, which the entry reads only from `x-gray-routing`, and not a model the entry has no route of
+    // here (the entry never forwards a request back): those are answered here as before.
+    const entry = this.deps.entryChat;
+    if (this.lane === null && entry !== undefined && !this.stripProvider && ticketHeader(this.request.headers) === null && entryServesChain(snapshot, chain, protocol)) return this.forwardToEntry(entry, body);
+    // docs/design/one-address.md: at the entry, the other direction. A request for models this entry has no route of on
+    // this API in its view (lane relays and the endpoint routes it serves; a route's existence decides, not whether it
+    // serves now, so a model whose routes are all down stays here) goes to Gray's API when the API serves one of them
+    // there (a Gemini image model, a model the API serves through translation). Never a verifiable preference (the
+    // body's, `x-gray-routing`, the key's or the workspace's default, all layered above), a model check, or a request that
+    // arrived through the API (it has no `apiForward`): those get the entry's own answer.
+    const toApi = this.lane?.apiForward;
+    if (toApi !== undefined && this.lane!.arrival !== "gray_api" && !layered.preference.verifiable && ticketHeader(this.request.headers) === null && !entryRouted(snapshot, chain, protocol) && (await toApi.serves(chain, protocol))) {
+      return this.forwardToApi(toApi, body);
+    }
     // A ModelTrace probe is a model check only with the ticket the console signed for it (`takeModelCheck`). It checks one
     // route: its own preference names that endpoint alone, with fallbacks refused, for one model; the stored defaults
     // layered over it only narrow it. Anything else is refused before anything is held or sent.
@@ -2621,6 +2666,124 @@ export class InferenceRun {
     // The request's time ran out before the next model: the last refusal is the answer.
     this.flushRecord();
     return refused!;
+  }
+
+  /**
+   * `verifiable_routes_at_lane` names the confidential entry's address when this gateway forwards chat there
+   * (LANE_ENTRY_ORIGIN); every other refusal, and that one without the setting, is the catalog's.
+   */
+  private atEntry(error: ApiError): ApiError {
+    const entry = this.deps.entryChat;
+    if (entry === undefined || error.code !== "verifiable_routes_at_lane") return error;
+    return error.withMessage(
+      `The routing preference \`verifiable: true\` asks for verifiable routes, which are served only at Gray's confidential VM address, ${entry.origin}, not at this one. Send the request there.`,
+    );
+  }
+
+  /**
+   * The request goes to the confidential entry as the client sent it (docs/design/one-address.md): the same method, path
+   * and query (a client's base URL included), the body bytes read here (a spooled body read back as it streams), the
+   * client's headers but the hop-by-hop, address, proxy and Gray's own, and this gateway's `x-gray-api-forward` mark.
+   * The entry admits, bills, records and answers it; its answer streams back as it came. This gateway keeps no record
+   * of it (the entry's is the request's one record: two would list one request twice) and counts nothing against the
+   * key: it lets go of what the request holds here, its content unwritten. An entry that does not answer is the
+   * client's 502 `upstream_unavailable`, recorded here as a failure: nothing was billed.
+   *
+   * Until the entry has the body, a spooled one is kept: its delete waits on `relayed` (`authorized`), which settles
+   * once the entry read the stream to its end or its answer ended, whichever is first (an entry that refuses before it
+   * reads needs no more of it). Until the answer has reached the client, or the client left, the request counts as in
+   * flight here (`load`), as an answer this gateway serves itself does.
+   */
+  private async forwardToEntry(entry: EntryChatForward, body: Body): Promise<Response> {
+    const url = new URL(this.request.url);
+    const target = new URL(`${url.pathname}${url.search}`, entry.origin);
+    const headers = forwardedRequestHeaders(this.request.headers);
+    let bodyDone!: () => void;
+    this.relayed = new Promise<void>((resolve) => (bodyDone = resolve));
+    let payload: BodyInit | null;
+    if (body.tier === "C") {
+      const opened = await this.spoolOpener(body)();
+      payload = opened === null ? null : endingWith(opened, bodyDone);
+      if (opened === null) bodyDone();
+      headers.set("content-length", String(body.length));
+    } else {
+      payload = body.bytes;
+      bodyDone();
+    }
+    let answer: Response;
+    try {
+      headers.set(API_FORWARD_HEADER, await entry.mark({ method: this.request.method, host: target.host, pathAndQuery: `${target.pathname}${target.search}` }, this.deps.clock()));
+      answer = await entry.fetch(new Request(target, { method: this.request.method, headers, body: payload, ...(payload instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit));
+    } catch (error) {
+      bodyDone();
+      console.error(JSON.stringify({ level: "error", event: "lane_entry_unreachable", request_id: this.requestId, error: error instanceof Error ? error.message : String(error) }));
+      return this.refuse(new ApiError(502, "upstream_unavailable").withMessage("Gray could not reach its confidential entry for this request. You are not charged for it; retry."), "preference");
+    }
+    // Its place in the count is given back once, by whoever took the request's end (`forwarded`, or `record` before it).
+    const counted = this.forwarded();
+    console.log(JSON.stringify({ level: "info", event: "chat_forwarded_to_entry", request_id: this.requestId, status: answer.status }));
+    return forwardedAnswer(answer, () => {
+      bodyDone();
+      if (counted) this.deps.load.leave();
+    });
+  }
+
+  /**
+   * The entry's request for a model only Gray's API serves (docs/design/one-address.md), as `forwardToEntry` sends the
+   * other way: the client's method, URL and headers, the body bytes read here (a spooled body read back as it streams,
+   * kept until the API read it or answered), and the entry's mark (`LaneApiForward.send`, `api-forward.ts` `sendToApi`).
+   * The API admits, bills, records and answers it (its record keeps no client address: the mark says it came through
+   * the entry); its answer streams back as it came, with `x-gray-served-by`. The entry writes no record and signs no
+   * receipt of it: one record per request. It counts as in flight here (`load`) until the answer ends. An API that does
+   * not answer is the client's 502 `api_unreachable`, recorded here as the entry's failure: nothing was billed.
+   */
+  private async forwardToApi(api: LaneApiForward, body: Body): Promise<Response> {
+    const headers = new Headers(this.request.headers);
+    let bodyDone!: () => void;
+    this.relayed = new Promise<void>((resolve) => (bodyDone = resolve));
+    let payload: BodyInit | null;
+    if (body.tier === "C") {
+      const opened = await this.spoolOpener(body)();
+      payload = opened === null ? null : endingWith(opened, bodyDone);
+      if (opened === null) bodyDone();
+      headers.set("content-length", String(body.length));
+    } else {
+      payload = body.bytes;
+      headers.set("content-length", String(body.bytes.length));
+      bodyDone();
+    }
+    const asked = new Request(this.request.url, { method: this.request.method, headers, body: payload, signal: this.request.signal, ...(payload instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit);
+    const answer = await api.send(asked);
+    if (answer === null) {
+      bodyDone();
+      return this.refuse(apiUnreachable(), "preference");
+    }
+    // Its place in the count is given back once, by whoever took the request's end (`forwarded`, or `record` before it).
+    const counted = this.forwarded();
+    console.log(JSON.stringify({ level: "info", event: "chat_forwarded_to_api", request_id: this.requestId, status: answer.status }));
+    return forwardedAnswer(answer, () => {
+      bodyDone();
+      if (counted) this.deps.load.leave();
+    });
+  }
+
+  /**
+   * A request the entry answered (`forwardToEntry`): what it holds here is let go, and nothing is recorded or counted
+   * against its key. Its place in the isolate's count (`load`) is given back when the forwarded answer ends.
+   */
+  private forwarded(): boolean {
+    if (this.recorded) return false;
+    this.recorded = true;
+    this.pendingRecord = null;
+    this.pendingErrorBody = null;
+    this.deferRecord = false;
+    this.rateOpen = false;
+    for (const release of this.holds) release();
+    this.answerShare.release();
+    this.content?.discard();
+    this.requestBody = null;
+    this.retained.set("request_body", 0);
+    return true;
   }
 
   /**

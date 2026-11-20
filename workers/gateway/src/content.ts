@@ -186,16 +186,27 @@ export function r2ContentStore(bucket: ContentBucket): ContentStore {
  * The keyless limits (content.md 9): a request whose workspace is not known stores content and an index
  * row only within its sender's and its location's rate (two Rate Limiting bindings, each counted per
  * Cloudflare location); past either, neither is written and the point says `keyless_rate`.
+ *
+ * A request the confidential entry forwarded (`viaEntry`, the entry key id the mark verified, entry-forward.ts) has no
+ * sender address here, and every client of the entry would otherwise share the one `sender:unknown` count. It counts
+ * under `entry:<key id>` in KEYLESS_CONTENT_PER_ENTRY alone (docs/design/one-address.md), whose limit only a deliberate
+ * flood reaches; past it the request is answered as ever, its content not stored, and `keyless_entry_window_full`
+ * tells the operators (not a page: no client is refused). Without that binding it counts as before.
  */
 export interface KeylessLimits {
-  allow(sender: string | null): Promise<boolean>;
+  allow(sender: string | null, viaEntry?: string | null): Promise<boolean>;
 }
 
-export function keylessLimits(perSender: RateLimit | undefined, perLocation: RateLimit | undefined): KeylessLimits | null {
-  if (perSender === undefined && perLocation === undefined) return null;
+export function keylessLimits(perSender: RateLimit | undefined, perLocation: RateLimit | undefined, perEntry?: RateLimit): KeylessLimits | null {
+  if (perSender === undefined && perLocation === undefined && perEntry === undefined) return null;
   return {
-    async allow(sender) {
+    async allow(sender, viaEntry = null) {
       // A binding that fails does not stop the request's record: it fails open.
+      if (viaEntry !== null && perEntry !== undefined) {
+        const within = await perEntry.limit({ key: `entry:${viaEntry}` }).then((r) => r.success, () => true);
+        if (!within) console.error(JSON.stringify({ level: "alert", event: "keyless_entry_window_full", entry_key_id: viaEntry }));
+        return within;
+      }
       const sent = perSender === undefined ? true : await perSender.limit({ key: `sender:${sender ?? "unknown"}` }).then((r) => r.success, () => true);
       if (!sent) return false;
       return perLocation === undefined ? true : await perLocation.limit({ key: "keyless" }).then((r) => r.success, () => true);

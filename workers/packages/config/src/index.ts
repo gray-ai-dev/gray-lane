@@ -1448,6 +1448,38 @@ export const SETTINGS: readonly SettingSpec[] = [
       "sends an API key it created, never a cookie). The gateway's errors link to the console's pages there (`public_errors::Origins`). " +
       "Empty: no cross-origin call is allowed, and the errors link to the request's own origin, as one origin for both.",
   },
+  {
+    name: "LANE_ENTRY_PUBLIC_KEYS",
+    key: "laneEntryPublicKeys",
+    workers: ["gateway"],
+    type: "text",
+    default: "",
+    textCheck: keyListProblem,
+    source:
+      "docs/design/one-address.md: the confidential entry forwards every path it does not serve to this Worker, marked with a signature by its " +
+      "bridge key (@gray/lane-wire forward-mark.ts). The entries' bridge public keys: production's values file laneBridgePublicKeys (lane-1), " +
+      "staging's lane-1 key its keys tool derives. Never a per-provider VM's key.",
+    doc:
+      "keyId:<64 lowercase hex>[,...]: the Ed25519 public keys of the confidential entries' bridge keys. A request whose x-gray-entry-forward " +
+      "mark one of them signed is taken as forwarded by the entry: it records no client address (the entry has none to give) and its " +
+      "per-network setup limits count in the entry's window. Empty: no mark is accepted, and every mark is taken off as a client's.",
+  },
+  {
+    name: "LANE_ENTRY_ORIGIN",
+    key: "laneEntryOrigin",
+    workers: ["gateway"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" ? null : originProblem(v)),
+    source:
+      "docs/design/one-address.md: customers use the confidential entry's address for every path, this Worker's stays as the older alias. " +
+      "Set by the deploy session once every entry replica accepts this Worker's x-gray-api-forward mark (its compose measures " +
+      "LANE_API_FORWARD_PUBLIC_KEY); empty until then.",
+    doc:
+      "The confidential entry's origin (https://lane.usefallback.com). Set: a chat request without a verifiable routing preference is " +
+      "forwarded there with this Worker's signed mark, a verifiable one is refused naming it, and every answer to a request that did not come " +
+      "through the entry carries Deprecation and a successor-version Link naming it. Empty: chat is answered here, as before.",
+  },
   // Endpoint permits and circuits: EndpointRootDO and EndpointShardDO (workers/packages/endpoint,
   // docs/cloudflare-native/endpoint.md). The server values cited are crates/gray-gateway/src/ranking.rs
   // RankingConfig::default and crates/gray-gateway/src/config/mod.rs Timeouts::default.
@@ -3075,6 +3107,22 @@ export const SETTINGS: readonly SettingSpec[] = [
       "crates/gray-gateway/src/claim_limit.rs FAILED_CLAIMS_PER_NETWORK = 10: a code carries 60 random bits, so the limit only keeps one network " +
       "from spending the database's time; a claim that hands out its key is given back. Maximum: a bound on a mistyped value.",
     doc: "Setup code claims (POST /v1/setup/claim) one client network (an IPv4 address or an IPv6 /64) may make per window that hand out nothing.",
+  },
+  {
+    name: "SETUP_CLAIMS_PER_ENTRY",
+    key: "setupClaimsPerEntry",
+    workers: ["console"],
+    type: "int",
+    default: "500",
+    min: 1,
+    max: 100000,
+    source:
+      "docs/design/one-address.md: the confidential entry cannot see a client's address, so the claims it forwards share one window per " +
+      "entry key. 500 failed claims per SETUP_CLAIM_WINDOW_SECONDS, so only a deliberate flood fills it (a page, entry_claim_window_full). " +
+      "A code carries 60 random bits and lives 30 minutes: at this rate, with 10^4 live codes, a guess hits with a chance of about 2e-7 a year.",
+    doc:
+      "Setup code claims and provider setup claims forwarded by the confidential entry (x-gray-via-entry) that may hand out nothing per " +
+      "window, all clients of that entry together.",
   },
   {
     name: "SETUP_CLAIM_WINDOW_SECONDS",
@@ -5598,6 +5646,10 @@ export interface GatewayConfig {
   readonly jobsLocationHint: LocationHint;
   /** The console's origin whose pages may call the model API cross-origin; "" for none (workers/gateway/src/cors.ts). */
   readonly consoleOrigin: string;
+  /** LANE_ENTRY_PUBLIC_KEYS: the entries' bridge keys whose x-gray-entry-forward marks are accepted; "" for none. */
+  readonly laneEntryPublicKeys: string;
+  /** LANE_ENTRY_ORIGIN: the confidential entry's origin chat is forwarded to; "" to answer chat here. */
+  readonly laneEntryOrigin: string;
   readonly endpointReportMs: number;
   readonly endpointBreakerFailureThreshold: number;
   readonly endpointBreakerMinSamples: number;
@@ -5773,6 +5825,7 @@ export interface ConsoleConfig {
   readonly mossVerifyTimeoutMs: number;
   readonly chainRpcTimeoutMs: number;
   readonly setupClaimsPerNetwork: number;
+  readonly setupClaimsPerEntry: number;
   readonly setupClaimWindowSeconds: number;
   readonly setupClaimWindowWaitMs: number;
   readonly internalCallTimeoutMs: number;

@@ -25,6 +25,13 @@
 // read the entry's answers (workers/gateway/src/cors.ts). The committed compose has no such line, so a render without
 // the flag measures what it did before, and the errors then name the entry's own origin.
 //
+// `--api-origin <https origin>` and `--api-forward-public-key <key id>:<64 hex>` (default layout only; release.mjs passes
+// environments.json's `api_url` origin and `api_forward_public_key`, docs/design/one-address.md) add lane's API_ORIGIN
+// and LANE_API_FORWARD_PUBLIC_KEY under CONSOLE_ORIGIN (or GATEWAY_FALLBACK_REGION without it): the API Worker every
+// path the entry does not serve itself is forwarded to, and the key whose x-gray-api-forward mark the entry accepts on a
+// chat request the API Worker forwarded. The committed compose has neither line, so a render without the flags measures
+// what it did before, and the entry then answers its 404 for those paths.
+//
 // Routing PR 9 (docs/confidential-lane-stack-routing.md section 9.1): `--release-public-key <64 hex>` and
 // `--release-freshness-public-key <64 hex>` (the environment's, environments.json) set lane's list keys in either
 // layout, and `--lane-peers true|false` (default layout only) sets LANE_PEERS and adds or removes egress's `-peer` and
@@ -362,6 +369,12 @@ const REPLICA_PLACEHOLDER = "{n}";
 const REPLICA_ENVS = Object.freeze([REPLICA_PATTERN_ENV, REPLICA_ENV]);
 /** `--console-origin`, default layout only: the console's origin, a gateway var (@gray/config CONSOLE_ORIGIN). */
 const CONSOLE_ORIGIN_ENV = "CONSOLE_ORIGIN";
+/** `--api-origin`, default layout only: the API Worker the entry forwards the paths it does not serve to. */
+const API_ORIGIN_ENV = "API_ORIGIN";
+/** `--api-forward-public-key`, default layout only: the API Worker's forward key, `<key id>:<64 lowercase hex>`. */
+const API_FORWARD_KEY_ENV = "LANE_API_FORWARD_PUBLIC_KEY";
+/** The one-address settings (docs/design/one-address.md) only an entry may carry. */
+const API_FORWARD_ENVS = Object.freeze([API_ORIGIN_ENV, API_FORWARD_KEY_ENV]);
 /** Every lane setting of routing PR 9 only an entry may carry. */
 const ENTRY_ENVS = Object.freeze([PEERS_ENV, ...PEER_TUNABLES]);
 /** Go's flag package reads `-name`, `--name`, `-name=v` and `--name=v` alike; the gate reads every spelling. */
@@ -1641,6 +1654,7 @@ export function checkCompose(composeText, options = {}) {
     checkEntryPeerlink(parsed.services, label, problems);
     replicas = checkEntryReplica(parsed.services, label, problems);
     checkConsoleOrigin(parsed.services, label, problems);
+    checkApiForward(parsed.services, label, problems);
     // The stack settings are what makes the entrypoint render the relay listener (S28); the default
     // layout has no relay network, so none of them belongs there.
     for (const [name, service] of parsed.services) {
@@ -1777,6 +1791,35 @@ function checkConsoleOrigin(services, label, problems) {
   if (value === undefined) return;
   const problem = typeof value === "string" ? consoleOriginProblem(value) : "is not a string";
   if (problem !== null) problems.push(`${label}: lane.${CONSOLE_ORIGIN_ENV} ${JSON.stringify(value)} ${problem}; it is the console the entry's errors link to (--console-origin)`);
+}
+
+/**
+ * `--api-origin` and the gate's lane API_ORIGIN: an https origin written as one, which the entrypoint turns into the
+ * `api` service's address and certificate host. Returns the problem, or null.
+ */
+function apiOriginProblem(text) {
+  return consoleOriginProblem(text);
+}
+
+/** `--api-forward-public-key` and the gate's lane LANE_API_FORWARD_PUBLIC_KEY: one `<key id>:<64 lowercase hex>`. */
+function apiForwardKeyProblem(text) {
+  return /^[A-Za-z0-9._-]{1,64}:[0-9a-f]{64}$/.test(text) ? null : "must be one <key id>:<64 lowercase hex> (the API Worker's forward key)";
+}
+
+/** The default layout's lane API_ORIGIN and LANE_API_FORWARD_PUBLIC_KEY, when it sets them: in their flags' forms. */
+function checkApiForward(services, label, problems) {
+  const lane = services.get("lane");
+  if (!isMap(lane)) return;
+  const environment = environmentOf(lane);
+  for (const [name, check, what] of [
+    [API_ORIGIN_ENV, apiOriginProblem, "the API Worker the entry forwards to (--api-origin)"],
+    [API_FORWARD_KEY_ENV, apiForwardKeyProblem, "the key of the API Worker's forward mark (--api-forward-public-key)"],
+  ]) {
+    const value = environment.get(name);
+    if (value === undefined) continue;
+    const problem = typeof value === "string" ? check(value) : "is not a string";
+    if (problem !== null) problems.push(`${label}: lane.${name} ${JSON.stringify(value)} ${problem}; it is ${what}`);
+  }
 }
 
 /** `--bridge-url`: the same https-origin rule the entrypoint enforces at boot. */
@@ -2082,6 +2125,9 @@ function checkStackNotEntry(services, label, problems) {
   for (const name of REPLICA_ENVS) {
     if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry replica's setting: a relay stack VM is never an entry and has no public name (entry-replicas ER2)`);
   }
+  for (const name of API_FORWARD_ENVS) {
+    if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry's setting: only the entry forwards to and from the API Worker (one-address)`);
+  }
 }
 
 /**
@@ -2158,6 +2204,21 @@ function applyComposeFlags(composeText, options) {
     const problem = consoleOriginProblem(options.consoleOrigin);
     if (problem !== null) throw new Error(`--console-origin '${options.consoleOrigin}' ${problem}`);
     measured = addEnvLineAfter(measured, "GATEWAY_FALLBACK_REGION", CONSOLE_ORIGIN_ENV, options.consoleOrigin, "--console-origin");
+  }
+  // docs/design/one-address.md: under CONSOLE_ORIGIN when it is there, else under GATEWAY_FALLBACK_REGION; the key after
+  // the origin when both are given.
+  let apiAnchor = options.consoleOrigin !== undefined ? CONSOLE_ORIGIN_ENV : "GATEWAY_FALLBACK_REGION";
+  for (const [option, flag, name, check] of [
+    ["apiOrigin", "--api-origin", API_ORIGIN_ENV, apiOriginProblem],
+    ["apiForwardPublicKey", "--api-forward-public-key", API_FORWARD_KEY_ENV, apiForwardKeyProblem],
+  ]) {
+    const value = options[option];
+    if (value === undefined) continue;
+    if (layoutSpec(options).name === "stack") throw new Error(`${flag} is not a stack compose value: only the entry forwards to and from the API Worker`);
+    const problem = check(value);
+    if (problem !== null) throw new Error(`${flag} '${value}' ${problem}`);
+    measured = addEnvLineAfter(measured, apiAnchor, name, value, flag);
+    apiAnchor = name;
   }
   if (options.keysetNotAfter !== undefined) {
     measured = setEnvLines(measured, "KEYSET_NOT_AFTER", validateKeysetNotAfter(options.keysetNotAfter, options.nowSeconds), "--keyset-not-after", 1);
@@ -2429,6 +2490,8 @@ const USAGE = `usage: app-compose.mjs [--check] [--out <file>] [--compose <file>
   [--target dstack|phala] [--kms-ca-pubkey <182 hex>] [--deploy-env testnet|production]
   [--tls-domain <host> (default layout only)] [--bridge-url <https origin>] [--keyset-not-after <unix seconds>]
   [--console-origin <https origin> (default layout only: the console the entry's errors link to)]
+  [--api-origin <https origin> (default layout only: the API Worker the entry forwards the paths it does not serve to)]
+  [--api-forward-public-key <key id>:<64 hex> (default layout only: the API Worker's forward key)]
   [--tls-replica-domain-pattern <host with one {n}> (default layout only: the entry replicas' names, in --tls-domain's zone)]
   [--scheduler-pick-ms <ms>] [--release-public-key <64 hex>] [--release-freshness-public-key <64 hex>]
   [--lane-peers true|false (default layout only)] [--gateway-enabled true|false (default layout only; default true)]
@@ -2441,7 +2504,7 @@ const VALUE_OPTIONS = new Set([
   "--out", "--compose", "--image", "--target", "--kms-ca-pubkey", "--deploy-env", "--tls-domain", "--bridge-url",
   "--keyset-not-after", "--scheduler-pick-ms", "--layout", "--pre-launch", "--release-public-key",
   "--release-freshness-public-key", "--lane-peers", "--gateway-enabled", "--peer-entries", "--kms-url",
-  "--tls-replica-domain-pattern", "--console-origin",
+  "--tls-replica-domain-pattern", "--console-origin", "--api-origin", "--api-forward-public-key",
 ]);
 const BOOLEAN_OPTIONS = new Set(["--check", "--allow-placeholders", "--help"]);
 
@@ -2496,6 +2559,8 @@ export function main(argv = process.argv.slice(2), log = console.log) {
     tlsReplicaDomainPattern: values["--tls-replica-domain-pattern"],
     bridgeUrl: values["--bridge-url"],
     consoleOrigin: values["--console-origin"],
+    apiOrigin: values["--api-origin"],
+    apiForwardPublicKey: values["--api-forward-public-key"],
     keysetNotAfter: values["--keyset-not-after"],
     schedulerPickMs: values["--scheduler-pick-ms"],
     releasePublicKey: values["--release-public-key"],

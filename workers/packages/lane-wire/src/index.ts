@@ -37,6 +37,7 @@ export * from "./error.ts";
 export * from "./ints.ts";
 export * from "./ops.ts";
 export * from "./signing.ts";
+export * from "./forward-mark.ts";
 export * from "./nonce-objects.ts";
 export * from "./allow.ts";
 export * from "./account.ts";
