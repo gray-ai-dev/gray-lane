@@ -163,7 +163,9 @@ type stackObservation struct {
 	answer   stackVendorAnswer
 	statedAt time.Time
 	stated   bool
-	windows  []stackWindow
+	// modelGone is the vendor saying that model does not exist (stackModelGone).
+	modelGone bool
+	windows   []stackWindow
 }
 
 // newObservation reads one answer: its windows always, its classification and stated end when it is not 2xx.
@@ -173,6 +175,7 @@ func newObservation(account stackAccount, credHash, model, routeName string, sta
 	if status < 200 || status > 299 {
 		o.answer = classifyStackAnswer(status, header, body, complete, o.windows)
 		o.statedAt, o.stated = stackStatedEnd(o.answer.vendorCode, o.windows, o.answer.fields, header, now)
+		o.modelGone = stackModelGone(account.vendor, status, body, complete, model)
 	}
 	return o
 }
@@ -189,11 +192,21 @@ func (r coolingRule) coolEnd(o stackObservation, nowMS int64) int64 {
 // runRulesLocked applies the rules to one answer (S38): the first status rule that matches a vendor error makes
 // its entry, then every window rule whose window this answer reports at or past its percent. It reports whether
 // an entry did not fit (stack_cooling_full).
+//
+// One rule is fixed and comes before the document's: an answer that says the call's upstream model does not exist
+// (stackModelGone) holds the account for that model until a test of it passes, as `forbidden` holds it on a 403.
+// The document cannot say it, since its rules match a status and a vendor code and read no model.
 func (h *stackHealth) runRulesLocked(o stackObservation, nowMS int64) (full bool) {
 	if h.mode == coolingOff {
 		return false
 	}
-	if o.status >= 400 {
+	switch {
+	case o.status < 400:
+	case o.modelGone:
+		entry := &coolingEntry{kind: coolingHold, ruleID: stackModelGoneRule, class: o.answer.class, vendorCode: o.answer.vendorCode,
+			clears: coolingClears{test: true}}
+		full = h.makeEntryLocked(entry, o, "model", nowMS) || full
+	default:
 		for _, rule := range h.rules {
 			if !rule.matches(o) {
 				continue

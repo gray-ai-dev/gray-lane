@@ -12,6 +12,10 @@
  * a reference Gray never bound, or one bound before the count or the region changed. One case is not
  * covered: a reference bound in another region before the count changed is found only when its bucket
  * is the same under both counts (asking every count in every region would be 11 x 11 calls a miss).
+ *
+ * A caller that knows where its bindings can be names those places (`PinOptions.regions`, `PinOptions.earlierBuckets`)
+ * and a miss asks only them. The lane bridge writes every binding in one region under a count that is a constant of
+ * its code, so its lookup asks one store whether it hits or misses (workers/lane-bridge/src/continuation.ts).
  */
 import { type GatewayConfig, LOCATION_HINTS, type LocationHint, SETTINGS, durableObjectReset } from "@gray/config";
 import { ApiError } from "@gray/errors";
@@ -93,6 +97,9 @@ export function continuationTiming(cfg: Pick<GatewayConfig, "continuationBuckets
   return { buckets: cfg.continuationBuckets, timeoutMs: cfg.continuationCallTimeoutMs };
 }
 
+/** Every bucket count there can be: the powers of two up to MAX_BUCKETS, ascending. */
+const EVERY_COUNT: readonly number[] = Array.from({ length: Math.log2(MAX_BUCKETS) + 1 }, (_, i) => 2 ** i);
+
 class Timeout extends Error {}
 
 /** `promise`, or a Timeout after `ms` (as @gray/account's `within`) on `timers` (the platform's when absent); a late answer is ignored. */
@@ -157,8 +164,8 @@ async function resolve(o: PinOptions, ref: Reference): Promise<Resolution> {
   if (local.kind === "found") return local;
   const addresses: ContinuationAddress[] = [];
   const seen = new Set<number>([current]);
-  for (let count = 1; count <= MAX_BUCKETS; count *= 2) {
-    const bucket = hash % count;
+  for (const count of o.earlierBuckets ?? EVERY_COUNT) {
+    const bucket = bucketOf(hash, count);
     if (seen.has(bucket)) continue;
     seen.add(bucket);
     addresses.push({ workspace: o.workspace, region: o.region, bucket });
@@ -166,6 +173,8 @@ async function resolve(o: PinOptions, ref: Reference): Promise<Resolution> {
   for (const region of o.regions ?? LOCATION_HINTS) {
     if (region !== o.region) addresses.push({ workspace: o.workspace, region, bucket: current });
   }
+  // No other store can hold the binding: the local store's answer is the lookup's, a miss as soon as a hit.
+  if (addresses.length === 0) return local;
   const left = deadline - now();
   // No time left: none of the other stores could answer in time.
   if (left <= 0) return { kind: "unavailable", unanswered: [...(local.kind === "unavailable" ? local.unanswered : []), ...addresses] };
@@ -213,6 +222,14 @@ export interface PinOptions {
   readonly timing: StoreTiming;
   /** The regions a binding may live in; default every location hint. */
   readonly regions?: readonly LocationHint[];
+  /**
+   * The bucket counts a binding still alive may have been written under, other than `timing.buckets`: a miss asks the
+   * reference's bucket under each. Default every power of two up to MAX_BUCKETS, for a count that is a setting an
+   * operator may have changed (CONTINUATION_BUCKETS). A caller whose count is a constant of its code names the counts
+   * that constant had within a binding's life (CONTINUATION_TTL_MS), none when it never changed; with `regions` its
+   * own region alone, a lookup then asks one store.
+   */
+  readonly earlierBuckets?: readonly number[];
   /**
    * Where a binding found in another store is copied to the local one, after the answer (the gateway's `waitUntil`);
    * absent: no copy.

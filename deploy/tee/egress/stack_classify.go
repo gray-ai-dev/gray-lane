@@ -15,15 +15,17 @@ import (
 
 // S35, S36 and S38's stated end: what egress reads from one vendor answer of an account (a relay call or an
 // account test), as pure functions. Only these leave the classifier: a vendor code and a class from the closed
-// lists (stack_health_lists.go), the windows' numbers and words, and a stated end. Nothing of a body or of a
-// header value goes anywhere else: the message opening is compared here and dropped.
+// lists (stack_health_lists.go), the windows' numbers and words, a stated end, and whether the answer says the
+// call's model does not exist. Nothing of a body or of a header value goes anywhere else: a message is compared
+// here and dropped.
 //
 // What is read (S35): the held body, parsed strictly (checkStrictJSON: one value, no duplicate member, the
 // depth and number rules of stack_json.go); the strings `error.code`, `error.type`, `detail.code` and `detail`,
 // each at most 128 bytes and compared lower-cased; the first 80 bytes of the lower-cased, trimmed
 // `error.message`, only on statuses 400-403 and only against stackOpenings; and the integers `error.resets_at`
-// and `error.resets_in_seconds` (the ChatGPT backend's shape, rests.rs `resets_fields`). A body that did not end
-// within the hold (64 KiB, 10 s) is not read at all.
+// and `error.resets_in_seconds` (the ChatGPT backend's shape, rests.rs `resets_fields`). On a 400 or a 404,
+// `error.message`, `error.status` and `detail` are also compared with the vendor's words for a model that does not
+// exist (stackModelGone). A body that did not end within the hold (64 KiB, 10 s) is not read at all.
 
 const (
 	stackCodeFieldMax = 128
@@ -272,6 +274,92 @@ func classifyStackAnswer(status int, header http.Header, body []byte, complete b
 	}
 	code := stackVendorCode(status, header, fields, windows)
 	return stackVendorAnswer{vendorCode: code, class: stackErrorClass(status, code), fields: fields}
+}
+
+// S35's second reading: whether a vendor answer says the model the call named does not exist, or is not the
+// account's to use. The forwarded /model is the rid's `rewrite.model.to` (stack_check.go), which Gray's mapping
+// sets, so such an answer is about the account and that model and never about the customer's request. S38's fixed
+// rule holds the account for the model on it.
+//
+// The match is one vendor's exact shape: its status, its own code word, and a message that names the call's
+// upstream model. A 404 about anything else (a file id, a path, a response id), a message that names another
+// model, and a body that did not end within the hold match nothing. The message is compared here and dropped.
+//
+//	anthropic      404  error.type not_found_error, error.message `model: <model>`
+//	chatgpt_codex  400  detail `The '<model>' model is not supported when using Codex with a ChatGPT account.`
+//	gemini         404  error.status NOT_FOUND, error.message opens `models/<model> is not found`
+//	any but anthropic  400, 404  error.code model_not_found, error.message quotes <model>
+//
+// The last row is OpenAI's (Chat Completions answers 404 "The model `<model>` does not exist or you do not have
+// access to it.", Responses 400 "The requested model '<model>' does not exist.") and that of the vendors that
+// answer in its shape. Gemini's OpenAI-compatible endpoint answers Google's error object, alone or as the one
+// element of an array.
+
+const (
+	// stackModelGoneRule is the rule id of the entry S38's fixed rule makes.
+	stackModelGoneRule = "model_not_found"
+	// stackModelGoneTextMax bounds a message read for the match: the longest shape's words and a model id.
+	stackModelGoneTextMax = stackModelMax + 256
+
+	codexModelGoneOpening = "The '"
+	codexModelGoneEnding  = "' model is not supported when using Codex with a ChatGPT account."
+)
+
+// stackModelGone reports whether a held error answer (complete: its body ended within the hold) of an account of
+// vendor says that model, the call's upstream model, does not exist.
+func stackModelGone(vendor string, status int, body []byte, complete bool, model string) bool {
+	if !complete || model == "" || len(model) > stackModelMax || (status != http.StatusBadRequest && status != http.StatusNotFound) {
+		return false
+	}
+	if checkStrictJSON(body) != nil {
+		return false
+	}
+	value := jsontext.Value(body)
+	if elements, ok := elementsOf(value); ok {
+		if vendor != "gemini" || len(elements) != 1 {
+			return false
+		}
+		value = elements[0]
+	}
+	top, ok := objectOf(value)
+	if !ok {
+		return false
+	}
+	text := func(object stackObject, member string) string {
+		if text, ok := stringOf(object.members[member]); ok && len(text) <= stackModelGoneTextMax {
+			return text
+		}
+		return ""
+	}
+	errorObject, _ := objectOf(top.members["error"])
+	message := text(errorObject, "message")
+	switch vendor {
+	case "anthropic":
+		return status == http.StatusNotFound && text(errorObject, "type") == codeNotFoundError && message == "model: "+model
+	case "chatgpt_codex":
+		if status == http.StatusBadRequest && text(top, "detail") == codexModelGoneOpening+model+codexModelGoneEnding {
+			return true
+		}
+	case "gemini":
+		name := model
+		if !strings.HasPrefix(name, "models/") {
+			name = "models/" + name
+		}
+		if status == http.StatusNotFound && text(errorObject, "status") == "NOT_FOUND" && strings.HasPrefix(message, name+" is not found") {
+			return true
+		}
+	}
+	return text(errorObject, "code") == "model_not_found" && quotesModel(message, model)
+}
+
+// quotesModel is whether message names model inside one pair of quotes: `model`, 'model' or "model".
+func quotesModel(message, model string) bool {
+	for _, quote := range []string{"`", "'", `"`} {
+		if strings.Contains(message, quote+model+quote) {
+			return true
+		}
+	}
+	return false
 }
 
 // stackWindow is one vendor rate-limit window (S36) as GET /v1/stack/health lists it. A field egress could not

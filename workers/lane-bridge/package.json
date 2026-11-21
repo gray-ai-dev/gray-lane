@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run -c vitest.config.ts",
     "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
     "dev": "wrangler dev -c wrangler.jsonc --local"
   },
   "dependencies": {

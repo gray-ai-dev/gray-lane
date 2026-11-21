@@ -35,7 +35,7 @@ import { toJsonString, type Json } from "@gray/json";
 import { getNodeValue, parseTree, printParseErrorCode, type Node, type ParseError } from "jsonc-parser";
 import { isModifiedValue, requestModifiedEvent, type RequestModifiedEvent } from "@gray/attest";
 import { appendTemplates, type AppendRefusalCode, type AppendedText, type AppliedRecord } from "./append.ts";
-import { GRAY_LANE_REWRITES_V1, rewriteRuleFor, ruleAllowsValue, validateRewritePolicy, type LaneRewritePolicy } from "./policy.ts";
+import { GRAY_LANE_REWRITES_V1, rewriteRuleFor, ruleAllowsValue, validateRewritePolicy, type LaneRewritePolicy, type RewriteRule } from "./policy.ts";
 import { parseJsonPointer } from "./pointer.ts";
 import { isLaneProtocol, type LaneProtocol } from "./protocol.ts";
 import { LaneError, refusal, type Refusal } from "./refusal.ts";
@@ -89,12 +89,30 @@ export function applyDeclaredChanges(
       return refusal("policy", "the caller's lane rewrite policy is not a valid policy document");
     }
   }
-  const ops = options.grayOps;
+  const changed = applyMemberOps(received, options.grayOps, (op) => rewriteRuleFor(policy, protocol, op), policy.id);
+  if (!changed.ok) return changed;
+  const appended = appendTemplates(changed.bytes, protocol, options.appends);
+  if (!appended.ok) return appended;
+  return { ok: true, forwarded: appended.forwarded, events: changed.events, applied: appended.applied };
+}
+
+/**
+ * Gray's member ops on a JSON body, in order: each op held to the rule `ruleFor` gives it before a byte is read, the
+ * body strict JSON with no member name twice, each op a splice. `declaredIn` is the policy the events name. This is
+ * the whole of `applyDeclaredChanges` before the appends, and of a standard API's JSON body under
+ * gray-lane-rewrites-v2 (api-changes.ts).
+ */
+export function applyMemberOps(
+  received: Uint8Array,
+  ops: readonly GrayRewriteOp[],
+  ruleFor: (op: GrayRewriteOp) => RewriteRule | undefined,
+  declaredIn: string,
+): { readonly ok: true; readonly bytes: Uint8Array; readonly events: readonly RequestModifiedEvent[] } | Refusal<ChangeRefusalCode> {
   const seen = new Set<string>();
   for (const op of ops) {
     const shape = checkOpShape(op);
     if (shape !== undefined) return shape;
-    const rule = rewriteRuleFor(policy, protocol, op);
+    const rule = ruleFor(op);
     if (rule === undefined) return refusal("policy", "the op is not in the lane rewrite policy for this protocol");
     const value = op.op === "remove_member" ? undefined : op.value;
     if (!ruleAllowsValue(rule, value)) return refusal("policy", "the op's value is not allowed by the lane rewrite policy");
@@ -125,16 +143,14 @@ export function applyDeclaredChanges(
         op: op.op,
         path: op.path,
         ...(op.op === "remove_member" ? {} : { value: op.value }),
-        declaredIn: policy.id,
+        declaredIn,
       }) as unknown as RequestModifiedEvent,
     );
   }
 
   const encoded = encodeUtf8(text);
   if (!encoded.ok) return encoded;
-  const appended = appendTemplates(encoded.bytes, protocol, options.appends);
-  if (!appended.ok) return appended;
-  return { ok: true, forwarded: appended.forwarded, events, applied: appended.applied };
+  return { ok: true, bytes: encoded.bytes, events };
 }
 
 /** The SHA-256 an event's `value_sha256` would carry: of the serialized value's UTF-8 bytes. */

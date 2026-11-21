@@ -37,7 +37,8 @@
 // layout, and `--lane-peers true|false` (default layout only) sets LANE_PEERS and adds or removes egress's `-peer` and
 // `-peer-link /run/peerlink/peerlink.sock` (docs/design/relay-outbound-only.md §3.2) to match. The gate refuses a compose whose keys are missing, malformed or one key twice, whose LANE_PEERS and `-peer`
 // disagree, whose stack lane carries an entry's setting, or whose egress -max-body-bytes is below the lane's
-// BODY_PARSE_MAX_BYTES.
+// BODY_PARSE_MAX_BYTES. In the default layout it also holds egress's `-route-max-body-bytes` to at least the lane's
+// largest form (LANE_FORM_MAX_BYTES, docs/design/standard-media-at-entry.md §2.3).
 //
 // relay-outbound-only §3.2, §3.8 (PR 1.4): the default layout's third service is `peerlink`, gray-peerlink in the entry
 // role on its unix socket (PEERLINK_SOCKET), with no network (`network_mode: "none"`, the only service that may set
@@ -347,6 +348,15 @@ export const RELEASE_KEY_ENVS = Object.freeze(["LANE_RELEASE_PUBLIC_KEY", "LANE_
 export const ROUTES_FLAG = "-routes";
 export const ROUTE_DENY_SUFFIX_FLAG = "-route-deny-suffix";
 export const ROUTE_DENY_SUFFIX = "usefallback.com";
+/**
+ * docs/design/standard-media-at-entry.md §2.3, default layout only: the /route/ kind's own body bound, spelled so,
+ * once, with its value as the next argument. The entry forwards a held form whole through /route/, so the bound is at
+ * least the lane's largest form: LANE_FORM_MAX_BYTES, which no compose literal sets (the entrypoint renders none), so
+ * @gray/config's default is the lane's. At most ROUTE_MAX_BODY_BYTES_MAX, above which egress refuses to start
+ * (deploy/tee/egress/config.go `maxRouteMaxBodyBytes`, 64 MiB).
+ */
+export const ROUTE_MAX_BODY_FLAG = "-route-max-body-bytes";
+export const ROUTE_MAX_BODY_BYTES_MAX = 64 * 1024 * 1024;
 const RELEASE_KEY = /^[0-9a-f]{64}$/;
 export const PEERS_ENV = "LANE_PEERS";
 export const PEER_FLAG = "-peer";
@@ -2014,7 +2024,7 @@ function checkEntryPeers(services, label, problems) {
  * docs/design/lane-provider-routes.md §4, default layout: egress runs `-routes` and `-route-deny-suffix
  * usefallback.com`, each spelled so and once. The lane serves an endpoint route only through them (its view admits a
  * row only under that zone's denial), and the relay-stack layout's egress command is fixed without either
- * (STACK_FIXED), which egress refuses beside -relay-listen anyway.
+ * (STACK_FIXED), which egress refuses beside -relay-listen anyway. The route kind's body bound is `checkEntryRouteBody`'s.
  */
 function checkEntryRoutes(services, label, problems) {
   const egress = services.get("egress");
@@ -2029,6 +2039,30 @@ function checkEntryRoutes(services, label, problems) {
   const deny = command.flatMap((arg, index) => (goFlag("route-deny-suffix").test(arg) ? [index] : []));
   if (deny.length !== 1 || command[deny[0]] !== ROUTE_DENY_SUFFIX_FLAG || command[deny[0] + 1] !== ROUTE_DENY_SUFFIX) {
     problems.push(`${label}: egress.command must have ${ROUTE_DENY_SUFFIX_FLAG} ${ROUTE_DENY_SUFFIX} once, spelled so: no route row may point back at the deployment's own zone, and the lane's view denies exactly that one`);
+  }
+  checkEntryRouteBody(command, label, problems);
+}
+
+/**
+ * docs/design/standard-media-at-entry.md §2.3, default layout: egress's `-route-max-body-bytes <bytes>`, spelled so and
+ * once, is at least the lane's largest form (ROUTE_MAX_BODY_FLAG's comment) and at most egress's own maximum. Without
+ * the flag /route/ keeps -max-body-bytes (4 MiB), and egress would answer 413 to a form the lane accepted and held.
+ */
+function checkEntryRouteBody(command, label, problems) {
+  const form = SETTINGS.find((setting) => setting.name === "LANE_FORM_MAX_BYTES");
+  if (form === undefined || !/^[1-9][0-9]*$/.test(form.default ?? "")) throw new Error("@gray/config has no LANE_FORM_MAX_BYTES default");
+  const at = command.flatMap((arg, index) => (goFlag("route-max-body-bytes").test(arg) ? [index] : []));
+  if (at.length !== 1 || command[at[0]] !== ROUTE_MAX_BODY_FLAG) {
+    problems.push(`${label}: egress.command must have ${ROUTE_MAX_BODY_FLAG} <bytes> once, spelled so (it has ${at.length === 0 ? "none" : at.map((index) => command[index]).join(", ")}): the entry's forms leave through /route/, which otherwise keeps -max-body-bytes (docs/design/standard-media-at-entry.md §2.3)`);
+    return;
+  }
+  const value = command[at[0] + 1];
+  if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+    problems.push(`${label}: egress's ${ROUTE_MAX_BODY_FLAG} is not a whole number of bytes`);
+  } else if (Number(value) < Number(form.default)) {
+    problems.push(`${label}: egress's ${ROUTE_MAX_BODY_FLAG} ${value} is below the lane's largest form, LANE_FORM_MAX_BYTES ${form.default} (@gray/config's default): egress would refuse a form the lane accepted`);
+  } else if (Number(value) > ROUTE_MAX_BODY_BYTES_MAX) {
+    problems.push(`${label}: egress's ${ROUTE_MAX_BODY_FLAG} ${value} is above ${ROUTE_MAX_BODY_BYTES_MAX}, the most egress takes (deploy/tee/egress/config.go): it would refuse to start`);
   }
 }
 

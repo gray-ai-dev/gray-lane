@@ -52,20 +52,25 @@ export interface MediaSettings {
   readonly pollMaxMs: number;
 }
 
-/** `decode`: the client request as an `ApiRequest`; throws a 4xx `ApiError`. */
-export function decodeApi(protocol: Protocol, received: Received, settings: MediaSettings): ApiRequest {
+/**
+ * `decode`: the client request as an `ApiRequest`; throws a 4xx `ApiError`. `entry`: as the confidential entry serves
+ * it on a provider's own API (docs/design/standard-media-at-entry.md section 2.3): the fields and file heads are read
+ * as for the API Worker, and what differs is each decoder's own to say (streamed answers taken, the formats and shapes
+ * Gray would have to convert refused).
+ */
+export function decodeApi(protocol: Protocol, received: Received, settings: MediaSettings, entry = false): ApiRequest {
   switch (protocol) {
     case "system_one":
       return decodeSystemOne(received);
     case "rerank":
-      return decodeRerank(received);
+      return decodeRerank(received, entry);
     case "open_ai_image_generations":
     case "open_ai_image_edits":
-      return decodeImages(protocol, received);
+      return decodeImages(protocol, received, entry);
     case "open_ai_speech":
     case "open_ai_transcriptions":
     case "open_ai_translations":
-      return decodeAudio(protocol, received, settings.responseBytes);
+      return decodeAudio(protocol, received, settings.responseBytes, entry);
     case "open_ai_embeddings":
       return decodeEmbeddings(received, settings.responseBytes);
     case "open_ai_videos":

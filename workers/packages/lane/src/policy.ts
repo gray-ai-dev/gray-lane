@@ -26,9 +26,18 @@
  * for a particular request: that choice is the request path's (for example, a cap is `set_member`
  * when the client wrote the field and `insert_member` when it did not). The signed event log says
  * exactly which one ran, and replay proves the bytes.
+ *
+ * `gray-lane-rewrites-v2` (docs/design/standard-media-at-entry.md section 2.4) is a second document, published
+ * beside v1 as `gray-lane-rewrites-v2.json` with its literal copy `GRAY_LANE_REWRITES_V2`. It keeps v1's rules for
+ * the three text APIs and lists the standard APIs the entry serves on a provider's own API (`REWRITE_APIS`): for a
+ * JSON body `set_member /model` and the removal of `user`, `safety_identifier`, `metadata` and `provider`; for a
+ * form `set_form_field model` and `remove_form_field user`, whose path is the field's name. A video create keeps
+ * `metadata`, where a provider's own parameters travel. v1 is not changed by it: an event names the document that
+ * allows it (`declared_in`), and a verifier that carries v1 alone fails an event that names v2.
  */
 import { toJsonString, type Json } from "@gray/json";
-import { REQUEST_MODIFIED_OPS, isModifiedValue, type RequestModifiedOp } from "@gray/attest";
+import type { Protocol } from "@gray/protocol";
+import { REQUEST_MODIFIED_OPS, isFormFieldName, isFormOp, isModifiedValue, type RequestModifiedFormOp, type RequestModifiedMemberOp, type RequestModifiedOp } from "@gray/attest";
 import { parseJsonPointer } from "./pointer.ts";
 import { LaneError } from "./refusal.ts";
 import { LANE_PROTOCOLS, type LaneProtocol } from "./protocol.ts";
@@ -45,10 +54,67 @@ export type RewriteValueRule =
 
 /** One allowed op and path for one protocol. */
 export interface RewriteRule {
-  readonly op: RequestModifiedOp;
+  readonly op: RequestModifiedMemberOp;
   readonly path: string;
   /** Absent exactly for `remove_member`. */
   readonly value?: RewriteValueRule;
+}
+
+/** One allowed form op and field name for one API (gray-lane-rewrites-v2). */
+export interface FormRewriteRule {
+  readonly op: RequestModifiedFormOp;
+  /** The field's name, never a JSON Pointer. */
+  readonly path: string;
+  /** Absent exactly for `remove_form_field`; a form field's value is text. */
+  readonly value?: Extract<RewriteValueRule, { readonly kind: "string" }>;
+}
+
+/** A rule of gray-lane-rewrites-v2: on a JSON body's member or on a form's field. */
+export type ApiRewriteRule = RewriteRule | FormRewriteRule;
+
+/**
+ * The APIs gray-lane-rewrites-v2 lists (@gray/protocol's names): the lane's three text APIs, and the standard APIs the
+ * entry serves on a provider's own API (docs/design/standard-media-at-entry.md section 2.1).
+ */
+export type RewriteApi =
+  | LaneProtocol
+  | Extract<
+      Protocol,
+      | "open_ai_embeddings"
+      | "rerank"
+      | "open_ai_image_generations"
+      | "open_ai_image_edits"
+      | "open_ai_speech"
+      | "open_ai_transcriptions"
+      | "open_ai_translations"
+      | "open_ai_videos"
+      | "system_one"
+    >;
+
+/** v2's APIs, in the order the document lists them. */
+export const REWRITE_APIS: readonly RewriteApi[] = Object.freeze([
+  ...LANE_PROTOCOLS,
+  "open_ai_embeddings",
+  "rerank",
+  "open_ai_image_generations",
+  "open_ai_image_edits",
+  "open_ai_speech",
+  "open_ai_transcriptions",
+  "open_ai_translations",
+  "open_ai_videos",
+  "system_one",
+] as const);
+
+/** Whether `value` is one of v2's APIs. */
+export function isRewriteApi(value: unknown): value is RewriteApi {
+  return typeof value === "string" && (REWRITE_APIS as readonly string[]).includes(value);
+}
+
+/** The whole v2 document: v1's shape, over more APIs, with form rules beside member rules. */
+export interface LaneRewritePolicyV2 {
+  readonly id: string;
+  readonly version: number;
+  readonly protocols: Readonly<Record<RewriteApi, readonly ApiRewriteRule[]>>;
 }
 
 /** The whole published document. */
@@ -123,6 +189,64 @@ export const GRAY_LANE_REWRITES_V1: LaneRewritePolicy = validateRewritePolicy(RA
 /** `declared_in` of every event this policy allows. */
 export const GRAY_LANE_REWRITES_V1_ID = GRAY_LANE_REWRITES_V1.id;
 
+/** What Gray changes in a JSON body of a standard API: the provider's name for the model, and what names the end user or routes. */
+const API_JSON_RULES = [
+  { op: "set_member", path: "/model", value: MODEL_STRING },
+  { op: "remove_member", path: "/user" },
+  { op: "remove_member", path: "/safety_identifier" },
+  { op: "remove_member", path: "/metadata" },
+  { op: "remove_member", path: "/provider" },
+] as const;
+/** The same in a form: its routing preference is a header, so there is no `provider` field to take out. */
+const API_FORM_RULES = [
+  { op: "set_form_field", path: "model", value: MODEL_STRING },
+  { op: "remove_form_field", path: "user" },
+] as const;
+
+const RAW_POLICY_V2: unknown = {
+  id: "gray-lane-rewrites-v2",
+  version: 2,
+  protocols: {
+    ...(RAW_POLICY as { readonly protocols: Record<string, unknown> }).protocols,
+    open_ai_embeddings: API_JSON_RULES,
+    rerank: API_JSON_RULES,
+    open_ai_image_generations: API_JSON_RULES,
+    open_ai_image_edits: API_FORM_RULES,
+    open_ai_speech: API_JSON_RULES,
+    open_ai_transcriptions: API_FORM_RULES,
+    open_ai_translations: API_FORM_RULES,
+    // A video create is JSON or a form, and keeps `metadata`: the provider's own parameters (the standard's clause 11.12).
+    open_ai_videos: [...API_JSON_RULES.filter((rule) => rule.path !== "/metadata"), ...API_FORM_RULES],
+    system_one: API_JSON_RULES,
+  },
+};
+
+/** gray-lane-rewrites-v2: v1's rules for the three text APIs, and the standard APIs' (docs/design/standard-media-at-entry.md section 2.4). */
+export const GRAY_LANE_REWRITES_V2: LaneRewritePolicyV2 = validateRewritePolicyV2(RAW_POLICY_V2);
+
+/** `declared_in` of every event v2 allows. */
+export const GRAY_LANE_REWRITES_V2_ID = "gray-lane-rewrites-v2" as const;
+if (GRAY_LANE_REWRITES_V2.id !== GRAY_LANE_REWRITES_V2_ID) throw new LaneError("lane/policy", "gray-lane-rewrites-v2's id");
+
+/**
+ * v2's rules for the lane's three text APIs as a policy of v1's shape, for the replay of a text request whose ops
+ * name v2 (`replayForwarded`, `applyDeclaredChanges`). They are v1's rules under v2's id.
+ */
+export const GRAY_LANE_REWRITES_V2_TEXT: LaneRewritePolicy = validateRewritePolicy({
+  id: GRAY_LANE_REWRITES_V2.id,
+  version: GRAY_LANE_REWRITES_V2.version,
+  protocols: Object.fromEntries(LANE_PROTOCOLS.map((protocol) => [protocol, GRAY_LANE_REWRITES_V2.protocols[protocol]])),
+});
+
+/** The rule of `policy` that allows `op` on `path` for `api`, or undefined. */
+export function apiRewriteRuleFor(
+  policy: LaneRewritePolicyV2,
+  api: RewriteApi,
+  op: { readonly op: RequestModifiedOp; readonly path: string },
+): ApiRewriteRule | undefined {
+  return policy.protocols[api].find((rule) => rule.op === op.op && rule.path === op.path);
+}
+
 /** The rule that allows `op` on `path` for `protocol`, or undefined. */
 export function rewriteRuleFor(
   policy: LaneRewritePolicy,
@@ -132,9 +256,9 @@ export function rewriteRuleFor(
   return policy.protocols[protocol].find((rule) => rule.op === op.op && rule.path === op.path);
 }
 
-/** Whether `value` satisfies a rule's value constraint. `remove_member` requires `undefined`. */
-export function ruleAllowsValue(rule: RewriteRule, value: Json | undefined): boolean {
-  if (rule.op === "remove_member") return value === undefined;
+/** Whether `value` satisfies a rule's value constraint. `remove_member` and `remove_form_field` require `undefined`. */
+export function ruleAllowsValue(rule: ApiRewriteRule, value: Json | undefined): boolean {
+  if (rule.op === "remove_member" || rule.op === "remove_form_field") return value === undefined;
   if (rule.value === undefined || value === undefined) return false;
   switch (rule.value.kind) {
     case "string": {
@@ -182,6 +306,58 @@ export function validateRewritePolicy(value: unknown): LaneRewritePolicy {
     parsed[protocol] = rules;
   }
   return { id, version: Number(version), protocols: parsed as Record<LaneProtocol, readonly RewriteRule[]> };
+}
+
+/**
+ * Validate a document of v2's shape and return its typed form: exactly `REWRITE_APIS`, each rule a member rule as in
+ * v1 or a form rule (`set_form_field` with a string rule, `remove_form_field` with none, the path a field name). The
+ * three text APIs are JSON, so a form rule there is refused. Throws `LaneError`, as `validateRewritePolicy` does.
+ */
+export function validateRewritePolicyV2(value: unknown): LaneRewritePolicyV2 {
+  const root = record(value, "the policy");
+  const id = root.id;
+  if (typeof id !== "string" || !POLICY_ID.test(id)) throw new LaneError("lane/policy", "the policy id is not a lower-case policy id");
+  const version = integer(root.version);
+  if (version === undefined || version < 1n || version > 0x7fff_ffffn) throw new LaneError("lane/policy", "the policy version is not a positive integer");
+  const protocols = record(root.protocols, "the policy protocols");
+  const names = Object.keys(protocols).sort();
+  const expected = [...REWRITE_APIS].sort();
+  if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
+    throw new LaneError("lane/policy", "the policy must have exactly the APIs of gray-lane-rewrites-v2");
+  }
+  const parsed: Record<string, readonly ApiRewriteRule[]> = {};
+  for (const api of REWRITE_APIS) {
+    const list = protocols[api];
+    if (!Array.isArray(list)) throw new LaneError("lane/policy", `the ${api} rules are not an array`);
+    const text = (LANE_PROTOCOLS as readonly string[]).includes(api);
+    const seen = new Set<string>();
+    const rules: ApiRewriteRule[] = [];
+    for (const entry of list) {
+      if (!isFormOp(record(entry, `a ${api} rule`).op)) rules.push(parseRule(entry, api, seen));
+      else if (text) throw new LaneError("lane/policy", `a form rule in ${api}, whose body is JSON`);
+      else rules.push(parseFormRule(entry, api, seen));
+    }
+    parsed[api] = rules;
+  }
+  return { id, version: Number(version), protocols: parsed as Record<RewriteApi, readonly ApiRewriteRule[]> };
+}
+
+function parseFormRule(value: unknown, api: string, seen: Set<string>): FormRewriteRule {
+  const rule = record(value, `a ${api} rule`);
+  const op = rule.op;
+  if (op !== "set_form_field" && op !== "remove_form_field") throw new LaneError("lane/policy", `unknown rewrite op in ${api}`);
+  if (!isFormFieldName(rule.path)) throw new LaneError("lane/policy", `a ${api} form rule's path is not a field name`);
+  const identity = `${op} ${rule.path}`;
+  if (seen.has(identity)) throw new LaneError("lane/policy", `a ${api} rule is repeated`);
+  seen.add(identity);
+  if (op === "remove_form_field") {
+    if (rule.value !== undefined) throw new LaneError("lane/policy", `the ${api} removal rule carries a value`);
+    return { op, path: rule.path };
+  }
+  if (rule.value === undefined) throw new LaneError("lane/policy", `the ${api} ${op} rule has no value`);
+  const valueRule = parseValueRule(rule.value, api);
+  if (valueRule.kind !== "string") throw new LaneError("lane/policy", `the ${api} ${op} rule's value is not a string rule: a form field is text`);
+  return { op, path: rule.path, value: valueRule };
 }
 
 function parseRule(value: unknown, protocol: string, seen: Set<string>): RewriteRule {

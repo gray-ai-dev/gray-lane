@@ -92,10 +92,32 @@ export interface RequestTranslatedEvent {
   readonly declared_in: (typeof TRANSLATION_POLICIES)[number];
 }
 
-/** The closed op vocabulary of `request.modified` (one event per op, in application order). */
-export const REQUEST_MODIFIED_OPS = Object.freeze(["set_member", "insert_member", "remove_member"] as const);
+/** The ops on a JSON body: a member named by an RFC 6901 pointer (`/model`, `/stream_options/include_usage`). */
+export const REQUEST_MODIFIED_MEMBER_OPS = Object.freeze(["set_member", "insert_member", "remove_member"] as const);
+
+export type RequestModifiedMemberOp = (typeof REQUEST_MODIFIED_MEMBER_OPS)[number];
+
+/**
+ * The ops on a `multipart/form-data` body (docs/design/standard-media-at-entry.md section 2.4): a text field named by
+ * the `name` of its part's `Content-Disposition` (`model`, `user`). `set_form_field` replaces the field's value;
+ * `remove_form_field` takes the part out. The byte rules are @gray/lane's (form.ts).
+ */
+export const REQUEST_MODIFIED_FORM_OPS = Object.freeze(["set_form_field", "remove_form_field"] as const);
+
+export type RequestModifiedFormOp = (typeof REQUEST_MODIFIED_FORM_OPS)[number];
+
+/**
+ * The closed op vocabulary of `request.modified` (one event per op, in application order). A verifier that does not
+ * know an op fails the receipt that carries it: gray-lane-verify 1.3.0 and earlier know the three member ops only.
+ */
+export const REQUEST_MODIFIED_OPS = Object.freeze([...REQUEST_MODIFIED_MEMBER_OPS, ...REQUEST_MODIFIED_FORM_OPS] as const);
 
 export type RequestModifiedOp = (typeof REQUEST_MODIFIED_OPS)[number];
+
+/** Whether `op` is one of the two form ops. */
+export function isFormOp(op: unknown): op is RequestModifiedFormOp {
+  return typeof op === "string" && (REQUEST_MODIFIED_FORM_OPS as readonly string[]).includes(op);
+}
 
 /** The four types no extension may use (§7.4: `MUST NOT reuse the required types`). */
 export const REQUIRED_EVENT_TYPES: readonly string[] = Object.freeze([
@@ -174,14 +196,15 @@ export function isRelayPolicyReasonCode(value: unknown): value is RelayPolicyRea
 /**
  * One declared rewrite of the request body: a JSON Pointer path and the value written (or the
  * digest of that value when the event does not carry it). `declared_in` names the published lane
- * rewrite policy that allowed the op, e.g. `gray-lane-rewrites-v1`.
+ * rewrite policy that allowed the op, e.g. `gray-lane-rewrites-v1`. A form op names a form field
+ * instead of a pointer, and `set_form_field` always carries its value, a string.
  */
 export interface RequestModifiedEvent {
   readonly type: "request.modified";
   readonly op: RequestModifiedOp;
-  /** RFC 6901, absolute: `/model`, `/stream_options/include_usage`. */
+  /** A member op: RFC 6901, absolute (`/model`, `/stream_options/include_usage`). A form op: the field's name (`model`). */
   readonly path: string;
-  /** The value a set/insert writes. Exactly one of `value` and `value_sha256` is present. */
+  /** The value a set/insert writes. Exactly one of `value` and `value_sha256` is present; `set_form_field` has `value`. */
   readonly value?: Json;
   /** SHA-256 of the UTF-8 bytes of `toJsonString(value)` for a value the event does not carry. */
   readonly value_sha256?: string;
@@ -218,31 +241,81 @@ export const relayPolicyRefusedSchema = z.object({
 });
 
 const modifiedPathSchema = z.string().min(1).max(256).regex(/^\//, "an absolute JSON Pointer starts with /");
+/**
+ * A form op's path, the field's name as its part's `Content-Disposition` writes it: letters, digits and `_ . - [ ]`,
+ * so no quote, backslash, percent sign or space, which form parsers read in different ways. Never a JSON Pointer.
+ */
+const FORM_FIELD_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.[\]-]{0,255}$/;
+
+/** Whether `value` is a field name a form op may carry as its path. */
+export function isFormFieldName(value: unknown): value is string {
+  return typeof value === "string" && FORM_FIELD_NAME.test(value);
+}
 const declaredInSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,127}$/, "a lower_case policy id");
 const modifiedValueSchema = z.union([z.string(), z.boolean(), z.bigint(), z.record(z.string(), z.unknown())]);
 
+/** The value rule of a member op: `remove_member` carries neither value; `set_member` and `insert_member` exactly one. */
+function checkMemberValue(event: { readonly op: string; readonly value?: unknown; readonly value_sha256?: unknown }, ctx: z.RefinementCtx): void {
+  if (event.op === "remove_member") {
+    if (event.value !== undefined || event.value_sha256 !== undefined) {
+      ctx.addIssue({ code: "custom", path: ["value"], message: "remove_member carries no value" });
+    }
+    return;
+  }
+  if ((event.value === undefined) === (event.value_sha256 === undefined)) {
+    ctx.addIssue({ code: "custom", path: ["value"], message: "exactly one of value and value_sha256 is required" });
+  }
+}
+
 /**
- * `request.modified`: one op, its RFC 6901 path, its value (or value digest), and the policy id.
- * `remove_member` carries neither value; `set_member` and `insert_member` carry exactly one.
+ * `request.modified` with one of the three member ops: the op, its RFC 6901 path, its value (or value digest), and the
+ * policy id. A relay stack's attempts and a `peer.forwarded` take these alone: their bodies are the text APIs' JSON.
  */
-export const requestModifiedSchema = z
+export const requestMemberModifiedSchema = z
   .object({
     type: z.literal(EVENT_REQUEST_MODIFIED),
-    op: z.enum(REQUEST_MODIFIED_OPS),
+    op: z.enum(REQUEST_MODIFIED_MEMBER_OPS),
     path: modifiedPathSchema,
     value: modifiedValueSchema.optional(),
     value_sha256: hex32.optional(),
     declared_in: declaredInSchema,
   })
+  .superRefine(checkMemberValue);
+
+/**
+ * `request.modified`: one op, its path, its value (or value digest), and the policy id.
+ *
+ * - A member op (`set_member`, `insert_member`, `remove_member`): the path is an absolute RFC 6901 pointer.
+ *   `remove_member` carries neither value; the other two carry exactly one of `value` and `value_sha256`.
+ * - A form op (`set_form_field`, `remove_form_field`): the path is the field's name. `set_form_field` carries the
+ *   string it writes as `value`, never a digest, so every such event replays; `remove_form_field` carries no value.
+ *
+ * The op vocabulary is closed: an op outside it fails the event.
+ */
+export const requestModifiedSchema = z
+  .object({
+    type: z.literal(EVENT_REQUEST_MODIFIED),
+    op: z.enum(REQUEST_MODIFIED_OPS),
+    path: z.string().min(1).max(256),
+    value: modifiedValueSchema.optional(),
+    value_sha256: hex32.optional(),
+    declared_in: declaredInSchema,
+  })
   .superRefine((event, ctx) => {
-    if (event.op === "remove_member") {
-      if (event.value !== undefined || event.value_sha256 !== undefined) {
-        ctx.addIssue({ code: "custom", path: ["value"], message: "remove_member carries no value" });
-      }
+    if (!isFormOp(event.op)) {
+      // As before the form ops: a path that is no pointer is the event's one issue.
+      if (!event.path.startsWith("/")) ctx.addIssue({ code: "custom", path: ["path"], message: "an absolute JSON Pointer starts with /" });
+      else checkMemberValue(event, ctx);
       return;
     }
-    if ((event.value === undefined) === (event.value_sha256 === undefined)) {
-      ctx.addIssue({ code: "custom", path: ["value"], message: "exactly one of value and value_sha256 is required" });
+    if (!isFormFieldName(event.path)) {
+      ctx.addIssue({ code: "custom", path: ["path"], message: "a form op's path is the field's name: letters, digits and _ . - [ ]" });
+    }
+    if (event.value_sha256 !== undefined) ctx.addIssue({ code: "custom", path: ["value_sha256"], message: "a form op carries no value digest" });
+    if (event.op === "remove_form_field") {
+      if (event.value !== undefined) ctx.addIssue({ code: "custom", path: ["value"], message: "remove_form_field carries no value" });
+    } else if (typeof event.value !== "string" || !event.value.isWellFormed()) {
+      ctx.addIssue({ code: "custom", path: ["value"], message: "set_form_field carries the text it writes" });
     }
   });
 
@@ -749,7 +822,7 @@ export const peerForwardedSchema = z
      * inner `request.received`). Absent when the entry sent the client's bytes as they came. Today the one such op is
      * `remove_member /provider`, the routing preference the client stated in the body.
      */
-    modified: z.array(requestModifiedSchema).min(1).optional(),
+    modified: z.array(requestMemberModifiedSchema).min(1).optional(),
   })
   .strict();
 
@@ -1012,7 +1085,8 @@ export function relayPolicyRefusedEvent(input: {
 
 /**
  * The `request.modified` event object: one declared op, its path, and its value (or the SHA-256 of
- * the serialized value when the event does not carry it). Throws on a shape no receipt may carry.
+ * the serialized value when the event does not carry it). A form op's path is the field's name and
+ * `set_form_field`'s value a string. Throws on a shape no receipt may carry.
  */
 export function requestModifiedEvent(input: {
   readonly op: RequestModifiedOp;
@@ -1022,6 +1096,17 @@ export function requestModifiedEvent(input: {
   readonly declaredIn: string;
 }): JsonObject {
   if (!REQUEST_MODIFIED_OPS.includes(input.op)) throw new Error(`unknown request.modified op: ${String(input.op)}`);
+  if (isFormOp(input.op)) {
+    if (!isFormFieldName(input.path)) throw new Error("a form op's path is the field's name: letters, digits and _ . - [ ]");
+    if (!declaredInSchema.safeParse(input.declaredIn).success) throw new Error(`not a lane rewrite policy id: ${input.declaredIn}`);
+    if (input.valueSha256 !== undefined) throw new Error("a form op carries no value digest");
+    if (input.op === "remove_form_field") {
+      if (input.value !== undefined) throw new Error("remove_form_field carries no value");
+      return { type: EVENT_REQUEST_MODIFIED, op: input.op, path: input.path, declared_in: input.declaredIn };
+    }
+    if (typeof input.value !== "string" || !input.value.isWellFormed()) throw new Error("set_form_field carries the text it writes");
+    return { type: EVENT_REQUEST_MODIFIED, op: input.op, path: input.path, declared_in: input.declaredIn, value: input.value };
+  }
   if (!modifiedPathSchema.safeParse(input.path).success || !input.path.isWellFormed()) throw new Error("path is an absolute JSON Pointer of at most 256 characters");
   if (!declaredInSchema.safeParse(input.declaredIn).success) throw new Error(`not a lane rewrite policy id: ${input.declaredIn}`);
   if (input.op === "remove_member") {
@@ -1319,6 +1404,9 @@ export type EventLogProblem =
   | "translated_repeated"
   | "translated_position"
   | "translated_with_relay_policy"
+  // A form op (`set_form_field`, `remove_form_field`, docs/design/standard-media-at-entry.md section 2.4):
+  | "form_op_mixed"
+  | "form_op_position"
   // Relay-stack receipts (S26):
   | "stack_event_repeated"
   | "returned_not_last"
@@ -1367,7 +1455,9 @@ export interface EventLogIssue {
  *    present) and `response.returned`;
  * 9. every `request.modified` event sits after `request.received`, before `relay_policy.applied`
  *    and `request.forwarded`, and a forwarded receipt that declares modifications has a
- *    `request.forwarded` event (a refusal forwarded nothing, so it cannot declare one);
+ *    `request.forwarded` event (a refusal forwarded nothing, so it cannot declare one); a log's ops
+ *    are all member ops or all form ops, and form ops come with no `relay_policy.*` event and no
+ *    `request.translated`;
  * 10. every known event matches its shape; unknown types are accepted (verifiers ignore them, §7.4).
  *
  * A relay-stack log ([`isStackEventLog`]) keeps rules 1, 2 and 10 and replaces 3–9 with the attempt
@@ -1459,6 +1549,16 @@ export function checkEventLog(events: readonly Json[]): readonly EventLogIssue[]
   }
   if (translatedIndexes.length > 0 && policyIndexes.length > 0) {
     issues.push({ code: "translated_with_relay_policy", message: "a translated request has no relay_policy.* event: Gray translates for endpoint routes alone" });
+  }
+  // Form ops (docs/design/standard-media-at-entry.md section 2.4). A body is JSON or a form, so a log's ops are of one
+  // kind. A form goes to a provider's own API as the client sent it: no relay policy runs on it and it is not translated.
+  const formIndexes = modifiedIndexes.filter((index) => isFormOp(get(events[index] as Json, "op")));
+  if (formIndexes.length > 0) {
+    if (formIndexes.length !== modifiedIndexes.length) {
+      issues.push({ code: "form_op_mixed", message: "request.modified names member ops and form ops: a body is JSON or a form" });
+    }
+    if (policyIndexes.length > 0) issues.push({ code: "form_op_position", message: "a form op with a relay_policy.* event: a relay's request is JSON" });
+    if (translatedIndexes.length > 0) issues.push({ code: "form_op_position", message: "a form op with request.translated: Gray translates between the text APIs' JSON" });
   }
   for (const index of policyIndexes) {
     const type = types[index];
@@ -1677,6 +1777,7 @@ function checkStackOrder(events: readonly Json[], types: readonly (string | unde
         break;
       }
       case EVENT_REQUEST_MODIFIED:
+        if (isFormOp(get(event, "op"))) push("form_op_position", `request.modified at event ${index} names a form op: a relay stack's request is JSON`);
         if (open === null) outside(index, type);
         else if (open.stage !== "started" && open.stage !== "modified") push("attempt_order", `request.modified at event ${index} follows ${STAGE_EVENTS[open.stage]}`);
         else open.stage = "modified";

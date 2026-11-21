@@ -102,14 +102,16 @@ export class AnswerPool {
 }
 
 /**
- * One request's part of the isolate's AnswerPool: its answer's (`hold`) and its tool-call ids' (the
- * originals its handles opened and the handles its answer issued, `holdIds`), summed against the
- * same limit.
+ * One request's part of the isolate's AnswerPool: its answer's (`hold`), its tool-call ids' (the
+ * originals its handles opened and the handles its answer issued, `holdIds`) and a body it holds
+ * whole outside the body tiers (`holdBody`: a form of a standard API at the confidential entry, and
+ * the bytes it forwards of it), summed against the same limit.
  */
 export class AnswerShare {
   private readonly pool: AnswerPool;
   private mine = 0;
   private ids = 0;
+  private body = 0;
   private released = false;
 
   constructor(pool: AnswerPool) {
@@ -118,7 +120,7 @@ export class AnswerShare {
 
   /** What this request holds in the pool now. */
   get bytes(): number {
-    return this.mine + this.ids;
+    return this.mine + this.ids + this.body;
   }
 
   /** The most the request's tool-call ids may hold in all, as the pool stands: `limit` less what the others hold, and this request's answer. */
@@ -153,6 +155,19 @@ export class AnswerShare {
   }
 
   /**
+   * The request's held body now takes `bytes` (docs/design/standard-media-at-entry.md section 2.3: a form the
+   * entry holds whole counts against the isolate's memory budget, as a held answer does): false, and nothing
+   * moved, when it grows and the isolate would then hold more than `limit`; letting go always succeeds.
+   */
+  holdBody(bytes: number, limit: number): boolean {
+    if (this.released) return true;
+    if (bytes > this.body && this.pool.bytes - this.body + bytes > limit) return false;
+    this.pool.move(bytes - this.body);
+    this.body = bytes;
+    return true;
+  }
+
+  /**
    * Records `bytes` already allocated in memory (a whole answer whose upstream body has finished): counted
    * in the pool until `release()` so concurrent mid-read requests see the weight, without refusing a
    * completed answer.
@@ -166,9 +181,10 @@ export class AnswerShare {
   /** The request ended: what it held leaves the pool. Idempotent. */
   release(): void {
     if (this.released) return;
-    this.pool.move(-(this.mine + this.ids));
+    this.pool.move(-(this.mine + this.ids + this.body));
     this.mine = 0;
     this.ids = 0;
+    this.body = 0;
     this.released = true;
   }
 }

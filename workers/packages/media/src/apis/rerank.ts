@@ -124,19 +124,70 @@ function read(value: Json): [JsonObject, RerankRequest] {
   return [fields, rerankOf(fields)];
 }
 
-/** `decode`. */
-export function decodeRerank(received: Received): ApiRequest {
+/** The fields of the one shape the entry takes (the standard's clause 11.9; Jina's, vLLM's and Cohere v2's). */
+const ENTRY_FIELDS = ["model", "query", "documents", "top_n", "return_documents"];
+
+/**
+ * `decode`. `entry`: the request as the confidential entry serves it on a provider's own API
+ * (docs/design/standard-media-at-entry.md section 1.3): one shape and no mapping. `model`, `query` (a string),
+ * `documents` (strings), optional `top_n` and `return_documents`; any other field, a `{"text"}` document among them,
+ * is refused, since the request goes to the provider as the client wrote it. A route priced per request holds and
+ * charges one unit.
+ */
+export function decodeRerank(received: Received, entry = false): ApiRequest {
   if (received.kind !== "json") throw invalid("invalid_protocol_request");
   const model = jsonModel(received.value);
   let body: JsonObject;
   let request: RerankRequest;
   try {
+    if (entry && isObject(received.value)) {
+      if (Object.keys(received.value).some((k) => !ENTRY_FIELDS.includes(k))) throw "unsupported_request_field";
+      const documents = get(received.value, "documents");
+      if (Array.isArray(documents) && documents.some((document) => typeof document !== "string")) throw "invalid_protocol_request";
+    }
     [body, request] = read(received.value);
   } catch (error) {
     if (typeof error === "string") throw invalid(error);
     throw error;
   }
-  return { model, stream: false, selectors: [], bound: rerankBound(request), body: { kind: "json", value: body } };
+  const bound = rerankBound(request);
+  return { model, stream: false, selectors: [], bound: entry ? { ...bound, units: 1n } : bound, body: { kind: "json", value: body } };
+}
+
+/**
+ * The checks and metering of a rerank answer at the entry, on the projection a passing answer keeps (the ranking's
+ * indexes and scores, `usage`): `{"results": [{"index", "relevance_score"}]}`, each document ranked at most once. A
+ * route priced per request is charged one unit and nothing is read; one priced by tokens `usage.total_tokens` as input
+ * tokens, free when it reports none. Nothing is cut: the answer is the provider's. Throws the answer's refusal.
+ */
+export function entryRerankAnswer(api: ApiRequest, value: Json, billsUnits: boolean): Billed {
+  let request: RerankRequest | undefined;
+  if (api.body.kind === "json") {
+    try {
+      request = rerankOf(api.body.value);
+    } catch {
+      request = undefined;
+    }
+  }
+  if (request === undefined || get(value, "data") !== undefined || !rerankAnsweredBy(request, value)) throw apiError(502, "invalid_upstream_response");
+  let billed: Billed;
+  if (billsUnits) {
+    billed = metered({ counters: { ...ZERO_COUNTERS, units: 1n }, raw: { requests: 1n }, unit: "requests" });
+  } else {
+    const usage = get(value, "usage");
+    const present = usage === undefined || usage === null ? undefined : usage;
+    if (present === undefined) return missing("usage missing");
+    let tokens: bigint | undefined;
+    try {
+      tokens = inputUsage(present);
+    } catch {
+      throw apiError(502, "billing_usage_invalid");
+    }
+    if (tokens === 0n) throw apiError(502, "billing_usage_invalid");
+    billed = tokens === undefined ? missing("usage.total_tokens missing", present) : metered({ counters: { ...ZERO_COUNTERS, input_tokens: tokens }, raw: present, unit: undefined });
+  }
+  if (billed.kind === "metered") checkMetered("rerank", api.bound, billed.metered, billsUnits);
+  return billed;
 }
 
 /** `forwarded`: the body in the options every service takes (no limit, no `truncation: true`, `{"text"}` documents as text). */

@@ -93,16 +93,33 @@ const STREAM_FIELDS = ["stream", "partial_images"];
 /** Leading bytes of an input image the adapters read: they sniff its type from these and check the rest only for size. */
 const SNIFF_BYTES = 48;
 
-export function decodeImages(protocol: Protocol, received: Received): ApiRequest {
+/**
+ * `decode`. `entry`: the request as the confidential entry serves it on a provider's own API
+ * (docs/design/standard-media-at-entry.md section 2.3): the provider's answer passes as it arrives, so a streamed
+ * request is taken (`stream: true`, with `partial_images` from 0 to 3) and sent to a route that states streaming, and
+ * any `response_format` but `b64_json` is refused with 400 `unsupported_response_format`, since Gray fetches no image
+ * from a provider's link and hands none on.
+ */
+export function decodeImages(protocol: Protocol, received: Received, entry = false): ApiRequest {
   if (protocol === "open_ai_image_edits") {
     if (received.kind !== "form") throw invalid("invalid_protocol_request");
-    return decodeEdit(received.parts);
+    return decodeEdit(received.parts, entry);
   }
   if (received.kind !== "json") throw invalid("invalid_protocol_request");
-  return decodeGeneration(received.value);
+  return decodeGeneration(received.value, entry);
 }
 
-function decodeGeneration(body: Json): ApiRequest {
+/** Most partial images a streamed request may ask for (OpenAI's `partial_images` range). */
+const MAX_PARTIAL_IMAGES = 3n;
+
+/** 400 for a `response_format` whose images the entry cannot hand on inline. */
+function inlineOnly(): ApiError {
+  return invalid("unsupported_response_format")
+    .withMessage("Images come back inline at this address: send `response_format: \"b64_json\"` or leave it out. Gray hands on no link to a provider's storage.")
+    .withParam("response_format");
+}
+
+function decodeGeneration(body: Json, entry: boolean): ApiRequest {
   const model = jsonModel(body);
   if (!isObject(body)) throw invalid("invalid_protocol_request");
   const fields: JsonObject = {};
@@ -112,7 +129,10 @@ function decodeGeneration(body: Json): ApiRequest {
   const streams = stream !== undefined && stream !== null && stream !== false;
   const partial = get(fields, "partial_images");
   const partialOn = partial !== undefined && partial !== null && partial !== 0n;
-  if (streams || partialOn) throw invalid("streaming_unsupported");
+  if (entry) {
+    if (streams && stream !== true) throw invalid("invalid_protocol_request");
+    if (partialOn && (typeof partial !== "bigint" || partial < 0n || partial > MAX_PARTIAL_IMAGES)) throw invalid("invalid_protocol_request");
+  } else if (streams || partialOn) throw invalid("streaming_unsupported");
   const text = (key: string) => {
     const v = get(fields, key);
     return typeof v === "string" ? v : undefined;
@@ -129,17 +149,17 @@ function decodeGeneration(body: Json): ApiRequest {
     (compression === undefined || compression === null || (typeof compression === "bigint" && compression >= 0n && compression <= 100n));
   if (!wellFormed) throw invalid("invalid_protocol_request");
   const format = text("response_format");
-  if (format !== undefined && format !== "b64_json") throw invalid("unsupported_parameter");
+  if (format !== undefined && format !== "b64_json") throw entry ? inlineOnly() : invalid("unsupported_parameter");
   let n = 1n;
   const nValue = get(fields, "n");
   if (nValue !== undefined && nValue !== null) {
     if (typeof nValue !== "bigint" || nValue < 1n || nValue > MAX_N) throw invalid("invalid_protocol_request");
     n = nValue;
   }
-  return { model, stream: false, selectors: selectors(text("size"), text("quality")), bound: imagesBound(n), body: { kind: "json", value: fields } };
+  return { model, stream: entry && streams, selectors: selectors(text("size"), text("quality")), bound: imagesBound(n), body: { kind: "json", value: fields } };
 }
 
-function decodeEdit(all: readonly FormPart[]): ApiRequest {
+function decodeEdit(all: readonly FormPart[], entry: boolean): ApiRequest {
   const parts = all.filter((p) => !OPENAI_LINKING_FIELDS.includes(p.name));
   let images = 0;
   let masks = 0;
@@ -158,9 +178,12 @@ function decodeEdit(all: readonly FormPart[]): ApiRequest {
   }
   const stream = text.get("stream");
   const partial = text.get("partial_images");
-  if (!(stream === undefined || stream === "false") || !(partial === undefined || partial === "0")) throw invalid("streaming_unsupported");
+  if (entry) {
+    if (!(stream === undefined || stream === "false" || stream === "true")) throw invalid("invalid_protocol_request");
+    if (!(partial === undefined || (/^[0-9]$/.test(partial) && BigInt(partial) <= MAX_PARTIAL_IMAGES))) throw invalid("invalid_protocol_request");
+  } else if (!(stream === undefined || stream === "false") || !(partial === undefined || partial === "0")) throw invalid("streaming_unsupported");
   const format = text.get("response_format");
-  if (format !== undefined && format !== "b64_json") throw invalid("unsupported_parameter");
+  if (format !== undefined && format !== "b64_json") throw entry ? inlineOnly() : invalid("unsupported_parameter");
   const number = (name: string, min: bigint, max: bigint): bigint | undefined => {
     const value = text.get(name);
     if (value === undefined) return undefined;
@@ -179,7 +202,7 @@ function decodeEdit(all: readonly FormPart[]): ApiRequest {
   if (!present("model") || !present("prompt")) throw invalid("invalid_protocol_request");
   return {
     model: text.get("model") as string,
-    stream: false,
+    stream: entry && stream === "true",
     selectors: selectors(text.get("size"), text.get("quality")),
     bound: imagesBound(n),
     body: { kind: "multipart", parts },
@@ -412,6 +435,63 @@ export function compatibleImagesBilled(api: ApiRequest, value: Json, billsUnits:
   if (billsUnits) return metered(imageUnits(present !== undefined && isObject(present) ? present : undefined, count));
   if (present === undefined) return missing("usage missing");
   return billedBy(() => ({ counters: imageTokenUsage(present), raw: present, unit: undefined }), present);
+}
+
+/**
+ * Whether an image entry's `url` member is a link: a non-empty string. Some providers write the member with no value
+ * (`null`, or an empty string) beside the inline image; that names no address, so it is no link.
+ */
+export function isImageLink(url: Json | undefined): boolean {
+  return typeof url === "string" && url.length > 0;
+}
+
+/**
+ * The checks and metering of an images answer at the confidential entry, on the projection a passing answer keeps
+ * (each `b64_json`'s head, each `url`, the usage; docs/design/standard-media-at-entry.md section 2.5): every `data`
+ * entry carries an inline PNG, JPEG or WebP image, and none carries a link (`isImageLink`), which would hand the client
+ * the address of the provider's storage (the standard's clause 11.5; Gray fetches none and removes nothing from an
+ * answer that passes as it arrives). At most the images asked for; billed as `compatibleImagesBilled` bills them.
+ * Throws the answer's refusal.
+ */
+export function entryImagesBilled(api: ApiRequest, value: Json, billsUnits: boolean): Billed {
+  const data = get(value, "data");
+  if (!Array.isArray(data) || data.length === 0) throw apiError(502, "invalid_upstream_response");
+  for (const entry of data) {
+    const inline = get(entry, "b64_json");
+    if (typeof inline !== "string" || !isInlineImage(inline) || isImageLink(get(entry, "url"))) throw apiError(502, "invalid_upstream_response");
+  }
+  return compatibleImagesBilled(api, value, billsUnits);
+}
+
+/**
+ * The same for a streamed images answer (`image_generation.completed` or `image_edit.completed` events): one image a
+ * completed event, at most the images asked for, none an answer with no image. A route priced per image is charged
+ * the completed events; one priced by tokens each completed event's `usage`, added, and nothing when one reports none.
+ * `completed`: each completed event's `usage` (undefined when it has none).
+ */
+export function entryImagesStreamBilled(api: ApiRequest, completed: readonly (Json | undefined)[], billsUnits: boolean): Billed {
+  if (completed.length === 0) throw apiError(502, "invalid_upstream_response");
+  const count = BigInt(completed.length);
+  withinRequest(api, count);
+  const present = completed.filter((usage): usage is Json => usage !== undefined && usage !== null);
+  if (billsUnits) return metered(imageUnits(present.length > 0 ? { events: present } : undefined, count));
+  if (present.length !== completed.length) return missing("usage missing", present.length > 0 ? present : null);
+  return billedBy(() => {
+    let total: UsageCounters = { ...ZERO_COUNTERS };
+    for (const usage of present) {
+      const one = imageTokenUsage(usage);
+      total = {
+        ...total,
+        input_tokens: total.input_tokens + one.input_tokens,
+        output_tokens: total.output_tokens + one.output_tokens,
+        image_input_tokens: total.image_input_tokens + one.image_input_tokens,
+        audio_input_tokens: total.audio_input_tokens + one.audio_input_tokens,
+        image_output_tokens: total.image_output_tokens + one.image_output_tokens,
+        audio_output_tokens: total.audio_output_tokens + one.audio_output_tokens,
+      };
+    }
+    return { counters: total, raw: present.length === 1 ? (present[0] as Json) : present, unit: undefined };
+  }, present);
 }
 
 /**

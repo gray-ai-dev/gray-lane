@@ -167,8 +167,11 @@ services:
     # row the lane pushed, docs/design/lane-provider-routes.md §4), and `-route-deny-suffix usefallback.com` keeps every
     # row off the deployment's own zones: the lane's view admits only rows egress takes under it (@gray/snapshot
     # ENTRY_ROUTE_DENY_SUFFIXES). The relay-stack layout's egress has neither (it refuses -routes beside -relay-listen).
+    # `-route-max-body-bytes 26214400` is the /route/ kind's own body bound (docs/design/standard-media-at-entry.md
+    # §2.3): 25 MiB, the lane's largest form (LANE_FORM_MAX_BYTES, @gray/config's default; the gate holds the flag to at
+    # least it), which the entry forwards whole to a provider. The vendor and peer paths keep -max-body-bytes.
     entrypoint: ["/usr/local/bin/gray-egress"]
-    command: ["-socket", "/run/gray/egress.sock", "-routes", "-route-deny-suffix", "usefallback.com", "-max-body-bytes", "4194304"]
+    command: ["-socket", "/run/gray/egress.sock", "-routes", "-route-deny-suffix", "usefallback.com", "-route-max-body-bytes", "26214400", "-max-body-bytes", "4194304"]
     volumes:
       # D63: the egress socket, shared with the lane; it holds only the socket.
       - egress-socket:/run/gray

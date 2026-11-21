@@ -10,6 +10,9 @@
  *    `gray-lane-rewrites-v1` policy — Gray's own rewrites (the upstream model, the output cap, the
  *    stripped end-user ids, `models`, Chat's `include_usage`) are declared as typed
  *    `request.modified` events and applied as byte-level ops before F, so the same replay works.
+ *    `applyApiChanges`, `replayApiChanges` and `gray-lane-rewrites-v2` do the same for the standard
+ *    APIs a provider's own API serves (embeddings, images, audio, videos, rerank, System One), whose
+ *    body is JSON or a `multipart/form-data` form (`applyFormOps`, the two form ops).
  *
  * D. `validateMethod`, `applyMethod` — a relay's registered change method (`gray-relay-method-v1`,
  *    docs/relay-changes-v2.md §2.2–§2.4): the registration checks, and V = apply(m, E, facts) by byte splices.
@@ -107,14 +110,35 @@ export { MAX_POINTER_LENGTH, MAX_POINTER_TOKENS, parseJsonPointer, type JsonPoin
 export {
   GRAY_LANE_REWRITES_V1,
   GRAY_LANE_REWRITES_V1_ID,
+  GRAY_LANE_REWRITES_V2,
+  GRAY_LANE_REWRITES_V2_ID,
+  GRAY_LANE_REWRITES_V2_TEXT,
   LANE_REWRITE_OPS,
+  REWRITE_APIS,
+  apiRewriteRuleFor,
+  isRewriteApi,
   rewriteRuleFor,
   ruleAllowsValue,
   validateRewritePolicy,
+  validateRewritePolicyV2,
+  type ApiRewriteRule,
+  type FormRewriteRule,
   type LaneRewritePolicy,
+  type LaneRewritePolicyV2,
+  type RewriteApi,
   type RewriteRule,
   type RewriteValueRule,
 } from "./policy.ts";
+export { FORM_BOUNDARY_MAX_BYTES, FORM_HEADER_MAX_BYTES, FORM_NAME_MAX_BYTES, applyFormOps, formBodyBoundary, formBoundaryOf, isFormBoundary, type FormRefusalCode, type GrayFormOp } from "./form.ts";
+export {
+  applyApiChanges,
+  replayApiChanges,
+  type ApiBody,
+  type ApiChangeRefusalCode,
+  type ApplyApiChangesOk,
+  type ApplyApiChangesOptions,
+  type GrayApiOp,
+} from "./api-changes.ts";
 export { StackEventDigester, stackBodyDigest, stackCanonical, stackEventDigest, stackJsonTree, stackTreeText, type StackJsonTree } from "./stack-digest.ts";
 export {
   GRAY_LANE_RESPONSE_REWRITES_V1,

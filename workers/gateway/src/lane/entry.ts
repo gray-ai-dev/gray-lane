@@ -10,6 +10,8 @@ import { allowedOrigin, EXPOSED, preflight, withCors } from "../cors.ts";
 import type { GatewayEnv } from "../env.ts";
 import { originsOf } from "../hosts.ts";
 import { servedProtocol } from "../paths.ts";
+import { type MediaDeps, ModelApiRun, modelApi } from "../apis.ts";
+import { entryStandardApi } from "./standard-api.ts";
 import { InferenceRun } from "../inference.ts";
 import { livez } from "../health.ts";
 import "./policy-interpreter.ts";
@@ -58,8 +60,11 @@ import type { LanePeers } from "./types.ts";
  * Routes:
  *
  * - generation (`POST /v1/messages`, `/v1/chat/completions`, `/v1/responses` and their unprefixed
- *   forms) → `InferenceRun` with the lane's dependency set. Gemini, the model APIs, the catalog and
- *   videos are 404s, as design v2 section A scopes them out.
+ *   forms) → `InferenceRun` with the lane's dependency set.
+ * - the standard APIs an entry serves itself (`POST /v1/embeddings`, `/v1/rerank`, `/v1/images/generations`,
+ *   `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/systemone`) →
+ *   `ModelApiRun` with the lane's dependency set (docs/design/standard-media-at-entry.md section 2). Videos, and every
+ *   other path the entry does not serve, go to the API Worker while the entry forwards (docs/design/one-address.md).
  * - `GET /v1/aci/attestation?nonce=` → the ACI report (moved from M0, `attestation.ts`).
  * - `GET /v1/aci/receipts/{id}` → the receipt store, owner checked (§7.6); on an entry,
  *   `GET /v1/aci/receipts/{id}/peers/{n}` → a peer attempt's stack VM report and inner receipt, the same owner check
@@ -1212,8 +1217,13 @@ async function route(
   // the lane's view holds (docs/design/lane-provider-routes.md sections 2 and 7; a lane relay maps no Gemini route).
   const listing = catalogRoute(request.method, path);
   const served = servedProtocol(request.method, path);
-  // docs/design/one-address.md: with API_ORIGIN every other public path is the API Worker's (`/v1/key`, the media and
-  // model APIs, the setup routes, paths no API serves), never one of the entry's own namespaces, and never a request the
+  // docs/design/standard-media-at-entry.md section 2.2: an entry with its endpoint routes (the default layout) serves the
+  // synchronous standard APIs itself, on a provider's own API. A relay stack VM has no such route and serves none.
+  const endpointRoutes = endpointRoutesOf(state, env, cfg);
+  const modelPath = served === null && listing === null && endpointRoutes !== null ? modelApi(request.method, path) : null;
+  const standard = modelPath !== null && entryStandardApi(modelPath) ? modelPath : null;
+  // docs/design/one-address.md: with API_ORIGIN every other public path is the API Worker's (`/v1/key`, video jobs, the
+  // setup routes, paths no API serves), never one of the entry's own namespaces, and never a request the
   // API Worker forwarded here (its mark): neither side forwards the other's request again.
   const forwardable = api !== null && !entryOwnPath(path) && !request.headers.has(API_FORWARD_HEADER);
   const sign: ForwardSigner = { keyId: state.laneKeyId, signer: state.bridgeSigner, now: state.now };
@@ -1222,11 +1232,11 @@ async function route(
     liveAnswers.add(answer);
     return answer;
   };
-  if (listing === null && served === null) return forwardable ? forwarded() : unmatched(request, cfg, url, path);
+  if (listing === null && served === null && standard === null) return forwardable ? forwarded() : unmatched(request, cfg, url, path);
   if (listing !== null && listing.kind === "key") return forwardable ? forwarded() : unmatched(request, cfg, url, path);
   // docs/design/one-address.md: a chat request the API Worker forwarded is marked; the mark is checked and taken off
   // (`api-arrival.ts`), an invalid one refused, and a request without one served as before.
-  const arrival = served === null ? null : await apiArrival(request, env["LANE_API_FORWARD_PUBLIC_KEY"], url, path, state.now(), originsOf(cfg, url));
+  const arrival = served === null && standard === null ? null : await apiArrival(request, env["LANE_API_FORWARD_PUBLIC_KEY"], url, path, state.now(), originsOf(cfg, url));
   if (arrival?.kind === "refused") return arrival.response;
   if (arrival?.kind === "gray_api") request = arrival.request;
   // The generation path: the same `InferenceRun` the main lane runs, with the lane's dependencies.
@@ -1236,11 +1246,11 @@ async function route(
     state,
     bridge: { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv) },
     ...(peers === null ? {} : { peers }),
-    ...endpointRoutesField(endpointRoutesOf(state, env, cfg)),
+    ...endpointRoutesField(endpointRoutes),
     ...(arrival?.kind === "gray_api" ? { arrival: "gray_api" as const } : {}),
     // docs/design/one-address.md: a request for a model this entry has no route of on its API, which Gray's API serves,
-    // goes there (InferenceRun `forwardToApi`); never one that arrived through the API.
-    ...(forwardable && served !== null && arrival?.kind !== "gray_api" ? { apiForward: laneApiForward(api!, sign, url, (p) => ctx.waitUntil(p)) } : {}),
+    // goes there (InferenceRun and ModelApiRun `forwardToApi`); never one that arrived through the API.
+    ...(forwardable && (served !== null || standard !== null) && arrival?.kind !== "gray_api" ? { apiForward: laneApiForward(api!, sign, url, (p) => ctx.waitUntil(p)) } : {}),
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
   if (listing !== null) {
@@ -1250,6 +1260,13 @@ async function route(
     // is merged the same way.
     const asGet = request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
     return mergedListing(request, url, listing, await serveCatalog(asGet, listing, path, catalog), api!, sign, { cfg, url, path });
+  }
+  if (standard !== null) {
+    // The model APIs' request path with the lane's dependencies; it starts no video job, so it reads no job binding.
+    const media: MediaDeps = { ...deps, videos: env as unknown as MediaDeps["videos"] };
+    const answered = await new ModelApiRun(request, standard, media, ctx, declared).serve();
+    liveAnswers.add(answered);
+    return answered;
   }
   if (served === null) return unmatched(request, cfg, url, path);
   // The sinks' buffered points flush at the request's end, from inside `InferenceRun`'s own

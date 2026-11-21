@@ -981,6 +981,26 @@ export const SETTINGS: readonly SettingSpec[] = [
       "read. Read by the lane in the entry layout with a replica index only.",
   },
   {
+    name: "LANE_FORM_MAX_BYTES",
+    key: "laneFormMaxBytes",
+    workers: ["gateway"],
+    type: "int",
+    default: "26214400",
+    min: 1048576,
+    max: 33554432,
+    source:
+      "docs/design/standard-media-at-entry.md section 2.3 and D4: 25 MiB, OpenAI's documented file limit for transcriptions, " +
+      "proposed until it is measured against the entry's memory on staging. The entry holds a form's bytes as received and, " +
+      "while an attempt is out, the bytes it forwards (the form with its `model` set), so one form takes up to twice this " +
+      "of the answers' pool (ANSWER_HELD_MAX_BYTES, 64 MiB), and a form the pool cannot hold now is refused with 429 " +
+      "gateway_capacity. Maximum 32 MiB: twice it is that pool's maximum. Egress's `-route-max-body-bytes` in the entry's " +
+      "compose is set to at least this value.",
+    doc:
+      "The largest multipart form the confidential entry reads for the standard APIs it serves itself (image edits, " +
+      "transcriptions, translations). The form is held whole in memory, never written to disk; a larger one is refused " +
+      "with 413 request_body_limit before anything is sent. Read by the lane in the entry layout.",
+  },
+  {
     name: "LANE_ENTRY_READY_BOUND_MS",
     key: "laneEntryReadyBoundMs",
     workers: ["gateway"],
@@ -5709,6 +5729,8 @@ export interface GatewayConfig {
   readonly laneStackPollMs: number;
   /** LANE_ENTRY_ROLE_POLL_MS (entry replicas, ER9 as revised): how often an entry replica reads its role through the bridge. */
   readonly laneEntryRolePollMs: number;
+  /** LANE_FORM_MAX_BYTES (docs/design/standard-media-at-entry.md 2.3): the largest multipart form the entry holds for a standard API. */
+  readonly laneFormMaxBytes: number;
   /** LANE_ENTRY_READY_BOUND_MS (entry replicas, §13 readiness): how long after its boot an entry's /readyz fails open. */
   readonly laneEntryReadyBoundMs: number;
   /** LANE_STACK_REPORT_MIN_MS (S42): the shortest interval between two stack.report calls carrying a change. */

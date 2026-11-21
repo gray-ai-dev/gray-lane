@@ -87,15 +87,26 @@ const JSON_TYPE = "application/json";
 const TEXT_TYPE = "text/plain; charset=utf-8";
 const VTT_TYPE = "text/vtt; charset=utf-8";
 
-/** `decode` for the audio APIs. `responseBytes` is the media answer limit the speech size check holds to. */
-export function decodeAudio(protocol: Protocol, received: Received, responseBytes: number): ApiRequest {
+/**
+ * `decode` for the audio APIs. `responseBytes` is the media answer limit the speech size check holds to.
+ *
+ * `entry`: the request as the confidential entry serves it on a provider's own API
+ * (docs/design/standard-media-at-entry.md sections 2.3 and 2.6), where the provider's answer passes as it arrives and
+ * Gray converts no format:
+ *
+ * - speech streamed as events (`stream_format: "sse"`) is taken, and the hold is the characters Gray counts, which is
+ *   the charge (the wider `characterBound` was for vendors that count differently);
+ * - a transcription streamed as events (`stream` `true`) is taken, and so is `diarized_json`;
+ * - `text`, `srt` and `vtt`, which have nowhere to report usage, are refused with 400 `unsupported_response_format`.
+ */
+export function decodeAudio(protocol: Protocol, received: Received, responseBytes: number, entry = false): ApiRequest {
   if (protocol === "open_ai_speech") {
     if (received.kind !== "json") throw invalid("invalid_protocol_request");
-    return decodeSpeech(received.value, responseBytes);
+    return decodeSpeech(received.value, responseBytes, entry);
   }
   if (protocol === "open_ai_transcriptions" || protocol === "open_ai_translations") {
     if (received.kind !== "form") throw invalid("invalid_protocol_request");
-    return decodeTranscription(protocol, received.parts);
+    return decodeTranscription(protocol, received.parts, entry);
   }
   throw apiError(404, "unsupported_protocol");
 }
@@ -106,7 +117,7 @@ function chars(s: string): number {
   return n;
 }
 
-function decodeSpeech(value: Json, responseBytes: number): ApiRequest {
+function decodeSpeech(value: Json, responseBytes: number, entry: boolean): ApiRequest {
   const bad = () => invalid("invalid_protocol_request");
   if (!isObject(value)) throw bad();
   const body: JsonObject = {};
@@ -145,16 +156,16 @@ function decodeSpeech(value: Json, responseBytes: number): ApiRequest {
   }
   const streamFormat = get(body, "stream_format");
   if (streamFormat !== undefined) {
-    if (streamFormat === "sse") throw invalid("streaming_unsupported");
-    if (streamFormat !== "audio") throw bad();
+    if (streamFormat === "sse" && !entry) throw invalid("streaming_unsupported");
+    if (streamFormat !== "audio" && streamFormat !== "sse") throw bad();
   }
   if (UNCOMPRESSED_FORMATS.includes(format)) {
     const seconds = chars(input) / (SLOW_CHARACTERS_PER_SECOND * speed);
     if (seconds * PCM_BYTES_PER_SECOND > responseBytes) throw invalid("audio_output_limit");
   }
-  const units = characterBound(input) + characterBound(instructions);
+  const units = entry ? BigInt(chars(input) + chars(instructions)) : characterBound(input) + characterBound(instructions);
   // Speech bills characters, never tokens.
-  return { model, stream: false, selectors: [], bound: { inputTokens: 0n, outputTokens: 0n, units }, body: { kind: "json", value: body } };
+  return { model, stream: entry && streamFormat === "sse", selectors: [], bound: { inputTokens: 0n, outputTokens: 0n, units }, body: { kind: "json", value: body } };
 }
 
 /** `character_bound`: most characters a vendor may bill: one per ASCII character, two per other character. */
@@ -173,7 +184,21 @@ export function speechCharacters(api: ApiRequest): bigint | undefined {
   return BigInt(chars(input) + (typeof instructions === "string" ? chars(instructions) : 0));
 }
 
-function decodeTranscription(protocol: Protocol, all: readonly FormPart[]): ApiRequest {
+/** The formats the entry answers a transcript in: the ones that carry `usage` (the standard's clause 11.7). */
+const ENTRY_TRANSCRIPTS: Readonly<Record<string, readonly string[]>> = {
+  open_ai_transcriptions: ["json", "verbose_json", "diarized_json"],
+  open_ai_translations: ["json", "verbose_json"],
+};
+
+/** 400 for a transcript format with nowhere to report usage. */
+function usageFormatOnly(protocol: Protocol): ApiError {
+  const formats = (ENTRY_TRANSCRIPTS[protocol] ?? []).map((format) => `\`${format}\``).join(", ");
+  return invalid("unsupported_response_format")
+    .withMessage(`This address answers this API in ${formats}: the formats that report the usage Gray bills on. Gray converts no format; build \`text\`, \`srt\` or \`vtt\` from the JSON answer.`)
+    .withParam("response_format");
+}
+
+function decodeTranscription(protocol: Protocol, all: readonly FormPart[], entry: boolean): ApiRequest {
   const bad = () => invalid("invalid_form_field");
   const allowed = protocol === "open_ai_translations" ? TRANSLATION_FIELDS : TRANSCRIPTION_FIELDS;
   const parts = all.filter((p) => !OPENAI_LINKING_FIELDS.includes(p.name));
@@ -185,11 +210,13 @@ function decodeTranscription(protocol: Protocol, all: readonly FormPart[]): ApiR
   if (files.length > 1) throw invalid("duplicate_form_field");
   const file = files[0] as FormPart;
   if (file.fileName === undefined || partSize(file) === 0) throw bad();
-  const format = parseTranscript(formText(parts, "response_format"));
+  const asked = formText(parts, "response_format");
+  if (entry && asked !== undefined && !(ENTRY_TRANSCRIPTS[protocol] ?? []).includes(asked)) throw usageFormatOnly(protocol);
+  const format = entry && asked === "diarized_json" ? "json" : parseTranscript(asked);
   if (format === undefined) throw invalid("unsupported_response_format");
   const stream = formText(parts, "stream");
-  if (stream === "true") throw invalid("streaming_unsupported");
-  if (stream !== undefined && stream !== "false") throw bad();
+  if (stream === "true" && !entry) throw invalid("streaming_unsupported");
+  if (stream !== undefined && stream !== "false" && stream !== "true") throw bad();
   const temperature = formText(parts, "temperature");
   if (temperature !== undefined) {
     const t = parseRustF64(temperature);
@@ -205,7 +232,7 @@ function decodeTranscription(protocol: Protocol, all: readonly FormPart[]): ApiR
     if (!(text === "word" || text === "segment") || format !== "verbose_json") throw bad();
   }
   // The client's format stays in the form for the answer; the format asked upstream is set when sent.
-  return { model, stream: false, selectors: [], bound: UNBOUNDED, body: { kind: "multipart", parts } };
+  return { model, stream: entry && stream === "true", selectors: [], bound: UNBOUNDED, body: { kind: "multipart", parts } };
 }
 
 /**

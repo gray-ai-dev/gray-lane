@@ -425,7 +425,7 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
  * Whether a route of `snapshot` belongs to the lane whose mode is `mode`. The main mode: every route but a
  * `lane_relay` one, so Gray's public gateway never sends to a relay (design v2 section B). The lane mode: every
  * `lane_relay` route, and the endpoint routes the lane's entry serves (docs/design/lane-provider-routes.md section 2,
- * `entryEndpointRoute`: `bearer` or `protocol_native` on Messages, Chat, Responses or Gemini, no adapter, a base URL egress's
+ * `entryEndpointRoute`: `bearer` or `protocol_native` on one of ENTRY_ENDPOINT_PROTOCOLS, no adapter, a base URL egress's
  * `/route/` kind carries). An endpoint route is in both modes: the `api` address keeps serving it.
  *
  * Which routes are confidential is not this: the catalog marks `lane_relay` routes alone (gray-jobs src/catalog.ts

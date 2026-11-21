@@ -135,10 +135,10 @@ export {
   wholeGeminiView,
 } from "./apis/gemini-images.ts";
 export { type EmbeddingShape, type EmbeddingsShape, embeddingShape, embeddingsAnswer, embeddingsShapeOf, widthOfShape } from "./apis/embeddings.ts";
-export { rerankAnswer, rerankMayCut } from "./apis/rerank.ts";
+export { entryRerankAnswer, rerankAnswer, rerankMayCut } from "./apis/rerank.ts";
 export { systemOneAnswer } from "./apis/systemone.ts";
 export { audioContentType, speechCharacters, transcriptAnswer, transcriptPassesThrough, transcriptionBilled } from "./apis/audio.ts";
-export { type Answered, compatibleImagesBilled, delivered } from "./apis/images.ts";
+export { type Answered, compatibleImagesBilled, delivered, entryImagesBilled, entryImagesStreamBilled, isImageLink } from "./apis/images.ts";
 export { type Budget, type EgressPolicy, type Fetcher, downloadImage, isImage, isInlineImage, vetUrl } from "./apis/egress.ts";
 export { MAX_PARTS, MAX_PART_LABEL, formBoundary, receiveForm } from "./apis/form.ts";
 export { type Created, CreateRejected, DEFAULT_RESERVED_SECONDS, OPENAI_DEFAULT_SECONDS, canonicalSize, videoCreated } from "./apis/video.ts";
