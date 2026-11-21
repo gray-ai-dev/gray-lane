@@ -1,14 +1,16 @@
+import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 import { ReceiptBuilder } from "@gray/attest";
 import { ApiError } from "@gray/errors";
 import { type JsonObject, isObject, readSerdeBytes } from "@gray/json";
-import { GRAY_LANE_REWRITES_V2, apiRewriteRuleFor, applyApiChanges, formBodyBoundary, formBoundaryOf, isRewriteApi, type GrayApiOp, type RewriteApi } from "@gray/lane";
+import { GRAY_LANE_REWRITES_V2, apiChangeSegments, apiRewriteRuleFor, formBodyBoundary, formBoundaryOf, isRewriteApi, type GrayApiOp, type RewriteApi } from "@gray/lane";
 import { type FormPart, formBoundary, partText } from "@gray/media";
 import { DEFAULT_ACCEPT, OPENAI_LINKING_FIELDS, type Protocol } from "@gray/protocol";
 import { ENTRY_STANDARD_PROTOCOLS } from "@gray/snapshot";
 import { readBody } from "../body.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
-import { addReceiptEvents, laneDuplicateKey, type Forwarded } from "./hooks.ts";
+import { addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 
 /**
@@ -19,11 +21,13 @@ import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
  *
  * - The body. JSON is read whole within the lane's body cap. A form is read whole within LANE_FORM_MAX_BYTES and held
  *   in memory, never written to disk: `model` may come after a file, and the route and the hold must be known before
- *   anything is sent. Its bytes count against the isolate's memory budget (retained.ts `AnswerShare.holdBody`).
+ *   anything is sent. It is held once: its bytes count, from before the first is read, against what the process holds
+ *   of forms together (LANE_FORM_HELD_MAX_BYTES, retained.ts `AnswerShare.holdBody`).
  * - The declared changes. The entry changes the client's bytes in place and declares each change under
  *   `gray-lane-rewrites-v2` (@gray/lane `applyApiChanges`, the function a verifier replays): `model` set to the
  *   provider's name for the model, and the end-user and routing members taken out. Nothing else of the body changes,
- *   and nothing is serialized again.
+ *   and nothing is serialized again. A form's forwarded bytes are never made as a second copy: they are sent, and
+ *   hashed for the receipt, as views over the held form with the written value between them (`entryForwarded`).
  * - The form's boundary. A form the entry changes begins with its boundary line, whose boundary is the `boundary`
  *   parameter of the request's `content-type`: a receipt hashes bodies and carries no header, so this is what lets a
  *   customer replay the form's ops from the body alone, and what makes the provider, told that header, read the form
@@ -55,15 +59,19 @@ export interface EntryBodyLimits {
   readonly formBytes: number;
   /** REQUEST_BODY_MS. */
   readonly waitMs: number;
-  /** ANSWER_HELD_MAX_BYTES: what the isolate's pool holds of the answers and held bodies in flight. */
+  /** LANE_FORM_HELD_MAX_BYTES: what the process holds of forms in flight together. */
   readonly pooledBytes: number;
 }
 
 const invalidMultipart = (message: string): ApiError => new ApiError(400, "invalid_multipart").withMessage(message);
 
-/** 429 for a form the isolate cannot hold now: Gray's own limit, and nothing was sent. */
+/**
+ * 429 for a form the process cannot hold now: Gray's own limit, answered from the request's head, before the form is
+ * read, and nothing was sent. No `retry-after`, as the catalog has it for `gateway_memory` (docs/api-errors.md): room
+ * comes back when another request's provider answers, a time Gray does not know, so the client's own backoff applies.
+ */
 function formCapacity(): ApiError {
-  return new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory").withRetryAfter(1n);
+  return new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory");
 }
 
 /** The bytes of `whole` as a stream of views, for a reader that takes a body in chunks. */
@@ -85,10 +93,11 @@ function viewsOf(whole: Uint8Array, chunkBytes: number): ReadableStream<Uint8Arr
 export const ENTRY_FORM_CHUNK_BYTES = 64 * 1024;
 
 /**
- * Reads the body of a standard API's request at the entry (section 2.3). A form (`form`) is held whole: its bytes
- * count in `share` from before they are read (twice their stated length, or twice the bound when none is stated: the
- * form and the bytes forwarded of it), so the isolate never holds a form it did not make room for. `held` hears the
- * bytes the read holds as it goes. A refusal as an ApiError; nothing is held after one.
+ * Reads the body of a standard API's request at the entry (section 2.3). A form (`form`) is held whole, once: its
+ * bytes count in `share` from before they are read, so the process never holds a form it did not make room for. A
+ * form that states its length takes that length, read into one buffer of it. One that states none is read in chunks
+ * and joined, so it takes twice the bound while it is read (the chunks and their join, body.ts) and its own length
+ * after. `held` hears the bytes the read holds as it goes. A refusal as an ApiError; nothing is held after one.
  */
 export async function readEntryBody(request: Request, protocol: Protocol, form: boolean, limits: EntryBodyLimits, share: AnswerShare, held: (bytes: number) => void): Promise<EntryBody | ApiError> {
   if (!form) {
@@ -119,18 +128,19 @@ export async function readEntryBody(request: Request, protocol: Protocol, form: 
   const header = request.headers.get("content-length");
   const declared = header !== null && /^[0-9]+$/.test(header) ? Number(header) : null;
   if (declared !== null && declared > limits.formBytes) return formTooLarge(limits.formBytes);
-  // Room for the form and for the bytes forwarded of it, before a byte is read.
-  if (!share.holdBody(2 * (declared ?? limits.formBytes), limits.pooledBytes)) return formCapacity();
+  // Room for the form before a byte is read.
+  if (!share.holdBody(declared ?? 2 * limits.formBytes, limits.pooledBytes)) return formCapacity();
   const letGo = (error: ApiError): ApiError => {
     share.holdBody(0, limits.pooledBytes);
     held(0);
     return error;
   };
-  const read = await readBody(request, { protocol, limit: limits.formBytes, parseMax: limits.formBytes, rawMax: limits.formBytes, waitMs: limits.waitMs }, undefined, held);
+  // `whole`: the stated length is reserved above, so the read takes one buffer of it and never a second while it grows.
+  const read = await readBody(request, { protocol, limit: limits.formBytes, parseMax: limits.formBytes, rawMax: limits.formBytes, waitMs: limits.waitMs, whole: true }, undefined, held);
   if (!read.ok) return letGo(read.error.code === "request_body_limit" ? formTooLarge(limits.formBytes) : read.error);
   if (read.body.tier === "C") return letGo(new ApiError(500, "internal_error"));
   const bytes = read.body.bytes;
-  share.holdBody(2 * bytes.length, limits.pooledBytes);
+  share.holdBody(bytes.length, limits.pooledBytes);
   held(bytes.length);
   // The fields and the file heads, by the parser the API Worker reads a form with (form.ts): no file's bytes are copied.
   const parsed = await readForm(
@@ -221,17 +231,104 @@ export function entryOps(protocol: Protocol, body: EntryBody, upstreamModel: str
   return ops;
 }
 
+/** What an attempt forwards of a standard API's body. */
+export type EntryForward =
+  | {
+      readonly ok: true;
+      /** The forwarded bytes' length and their `sha256:` hash, as the receipt names them. */
+      readonly length: number;
+      readonly hash: string;
+      /**
+       * The bytes this forward holds beyond the client's own: a JSON body's changed copy; of a form only the values
+       * written, the rest being views over the held form.
+       */
+      readonly ownBytes: number;
+      readonly events: readonly Readonly<Record<string, unknown>>[];
+      /** The body as `sendable` takes it (upstream.ts): a fresh stream for each attempt, in chunks of `chunkBytes` at most. */
+      body(chunkBytes: number): { readonly length: number; readonly stream: () => ReadableStream<Uint8Array> };
+    }
+  | { readonly ok: false; readonly error: ApiError };
+
+/** `pieces` in order as a stream of views of at most `chunkBytes`, made as the reader pulls; nothing is copied. */
+function piecesStream(pieces: readonly Uint8Array[], chunkBytes: number): ReadableStream<Uint8Array> {
+  let index = 0;
+  let at = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        while (index < pieces.length && at >= (pieces[index] as Uint8Array).length) {
+          index += 1;
+          at = 0;
+        }
+        if (index >= pieces.length) return controller.close();
+        const piece = pieces[index] as Uint8Array;
+        controller.enqueue(piece.subarray(at, Math.min(piece.length, at + chunkBytes)));
+        at += chunkBytes;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+/** The runtime's streamed digest (workerd's `crypto.DigestStream`); Node has none. */
+type DigestStreamOf = new (algorithm: string) => WritableStream<Uint8Array> & { readonly digest: Promise<ArrayBuffer> };
+
+/**
+ * `sha256:` of `pieces` in order, read where they lie, by the runtime's own SHA-256 and not the JavaScript one the
+ * small bodies use (hooks.ts `bodyHashOf`): the entry's process runs its JavaScript on one thread, and a form's two
+ * hashes are the most that thread does for it. Measured on the build box (2026-11-21 UTC, Node 24, one 24 MiB form):
+ * 83 ms a hash in JavaScript, 14 ms natively; with ten such forms arriving together the JavaScript
+ * hashes held the thread about two seconds and two of the ten failed their billing admission, whose attempt has
+ * 1.5 s (docs/design/standard-media-at-entry.md D4). One piece goes to WebCrypto's digest whole; several go through
+ * the streamed digest, a view at a time, so no joined copy is made. Without one (the Node tests) the JavaScript hash
+ * reads the pieces: the same digest.
+ */
+export async function piecesHash(pieces: readonly Uint8Array[]): Promise<string> {
+  if (pieces.length === 1) return `sha256:${bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", pieces[0] as Uint8Array)))}`;
+  const Digest = (crypto as unknown as { readonly DigestStream?: DigestStreamOf }).DigestStream;
+  if (Digest === undefined) {
+    const hash = sha256.create();
+    for (const piece of pieces) hash.update(piece);
+    return `sha256:${bytesToHex(hash.digest())}`;
+  }
+  const stream = new Digest("SHA-256");
+  const writer = stream.getWriter();
+  for (const piece of pieces) await writer.write(piece);
+  await writer.close();
+  return `sha256:${bytesToHex(new Uint8Array(await stream.digest))}`;
+}
+
+/** `sha256:` of a standard API's body as the client sent it (`request.received`), by the runtime's own SHA-256 (`piecesHash`). */
+export function entryBodyHash(body: EntryBody): Promise<string> {
+  return piecesHash([body.bytes]);
+}
+
 /**
  * The bytes an attempt forwards and the events that declare them: `applyApiChanges(received, ops)` under
- * gray-lane-rewrites-v2, the function a receipt's replay runs. A refusal is the entry's fixed answer and never
- * echoes the body: a member name twice is `lane_duplicate_key`; a form the byte rules refuse is `invalid_multipart`
- * (a field the op names twice or as a file among them); a provider's model name the policy does not allow is the
- * route's fault, never sent.
+ * gray-lane-rewrites-v2, the function a receipt's replay runs, as the pieces @gray/lane `apiChangeSegments` gives of
+ * it. A form's pieces are views over the held form and the value written, so the form is held once however many
+ * attempts send it: each attempt's stream is made anew from the same pieces, and the hash the receipt carries is
+ * taken over them in place (`piecesHash`). A refusal is the entry's fixed answer and never echoes the body: a member
+ * name twice is `lane_duplicate_key`; a form the byte rules refuse is `invalid_multipart` (a field the op names twice
+ * or as a file among them); a provider's model name the policy does not allow is the route's fault, never sent.
  */
-export function entryForwarded(protocol: Protocol, body: EntryBody, upstreamModel: string): Forwarded {
+export async function entryForwarded(protocol: Protocol, body: EntryBody, upstreamModel: string): Promise<EntryForward> {
   if (!isRewriteApi(protocol)) return { ok: false, error: new ApiError(500, "internal_error") };
-  const applied = applyApiChanges(body.bytes, protocol, { kind: body.kind }, { ops: entryOps(protocol, body, upstreamModel) });
-  if (applied.ok) return { ok: true, bytes: applied.forwarded, events: applied.events.map((event) => event as unknown as Readonly<Record<string, unknown>>), applied: [] };
+  const applied = apiChangeSegments(body.bytes, protocol, { kind: body.kind }, { ops: entryOps(protocol, body, upstreamModel) });
+  if (applied.ok) {
+    const pieces = applied.segments;
+    const received = body.bytes.buffer;
+    let ownBytes = 0;
+    for (const piece of pieces) if (piece.buffer !== received) ownBytes += piece.length;
+    return {
+      ok: true,
+      length: applied.length,
+      hash: await piecesHash(pieces),
+      ownBytes,
+      events: applied.events.map((event) => event as unknown as Readonly<Record<string, unknown>>),
+      body: (chunkBytes) => ({ length: applied.length, stream: () => piecesStream(pieces, chunkBytes) }),
+    };
+  }
   switch (applied.code) {
     case "duplicate_key":
       return { ok: false, error: laneDuplicateKey() };

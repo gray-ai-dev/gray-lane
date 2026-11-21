@@ -78,15 +78,28 @@ export class Retained {
  * limit. The pool sums those same numbers and holds the isolate to ANSWER_HELD_MAX_BYTES too: its
  * source keeps one held answer at a third of the 180 MB an isolate reached before it reset
  * (m0/memory.md), and the sum keeps every held answer of the isolate together there.
+ *
+ * The forms the confidential entry holds whole are summed beside the answers, not among them (`bodyBytes`, against
+ * LANE_FORM_HELD_MAX_BYTES; docs/design/standard-media-at-entry.md section 2.3 and D4): the entry's process runs in a
+ * CVM, whose memory that bound is measured from, and a sum of its own keeps forms from taking the answers' room or
+ * answers the forms'.
  */
 export class AnswerPool {
   private total = 0;
+  private bodies = 0;
   /** The most held at once (tests). */
   peak = 0;
+  /** The most the held bodies took at once (tests). */
+  bodyPeak = 0;
 
   /** What the answers in flight hold now. */
   get bytes(): number {
     return this.total;
+  }
+
+  /** What the held bodies in flight take now. */
+  get bodyBytes(): number {
+    return this.bodies;
   }
 
   /** A request's part of the pool; `release` it when the request ends. */
@@ -99,13 +112,19 @@ export class AnswerPool {
     this.total += delta;
     if (this.total > this.peak) this.peak = this.total;
   }
+
+  /** Moves `delta` bytes of held bodies into (or out of) their sum. */
+  moveBody(delta: number): void {
+    this.bodies += delta;
+    if (this.bodies > this.bodyPeak) this.bodyPeak = this.bodies;
+  }
 }
 
 /**
- * One request's part of the isolate's AnswerPool: its answer's (`hold`), its tool-call ids' (the
- * originals its handles opened and the handles its answer issued, `holdIds`) and a body it holds
- * whole outside the body tiers (`holdBody`: a form of a standard API at the confidential entry, and
- * the bytes it forwards of it), summed against the same limit.
+ * One request's part of the isolate's AnswerPool: its answer's (`hold`) and its tool-call ids' (the
+ * originals its handles opened and the handles its answer issued, `holdIds`), summed against the same
+ * limit; and a body it holds whole outside the body tiers (`holdBody`: a form of a standard API at the
+ * confidential entry), summed with the other requests' held bodies against a limit of their own.
  */
 export class AnswerShare {
   private readonly pool: AnswerPool;
@@ -118,9 +137,9 @@ export class AnswerShare {
     this.pool = pool;
   }
 
-  /** What this request holds in the pool now. */
+  /** What this request's answer and ids hold in the pool now. */
   get bytes(): number {
-    return this.mine + this.ids + this.body;
+    return this.mine + this.ids;
   }
 
   /** The most the request's tool-call ids may hold in all, as the pool stands: `limit` less what the others hold, and this request's answer. */
@@ -156,13 +175,13 @@ export class AnswerShare {
 
   /**
    * The request's held body now takes `bytes` (docs/design/standard-media-at-entry.md section 2.3: a form the
-   * entry holds whole counts against the isolate's memory budget, as a held answer does): false, and nothing
-   * moved, when it grows and the isolate would then hold more than `limit`; letting go always succeeds.
+   * entry holds whole counts against the process's memory): false, and nothing moved, when it grows and the
+   * bodies held in the isolate would then take more than `limit` together; letting go always succeeds.
    */
   holdBody(bytes: number, limit: number): boolean {
     if (this.released) return true;
-    if (bytes > this.body && this.pool.bytes - this.body + bytes > limit) return false;
-    this.pool.move(bytes - this.body);
+    if (bytes > this.body && this.pool.bodyBytes - this.body + bytes > limit) return false;
+    this.pool.moveBody(bytes - this.body);
     this.body = bytes;
     return true;
   }
@@ -181,7 +200,8 @@ export class AnswerShare {
   /** The request ended: what it held leaves the pool. Idempotent. */
   release(): void {
     if (this.released) return;
-    this.pool.move(-(this.mine + this.ids + this.body));
+    this.pool.move(-(this.mine + this.ids));
+    this.pool.moveBody(-this.body);
     this.mine = 0;
     this.ids = 0;
     this.body = 0;

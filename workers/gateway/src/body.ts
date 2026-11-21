@@ -51,6 +51,12 @@ export interface BodyLimits {
   readonly waitMs: number;
   /** The timers REQUEST_BODY_MS runs on: the platform's when absent (production); a fault test's held clock (`GatewayDeps.waitTimers`). */
   readonly timers?: { setTimeout(handler: () => void, ms: number): unknown; clearTimeout(handle: unknown): void };
+  /**
+   * The caller made room for the stated length before this read (the entry's forms, lane/standard-api.ts
+   * `readEntryBody`, whose key is checked and whose pool is reserved first): the buffer is that length from the first
+   * byte, so no smaller one is copied into a larger one as the body arrives.
+   */
+  readonly whole?: boolean;
 }
 
 export function bodyTooLarge(protocol: Protocol, limit: number): ApiError {
@@ -78,7 +84,7 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
   // A stated length (tiers A and B): start with a modest buffer (at most 64 KiB) and grow as bytes arrive so an
   // unauthenticated request naming a 64 MiB Content-Length cannot pre-allocate 64 MiB before sending a byte.
   const INITIAL_DECLARED_BUFFER = 65_536;
-  let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
+  let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(limits.whole === true ? declared : Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
   let spooled: Spool | null = declared !== null && declared > limits.rawMax ? await newSpool() : null;
   const chunks: Uint8Array[] = [];
   let chunked = 0;

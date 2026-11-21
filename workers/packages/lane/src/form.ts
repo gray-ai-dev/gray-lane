@@ -190,6 +190,76 @@ export function applyFormOps(received: Uint8Array, ops: readonly GrayFormOp[]): 
   return { ok: true, forwarded: body };
 }
 
+/**
+ * `applyFormOps(received, ops).forwarded` as pieces in order: views over `received` for the bytes kept, and one small
+ * array for each value written. Their concatenation is that result byte for byte, and what `applyFormOps` refuses this
+ * refuses with the same code, so a caller that sends or hashes the forwarded form need not hold a second copy of a
+ * large one (the entry: docs/design/standard-media-at-entry.md section 2.3). `applyFormOps` stays the definition, and
+ * the function a verifier replays; test/form-segments.test.ts holds this one to it over the golden vectors and over
+ * random forms and ops.
+ *
+ * Why no second reading is needed here. `applyFormOps` reads the result again after each op. A set writes a value
+ * that holds no CR or LF between the part's empty line and the CRLF before the next delimiter, so the delimiter can
+ * occur in the result only where it stood before or inside the value: no occurrence can span the value's edges, whose
+ * neighbours are a CR and an LF, bytes no boundary holds. The second reading therefore fails exactly when the value
+ * holds the delimiter. A removal takes a part from its delimiter line to the next one: what stood before ends in the
+ * CRLF that preceded it (or is nothing), what follows begins with a delimiter, so every other part reads as it did,
+ * and the reading fails exactly when no part is left. Each op names a part of its own (a name that stands once), so
+ * the ops' byte ranges in `received` do not overlap. Two ops on one name are outside this argument: they are applied
+ * by `applyFormOps` itself, and the result is one piece.
+ */
+export function formOpSegments(received: Uint8Array, ops: readonly GrayFormOp[]): { readonly ok: true; readonly segments: readonly Uint8Array[]; readonly length: number } | Refusal<FormRefusalCode> {
+  if (!(received instanceof Uint8Array)) return invalid("the body is not a byte array");
+  if (new Set(ops.map((op) => op.path)).size !== ops.length) {
+    const whole = applyFormOps(received, ops);
+    return whole.ok ? { ok: true, segments: [whole.forwarded], length: whole.forwarded.length } : whole;
+  }
+  const boundary = formBodyBoundary(received);
+  if (boundary === null) return refusal("boundary", "the body does not begin with a boundary line: two hyphens, 1 to 70 RFC 2046 boundary characters, CRLF");
+  const dash = ENCODER.encode(`--${boundary}`);
+  const scan = scanForm(received, dash);
+  if (!scan.ok) return scan;
+  /** The parts still standing, and each op's byte range in `received` with what is written there. */
+  let parts = scan.parts;
+  const edits: { readonly start: number; readonly end: number; readonly value: Uint8Array | null }[] = [];
+  for (const op of ops) {
+    const name = ENCODER.encode(op.path);
+    const named = parts.filter((part) => sameBytes(part.name, name));
+    if (named.length === 0) return refusal("not_found", "the form has no field of that name");
+    if (named.length > 1) return refusal("duplicate_field", "the form holds a field of that name twice");
+    const part = named[0] as FormPart;
+    if (part.file) return refusal("file_field", "the field of that name is a file");
+    if (op.op === "set_form_field") {
+      if (typeof op.value !== "string" || !op.value.isWellFormed()) return refusal("value", "the value is not well-formed text");
+      const value = ENCODER.encode(op.value);
+      if (value.includes(CR) || value.includes(LF)) return refusal("value", "the value holds a line break");
+      if (!occurrences(value, dash).next().done) return refusal("value", "the value changes how the form reads");
+      edits.push({ start: part.valueStart, end: part.valueEnd, value });
+    } else {
+      // A removal that leaves no part leaves no form.
+      if (parts.length === 1) return invalid("the form has no part");
+      edits.push({ start: part.start, end: part.end, value: null });
+      parts = parts.filter((other) => other !== part);
+    }
+  }
+  edits.sort((left, right) => left.start - right.start);
+  const segments: Uint8Array[] = [];
+  let length = 0;
+  let at = 0;
+  const push = (piece: Uint8Array): void => {
+    if (piece.length === 0) return;
+    segments.push(piece);
+    length += piece.length;
+  };
+  for (const edit of edits) {
+    push(received.subarray(at, edit.start));
+    if (edit.value !== null) push(edit.value);
+    at = edit.end;
+  }
+  push(received.subarray(at));
+  return { ok: true, segments, length };
+}
+
 /** Whether two readings hold the same fields in the same order: each name, and whether it is a file. */
 function sameFields(left: readonly FormPart[], right: readonly FormPart[]): boolean {
   return left.length === right.length && left.every((part, index) => sameBytes(part.name, (right[index] as FormPart).name) && part.file === (right[index] as FormPart).file);

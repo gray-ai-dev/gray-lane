@@ -14,7 +14,7 @@
  */
 import { isFormFieldName, isFormOp, requestModifiedEvent, type RequestModifiedEvent } from "@gray/attest";
 import { applyMemberOps, changeValueSha256, type ChangeRefusalCode, type GrayRewriteOp } from "./changes.ts";
-import { applyFormOps, type FormRefusalCode, type GrayFormOp } from "./form.ts";
+import { applyFormOps, formOpSegments, type FormRefusalCode, type GrayFormOp } from "./form.ts";
 import { GRAY_LANE_REWRITES_V2, apiRewriteRuleFor, isRewriteApi, ruleAllowsValue, validateRewritePolicyV2, type LaneRewritePolicyV2, type RewriteApi, type RewriteRule } from "./policy.ts";
 import { refusal, type Refusal } from "./refusal.ts";
 import { isSha256Hex } from "./sha256.ts";
@@ -46,27 +46,76 @@ export type ApiChangeRefusalCode = ChangeRefusalCode | FormRefusalCode;
  * read. A refusal is a value, never a throw.
  */
 export function applyApiChanges(received: Uint8Array, api: RewriteApi, body: ApiBody, options: ApplyApiChangesOptions): ApplyApiChangesOk | Refusal<ApiChangeRefusalCode> {
-  if (!isRewriteApi(api)) return refusal("unknown_protocol", "the API is not one gray-lane-rewrites-v2 lists");
-  if (options === null || typeof options !== "object") return refusal("op_shape", "the changes are not an object");
-  if (!Array.isArray(options.ops)) return refusal("op_shape", "ops is not an array");
-  if (body === null || typeof body !== "object" || (body.kind !== "json" && body.kind !== "form")) return refusal("op_shape", "the body is neither JSON nor a form");
-  let policy = GRAY_LANE_REWRITES_V2;
-  if (options.policy !== undefined) {
-    try {
-      policy = validateRewritePolicyV2(options.policy);
-    } catch {
-      return refusal("policy", "the caller's lane rewrite policy is not a valid policy document");
-    }
-  }
+  const checked = checkedChanges(api, body, options);
+  if (!("policy" in checked)) return checked;
+  const { policy } = checked;
   if (body.kind === "json") {
     // `applyMemberOps` refuses an op that is not a member op by its shape, before it asks for a rule.
     const changed = applyMemberOps(received, options.ops as readonly GrayRewriteOp[], (op) => memberRule(policy, api, op), policy.id);
     return changed.ok ? { ok: true, forwarded: changed.bytes, events: changed.events } : changed;
   }
+  const ops = checkedFormOps(options.ops, api, policy);
+  if (!Array.isArray(ops)) return ops;
+  const changed = applyFormOps(received, ops);
+  if (!changed.ok) return changed;
+  return { ok: true, forwarded: changed.forwarded, events: formEvents(ops, policy) };
+}
 
+export interface ApiChangeSegmentsOk {
+  readonly ok: true;
+  /** The bytes to forward, as pieces in order. */
+  readonly segments: readonly Uint8Array[];
+  /** Their length together. */
+  readonly length: number;
+  /** One `request.modified` event per op, in application order. */
+  readonly events: readonly RequestModifiedEvent[];
+}
+
+/**
+ * `applyApiChanges` with the forwarded bytes as pieces: for a form, views over `received` and the values written
+ * (form.ts `formOpSegments`), so the caller holds no second copy of a large form; for a JSON body, the one array
+ * `applyApiChanges` makes. The pieces' concatenation, the events and every refusal are `applyApiChanges`' own, which
+ * stays what a verifier replays.
+ */
+export function apiChangeSegments(received: Uint8Array, api: RewriteApi, body: ApiBody, options: ApplyApiChangesOptions): ApiChangeSegmentsOk | Refusal<ApiChangeRefusalCode> {
+  const checked = checkedChanges(api, body, options);
+  if (!("policy" in checked)) return checked;
+  const { policy } = checked;
+  if (body.kind === "json") {
+    const changed = applyApiChanges(received, api, body, options);
+    return changed.ok ? { ok: true, segments: [changed.forwarded], length: changed.forwarded.length, events: changed.events } : changed;
+  }
+  const ops = checkedFormOps(options.ops, api, policy);
+  if (!Array.isArray(ops)) return ops;
+  const changed = formOpSegments(received, ops);
+  if (!changed.ok) return changed;
+  return { ok: true, segments: changed.segments, length: changed.length, events: formEvents(ops, policy) };
+}
+
+/** The checks every change set passes before a byte is read: the API, the shape of the arguments, the policy. */
+function checkedChanges(api: RewriteApi, body: ApiBody, options: ApplyApiChangesOptions): { readonly policy: LaneRewritePolicyV2 } | Refusal<ApiChangeRefusalCode> {
+  if (!isRewriteApi(api)) return refusal("unknown_protocol", "the API is not one gray-lane-rewrites-v2 lists");
+  if (options === null || typeof options !== "object") return refusal("op_shape", "the changes are not an object");
+  if (!Array.isArray(options.ops)) return refusal("op_shape", "ops is not an array");
+  if (body === null || typeof body !== "object" || (body.kind !== "json" && body.kind !== "form")) return refusal("op_shape", "the body is neither JSON nor a form");
+  if (options.policy === undefined) return { policy: GRAY_LANE_REWRITES_V2 };
+  try {
+    return { policy: validateRewritePolicyV2(options.policy) };
+  } catch {
+    return refusal("policy", "the caller's lane rewrite policy is not a valid policy document");
+  }
+}
+
+/** One `request.modified` event per form op, naming the policy. */
+function formEvents(ops: readonly GrayFormOp[], policy: LaneRewritePolicyV2): RequestModifiedEvent[] {
+  return ops.map((op) => requestModifiedEvent({ op: op.op, path: op.path, ...(op.op === "set_form_field" ? { value: op.value } : {}), declaredIn: policy.id }) as unknown as RequestModifiedEvent);
+}
+
+/** A form's ops, each checked against the policy for `api`, each path once; or the refusal. */
+function checkedFormOps(given: readonly unknown[], api: RewriteApi, policy: LaneRewritePolicyV2): GrayFormOp[] | Refusal<ApiChangeRefusalCode> {
   const ops: GrayFormOp[] = [];
   const seen = new Set<string>();
-  for (const op of options.ops as readonly unknown[]) {
+  for (const op of given) {
     if (op === null || typeof op !== "object") return refusal("op_shape", "an op is not an object");
     const candidate = op as { readonly op?: unknown; readonly path?: unknown; readonly value?: unknown };
     if (candidate.op !== "set_form_field" && candidate.op !== "remove_form_field") return refusal("op_shape", "a form takes set_form_field and remove_form_field only");
@@ -81,10 +130,7 @@ export function applyApiChanges(received: Uint8Array, api: RewriteApi, body: Api
     seen.add(candidate.path);
     ops.push(value === undefined ? { op: "remove_form_field", path: candidate.path } : { op: "set_form_field", path: candidate.path, value });
   }
-  const changed = applyFormOps(received, ops);
-  if (!changed.ok) return changed;
-  const events = ops.map((op) => requestModifiedEvent({ op: op.op, path: op.path, ...(op.op === "set_form_field" ? { value: op.value } : {}), declaredIn: policy.id }) as unknown as RequestModifiedEvent);
-  return { ok: true, forwarded: changed.forwarded, events };
+  return ops;
 }
 
 /** The member rule of `policy` for `op` on `api`'s JSON body, or undefined. */

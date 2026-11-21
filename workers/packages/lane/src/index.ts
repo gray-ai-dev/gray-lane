@@ -129,12 +129,14 @@ export {
   type RewriteRule,
   type RewriteValueRule,
 } from "./policy.ts";
-export { FORM_BOUNDARY_MAX_BYTES, FORM_HEADER_MAX_BYTES, FORM_NAME_MAX_BYTES, applyFormOps, formBodyBoundary, formBoundaryOf, isFormBoundary, type FormRefusalCode, type GrayFormOp } from "./form.ts";
+export { FORM_BOUNDARY_MAX_BYTES, FORM_HEADER_MAX_BYTES, FORM_NAME_MAX_BYTES, applyFormOps, formBodyBoundary, formBoundaryOf, formOpSegments, isFormBoundary, type FormRefusalCode, type GrayFormOp } from "./form.ts";
 export {
+  apiChangeSegments,
   applyApiChanges,
   replayApiChanges,
   type ApiBody,
   type ApiChangeRefusalCode,
+  type ApiChangeSegmentsOk,
   type ApplyApiChangesOk,
   type ApplyApiChangesOptions,
   type GrayApiOp,

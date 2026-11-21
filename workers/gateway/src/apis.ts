@@ -87,9 +87,9 @@ import { type GatewayDeps, InferenceRun } from "./inference.ts";
 import { forwardedAnswer } from "./entry-forward.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { apiUnreachable } from "./lane/api-forward.ts";
-import { type Forwarded, type ResponseHash, bodyHashOf, egressBeforeVendor, egressSidecarFailure, forwardedStream, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
+import { type ResponseHash, bodyHashOf, egressBeforeVendor, egressSidecarFailure, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
-import { type EntryBody, ENTRY_FORM_CHUNK_BYTES, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
+import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHash, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
 import type { LaneApiForward, LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
 import { answerReader, type MediaAnswer } from "./media-answer.ts";
 import { type VideoCall, VideoJobConflict, alert, holdOf, mediaFetch, mediaRouteOf, mediaSettings, replayVideoCreate, startVideoJob, videoHoldLifetimeMs } from "./media.ts";
@@ -478,7 +478,7 @@ export class ModelApiRun {
   private entryBody: EntryBody | null = null;
   private laneReceivedHash: string | null = null;
   /** The bytes forwarded to the last route attempted, by its provider's name for the model: one copy at a time. */
-  private entryForwards: { readonly upstreamModel: string; readonly forwarded: Forwarded } | null = null;
+  private entryForwards: { readonly upstreamModel: string; readonly forwarded: EntryForward } | null = null;
   /** The receipt id, once a body was handed to a provider's fetch (inference.ts `laneReceiptId`). */
   private laneReceiptId: string | null = null;
   /** The committed attempt's draft, and the draft of the last attempt whose body a fetch took (inference.ts, D53). */
@@ -1172,7 +1172,7 @@ export class ModelApiRun {
     const jsonBytes = Math.min(cfg.bodyParseMaxBytes, lane.timing.bodyMaxBytes);
     // The client's upload is REQUEST_BODY_MS's, not the pre phase's.
     this.budget.pause();
-    const body = await readEntryBody(this.request, this.protocol, form, { jsonBytes, formBytes: cfg.laneFormMaxBytes, waitMs: cfg.requestBodyMs, pooledBytes: cfg.answerHeldMaxBytes }, this.answerShare, (bytes) => this.retained.set("request_body", bytes));
+    const body = await readEntryBody(this.request, this.protocol, form, { jsonBytes, formBytes: cfg.laneFormMaxBytes, waitMs: cfg.requestBodyMs, pooledBytes: cfg.laneFormHeldMaxBytes }, this.answerShare, (bytes) => this.retained.set("request_body", bytes));
     this.budget.resume();
     if (body instanceof ApiError) return this.refuse(body, "body");
     this.requestComplete = true;
@@ -1223,7 +1223,7 @@ export class ModelApiRun {
     }
     if (named.tag !== null) api = { ...api, model: named.model };
     this.entryBody = body;
-    this.laneReceivedHash = bodyHashOf(body.bytes);
+    this.laneReceivedHash = await entryBodyHash(body);
     return this.route(snapshot, key, api);
   }
 
@@ -2542,17 +2542,17 @@ export class ModelApiRun {
 
   /**
    * The bytes an entry's attempt forwards to a provider that calls the model `upstreamModel`, and the events that
-   * declare them (lane/standard-api.ts `entryForwarded`). One copy is kept, the last route's: a failover to a provider
-   * with another name for the model makes its own once the earlier one is let go, so the request holds the client's
-   * bytes and one forwarded copy at most.
+   * declare them (lane/standard-api.ts `entryForwarded`). One is kept, the last route's: a failover to a provider
+   * with another name for the model makes its own once the earlier one is let go. A form's is views over the client's
+   * bytes, so the request holds the form once; a JSON body's is one changed copy.
    */
-  private entryForwardedFor(body: EntryBody, upstreamModel: string): Forwarded {
+  private async entryForwardedFor(body: EntryBody, upstreamModel: string): Promise<EntryForward> {
     const kept = this.entryForwards;
     if (kept !== null && kept.upstreamModel === upstreamModel) return kept.forwarded;
     this.entryForwards = null;
-    const forwarded = entryForwarded(this.protocol, body, upstreamModel);
+    const forwarded = await entryForwarded(this.protocol, body, upstreamModel);
     this.entryForwards = { upstreamModel, forwarded };
-    this.retained.set("request_body", body.bytes.length + (forwarded.ok ? forwarded.bytes.length : 0));
+    this.retained.set("request_body", body.bytes.length + (forwarded.ok ? forwarded.ownBytes : 0));
     return forwarded;
   }
 
@@ -2561,7 +2561,7 @@ export class ModelApiRun {
     this.entryBody = null;
     this.entryForwards = null;
     this.retained.set("request_body", 0);
-    this.answerShare.holdBody(0, this.deps.cfg.answerHeldMaxBytes);
+    this.answerShare.holdBody(0, this.deps.cfg.laneFormHeldMaxBytes);
   }
 
   /**
@@ -2576,15 +2576,15 @@ export class ModelApiRun {
     const record = attempt.candidate.record;
     const body = this.entryBody;
     if (body === null) return { kind: "refused", error: new ApiError(500, "internal_error") };
-    const forwarded = this.entryForwardedFor(body, record.upstreamModel);
+    const forwarded = await this.entryForwardedFor(body, record.upstreamModel);
     if (!forwarded.ok) return { kind: "refused", error: forwarded.error };
     // A form at the bound that the provider's longer name for the model takes past it: the bound is also what egress
     // carries to a route (`-route-max-body-bytes`), so the entry refuses it with the limit rather than send it.
-    if (body.kind === "form" && forwarded.bytes.length > this.deps.cfg.laneFormMaxBytes) return { kind: "refused", error: formTooLarge(this.deps.cfg.laneFormMaxBytes) };
+    if (body.kind === "form" && forwarded.length > this.deps.cfg.laneFormMaxBytes) return { kind: "refused", error: formTooLarge(this.deps.cfg.laneFormMaxBytes) };
     attempt.laneDraft = receiptDraft({
       modifiedEvents: forwarded.events,
       policy: null,
-      forwardedHash: bodyHashOf(forwarded.bytes),
+      forwardedHash: forwarded.hash,
       accountId: null,
       upstreamModel: record.upstreamModel,
       // The host the bytes go to (`upstream_name`): the provider's, whose API is not a TEE.
@@ -2610,7 +2610,7 @@ export class ModelApiRun {
     let stream: ReadableStream<Uint8Array> | null = null;
     try {
       const headers = entryUpstreamHeaders(body, this.request.headers.get("content-type"), entry.credential);
-      stream = sendable(forwardedStream(forwarded.bytes, body.kind === "form" ? ENTRY_FORM_CHUNK_BYTES : UPSTREAM_BODY_CHUNK_BYTES), () => {
+      stream = sendable(forwarded.body(body.kind === "form" ? ENTRY_FORM_CHUNK_BYTES : UPSTREAM_BODY_CHUNK_BYTES), () => {
         taken = true;
         // The body is handed to the provider's fetch: the response names the id its receipt will use, and the last
         // body that really went is the receipt of a request no attempt commits.

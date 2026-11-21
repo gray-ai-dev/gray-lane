@@ -987,18 +987,45 @@ export const SETTINGS: readonly SettingSpec[] = [
     type: "int",
     default: "26214400",
     min: 1048576,
-    max: 33554432,
+    max: 26214400,
     source:
-      "docs/design/standard-media-at-entry.md section 2.3 and D4: 25 MiB, OpenAI's documented file limit for transcriptions, " +
-      "proposed until it is measured against the entry's memory on staging. The entry holds a form's bytes as received and, " +
-      "while an attempt is out, the bytes it forwards (the form with its `model` set), so one form takes up to twice this " +
-      "of the answers' pool (ANSWER_HELD_MAX_BYTES, 64 MiB), and a form the pool cannot hold now is refused with 429 " +
-      "gateway_capacity. Maximum 32 MiB: twice it is that pool's maximum. Egress's `-route-max-body-bytes` in the entry's " +
-      "compose is set to at least this value.",
+      "docs/design/standard-media-at-entry.md section 2.3 and D4: 25 MiB, OpenAI's documented file limit for transcriptions " +
+      "(25 MB), with room for the form's other parts. Measured on staging's two entry replicas (tdx.medium, 3,729 MiB of " +
+      "guest memory each; scripts/cf-staging.sh form-bound, 2026-11-21 UTC): a 25 MiB form was served by each " +
+      "(23.7 to 24.5 s with the stand-in provider holding its answer 20 s), a 26 MiB one refused with 413 half a second " +
+      "after its head, and the replicas' available memory never fell below 2,897 MiB. Maximum: the default. Nothing larger " +
+      "was measured, and egress's `-route-max-body-bytes` in the entry's compose carries exactly this value " +
+      "(deploy/tee/app-compose.mjs holds the two together).",
     doc:
       "The largest multipart form the confidential entry reads for the standard APIs it serves itself (image edits, " +
       "transcriptions, translations). The form is held whole in memory, never written to disk; a larger one is refused " +
       "with 413 request_body_limit before anything is sent. Read by the lane in the entry layout.",
+  },
+  {
+    name: "LANE_FORM_HELD_MAX_BYTES",
+    key: "laneFormHeldMaxBytes",
+    workers: ["gateway"],
+    type: "int",
+    default: "268435456",
+    min: 1048576,
+    max: 268435456,
+    source:
+      "docs/design/standard-media-at-entry.md D4 and section 6.1, measured 2026-11-21 UTC. What one byte of a held form costs: with ten " +
+      "24 MiB forms held together (240 MiB) on the build box, the entry's own workerd and egress (deploy/tee/e2e.sh lane, the " +
+      "form-bound step, four runs), workerd's resident memory rose by 262 to 318 MiB (at most 1.33 times the forms held) and " +
+      "egress's, which reads a route's body whole, by 486 to 515 MiB (at most 2.15 times): at most 3.48 bytes together for each " +
+      "byte held, and workerd kept its high-water mark afterwards. What the machine has: staging's entry replicas (tdx.medium, " +
+      "3,729 MiB of guest memory) had at least 2,897 MiB available at every sample of the form runs of 2026-11-21. The bound " +
+      "keeps half of that free when the sum is full, because the ratio was measured on the build box and not in the CVM, and " +
+      "the answers' sum and everything else the three containers hold share the guest: 2,897 / (2 x 3.48) is 416 MiB, and " +
+      "256 MiB is the largest power of two under it (ten forms of LANE_FORM_MAX_BYTES at once; 891 MiB at the measured " +
+      "ratio). Maximum: the default; a larger sum was not measured. The 64 MiB the forms shared with the answers before " +
+      "came from a Workers isolate's 128 MB, which this process does not have.",
+    doc:
+      "The most bytes of multipart forms the confidential entry's process holds at once, summed over the requests in " +
+      "flight: each form counts its stated length from before its first byte is read until its answer commits. A form " +
+      "that does not fit now is refused with 429 gateway_capacity (limit_source gateway_memory) before it is read. " +
+      "Apart from the answers' sum (ANSWER_HELD_MAX_BYTES). Read by the lane in the entry layout.",
   },
   {
     name: "LANE_ENTRY_READY_BOUND_MS",
@@ -5374,6 +5401,14 @@ export const CROSS_CHECKS: readonly CrossCheck[] = [
   },
   {
     workers: ["gateway"],
+    names: ["LANE_FORM_MAX_BYTES", "LANE_FORM_HELD_MAX_BYTES"],
+    check: (a, b) => (a <= b ? null : `${a} must be at most LANE_FORM_HELD_MAX_BYTES (${b})`),
+    source:
+      "A form that states its length takes that length of the forms' sum (workers/gateway/src/lane/standard-api.ts `readEntryBody`): " +
+      "a bound above the sum would admit a form no entry, however idle, could hold.",
+  },
+  {
+    workers: ["gateway"],
     names: ["BODY_PARSE_MAX_BYTES", "BODY_RAW_MAX_BYTES"],
     check: (a, b) => (a <= b ? null : `${a} must be at most BODY_RAW_MAX_BYTES (${b})`),
     source: "Tier A ends where tier B starts (docs/cloudflare-native.md section 3): a parse limit above the raw limit would leave no tier B.",
@@ -5731,6 +5766,8 @@ export interface GatewayConfig {
   readonly laneEntryRolePollMs: number;
   /** LANE_FORM_MAX_BYTES (docs/design/standard-media-at-entry.md 2.3): the largest multipart form the entry holds for a standard API. */
   readonly laneFormMaxBytes: number;
+  /** LANE_FORM_HELD_MAX_BYTES (docs/design/standard-media-at-entry.md 2.3, D4): the most the entry's process holds of forms at once. */
+  readonly laneFormHeldMaxBytes: number;
   /** LANE_ENTRY_READY_BOUND_MS (entry replicas, §13 readiness): how long after its boot an entry's /readyz fails open. */
   readonly laneEntryReadyBoundMs: number;
   /** LANE_STACK_REPORT_MIN_MS (S42): the shortest interval between two stack.report calls carrying a change. */
