@@ -5,7 +5,7 @@ import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, ty
 import { endingWith, entryServesChain, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
 import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
-import { type ContinuationLocator, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
+import { type ContinuationLocator, type PinResult, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
 import { answeredFailure, FREE_DELIVERY, type AccountBlockGates, type OutcomeMeasure, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type Pattern, type PermitToken } from "@gray/endpoint";
 import {
   ApiError,
@@ -188,7 +188,10 @@ import {
   egressSidecarFailure,
   forwardedBody,
   forwardedStream,
-  laneContinuationUnsupported,
+  laneContinuationConversation,
+  laneContinuationSealed,
+  laneContinuationTranslated,
+  laneContinuationUnrecorded,
   laneRoutingInBody,
   laneDuplicateKey,
   laneUpstreamOf,
@@ -2494,9 +2497,6 @@ export class InferenceRun {
   /**
    * The confidential lane's fixed refusals of a body (design v2 §A), in the design's order:
    *
-   * - a Responses continuation (`previous_response_id`/`conversation`): the conversation lives at the
-   *   vendor, under an account the relay's scheduler picked, so neither a pin nor an append could mean
-   *   anything (M11, M18);
    * - a Gray tool-call id handle (`gtc1_`): the lane resolves none, so the vendor would see an opaque
    *   id; starting a conversation on the lane is the documented migration rule (M25);
    * - a member name twice anywhere `applyDeclaredChanges` reads the body: the lane refuses rather than
@@ -2506,6 +2506,9 @@ export class InferenceRun {
    * the parse `afterBody` just made; its `layout` already holds one member per key (the last of a
    * repeated top-level key), so the duplicate check reads the body again with `@gray/json`'s serde
    * reader, which is the reader whose "last wins" rule the main lane's re-serialisation follows.
+   *
+   * A Responses continuation (`previous_response_id`, `conversation`) is not refused here (the owner's decision of
+   * 2026-11-21): it is routed to the endpoint that issued the response it names, once the routes are known (`lanePin`).
    */
   private laneRefusal(bytes: Uint8Array, parsed: ParsedRequest): ApiError | null {
     if (this.lane === null) return null;
@@ -2520,10 +2523,6 @@ export class InferenceRun {
     // refuses only a body that really holds a handle **at a tool-call id site** (F2 hooks-3), which
     // is the search `RequestToolIds.resolve` makes with the same two helpers.
     if (this.mayHoldHandles && this.laneBodyHoldsHandles(bytes, parsed, read.value)) return laneToolHandlesUnsupported();
-    // Only a whole body has a parse to read the continuation fields from; a tier B body's
-    // `previous_response_id` is not part of the conversation, so it is in `parsed.value`.
-    const body = parsed.whole ? read.value : null;
-    if (body !== null && continuesEarlierResponse(this.protocol, body)) return laneContinuationUnsupported();
     return null;
   }
 
@@ -3035,16 +3034,16 @@ export class InferenceRun {
     // request's tool-call id handles are looked up beside it, both before any route is chosen; they depend
     // on the body alone, so a model tried after another reuses them (`serve_model`).
     //
-    // The confidential lane skips both (design v2 §A, §C.11, M18, M25): a continuation was refused at
-    // the body and its handles with it, and the lane's tool-call ids are off by construction, so
-    // neither call is a bridge round trip the lane would pay for.
+    // The confidential lane resolves no handle (design v2 §A, §C.11, M25: a body holding one was refused, and the lane's
+    // tool-call ids are off by construction). Its continuation is pinned the same way through its own record
+    // (`lanePin`): one bridge call, made only for a request that names an earlier response.
     this.admission = "continuation";
     const laneMode = this.lane !== null;
     const resolving = laneMode || this.toolIds !== null ? null : this.resolveToolIds(snapshot, key, parsed, body, this.mayHoldHandles);
     // A binding found in another region's store is copied to this region's after the answer, so the conversation's next
     // turn from here asks one store (docs/request-path-availability.md M10).
     const pin = laneMode
-      ? { ok: true as const, pinned: null }
+      ? await this.lanePin(key, parsed, records)
       : await pinContinuation({ locate: this.io.continuation, workspace: key.workspaceId, region: this.deps.region, timing: this.continuationTiming("pre"), protocol, body: parsed.value, background: (work) => this.ctx.waitUntil(work) });
     const unresolved = resolving === null ? null : await resolving;
     if (!pin.ok) {
@@ -3105,6 +3104,9 @@ export class InferenceRun {
       if (targets === null) {
         return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, rules), "routes");
       }
+      // A translated request has nothing but Gray's software between the client and the provider's other API, which has
+      // no earlier response to continue: refused, whatever the model (`lanePin` left it to this point).
+      if (laneMode && continuesEarlierResponse(protocol, parsed.value)) return { kind: "response", response: this.refuse(laneContinuationTranslated(), "continuation") };
       const upstreams = targets.upstreams;
       // The implied rule takes only a body read whole, as any translation does, and a body that is not keeps the
       // answer it gets without a translation (decisions of 2026-10-23, the critic's finding): the rule never turns
@@ -4106,10 +4108,9 @@ export class InferenceRun {
         layout: scrubbed === null ? o.parsed.layout : scrubbed.layout,
         overlay: o.overlay,
         contract: this.deps.gate.contract({ request: o.canonical, body: o.parsed.value }),
-        // F2 hooks-6: a lane reply is never bound to a continuation store — the conversation lives at
-        // the vendor under an account the scheduler picked, and the lane refuses the members that
-        // would continue one. The customer's own `store` field is forwarded untouched.
-        stores: this.lane === null && storesContinuation(this.protocol, o.parsed.value),
+        // Read from the client's body: a lane reply is bound only on a route whose own software may hold the
+        // conversation (`laneBinds`), and a stack route's container is sent `store: false` whatever the client wrote.
+        stores: storesContinuation(this.protocol, o.parsed.value),
         removals: scrubbed?.removals ?? [],
       };
     }
@@ -5782,10 +5783,14 @@ export class InferenceRun {
    * rate, the record's code `relay_change_refused`). Refused there too, the request was at fault: the client gets that
    * last 400, the vendor's answer to the latest attempt (the dispatcher holds the later refusal and drops the first, as
    * the main gateway does), and neither relay is held to it. Ended there any other way, or with no other route, the
-   * client gets this 400 as before (`relayChangeAnswer`), held against no one. True when the request goes on.
+   * client gets this 400 as before (`relayChangeAnswer`), held against no one. True when the request goes on. Never for
+   * a request pinned to the endpoint that issued the response it continues (`lanePin`): that 400 is the client's.
    */
   private relayChangeRefused(d: Dispatcher, attempt: Attempt, status: number, outcome: RetryOutcome, error: ApiError, accountId: string | null, passthrough: StackPassthrough, serve: () => void): boolean {
     if (status !== 400 || outcome.class !== "refusal" || this.relayChangePermit !== null) return false;
+    // A request pinned to the endpoint that issued the response it continues is tried at no other operator: no other
+    // relay knows the id it names.
+    if (this.pinned) return false;
     if (!d.refused || d.held?.attempt !== attempt.index || !d.sendableElsewhere()) return false;
     this.relayChangePermit = InferenceRun.permitKey(attempt.permit);
     d.otherOperatorsOnly = true;
@@ -7365,8 +7370,74 @@ export class InferenceRun {
     return { ok: true };
   }
 
+  /**
+   * An entry's endpoint route or a relay stack's route: the software that answers is the provider's API or the relay's
+   * own, which may hold a conversation. A sealed-credential lane relay route is not one: Gray's lane calls the vendor
+   * itself with `store: false`, so nothing holds the earlier turns.
+   */
+  private laneHoldsConversation(route: RouteRecord): boolean {
+    return this.stackRoute(route) || this.laneEndpointRoute(route);
+  }
+
+  /**
+   * The endpoint a lane request's `previous_response_id` or `conversation` is bound to (the owner's decision of
+   * 2026-11-21: Gray keeps no conversation, the request goes unchanged to the software that issued the response, and
+   * routing it there is Gray's one job). The answers are the API Worker's (`pinContinuation`): 404
+   * `continuation_not_found` for a reference never bound, expired or another workspace's; 409
+   * `continuation_endpoint_conflict`; 503 `continuation_lookup_unavailable`; 400 `invalid_continuation_reference`.
+   *
+   * Where no software but Gray's is in the path the request is still refused, 400 `lane_continuation_unsupported`: a
+   * reference with no binding for a model whose candidate routes here are all sealed-credential lane relay routes
+   * (`laneContinuationSealed`), and a request that would be translated (`laneContinuationTranslated`, where the
+   * translation is chosen: with no native route the answer for no route comes first). And `conversation` is refused
+   * on a relay stack route (`laneContinuationConversation`): egress keeps that member on the vendor call equal to the
+   * client's (P2), so no container is sent one. A request that names no earlier response makes no call.
+   */
+  private async lanePin(key: KeyRecord, parsed: ParsedRequest, records: readonly RouteRecord[]): Promise<PinResult> {
+    if (!continuesEarlierResponse(this.protocol, parsed.value)) return { ok: true, pinned: null };
+    const record = this.lane?.continuation;
+    if (record === undefined) return { ok: false, error: laneContinuationUnrecorded(), unanswered: [] };
+    const { cfg } = this.deps;
+    const pin = await record.pin({ workspace: key.workspaceId, protocol: this.protocol, body: parsed.value, timeoutMs: this.budget.preWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs) });
+    if (pin.ok) {
+      const conversation = get(parsed.value, "conversation");
+      const named = conversation !== undefined && conversation !== null;
+      return named && records.some((r) => r.endpointId === pin.pinned && this.stackRoute(r)) ? { ok: false, error: laneContinuationConversation(), unanswered: [] } : pin;
+    }
+    if (pin.error.code !== "continuation_not_found") return pin;
+    // No native route: the translation branch answers (no route at all, or a translation, which is refused there).
+    if (records.length === 0) return { ok: true, pinned: null };
+    return records.some((r) => this.laneHoldsConversation(r)) ? pin : { ok: false, error: laneContinuationSealed(), unanswered: [] };
+  }
+
+  /** Whether a lane reply's references are recorded: an untranslated Responses reply to a request that stores, on a route whose own software answers. */
+  private laneBinds(a: Answering, attempt: Attempt): boolean {
+    return this.lane?.continuation !== undefined && a.protocol === "open_ai_responses" && a.stores && this.translation === null && this.laneHoldsConversation(attempt.route.record);
+  }
+
+  /**
+   * Records which endpoint issued `reply` (`LaneContinuation.bind`), within what the post phase has left. Best effort.
+   * A relay stack route's reply binds its response id alone: no container is sent `conversation` (`lanePin`).
+   */
+  private async laneBind(a: Answering, attempt: Attempt, reply: Json): Promise<void> {
+    const { cfg } = this.deps;
+    const result = await this.lane!.continuation!.bind({
+      workspace: this.key!.workspaceId,
+      endpoint: attempt.route.record.endpointId,
+      model: a.model,
+      reply: this.stackRoute(attempt.route.record) ? { id: get(reply, "id") ?? null } : reply,
+      timeoutMs: this.budget.postWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs),
+    });
+    if (result.failed > 0) console.warn(JSON.stringify({ level: "warn", event: "lane_continuation_unbound", request_id: this.requestId, endpoint: attempt.route.record.endpointId, failed: result.failed }));
+  }
+
   /** The continuation binding of the reply (an untranslated Responses reply to a request that stores), or null. */
   private binding(a: Answering, attempt: Attempt): StreamBinding | null {
+    if (this.lane !== null) {
+      // A stream names its response in its first event, long before it ends: the bind runs beside the stream and
+      // holds no event back for a bridge round trip.
+      return this.laneBinds(a, attempt) ? StreamBinding.through(async (reply) => this.ctx.waitUntil(this.laneBind(a, attempt, reply))) : null;
+    }
     return StreamBinding.forReply({
       locate: this.io.continuation,
       workspace: this.key!.workspaceId,
@@ -7849,20 +7920,25 @@ export class InferenceRun {
         attempt.checksLater = undefined;
         this.endAttempt(attempt, { kind: "success" }, false, null);
       }
-      // A Responses reply that stores is bound to its endpoint before the client has its last byte (`bind`).
-      await bindReplyReferences({
-        locate: this.io.continuation,
-        workspace: this.key!.workspaceId,
-        region: this.deps.region,
-        timing: this.continuationTiming("post"),
-        endpoint: route.record.endpointId,
-        model: a.model,
-        protocol: upstream,
-        stores: a.stores,
-        translated: false,
-        status: response.status,
-        reply: payload,
-      });
+      // A Responses reply that stores is bound to its endpoint before the client has its last byte (`bind`); a lane's,
+      // through its own record (`laneBind`).
+      if (this.lane !== null) {
+        if (this.laneBinds(a, attempt) && response.status >= 200 && response.status <= 299) await this.laneBind(a, attempt, payload);
+      } else {
+        await bindReplyReferences({
+          locate: this.io.continuation,
+          workspace: this.key!.workspaceId,
+          region: this.deps.region,
+          timing: this.continuationTiming("post"),
+          endpoint: route.record.endpointId,
+          model: a.model,
+          protocol: upstream,
+          stores: a.stores,
+          translated: false,
+          status: response.status,
+          reply: payload,
+        });
+      }
       // The rest goes to the client at its pace, whole with its length when the answer never started
       // (answer.ts `deliver`); the record, which lets go of the request's part of the isolate's answers,
       // follows the client. The sealed content got the bytes before it hears they are all (`AnswerSink.end`).
@@ -8226,6 +8302,8 @@ export class InferenceRun {
     }
     this.commit(d, attempt);
     this.endAttempt(attempt, { kind: "success" }, false, null);
+    // The terminal response is the reply: recorded before the client has it, as `nativeAnswer` records a buffered one.
+    if (this.laneBinds(a, attempt)) await this.laneBind(a, attempt, payload);
     const headers = new Headers({ "content-type": "application/json", "x-request-id": this.requestId, "x-gray-provider": await providerRef(route), "x-gray-attempt": String(attempt.index + 1) });
     this.capHeaders(headers);
     this.modelHeader(headers);

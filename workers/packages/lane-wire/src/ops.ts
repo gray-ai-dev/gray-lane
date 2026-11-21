@@ -71,6 +71,10 @@ import { BridgeWireError } from "./error.ts";
  * 2.7) keep the entry's video jobs: one record per job, which holds no content, in an object of the bridge's own named
  * by Gray's job id (target `video/<job id>`), and the environment's one due index of open jobs, their next poll and
  * their lease (target `video-due`). Only an entry's key may call them.
+ *
+ * `continuation.pin` and `continuation.bind` (continuation.ts) read and write which endpoint issued a Responses reply,
+ * by the hash of its id, so a request that continues it goes back to that endpoint from any lane VM that admits
+ * requests. The rows are in objects of the bridge's own, and the target is the workspace (`continuation/<workspace id>`).
  */
 export const BRIDGE_OPS = [
   "account.admit",
@@ -113,6 +117,8 @@ export const BRIDGE_OPS = [
   "video.get",
   "video.update",
   "video.due",
+  "continuation.pin",
+  "continuation.bind",
 ] as const;
 
 export type BridgeOp = (typeof BRIDGE_OPS)[number];
@@ -159,6 +165,8 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "video.get": "POST",
   "video.update": "POST",
   "video.due": "POST",
+  "continuation.pin": "POST",
+  "continuation.bind": "POST",
 });
 
 /** The base request target of each op; the snapshot read appends its two parameters (snapshot.ts). */
@@ -203,6 +211,8 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "video.get": "/v1/lane-bridge/video/get",
   "video.update": "/v1/lane-bridge/video/update",
   "video.due": "/v1/lane-bridge/video/due",
+  "continuation.pin": "/v1/lane-bridge/continuation/pin",
+  "continuation.bind": "/v1/lane-bridge/continuation/bind",
 });
 
 /**

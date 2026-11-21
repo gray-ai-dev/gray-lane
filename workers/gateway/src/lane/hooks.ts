@@ -105,10 +105,45 @@ export const LANE_CODES = {
   policyRefused: "relay_policy_refused",
 } as const;
 
-/** 400 for a Responses continuation in lane mode (design v2 §A, M11/M18): the conversation is at the vendor, under an account the scheduler picked. */
-export function laneContinuationUnsupported(): ApiError {
+/**
+ * 400 for a Responses continuation (`previous_response_id`, `conversation`) where no software but Gray's is in the
+ * path (the owner's decision of 2026-11-21). Gray keeps no conversation: a continuation is delivered unchanged to the
+ * software that issued the response it names, a relay's own in its VM or a provider's API, and routed there by
+ * `InferenceRun.lanePin`. On the routes below nothing holds the earlier turns, so the request is refused with why.
+ *
+ * A sealed-credential lane relay route: Gray's lane calls the vendor itself, with `store: false`, under an account the
+ * relay's scheduler picked. The request named a response Gray has no record of, and every route that could serve this
+ * model here is such a route.
+ */
+export function laneContinuationSealed(): ApiError {
   return new ApiError(400, LANE_CODES.continuation).withMessage(
-    "The confidential lane does not continue an earlier response: `previous_response_id` and `conversation` are refused, and a lane conversation must start fresh.",
+    "This model is served here only on relay routes where Gray calls the vendor itself with `store: false`, so nothing holds the response `previous_response_id` or `conversation` names. Send the whole conversation instead.",
+  );
+}
+
+/** As {@link laneContinuationSealed}, for a request Gray would translate to another API: the provider's other API has no earlier response to continue. */
+export function laneContinuationTranslated(): ApiError {
+  return new ApiError(400, LANE_CODES.continuation).withMessage(
+    "This model is served here through a translation to another API, which cannot continue an earlier response: `previous_response_id` and `conversation` are refused. Send the whole conversation instead.",
+  );
+}
+
+/**
+ * 400 for `conversation` on a relay stack route. Egress keeps `/conversation` on the vendor call equal to the client's
+ * (docs/relay-request-changes.md P2: nothing is kept at the vendor under a relay's account), so a relay's software could
+ * neither take the member out and serve the conversation from its own memory nor leave it in. Until that rule says
+ * otherwise no container is sent one; `previous_response_id` is delivered.
+ */
+export function laneContinuationConversation(): ApiError {
+  return new ApiError(400, LANE_CODES.continuation).withMessage(
+    "A relay route here does not take `conversation`: nothing may be kept at the vendor under a relay's account. Continue with `previous_response_id`, or send the whole conversation.",
+  );
+}
+
+/** As {@link laneContinuationSealed}, for a lane with no record of which route issued a response (no `LaneDeps.continuation`): it cannot route a continuation. */
+export function laneContinuationUnrecorded(): ApiError {
+  return new ApiError(400, LANE_CODES.continuation).withMessage(
+    "This address keeps no record of which route issued a response, so it cannot continue one: `previous_response_id` and `conversation` are refused. Send the whole conversation instead.",
   );
 }
 
@@ -147,14 +182,15 @@ export function lanePolicyRefused(): ApiError {
 
 /**
  * Whether a Responses request continues an earlier one (`previous_response_id` or `conversation`
- * present, either with a value): the lane refuses both (design v2 §A, M11). Read from the parsed
- * body, because `@gray/protocol`'s canonical projection has no member for either: only the Responses
- * API defines them, and the lane must refuse the pair exactly when the vendor would honour it.
+ * present, either with a value): the lane routes it to the endpoint that issued the response it names
+ * (`InferenceRun.lanePin`). Read from the parsed body, because `@gray/protocol`'s canonical projection has
+ * no member for either: only the Responses API defines them, and the lane must pin the request exactly
+ * when the software that answers would honour them.
  */
 export function continuesEarlierResponse(protocol: Protocol, body: Json): boolean {
   if (protocol !== "open_ai_responses" || !isObject(body)) return false;
   // A member the client wrote as `null` is how several clients spell "absent": the vendor reads it as
-  // no continuation either, so the lane does not refuse it (F2 hooks-9).
+  // no continuation either, so the lane pins nothing for it (F2 hooks-9).
   const present = (name: string): boolean => {
     const value = get(body, name);
     return value !== undefined && value !== null;

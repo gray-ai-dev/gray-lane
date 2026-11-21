@@ -7,11 +7,14 @@
  * PostgreSQL (docs/cloudflare-native.md section 4.1). No `cloudflare:*` imports.
  */
 export {
+  HASHED_REFERENCE_DOMAIN,
+  HASHED_REFERENCE_PATTERN,
   MAX_REFERENCE_BYTES,
   type Reference,
   type ReferenceKind,
   ResponseTap,
   continuationReferences,
+  hashedReference,
   replyReferences,
   storesContinuation,
 } from "./references.ts";
@@ -44,11 +47,13 @@ export {
   StreamBinding,
   bindBufferedReply,
   bindContinuation,
+  bindReferences,
   bindReplyReferences,
   bucketOf,
   continuationStoreName,
   continuationTiming,
   pinContinuation,
+  pinReferences,
   referenceHash,
   restrictToPinned,
 } from "./client.ts";

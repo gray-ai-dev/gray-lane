@@ -115,3 +115,23 @@ export class ResponseTap {
     return undefined;
   }
 }
+
+/** The domain line of a lane reference's hash; a new form of the hash takes a new line. */
+export const HASHED_REFERENCE_DOMAIN = "gray-lane-continuation/1";
+/** A hashed reference: `sha256:` and 64 lower hex. */
+export const HASHED_REFERENCE_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+const HASH_ENCODER = new TextEncoder();
+
+/**
+ * A reference as the confidential lane records it: SHA-256 over the domain line, the workspace, the kind and the id,
+ * as `sha256:<hex>`. The lane entry makes it inside its VM, so the bridge and the store hold a value that names one
+ * workspace's one reference and gives back neither the id nor anything of the conversation. The id itself is the
+ * vendor's or the relay's random string; the hash is there so a store's row cannot be used as a response id.
+ */
+export async function hashedReference(workspace: string, ref: Reference): Promise<Reference> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", HASH_ENCODER.encode(`${HASHED_REFERENCE_DOMAIN}\n${workspace}\n${ref.kind}\n${ref.reference}`)));
+  let hex = "";
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
+  return { kind: ref.kind, reference: `sha256:${hex}` };
+}

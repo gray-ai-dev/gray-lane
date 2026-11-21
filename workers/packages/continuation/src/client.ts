@@ -239,6 +239,14 @@ export async function pinContinuation(o: PinOptions & { readonly protocol: Proto
   if (o.protocol !== "open_ai_responses") return { ok: true, pinned: null };
   const refs = continuationReferences(o.body);
   if (refs === undefined) return { ok: false, error: CONTINUATION_ERRORS.invalidReference(), unanswered: [] };
+  return pinReferences(o, refs);
+}
+
+/**
+ * `pinContinuation` for references already read: the endpoint they are all bound to, null for none. The lane bridge
+ * calls it with the references a lane entry hashed (`hashedReference`), so the stores it asks never hold an id.
+ */
+export async function pinReferences(o: PinOptions, refs: readonly Reference[]): Promise<PinResult> {
   const answers = await Promise.all(refs.map((ref) => resolve(o, ref)));
   let pinned: string | null = null;
   for (const answer of answers) {
@@ -277,7 +285,11 @@ export interface BindOptions {
  * the answer counts what was bound and what was not, for the caller's log.
  */
 export async function bindContinuation(o: BindOptions & { readonly reply: Json }): Promise<{ readonly bound: number; readonly failed: number }> {
-  const refs = replyReferences(o.reply);
+  return bindReferences(o, replyReferences(o.reply));
+}
+
+/** `bindContinuation` for references already read (the lane bridge's, hashed by the lane entry that read the reply). */
+export async function bindReferences(o: BindOptions, refs: readonly Reference[]): Promise<{ readonly bound: number; readonly failed: number }> {
   // A deadline already spent (the gateway's request budget left none): nothing is asked, nothing bound.
   const timeoutMs = o.timing.timeoutMs;
   if (timeoutMs <= 0) return { bound: 0, failed: refs.length };
@@ -350,10 +362,10 @@ export async function bindReplyReferences(o: BindOptions & ReplyFacts & { readon
  */
 export class StreamBinding {
   private readonly tap = new ResponseTap();
-  private readonly options: BindOptions;
+  private readonly bind: (reply: Json) => Promise<unknown>;
 
-  constructor(options: BindOptions) {
-    this.options = options;
+  constructor(options: BindOptions | ((reply: Json) => Promise<unknown>)) {
+    this.bind = typeof options === "function" ? options : (reply) => bindContinuation({ ...options, reply });
   }
 
   /**
@@ -364,10 +376,18 @@ export class StreamBinding {
     return binds(o) ? new StreamBinding(o) : null;
   }
 
+  /**
+   * A binding whose stream's first `response` object goes to `bind` instead of the stores: the lane entry's, which
+   * hashes the references and binds them through its bridge. The caller decides whether the reply leaves any.
+   */
+  static through(bind: (reply: Json) => Promise<unknown>): StreamBinding {
+    return new StreamBinding(bind);
+  }
+
   /** Records the first `response` object `chunk` completes; resolves once it is bound (or the binding failed). */
   async observe(chunk: Uint8Array): Promise<void> {
     if (!this.tap.reading) return;
     const reply = this.tap.observe(chunk);
-    if (reply !== undefined) await bindContinuation({ ...this.options, reply });
+    if (reply !== undefined) await this.bind(reply);
   }
 }

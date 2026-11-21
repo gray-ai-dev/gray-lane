@@ -23,6 +23,7 @@ import { remoteSinks } from "./remote/sinks.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { LegacyLatch } from "./remote/legacy.ts";
 import { remoteModelCheckTickets } from "./remote/tickets.ts";
+import { remoteContinuation } from "./remote/continuation.ts";
 import { LaneFetchRefusal } from "./fetch-refusal.ts";
 import { gatedUpstreamAuth } from "./kms-lease.ts";
 import { endpointRowsOfSnapshot, type EntryEndpointRoutes } from "./endpoint-routes.ts";
@@ -40,7 +41,7 @@ import type { LaneProcessState } from "./state.ts";
  * | `endpoints` | `endpointShards` (DO namespace) | `remoteEndpointLocator` (signed `endpoint.*`; r16: the attempt's rank key, measures and rests, and the documents of before r16 to a bridge that refused them, remote/legacy.ts) |
  * | `endpointRoots` | `endpointRoots` (ENDPOINT_ROOT, ENDPOINT_ROOT_LOCATION_HINT) | `remoteEndpointRootLocator` (signed `endpoint.file_rest`, r16; none while the endpoint ops keep to the documents of before) |
  * | `sinks` | `bindingSinks` (Queue/Pipeline/AE) | `remoteSinks` (signed `records.*`, flushed in `waitUntil`) |
- * | `continuation` | `continuationStores` | unused in v1: the lane refuses `previous_response_id`/`conversation` (L2b's rule, M11), so the locator throws if anything reaches it |
+ * | `continuation` | `continuationStores` | unused: the lane's record of which endpoint issued a reply is `lane.continuation` (`remoteContinuation`: signed `continuation.pin|bind`, each id hashed in the VM first), so the locator throws if anything reaches it |
  * | `toolCallIds` | `toolCallIdShards` | `undefined` (off; the lane refuses `gtc1_` handles, M25) |
  * | `env.CONTENT` | R2 | a stub whose every method throws `lane_content_disabled` (content capture is off) |
  * | `keyless` | RateLimit bindings | `null` (a lane request always has a key) |
@@ -298,6 +299,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     policies: state.state.policySource,
     timing: state.state.timing,
     stackConfig: state.state.stackConfig,
+    // Which endpoint issued a Responses reply, shared with the other lane VMs that admit requests (the entry's replicas).
+    continuation: remoteContinuation(state.bridge),
     ...stackTransportOf(env.RELAY, egressBinding),
     ...(state.peers === undefined ? {} : { peers: state.peers }),
     ...endpointRouteDeps(state.endpointRoutes),
@@ -330,13 +333,14 @@ export function stackTransportOf(relay: Partial<LaneEgressBinding> | undefined, 
 }
 
 /**
- * The continuation locator of a lane request: the lane refuses `previous_response_id`/`conversation`
- * (M11/M18), so nothing may reach a continuation store. Throwing here rather than stubbing a promise
- * makes a hook that forgot the refusal a test failure, not a silent WAN call.
+ * The continuation locator of a lane request: the gateway's own stores are not the lane's. A lane pins and binds a
+ * Responses continuation through `lane.continuation` (one signed bridge call each, `remote/continuation.ts`), so nothing
+ * may reach this locator. Throwing here rather than stubbing a promise makes a path that forgot it a test failure, not
+ * a silent WAN call.
  */
 function laneContinuation() {
   const refuse = (): never => {
-    throw new Error("a lane request never reaches a continuation store (it refuses previous_response_id and conversation)");
+    throw new Error("a lane request never reaches the gateway's continuation stores (its record is lane.continuation)");
   };
   return () => ({ lookup: refuse, bind: refuse });
 }

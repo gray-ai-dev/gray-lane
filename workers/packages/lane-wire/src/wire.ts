@@ -1,6 +1,7 @@
 import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { z } from "zod";
 import { acmeChallengeAnswerSchema, acmeChallengeSchema } from "./acme-challenge.ts";
+import { continuationBindAnswerSchema, continuationBindRequestSchema, continuationPinAnswerSchema, continuationPinRequestSchema } from "./continuation.ts";
 import { entryRoleAnswerSchema, entryRoleRequestSchema } from "./entry-role.ts";
 import { endpointCredentialAnswerSchema, endpointCredentialRequestSchema } from "./endpoint-credential.ts";
 import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
@@ -185,6 +186,8 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "video.get": videoGetRequestSchema,
   "video.update": videoUpdateRequestSchema,
   "video.due": videoDueRequestSchema,
+  "continuation.pin": continuationPinRequestSchema,
+  "continuation.bind": continuationBindRequestSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 export const BRIDGE_RESPONSE_SCHEMAS = {
@@ -228,6 +231,8 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "video.get": videoGetAnswerSchema,
   "video.update": videoUpdateAnswerSchema,
   "video.due": videoDueAnswerSchema,
+  "continuation.pin": continuationPinAnswerSchema,
+  "continuation.bind": continuationBindAnswerSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 /**
