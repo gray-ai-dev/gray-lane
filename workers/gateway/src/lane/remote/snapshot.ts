@@ -41,11 +41,12 @@ import type { LegacyLatch } from "./legacy.ts";
  *
  * The lane snapshot's invariants (`assertLaneSnapshot`, design v2 section B): every route but the lane
  * relays' and the endpoint routes the entry serves (docs/design/lane-provider-routes.md section 2) is
- * removed, `translation` is unset and `contentRecipients` is empty. A snapshot that carries any other
- * is a configuration/boot error, not a request-time refusal: the lane would otherwise translate a
- * protocol the customer proved it does not (and the TEE would send a body the receipt cannot
- * describe), or send to an address its egress cannot carry. `laneRelaysOf` reads the relay registry
- * from the raw snapshot's lane routes.
+ * removed, `translation` (an operator's policy) is unset and `contentRecipients` is empty. A snapshot that
+ * carries any other is a configuration/boot error, not a request-time refusal: the lane would otherwise
+ * translate by a rule its receipts do not name, or send to an address its egress cannot carry. The entry
+ * translates by its own rule alone, onto its endpoint routes, each translation named in its receipt
+ * (translate.ts `entryRules`, docs/design/lane-provider-routes.md section 10); the snapshot carries only its
+ * switch (`entryTranslation`). `laneRelaysOf` reads the relay registry from the raw snapshot's lane routes.
  */
 
 export interface RemoteSnapshotSourceOptions extends BridgeClientOptions {
@@ -158,8 +159,8 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
  * such a snapshot.
  */
 export function mapSnapshot(snapshot: Snapshot): ReturnType<typeof gatewaySnapshotOf> {
-  // The lane's view: the lane_relay routes and the endpoint routes the entry serves, no translation policy, no content
-  // recipients (L3's lane mode). gray-jobs publishes one snapshot with every kind; the main mode here would leave the lane
+  // The lane's view: the lane_relay routes and the endpoint routes the entry serves, no operator translation policy (the
+  // entry's own rule needs none), no content recipients (L3's lane mode). gray-jobs publishes one snapshot with every kind; the main mode here would leave the lane
   // no relay.
   const mapped = gatewaySnapshotOf(snapshot, "lane");
   assertLaneSnapshot(mapped.version, mapped.routes, mapped.translation, Object.keys(mapped.contentRecipients).length);
@@ -177,7 +178,7 @@ export function assertLaneSnapshot(version: number, routes: readonly EntryRouteF
   if (foreign.length > 0) {
     throw new Error(`lane snapshot ${version} carries ${foreign.length} route(s) its entry does not serve (${foreign[0]?.auth ?? ""}): a lane snapshot holds the lane relays' routes and the endpoint routes its entry serves`);
   }
-  if (translation !== undefined) throw new Error(`lane snapshot ${version} carries a translation policy: a lane snapshot never translates`);
+  if (translation !== undefined) throw new Error(`lane snapshot ${version} carries an operator translation policy: the entry translates by its own rule alone`);
   if (recipientScopes > 0) throw new Error(`lane snapshot ${version} carries ${recipientScopes} content recipient scope(s): a lane snapshot has contentRecipients empty`);
 }
 

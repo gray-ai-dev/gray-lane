@@ -19,6 +19,12 @@ export type Rule =
   /** An operator listed them for the (model, client protocol) pair. A request the translation refuses is answered with the refusal. */
   | "operator"
   /**
+   * The confidential entry's own rule (the gateway's translate.ts `entryRules`, docs/design/lane-provider-routes.md section
+   * 8): every other text API on which the model has endpoint routes at the entry. A refusal is the answer, as under an
+   * operator's rule.
+   */
+  | "entry"
+  /**
    * The implied Responses fallback. A request the translation refuses is not served by it, and is answered as if it
    * had no translation: the refusal it would get without the rule (`selectTranslation`).
    */
@@ -36,18 +42,20 @@ export const RESPONSES_FALLBACK: readonly Protocol[] = ["open_ai_chat", "anthrop
  * Otherwise, while the lever is on, a Responses request of a model some endpoint maps on Responses (`responsesMapped`,
  * live or not: decision (b) is the strict fallback, so a model served on other APIs only is not reachable through
  * Responses by it) takes `RESPONSES_FALLBACK`, narrowed to the protocols with a live route of the model (`live`); with
- * none left, null, and the request is refused as without a translation.
+ * none left, null, and the request is refused as without a translation. `ruled` names the rule `policy` stands for: an
+ * operator's, or the confidential entry's own.
  */
 export function translationTargets(
-  policy: TranslationPolicy,
+  policy: Pick<TranslationPolicy, "upstreams">,
   fallback: Fallback,
   model: string,
   client: Protocol,
   responsesMapped: boolean,
   live: (upstream: Protocol) => boolean,
+  ruled: Exclude<Rule, "implied"> = "operator",
 ): { readonly upstreams: readonly Protocol[]; readonly rule: Rule } | null {
-  const ruled = policy.upstreams(model, client);
-  if (ruled !== undefined) return { upstreams: ruled, rule: "operator" };
+  const listed = policy.upstreams(model, client);
+  if (listed !== undefined) return { upstreams: listed, rule: ruled };
   if (client !== "open_ai_responses" || fallback === "off" || !responsesMapped) return null;
   const upstreams = RESPONSES_FALLBACK.filter((upstream) => live(upstream));
   return upstreams.length === 0 ? null : { upstreams, rule: "implied" };

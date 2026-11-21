@@ -1,9 +1,10 @@
 import { ApiError } from "@gray/errors";
 import { compareUtf8 } from "@gray/json";
 import { type CanonicalRequest, type Protocol, endpointPath, isGeneration, reasoningRequested, structured } from "@gray/protocol";
-import { type TranslationPolicy, protocolTitle } from "@gray/translation";
+import { protocolTitle } from "@gray/translation";
 import { laneModel } from "./preference.ts";
 import { chatFor, type GatewaySnapshot, type ModeCapabilities, type RouteRecord, routeServes } from "./snapshot.ts";
+import type { TranslationRules } from "./translate.ts";
 
 /**
  * What a request for a model without a usable native route is told (crates/gray-gateway/src/
@@ -112,7 +113,7 @@ export function missingCapability(model: string, protocol: Protocol, routes: rea
  * `policy`: the operator's translation policy; an API it lets reach a served one is named as a path
  * the model can be called through, as one that serves it natively is.
  */
-export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, protocol: Protocol, nowMs: number, mediaUnknown: boolean, policy?: TranslationPolicy): ApiError {
+export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, protocol: Protocol, nowMs: number, mediaUnknown: boolean, policy?: TranslationRules): ApiError {
   const model = request.model;
   // Whether Gray's confidential VM serves the model on this API there (`laneModel`): a pause here says so, and a model
   // this gateway does not know is served there. The lane's own snapshot carries no lane pairs, so in lane mode never.
@@ -120,7 +121,7 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
   const routes = snapshot.routes.filter((r) => r.model === model);
   const live = routes.filter((r) => routeServes(r.expiresAt, nowMs));
   // The upstream protocols that could serve a request through `protocol`: itself, and the translation
-  // targets the operator allows for the model.
+  // targets the rules allow for the model (the operator's, or the confidential entry's own).
   const targets: Protocol[] = [protocol, ...(policy?.upstreams(model, protocol) ?? [])];
   const here = live.filter((r) => targets.includes(r.protocol));
   if (here.length > 0) {

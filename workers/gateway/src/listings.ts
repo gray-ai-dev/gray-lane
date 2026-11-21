@@ -8,7 +8,8 @@ import { originsOf } from "./hosts.ts";
 import { checkStaleKey, lookUpKey, type KeyLookup } from "./key-lookup.ts";
 import { Outbound } from "./outbound.ts";
 import type { GatewaySnapshot, SnapshotCache, SnapshotSource } from "./snapshot.ts";
-import { translationPolicy } from "./translate.ts";
+import { viaEntryOf } from "./entry-forward.ts";
+import { translationRules, type TranslationRules } from "./translate.ts";
 
 /**
  * The model API's read-only routes beside the generation APIs (crates/gray-gateway/src/inference.rs
@@ -79,6 +80,11 @@ export interface CatalogDeps {
   readonly snapshots: SnapshotCache;
   readonly source: SnapshotSource;
   readonly background: (p: Promise<unknown>) => void;
+  /**
+   * The confidential entry's own listings (lane mode): the APIs it translates a model onto by its own rule
+   * (translate.ts `entryRules`). Absent: the main gateway's, by the operator's policy.
+   */
+  readonly lane?: boolean;
 }
 
 /** `key_status`'s refusal when the key's record, use or balance cannot be read. */
@@ -101,13 +107,13 @@ export async function serveCatalog(request: Request, route: CatalogRoute, path: 
       case "models":
       case "model": {
         const looked = await lookUpKey(request.headers, lookup, true);
-        return listing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head);
+        return listing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request));
       }
       case "gemini_models":
       case "gemini_model": {
         if (queryCredentials(url)) throw new ApiError(400, "query_credentials_unsupported");
         const looked = await lookUpKey(request.headers, lookup, true);
-        return geminiListing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head);
+        return geminiListing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request));
       }
       case "key": {
         // The lane serves no key status (its entry routes only the OpenAI listings here).
@@ -150,14 +156,25 @@ function value(v: CatalogJson, requestId: string, head: boolean): Response {
   return json(JSON.stringify(v), requestId, head);
 }
 
+/**
+ * The translation rules a listing reads (translate.ts `translationRules`): the entry's own at the entry; none for the
+ * entry's own copy of this gateway's list (a request it marked), so the entry is told only the APIs this gateway serves
+ * natively and never forwards a request this gateway would translate; else the operator's policy.
+ */
+function rulesFor(d: CatalogDeps, request: Request): (snapshot: GatewaySnapshot) => TranslationRules {
+  const lane = d.lane === true;
+  const viaEntry = !lane && viaEntryOf(request.headers) !== null;
+  return (snapshot) => translationRules(snapshot, lane, viaEntry);
+}
+
 /** `list` and `model`: the OpenAI listing, every API (`listed(rt, auth, None)`). */
-function listing(route: Extract<CatalogRoute, { kind: "models" | "model" }>, snapshot: GatewaySnapshot | null, scope: readonly string[] | null, cfg: GatewayConfig, requestId: string, head: boolean): Response {
+function listing(route: Extract<CatalogRoute, { kind: "models" | "model" }>, snapshot: GatewaySnapshot | null, scope: readonly string[] | null, cfg: GatewayConfig, requestId: string, head: boolean, rules: (snapshot: GatewaySnapshot) => TranslationRules): Response {
   const nowMs = Date.now();
   if (snapshot === null) {
     if (route.kind === "models") return value({ data: [], object: "list" }, requestId, head);
     throw notListed(route.id, []);
   }
-  const policy = translationPolicy(snapshot);
+  const policy = rules(snapshot);
   const models = listedIn(snapshot, policy, scope, null, nowMs, cfg.platformFeeBps);
   const facts = snapshot.facts ?? {};
   // A model id is client text (`constructor` is a valid one): only the record's own entries count.
@@ -175,8 +192,8 @@ function notListed(id: string, suggestions: readonly string[]): ApiError {
 }
 
 /** `gemini_list` and `gemini_model`: the models a Gemini client can call (`listed(rt, auth, Some(Gemini))`). */
-function geminiListing(route: Extract<CatalogRoute, { kind: "gemini_models" | "gemini_model" }>, snapshot: GatewaySnapshot | null, scope: readonly string[] | null, cfg: GatewayConfig, requestId: string, head: boolean): Response {
-  const models = snapshot === null ? new Map() : listedIn(snapshot, translationPolicy(snapshot), scope, "gemini", Date.now(), cfg.platformFeeBps);
+function geminiListing(route: Extract<CatalogRoute, { kind: "gemini_models" | "gemini_model" }>, snapshot: GatewaySnapshot | null, scope: readonly string[] | null, cfg: GatewayConfig, requestId: string, head: boolean, rules: (snapshot: GatewaySnapshot) => TranslationRules): Response {
+  const models = snapshot === null ? new Map() : listedIn(snapshot, rules(snapshot), scope, "gemini", Date.now(), cfg.platformFeeBps);
   if (route.kind === "gemini_models") return value({ models: [...models].map(([id, listed]) => geminiModelValue(id, listed.native)) }, requestId, head);
   const found = models.get(route.id);
   if (found !== undefined) return value(geminiModelValue(route.id, found.native), requestId, head);

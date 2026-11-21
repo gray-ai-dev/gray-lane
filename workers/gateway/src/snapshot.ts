@@ -257,6 +257,8 @@ export interface GatewaySnapshot {
    * (@gray/translation `TranslationPolicy.parse`); unset: nothing is translated (translate.ts).
    */
   readonly translation?: string;
+  /** `off` when the confidential entry does not translate (@gray/snapshot `Snapshot.entryTranslation`, ConfigDO's ENTRY_TRANSLATION); absent while it does. */
+  readonly entryTranslation?: "off";
   /**
    * The control database's replay key, sealed under the master key (@gray/snapshot
    * `Snapshot.replayKey`): the tool-call id keys derive from it (tool-ids.ts). Unset: no handle can be
@@ -501,6 +503,7 @@ export function gatewaySnapshotOf(snapshot: Snapshot, mode: GatewayMode = "main"
     ranking: null,
     contentRecipients: view.contentRecipients,
     ...(view.translation === undefined ? {} : { translation: view.translation }),
+    ...(view.entryTranslation === undefined ? {} : { entryTranslation: view.entryTranslation }),
     ...(view.replayKey === undefined ? {} : { replayKey: view.replayKey }),
     mapped: view.mapped,
     facts: view.facts,

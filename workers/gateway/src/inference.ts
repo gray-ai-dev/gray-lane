@@ -174,7 +174,7 @@ import { type GatewaySnapshot, type KeyRecord, type RouteRecord, type SnapshotCa
 import { spoolPlaintext } from "./spool.ts";
 import { AnswerIds, RequestToolIds, StreamIds, TOOL_ID_CODES, type ToolIdIsolate, ToolIdFailure, clientBytes as toolIdClientBytes, handlesInBody, handlesInSpan, releasesAny, siteMember, toolIdIsolate, upstreamValue } from "./tool-ids.ts";
 import { originsOf } from "./hosts.ts";
-import { translationPolicy } from "./translate.ts";
+import { NO_TRANSLATION, entryRules, translationRules } from "./translate.ts";
 import { type BodyEdits, UPSTREAM_BODY_CHUNK_BYTES, type UpstreamBody, heldBody, releasedAtEnd, sendable, storedBody, upstreamHeaders } from "./upstream.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import {
@@ -208,7 +208,7 @@ import {
   type Forwarded,
   type ResponseHash,
 } from "./lane/hooks.ts";
-import { checkEventLog, ReceiptBuilder } from "@gray/attest";
+import { checkEventLog, ReceiptBuilder, type TranslatedApi } from "@gray/attest";
 import { addReceiptEvents } from "./lane/hooks.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { apiUnreachable } from "./lane/api-forward.ts";
@@ -217,8 +217,8 @@ import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
 import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, type RewriteDecisions } from "./lane/plan.ts";
 import { completedResponse, keptWeight } from "./lane/codex.ts";
 import type { LaneApiForward, LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
-import type { AppendedText, LaneProtocol } from "@gray/lane";
-import { applyDeclaredChanges, checkOfficialUpstream, StackEventDigester, stackBodyDigest, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
+import type { AppendedText, GrayRewriteOp, LaneProtocol } from "@gray/lane";
+import { applyDeclaredChanges, checkOfficialUpstream, GRAY_LANE_TRANSLATION_V1, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
 import {
   addStackReceipt,
@@ -715,14 +715,25 @@ function laneFailureCode(error: unknown): string {
   return "unknown";
 }
 
-/** A Gemini request streams by its path's method, whatever its body says (forward_traced). */
 /**
- * Whether the lane's view has a route of one of `models` on `protocol` (docs/design/one-address.md): its existence, not
- * whether it serves now. The lane does not translate, so only a route of exactly that API counts.
+ * Whether the lane's view has a route of one of `models` on `protocol` (docs/design/one-address.md), or the entry
+ * translates one of them onto an endpoint route of another text API (translate.ts `entryRules`): a route's existence,
+ * not whether it serves now.
  */
-function entryRouted(snapshot: Pick<GatewaySnapshot, "routes">, models: readonly string[], protocol: Protocol): boolean {
-  return snapshot.routes.some((r) => r.protocol === protocol && models.includes(r.model));
+function entryRouted(snapshot: GatewaySnapshot, models: readonly string[], protocol: Protocol): boolean {
+  if (snapshot.routes.some((r) => r.protocol === protocol && models.includes(r.model))) return true;
+  const rules = entryRules(snapshot);
+  return models.some((model) => rules.upstreams(model, protocol) !== undefined);
 }
+
+/** Whether two byte strings are the same. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** A Gemini request streams by its path's method, whatever its body says (forward_traced). */
 
 function geminiStream(path: string): boolean {
   return path.endsWith(":streamGenerateContent");
@@ -1072,6 +1083,11 @@ export class InferenceRun {
    * main lane's request overlay and the lane's declared ops.
    */
   private laneDecisions: RewriteDecisions | null = null;
+  /**
+   * The output cap Gray wrote into the translated body (`Translation.writeOutputCap`), the last one a refit wrote: the
+   * entry's receipt names it (`request.translated.output_cap`), and a verifier writes it the same way. Null: none written.
+   */
+  private translationCap: bigint | null = null;
   /** The body the request was received with, exactly as it arrived: what every lane op and hash covers. */
   private laneReceived: Uint8Array | null = null;
   /**
@@ -2629,11 +2645,13 @@ export class InferenceRun {
     const entry = this.deps.entryChat;
     if (this.lane === null && entry !== undefined && !this.stripProvider && ticketHeader(this.request.headers) === null && entryServesChain(snapshot, chain, protocol)) return this.forwardToEntry(entry, body);
     // docs/design/one-address.md: at the entry, the other direction. A request for models this entry has no route of on
-    // this API in its view (lane relays and the endpoint routes it serves; a route's existence decides, not whether it
-    // serves now, so a model whose routes are all down stays here) goes to Gray's API when the API serves one of them
-    // there (a Gemini image model, a model the API serves through translation). Never a verifiable preference (the
-    // body's, `x-gray-routing`, the key's or the workspace's default, all layered above), a model check, or a request that
-    // arrived through the API (it has no `apiForward`): those get the entry's own answer.
+    // this API in its view and does not translate onto one of its endpoint routes (`entryRouted`; a route's existence
+    // decides, not whether it serves now, so a model whose routes are all down stays here) goes to Gray's API when the
+    // API serves one of them natively there (a Gemini image model). The API's list for the entry names the APIs it serves
+    // natively alone (translate.ts `translationRules`), so a request the API would translate is never sent through
+    // Cloudflare: the entry translates for itself. Never a verifiable preference (the body's, `x-gray-routing`, the key's
+    // or the workspace's default, all layered above), a model check, or a request that arrived through the API (it has
+    // no `apiForward`): those get the entry's own answer.
     const toApi = this.lane?.apiForward;
     if (toApi !== undefined && this.lane!.arrival !== "gray_api" && !layered.preference.verifiable && ticketHeader(this.request.headers) === null && !entryRouted(snapshot, chain, protocol) && (await toApi.serves(chain, protocol))) {
       return this.forwardToApi(toApi, body);
@@ -2906,6 +2924,7 @@ export class InferenceRun {
     this.pinned = false;
     if (index === 0) return;
     this.translation = null;
+    this.translationCap = null;
     // What the model before this one dropped of its native body is not this model's (`next_model` starts the log's
     // routing again): a translated answer names what its translation dropped alone (`mark_response`).
     this.nativeDropped = [];
@@ -3075,19 +3094,23 @@ export class InferenceRun {
       // A snapshot without the mapped pairs says it by its routes, as `unrouted` reads it.
       const responsesMapped =
         snapshot.mapped !== undefined ? snapshot.mapped.some((m) => m.model === canonical.model && m.protocol === "open_ai_responses") : snapshot.routes.some((r) => r.model === canonical.model && r.protocol === "open_ai_responses");
-      // The confidential lane never translates (design v2 §A, `assertLaneSnapshot`): it sends a vendor the bytes its
-      // client sent, which the receipt describes, so the implied rule is off there whatever TRANSLATION_FALLBACK says,
-      // as its snapshot carries no operator rule.
-      const targets = translationTargets(translationPolicy(snapshot), laneMode ? "off" : cfg.translationFallback, canonical.model, protocol, responsesMapped, live);
+      // The confidential entry translates by its own rule (docs/design/lane-provider-routes.md section 10, translate.ts
+      // `entryRules`): onto endpoint routes alone, never a lane relay's, whose receipt promises the vendor got the
+      // client's bytes; its receipt names each translation (`request.translated`). No operator rule and no implied
+      // fallback there, and never for a verifiable preference: an endpoint route is not one. A request the entry
+      // forwarded to this gateway is not translated here either (`translationRules`): the entry translates for itself.
+      const viaEntry = !laneMode && viaEntryOf(this.request.headers) !== null;
+      const rules = laneMode && this.preference.verifiable ? NO_TRANSLATION : translationRules(snapshot, laneMode, viaEntry);
+      const targets = translationTargets(rules, laneMode || viaEntry ? "off" : cfg.translationFallback, canonical.model, protocol, responsesMapped, live, laneMode ? "entry" : "operator");
       if (targets === null) {
-        return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, translationPolicy(snapshot)), "routes");
+        return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, rules), "routes");
       }
       const upstreams = targets.upstreams;
       // The implied rule takes only a body read whole, as any translation does, and a body that is not keeps the
       // answer it gets without a translation (decisions of 2026-10-23, the critic's finding): the rule never turns
       // that answer into a refusal of its size.
       if (!parsed.whole && targets.rule === "implied") {
-        return this.unserved(unrouted(snapshot, canonical, protocol, now, true, translationPolicy(snapshot)), "routes");
+        return this.unserved(unrouted(snapshot, canonical, protocol, now, true, rules), "routes");
       }
       // A translated body is made from the parse: only a body read whole can be translated
       // (docs/cloudflare-native.md section 3, tier A).
@@ -3113,7 +3136,9 @@ export class InferenceRun {
         stream: canonical.stream,
         upstreams,
         rule: targets.rule,
-        routes: (upstream) => snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === canonical.model && r.protocol === upstream && tierAdmitted(this.preference, r)),
+        // At the entry an endpoint route alone (`entryRules`): a lane relay's route, a relay stack's or a peer's is never a target.
+        routes: (upstream) =>
+          snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === canonical.model && r.protocol === upstream && tierAdmitted(this.preference, r) && (!laneMode || (r.auth !== "lane_relay" && this.laneRoutes(r)))),
         judge: (t, candidates) => {
           const able = candidates.filter((r) => capable(r, t.contract, false));
           if (able.length === 0) return { kind: "skip" };
@@ -3142,7 +3167,7 @@ export class InferenceRun {
           if (!priced.ok) return { kind: "failed", error: new ApiError(priced.status, priced.code) };
           return { kind: "serve", value: { routes: priced.routes, bound: priced.bound } };
         },
-        unrouted: () => unrouted(snapshot, canonical, protocol, now, false, translationPolicy(snapshot)),
+        unrouted: () => unrouted(snapshot, canonical, protocol, now, false, rules),
       });
       if (!selected.ok) return this.unserved(selected.error, "translation");
       const cap = admissionOutputCap(canonical.max_output_tokens, selected.translation.outputCap);
@@ -3266,8 +3291,9 @@ export class InferenceRun {
       if (written && routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok)) return final(this.refuse(stackCapRequired(), "cost_ceiling"));
       // Nor into a Gemini body at the lane's entry (docs/design/lane-provider-routes.md section 5): the published rewrite
       // policy (`gray-lane-rewrites-v1`) declares no op on Gemini's `generationConfig`, and a receipt names only declared
-      // changes, so a request whose hold needs a cap Gray would write is refused the same way.
-      if (written && this.lane !== null && protocol === "gemini") return final(this.refuse(geminiCapRequired(), "cost_ceiling"));
+      // changes, so a request whose hold needs a cap Gray would write is refused the same way. A translated body is
+      // another matter: the cap goes into it with the translation, which its receipt names (`request.translated.output_cap`).
+      if (written && this.lane !== null && protocol === "gemini" && translation === null) return final(this.refuse(geminiCapRequired(), "cost_ceiling"));
       const decisions = rewriteDecisions({
         protocol,
         stream: canonical.stream,
@@ -3285,7 +3311,10 @@ export class InferenceRun {
       this.laneDecisions = decisions;
       if (translation !== null) {
         // The cap Gray chose goes into the upstream body, with the upstream's field.
-        if (written) translation.writeOutputCap(sizing.outputCap);
+        if (written) {
+          translation.writeOutputCap(sizing.outputCap);
+          this.translationCap = BigInt(sizing.outputCap);
+        }
         const stated = !sizing.defaultCap || written ? sizing.outputCap : null;
         const refreshed = translation.refreshContract(canonical.model, canonical.stream, stated);
         if (refreshed !== null) return final(this.refuse(refreshed, "output_cap"));
@@ -4104,8 +4133,8 @@ export class InferenceRun {
    * and C: the conversation is not parsed) keeps its bytes: the layout scan found the items to take out
    * (parse.ts `ScrubScan`, the server's `scrub_native` of a body of any size), and each attempt's body leaves those spans
    * out (`removals`, `bodyEdits`). A later turn of a conversation an earlier translated turn served may well be one
-   * that large. Null in the confidential lane too: it never translates (design v2 §A), and a vendor is sent the bytes
-   * its client sent (`laneForwardedFor`), which the receipt describes, so it drops nothing and names nothing dropped.
+   * that large. Null in the confidential lane too: a vendor is sent the bytes its client sent, or their declared
+   * translation (`laneForwardedFor`), which the receipt describes, so it drops nothing it does not name.
    */
   private scrubbed(parsed: ParsedRequest): { readonly value: Json; readonly body: ClientBody | null; readonly layout: BodyLayout | null; readonly removals: readonly ScrubSpan[] } | null {
     if (this.lane !== null || this.protocol !== "open_ai_responses") return null;
@@ -6516,6 +6545,8 @@ export class InferenceRun {
     // no relay and so no appends, and its receipt describes the bytes as for a relay's.
     const endpoint = route.record.auth !== "lane_relay";
     if ((relayId === null && !endpoint) || received === null || decisions === null) return null;
+    // A translated request (`entryRules`: endpoint routes alone) forwards the declared translation of the client's bytes.
+    if (this.translation !== null) return endpoint ? this.laneTranslatedFor(route, received, o) : null;
     // A Gemini body goes as it came: the rewrite policy declares no Gemini op, and the request is refused at admission
     // when Gray would have to write its cap (`geminiCapRequired`). Its model is in the URL, never in the body.
     if (endpoint && prepared.protocol === "gemini") return { ok: true, bytes: received, events: [], applied: [] };
@@ -6533,6 +6564,47 @@ export class InferenceRun {
       forwarded = forwardedBody(received, prepared.protocol, plan, appends);
       this.laneForwarded.set(key, forwarded);
     }
+    return forwarded;
+  }
+
+  /**
+   * The bytes a translated request forwards to an endpoint route at the entry, and the events that declare them
+   * (docs/design/lane-provider-routes.md section 10; @gray/lane `translatedForwarded`, the function a verifier replays):
+   * the client's bytes without the members the gateway took out of them (`remove_member /models`, `/provider`,
+   * gray-lane-rewrites-v1), translated from the client's API to the route's with the cap Gray wrote, then the route's
+   * upstream model (`set_member /model`, gray-lane-translation-v1; a Gemini route names it in its URL). The bytes must
+   * be the translated body this request was inspected, priced and held for (`Translation.body`) with the same model:
+   * otherwise the receipt could not prove what was sent, and the attempt is refused, never sent. Cached per upstream
+   * model.
+   */
+  private laneTranslatedFor(route: Route, received: Uint8Array, o: Dispatch): Forwarded {
+    const t = this.translation!;
+    const model = route.record.upstreamModel;
+    const key = `\u0002translated\u0000${model}`;
+    const cached = this.laneForwarded.get(key);
+    if (cached !== undefined) return cached;
+    let client: Json;
+    try {
+      client = readSerdeBytes(received).value;
+    } catch {
+      return { ok: false, error: new ApiError(400, "invalid_json") };
+    }
+    const before: GrayRewriteOp[] = [];
+    if (o.parsed.strip && isObject(client) && Object.hasOwn(client, "models")) before.push({ op: "remove_member", path: "/models" });
+    if (this.stripProvider && isObject(client) && Object.hasOwn(client, "provider")) before.push({ op: "remove_member", path: "/provider" });
+    const after: GrayRewriteOp[] = t.upstream === "gemini" ? [] : [{ op: Object.hasOwn(t.body, "model") ? "set_member" : "insert_member", path: "/model", value: model }];
+    const spec = { endpoint: this.path, from: t.client as TranslatedApi, to: t.upstream as TranslatedApi, ...(this.translationCap === null ? {} : { outputCap: this.translationCap }) };
+    const replayed = translatedForwarded(received, spec, before, after, t.dropped);
+    const own = after.length === 0 ? { ok: true as const, forwarded: t.upstreamBytes() } : applyDeclaredChanges(t.upstreamBytes(), t.upstream as LaneProtocol, { grayOps: after, appends: [], policy: GRAY_LANE_TRANSLATION_V1 });
+    let forwarded: Forwarded;
+    if (replayed.ok && own.ok && bytesEqual(replayed.forwarded, own.forwarded)) {
+      forwarded = { ok: true, bytes: replayed.forwarded, events: [...replayed.events.before, replayed.events.translated, ...replayed.events.after], applied: [] };
+    } else {
+      // Gray's own failure: what the receipt's replay gives is not the body admission inspected. Content-free.
+      console.error(JSON.stringify({ level: "error", event: "lane_translation_unreplayable", request_id: this.requestId, from: t.client, to: t.upstream, replayed: replayed.ok, rewritten: own.ok }));
+      forwarded = { ok: false, error: new ApiError(500, "internal_error") };
+    }
+    this.laneForwarded.set(key, forwarded);
     return forwarded;
   }
 

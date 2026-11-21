@@ -199,11 +199,20 @@ export const PUBLIC_REFS: PublicRefs = {
   supplierRef: (workspaceId) => sha256Hex(`supplier:${workspaceId}`),
 };
 
+/**
+ * For each model, each API Gray's confidential entry offers it on only through translation, with the APIs it is
+ * translated onto in the order the entry tries them (@gray/snapshot `entryTranslations` of the snapshot's entry view,
+ * gray-jobs src/catalog.ts `catalogRoutes`). A model with none is not a key; empty while ENTRY_TRANSLATION is off.
+ */
+export type CatalogTranslations = ReadonlyMap<string, ReadonlyMap<Protocol, readonly Protocol[]>>;
+
 export interface CatalogInput {
   readonly routes: readonly CatalogRoute[];
   readonly unavailable: readonly UnavailableModel[];
   /** The routes listed while they are down (`CatalogDownRoute`); none when absent. */
   readonly down?: readonly CatalogDownRoute[];
+  /** The APIs each model is offered on at the confidential entry through translation (`CatalogTranslations`); none when absent. */
+  readonly translations?: CatalogTranslations;
   readonly metadata: ReadonlyMap<string, CatalogMetadata>;
   readonly feeBps: number;
   /** Unix milliseconds. */
@@ -363,6 +372,10 @@ export async function publicCatalog(input: CatalogInput, refs: PublicRefs = PUBL
     };
     const metadata = input.metadata.get(id);
     if (metadata !== undefined) model.metadata = metadata;
+    // The APIs the confidential entry offers the model on only by translating onto its providers' APIs. Absent without
+    // one, so a document with none is the server's, which has no confidential entry.
+    const translated = input.translations?.get(id);
+    if (translated !== undefined && translated.size > 0) model.translated = [...translated].map(([protocol, onto]) => ({ protocol, onto: [...onto] }));
     models.push(model);
   }
   return { models, unavailable };

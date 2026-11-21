@@ -37,6 +37,19 @@ export {
   type LaneProtocol,
   type Position,
 } from "./protocol.ts";
+export {
+  GRAY_LANE_TRANSLATION_V1,
+  GRAY_LANE_TRANSLATION_V1_ID,
+  HEADER_DROPPED,
+  geminiPathOf,
+  isTranslatedApi,
+  replayTranslated,
+  translateDeclared,
+  translatedForwarded,
+  type TranslationEvents,
+  type TranslationReplay,
+  type TranslationSpec,
+} from "./translation.ts";
 export { checkOfficialUpstream, type OfficialOrigin, type OfficialVendor, type OriginRefusalCode } from "./origin.ts";
 export {
   LANE_STACK_VENDORS,

@@ -3,11 +3,11 @@ import { rustTrim } from "@gray/errors";
 import { compareUtf8 } from "@gray/json";
 import type { CustomerRate } from "@gray/holds";
 import { billingUnit, endpointPath, geminiModelValue as geminiModel, isGeneration, modality, PROTOCOLS, type Protocol } from "@gray/protocol";
-import type { TranslationPolicy } from "@gray/translation";
 import { servesGeminiImages, speaks } from "./gemini-images.ts";
 import { pricedQuoteOf } from "./money.ts";
 import { jaroWinkler } from "./similarity.ts";
 import { type GatewaySnapshot, routeServes } from "./snapshot.ts";
+import type { TranslationRules } from "./translate.ts";
 
 /**
  * The model catalog the model API publishes (crates/gray-gateway/src/model_catalog.rs): which models a
@@ -92,11 +92,12 @@ export function sortProtocols(protocols: Iterable<Protocol>): Protocol[] {
  * `listed_in`: the models a key of `scope` may call through `protocol` (through any API for null), by id
  * in byte order; every model when `scope` is null or empty. A model is listed under a protocol when one
  * of its live, priced routes speaks it, or, when no live route of that protocol exists for it at all, when
- * the translation policy serves it to that protocol's clients from a route's protocol, or (Gemini) its
+ * the translation rules (the operator's policy; the confidential entry's own rule, translate.ts `entryRules`) serve it
+ * to that protocol's clients from a route's protocol, or (Gemini) its
  * image routes speak Gemini's API (`gemini_images::speaks`). A native route always wins on generation, its
  * failures included, so such a model is never listed as served otherwise.
  */
-export function listedIn(snapshot: GatewaySnapshot, policy: TranslationPolicy, scope: readonly string[] | null, protocol: Protocol | null, nowMs: number, feeBps: number): Map<string, Listed> {
+export function listedIn(snapshot: GatewaySnapshot, policy: TranslationRules, scope: readonly string[] | null, protocol: Protocol | null, nowMs: number, feeBps: number): Map<string, Listed> {
   const live = snapshot.routes.filter((r) => routeServes(r.expiresAt, nowMs));
   const routed = new Set(protocol === null ? [] : live.filter((r) => r.protocol === protocol).map((r) => r.model));
   const models = new Map<string, Listed>();
@@ -151,7 +152,7 @@ const GENERATION: readonly Protocol[] = ["open_ai_chat", "open_ai_responses", "a
  * generation APIs among them, those the translation policy serves from one of them, and Gemini's for an
  * image model its image routes serve (`gemini_images::serves`); then its other APIs, in enum order.
  */
-export function reachable(snapshot: GatewaySnapshot, policy: TranslationPolicy, model: string, served: ReadonlySet<Protocol>, nowMs: number): Protocol[] {
+export function reachable(snapshot: GatewaySnapshot, policy: TranslationRules, model: string, served: ReadonlySet<Protocol>, nowMs: number): Protocol[] {
   const apis = GENERATION.filter(
     (p) =>
       served.has(p) ||

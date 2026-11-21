@@ -14,6 +14,7 @@ import {
 } from "@gray/lane";
 import {
   EVENT_REQUEST_MODIFIED,
+  EVENT_REQUEST_TRANSLATED,
   bytesToLowerHex,
   requestModifiedEvent,
   type ReceiptBuilder,
@@ -394,9 +395,11 @@ export function addReceiptEvents(builder: ReceiptBuilder, input: { readonly rece
   const policy = input.draft.policy;
   if (forwarded !== null) {
     // One `request.modified` per op the attempt applied, in application order: after
-    // `request.received`, before `relay_policy.applied` and `request.forwarded` (§7.4, M2).
+    // `request.received`, before `relay_policy.applied` and `request.forwarded` (§7.4, M2). A translated attempt's
+    // `request.translated` stands among them, between the ops on the client's body and those on the translated one
+    // (docs/design/lane-provider-routes.md section 10).
     for (const event of input.draft.modifiedEvents) {
-      builder.addExtensionEvent(EVENT_REQUEST_MODIFIED, modifiedFields(event));
+      builder.addExtensionEvent(event.type === EVENT_REQUEST_TRANSLATED ? EVENT_REQUEST_TRANSLATED : EVENT_REQUEST_MODIFIED, modifiedFields(event));
     }
     if (policy !== null) addPolicyEvent(builder, policy);
     builder.addRequestForwardedHash(forwarded);

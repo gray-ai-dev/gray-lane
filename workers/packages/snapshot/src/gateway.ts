@@ -289,6 +289,8 @@ export interface GatewayView {
   readonly builtAt: number;
   /** The operator's translation policy document (`Snapshot.translation`); unset while none is stored. */
   readonly translation?: string;
+  /** `off` when the confidential entry does not translate (`Snapshot.entryTranslation`); absent while it does. */
+  readonly entryTranslation?: "off";
   /** The replay key, sealed (`Snapshot.replayKey`); unset while none is stored. */
   readonly replayKey?: string;
   /** The (model, API) pairs the enabled endpoints map, verified or not (`Snapshot.mapped`). */
@@ -488,7 +490,8 @@ export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
  * the main lane knows (its request is a 404 there, not a 503).
  *
  * `lane`: the lane's routes (`routeInMode`: the lane relays' and the endpoint routes its entry serves);
- * `translation` unset (the lane serves the client's own protocol); `contentRecipients` empty (the lane captures no
+ * `translation` unset (the entry's translations follow its own rule, `entryTranslationTargets`, never an operator's
+ * policy); `contentRecipients` empty (the lane captures no
  * content); `mapped` the lane relays' mappings and the direct mappings on a protocol the entry speaks (the lane answers
  * 503 for a known model with no live route). A pair carries no base URL or adapter, so a direct pair is kept by its
  * protocol alone: a model only an endpoint the entry cannot carry maps answers 503 there rather than 404. Every other
@@ -530,8 +533,9 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
   const workspaces: Record<string, GatewayWorkspace> = {};
   // A snapshot stored before the workspace rows travelled with it (ConfigDO's, until its next rebuild) has none.
   for (const w of snapshot.workspaces ?? []) workspaces[w.workspaceId] = { region: regions.get(w.workspaceId) ?? "any", home: w.home };
-  // A snapshot stored before the policy travelled with it has no field: none stored. The lane translates
-  // nothing, whatever the operator's policy says (design v2 section B).
+  // A snapshot stored before the policy travelled with it has no field: none stored. The lane reads no operator
+  // policy: its entry translates by its own rule onto endpoint routes alone (endpoint-route.ts `entryTranslationTargets`),
+  // which `entryTranslation` turns off.
   const translation = mode === "lane" ? null : (snapshot.translation ?? null);
   const replayKey = snapshot.replayKey ?? null;
   // A snapshot stored before the pairs travelled with it has none. A lane mode view keeps the pairs a lane
@@ -571,6 +575,7 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     contentRecipients,
     builtAt: snapshot.builtAt,
     ...(translation === null ? {} : { translation }),
+    ...(snapshot.entryTranslation === "off" ? { entryTranslation: "off" as const } : {}),
     ...(replayKey === null ? {} : { replayKey }),
     mapped,
     facts,
@@ -627,7 +632,8 @@ export class LaneViewError extends Error {
 /**
  * `assert_lane_view`: the lane snapshot's invariants (design v2 section B): every route is a `lane_relay`
  * route or an endpoint route the entry serves (`entryEndpointRoute`, docs/design/lane-provider-routes.md section
- * 2), none is translated, no content recipient travels, and every lane relay's route carries its relay record.
+ * 2), it carries no operator translation policy (the entry translates by its own rule, `entryTranslationTargets`), no
+ * content recipient travels, and every lane relay's route carries its relay record.
  * A violation is a boot error: the lane must fail closed rather than serve a route its egress cannot carry, or
  * one whose relay it does not know.
  *

@@ -1244,7 +1244,7 @@ async function route(
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
   if (listing !== null) {
-    const catalog = { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p: Promise<unknown>) => ctx.waitUntil(p) };
+    const catalog = { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p: Promise<unknown>) => ctx.waitUntil(p), lane: true };
     if (!forwardable) return serveCatalog(request, listing, path, catalog);
     // docs/design/one-address.md "/v1/models": the entry's own listing (OpenAI's or Gemini's), asked as a GET so a HEAD
     // is merged the same way.

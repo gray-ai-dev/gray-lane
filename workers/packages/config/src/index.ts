@@ -84,6 +84,9 @@ export const ERROR_TEXT_FALLBACK_MODES = ["on", "off"] as const;
 export type ErrorTextFallback = (typeof ERROR_TEXT_FALLBACK_MODES)[number];
 export const CHECK_CONFIRMATION_MODES = ["on", "off"] as const;
 export type CheckConfirmation = (typeof CHECK_CONFIRMATION_MODES)[number];
+/** ENTRY_TRANSLATION values: whether the confidential entry translates between text APIs for endpoint routes (@gray/snapshot `entryTranslationTargets`). */
+export const ENTRY_TRANSLATION_MODES = ["on", "off"] as const;
+export type EntryTranslation = (typeof ENTRY_TRANSLATION_MODES)[number];
 /** ALLOW_PRIVATE_UPSTREAMS values: the server's GRAY_ALLOW_PRIVATE_UPSTREAMS, `1` on a development console. */
 export const PRIVATE_UPSTREAM_SWITCHES = ["0", "1"] as const;
 export type PrivateUpstreamSwitch = (typeof PRIVATE_UPSTREAM_SWITCHES)[number];
@@ -2580,6 +2583,24 @@ export const SETTINGS: readonly SettingSpec[] = [
       "crates/gray-gateway/src/inference.rs:120), so one failed rebuild never raises the stale-snapshot alert. The minimum keeps a rebuild, a " +
       "fixed number of queries at about 6 ms each near the database (docs/cloudflare-native/m0/database.md), from running back to back.",
     doc: "How often ConfigDO rebuilds the key, route and offer snapshot from PostgreSQL. A new version is published only when the content changed.",
+  },
+  {
+    name: "ENTRY_TRANSLATION",
+    key: "entryTranslation",
+    workers: ["jobs"],
+    type: "enum",
+    values: ENTRY_TRANSLATION_MODES,
+    default: "on",
+    source:
+      "The owner's decision of 2026-11-21 (docs/design/lane-provider-routes.md section 10): the confidential entry translates between text " +
+      "APIs for endpoint routes by default, every translation named in the answer's receipt. ConfigDO writes the switch into the snapshot " +
+      "(`entryTranslation`), so the entry's routing, its model lists and the catalog's Model page read one value, and turning it off needs " +
+      "no release of the entry. The same on/off shape as ERROR_TEXT_FALLBACK.",
+    doc:
+      "Whether the confidential entry serves a model on a text API (Chat Completions, Responses, Messages, Gemini) it has no route of on that " +
+      "API by translating the request onto another on which the model has endpoint routes there. `on`: it does, and says so in the answer's " +
+      "headers and its receipt; the entry's model lists and the Model page list those APIs. `off`: the entry serves each API's own routes " +
+      "only. Never a lane relay's route, and never a model check or a verifiable preference.",
   },
   {
     name: "JOBS_LOCATION_HINT",
@@ -5826,6 +5847,8 @@ export interface JobsConfig extends LedgerJobsConfig {
   readonly deployEnv: DeployEnv;
   readonly endpointRootLocationHint: LocationHint;
   readonly configRebuildMs: number;
+  /** ENTRY_TRANSLATION: whether the confidential entry translates between text APIs (ConfigDO writes it into the snapshot). */
+  readonly entryTranslation: EntryTranslation;
   readonly configAlertAgeMs: number;
   readonly alertGroupMs: number;
   readonly internalCallTimeoutMs: number;

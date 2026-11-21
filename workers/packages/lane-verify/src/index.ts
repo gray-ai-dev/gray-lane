@@ -14,7 +14,9 @@
  *    Gray's declared `request.modified` rewrites and the declared, pre-registered template appends,
  *    using the same replays the gateway ran (`@gray/lane`'s `verifyForwarded` and
  *    `verifyForwardedWithChanges`). `verifyResponseReceiptText(text, ...)` is the same check for the
- *    text a customer received, read through `@gray/attest`'s strict reader.
+ *    text a customer received, read through `@gray/attest`'s strict reader. A receipt that names a
+ *    translation (`request.translated`) is replayed with `@gray/lane`'s `replayTranslated`, the
+ *    translation the gateway ran, and the result's `translation` names it.
  *
  * 3. `verifyPeerAttestation(report, {layout, releaseList, nonce, tlsSpkiSha256, host, quoteVerifier})` is
  *    the first question as one lane VM asks it of another (docs/confidential-lane-stack-routing.md §4.3):
@@ -123,6 +125,7 @@ export {
   type AppendedTextRecord,
   type ReceiptCheck,
   type ReceiptCheckStatus,
+  type ReceiptTranslation,
   type ResponseReceiptVerification,
   type StackAttemptRecord,
   type StackReceiptSummary,

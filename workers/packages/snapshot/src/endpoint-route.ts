@@ -253,3 +253,62 @@ export function entryEndpointRoute(
   const target = endpointRouteTarget(r.baseUrl, deny);
   return target !== null && endpointRoutePath(r.url, target) !== null;
 }
+
+/**
+ * The APIs the entry translates between (docs/design/lane-provider-routes.md section 10; the owner's decision of
+ * 2026-11-21): its endpoint protocols, the four text APIs @gray/translation carries in both directions. Their order is
+ * the order the entry tries translation targets in, the client's own API left out: @gray/protocol's `PROTOCOLS` order,
+ * which for a Responses client is the implied fallback's (@gray/translation `RESPONSES_FALLBACK`).
+ */
+export const ENTRY_TRANSLATED_APIS: readonly Protocol[] = Object.freeze(["open_ai_chat", "open_ai_responses", "anthropic_messages", "gemini"]);
+
+/**
+ * The APIs a request on `client` for one model is translated onto at the entry, in the order they are tried: none when
+ * `client` is not one of ENTRY_TRANSLATED_APIS or the model has a route of its own on it at the entry (`native`: a lane
+ * relay's route or an endpoint route, live or not, so a native route always comes first, its failures included);
+ * otherwise each other API of the list on which the model has an endpoint route at the entry (`endpoint`). A lane
+ * relay's route is never a target: its receipt promises the vendor got the client's bytes. The entry's routing, its
+ * model lists, the main gateway's forward to the entry and the catalog read this one rule.
+ */
+export function entryTranslationTargets(client: Protocol, native: (api: Protocol) => boolean, endpoint: (api: Protocol) => boolean): Protocol[] {
+  if (!ENTRY_TRANSLATED_APIS.includes(client) || native(client)) return [];
+  return ENTRY_TRANSLATED_APIS.filter((api) => api !== client && endpoint(api));
+}
+
+/** One route of the entry's view as `entryTranslations` reads it: its model, its API, and whether it is an endpoint route (else a lane relay's). */
+export interface EntryOffer {
+  readonly model: string;
+  readonly protocol: Protocol;
+  readonly endpoint: boolean;
+}
+
+/**
+ * For each model of `routes` (the entry's view: lane relays' routes and the endpoint routes it serves), each API it is
+ * offered on at the entry only through translation, with the APIs it is translated onto (`entryTranslationTargets`), in
+ * ENTRY_TRANSLATED_APIS order. A model with none is left out. Empty when `off`.
+ */
+export function entryTranslations(routes: Iterable<EntryOffer>, off: boolean): Map<string, Map<Protocol, Protocol[]>> {
+  const out = new Map<string, Map<Protocol, Protocol[]>>();
+  if (off) return out;
+  const native = new Map<string, Set<Protocol>>();
+  const endpoint = new Map<string, Set<Protocol>>();
+  for (const r of routes) {
+    let all = native.get(r.model);
+    if (all === undefined) native.set(r.model, (all = new Set()));
+    all.add(r.protocol);
+    if (!r.endpoint) continue;
+    let own = endpoint.get(r.model);
+    if (own === undefined) endpoint.set(r.model, (own = new Set()));
+    own.add(r.protocol);
+  }
+  for (const [model, apis] of endpoint) {
+    const all = native.get(model)!;
+    const translated = new Map<Protocol, Protocol[]>();
+    for (const client of ENTRY_TRANSLATED_APIS) {
+      const targets = entryTranslationTargets(client, (api) => all.has(api), (api) => apis.has(api));
+      if (targets.length > 0) translated.set(client, targets);
+    }
+    if (translated.size > 0) out.set(model, translated);
+  }
+  return out;
+}

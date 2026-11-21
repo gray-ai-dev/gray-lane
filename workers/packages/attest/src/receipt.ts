@@ -23,6 +23,7 @@ import {
   relayStackChangedEvent,
   relayStackFeedIncompleteEvent,
   requestModifiedEvent,
+  requestTranslatedEvent,
   requestForwardedEvent,
   requestReceivedEvent,
   responseReturnedEvent,
@@ -372,6 +373,14 @@ export class ReceiptBuilder {
     readonly declaredIn: string;
   }): void {
     this.#push(requestModifiedEvent(input));
+  }
+
+  /**
+   * Gray's `request.translated` (docs/design/lane-provider-routes.md section 10): the request went to the provider on
+   * `to`, translated from the client's `from`. After the ops on the client's body, before those on the translated body.
+   */
+  addRequestTranslated(input: Parameters<typeof requestTranslatedEvent>[0]): void {
+    this.#push(requestTranslatedEvent(input));
   }
 
   /** Relay stack, backend mode (§4.8): the entry this stack VM served the request for. Right after `request.received`. */

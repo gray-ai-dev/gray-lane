@@ -1,7 +1,7 @@
 import type { GatewayConfig } from "@gray/config";
 import { API_FORWARD_HEADER, API_FORWARD_KEY_ID, apiForwardSeed, checkForwardMark, ENTRY_FORWARD_HEADER, forwardMarkKeys, signForwardMark, VIA_ENTRY_HEADER, type ForwardMarkTarget } from "@gray/lane-wire";
 import type { Protocol } from "@gray/protocol";
-import { entryEndpointRoute, laneServedKey } from "@gray/snapshot";
+import { entryEndpointRoute, entryTranslationTargets, laneServedKey } from "@gray/snapshot";
 import type { GatewaySnapshot } from "./snapshot.ts";
 
 /**
@@ -171,19 +171,23 @@ export function forwardedAnswer(answer: Response, onEnd: () => void = () => {}):
 }
 
 /**
- * Whether the confidential entry serves one of `models` on `protocol`, by this gateway's snapshot and the rule the
+ * Whether the confidential entry serves one of `models` on `protocol`, by this gateway's snapshot and the rules the
  * entry's own view is built with (@gray/snapshot `routeInMode(…, "lane")`): a lane relay's route of the pair
- * (`laneServed`), or an endpoint route the entry serves too (`entryEndpointRoute`) with exactly that API, since the entry
- * does not translate. A route's existence decides, not whether it serves now: a pair whose routes are all down is still
- * the entry's to answer. A model the entry has no such route of (one this gateway serves only through translation, a
- * Gemini image model served through its image routes) is answered here: the entry never forwards a request back.
+ * (`laneServed`), an endpoint route the entry serves too (`entryEndpointRoute`) with exactly that API, or, while the
+ * entry translates (`entryTranslation`), an endpoint route of the model there on another text API it translates onto
+ * (@gray/snapshot `entryTranslationTargets`). A route's existence decides, not whether it serves now: a pair whose routes
+ * are all down is still the entry's to answer. A model the entry has no such route of (a Gemini image model served
+ * through its image routes, one this gateway serves only through its operator's translation) is answered here: the
+ * entry never forwards a request back.
  */
-export function entryServes(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed">, models: readonly string[], protocol: Protocol): boolean {
+export function entryServes(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed" | "entryTranslation">, models: readonly string[], protocol: Protocol): boolean {
   const served = snapshot.laneServed ?? {};
   if (models.some((model) => Object.hasOwn(served, laneServedKey(model, protocol)))) return true;
-  return snapshot.routes.some(
-    (r) => r.protocol === protocol && r.auth !== "lane_relay" && models.includes(r.model) && entryEndpointRoute({ auth: r.auth, protocol: r.protocol, adapter: r.adapter, baseUrl: r.baseUrl, url: r.url }),
-  );
+  const endpoint = snapshot.routes.filter((r) => r.auth !== "lane_relay" && models.includes(r.model) && entryEndpointRoute({ auth: r.auth, protocol: r.protocol, adapter: r.adapter, baseUrl: r.baseUrl, url: r.url }));
+  if (endpoint.some((r) => r.protocol === protocol)) return true;
+  if (snapshot.entryTranslation === "off") return false;
+  // No route of the pair at the entry (above): a model with an endpoint route there on another text API is translated.
+  return models.some((model) => entryTranslationTargets(protocol, () => false, (api) => endpoint.some((r) => r.model === model && r.protocol === api)).length > 0);
 }
 
 /**
@@ -192,7 +196,7 @@ export function entryServes(snapshot: Pick<GatewaySnapshot, "routes" | "laneServ
  * serve. A list naming such a model is answered here, as before: at the entry that model would be skipped for a later one
  * the client listed after it, and the entry never forwards a request back.
  */
-export function entryServesChain(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed" | "mapped">, models: readonly string[], protocol: Protocol): boolean {
+export function entryServesChain(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed" | "mapped" | "entryTranslation">, models: readonly string[], protocol: Protocol): boolean {
   let any = false;
   for (const model of models) {
     if (entryServes(snapshot, [model], protocol)) {

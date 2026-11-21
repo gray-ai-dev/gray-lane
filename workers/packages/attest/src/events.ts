@@ -6,8 +6,9 @@ import { isU64, u64Schema } from "./integers.ts";
 import { stackEventsChainStart } from "./stack-hash.ts";
 
 /**
- * The receipt event vocabulary (ACI spec §7.3–§7.5) plus Gray's three implementation-specific
- * events: `relay_policy.applied`, `relay_policy.refused` and `request.modified`.
+ * The receipt event vocabulary (ACI spec §7.3–§7.5) plus Gray's implementation-specific events:
+ * `relay_policy.applied`, `relay_policy.refused`, `request.modified` and `request.translated` (a request the entry
+ * translated onto another text API, docs/design/lane-provider-routes.md section 10).
  *
  * Events are flat objects: `type` plus type-specific fields, in the array order (§7.3). Services MAY
  * add events with implementation-specific types and verifiers ignore types they do not recognize
@@ -53,6 +54,43 @@ export const EVENT_RELAY_POLICY_REFUSED = "relay_policy.refused";
  * `relay_policy.applied` and `request.forwarded`.
  */
 export const EVENT_REQUEST_MODIFIED = "request.modified";
+
+/**
+ * Gray's translation extension event (docs/design/lane-provider-routes.md section 10): the entry served the request on
+ * another text API than the client's, translating the request with the published translation code and the answer back.
+ * At most one, in a single-forward receipt only, after `request.received` and before `request.forwarded`. The
+ * `request.modified` events before it are Gray's ops on the client's body (`gray-lane-rewrites-v1`, the client's API);
+ * the ones after it are its ops on the translated body (`declared_in` the event's own policy, the upstream API's). The
+ * forwarded body is the client's bytes with the ops before, then the translation, then the ops after.
+ */
+export const EVENT_REQUEST_TRANSLATED = "request.translated";
+
+/** The APIs a `request.translated` names (@gray/protocol's names): the four text APIs the translation carries. */
+export const TRANSLATED_APIS = Object.freeze(["open_ai_chat", "open_ai_responses", "anthropic_messages", "gemini"] as const);
+export type TranslatedApi = (typeof TRANSLATED_APIS)[number];
+
+/**
+ * The published translations a `request.translated` may name (`declared_in`): the translation code and the ops it allows
+ * on a translated body (@gray/lane `GRAY_LANE_TRANSLATION_V1`). A verifier replays only the ones it carries.
+ */
+export const TRANSLATION_POLICIES = Object.freeze(["gray-lane-translation-v1"] as const);
+
+/** The most names one `request.translated` lists as dropped. */
+export const TRANSLATED_DROPPED_MAX = 64;
+
+/** A `request.translated`: the APIs, the client fields the translated body does not carry, a cap Gray wrote, the policy. */
+export interface RequestTranslatedEvent {
+  readonly type: typeof EVENT_REQUEST_TRANSLATED;
+  /** The API the client sent the request on. */
+  readonly from: TranslatedApi;
+  /** The API the provider was sent it on. */
+  readonly to: TranslatedApi;
+  /** The client fields the translated request does not carry, by name, sorted and each once (`x-gray-translation-dropped`). */
+  readonly dropped: readonly string[];
+  /** The output cap Gray wrote into the translated body (@gray/protocol `applyOutputCap`), when it wrote one. */
+  readonly output_cap?: bigint;
+  readonly declared_in: (typeof TRANSLATION_POLICIES)[number];
+}
 
 /** The closed op vocabulary of `request.modified` (one event per op, in application order). */
 export const REQUEST_MODIFIED_OPS = Object.freeze(["set_member", "insert_member", "remove_member"] as const);
@@ -207,6 +245,51 @@ export const requestModifiedSchema = z
       ctx.addIssue({ code: "custom", path: ["value"], message: "exactly one of value and value_sha256 is required" });
     }
   });
+
+/** A dropped field's name: a lower-case identifier of the translation's own vocabulary, never client text. */
+const droppedNameSchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/, "a lower-case field name");
+
+/** `request.translated` ([`RequestTranslatedEvent`]): two different text APIs, the dropped names sorted and each once. */
+export const requestTranslatedSchema = z
+  .object({
+    type: z.literal(EVENT_REQUEST_TRANSLATED),
+    from: z.enum(TRANSLATED_APIS),
+    to: z.enum(TRANSLATED_APIS),
+    dropped: z.array(droppedNameSchema).max(TRANSLATED_DROPPED_MAX),
+    output_cap: u64Schema.min(1n, "an output cap is 1 to 4294967295").max(4_294_967_295n, "an output cap is 1 to 4294967295").optional(),
+    declared_in: z.enum(TRANSLATION_POLICIES),
+  })
+  .strict()
+  .superRefine((event, ctx) => {
+    if (event.from === event.to) ctx.addIssue({ code: "custom", path: ["to"], message: "a translation names two different APIs" });
+    for (let i = 1; i < event.dropped.length; i += 1) {
+      if (!(event.dropped[i - 1]! < event.dropped[i]!)) {
+        ctx.addIssue({ code: "custom", path: ["dropped"], message: "the dropped names are sorted and each once" });
+        break;
+      }
+    }
+  });
+
+/** `request.translated`: the shape `requestTranslatedSchema` holds every receipt to. Throws on one no receipt may carry. */
+export function requestTranslatedEvent(input: {
+  readonly from: TranslatedApi;
+  readonly to: TranslatedApi;
+  readonly dropped: readonly string[];
+  readonly outputCap?: bigint;
+  readonly declaredIn: (typeof TRANSLATION_POLICIES)[number];
+}): JsonObject {
+  const event: JsonObject = {
+    type: EVENT_REQUEST_TRANSLATED,
+    from: input.from,
+    to: input.to,
+    dropped: [...new Set(input.dropped)].sort(),
+    ...(input.outputCap === undefined ? {} : { output_cap: input.outputCap }),
+    declared_in: input.declaredIn,
+  };
+  const checked = requestTranslatedSchema.safeParse(event);
+  if (!checked.success) throw new Error(`not a request.translated event: ${checked.error.issues.map((issue) => issue.message).join("; ")}`);
+  return event;
+}
 
 /**
  * Gray's relay-stack extension events (plan S26), one group per upstream attempt. Never one of the
@@ -1232,6 +1315,10 @@ export type EventLogProblem =
   | "policy_outcome_position"
   | "modified_without_forwarded"
   | "modified_position"
+  // A translated request (`request.translated`, docs/design/lane-provider-routes.md section 10):
+  | "translated_repeated"
+  | "translated_position"
+  | "translated_with_relay_policy"
   // Relay-stack receipts (S26):
   | "stack_event_repeated"
   | "returned_not_last"
@@ -1361,6 +1448,17 @@ export function checkEventLog(events: readonly Json[]): readonly EventLogIssue[]
     if (returned >= 0 && index > returned) {
       issues.push({ code: "modified_position", message: "request.modified follows response.returned" });
     }
+  }
+  // A translation (docs/design/lane-provider-routes.md section 10): once, between request.received and request.forwarded,
+  // and never with a relay policy, which runs for a lane relay's route, never translated.
+  const translatedIndexes = types.flatMap((type, index) => (type === EVENT_REQUEST_TRANSLATED ? [index] : []));
+  if (translatedIndexes.length > 1) issues.push({ code: "translated_repeated", message: "request.translated appears more than once" });
+  for (const index of translatedIndexes) {
+    if (forwarded < 0 || index > forwarded) issues.push({ code: "translated_position", message: "request.translated does not precede request.forwarded" });
+    if (received >= 0 && index < received) issues.push({ code: "translated_position", message: "request.translated precedes request.received" });
+  }
+  if (translatedIndexes.length > 0 && policyIndexes.length > 0) {
+    issues.push({ code: "translated_with_relay_policy", message: "a translated request has no relay_policy.* event: Gray translates for endpoint routes alone" });
   }
   for (const index of policyIndexes) {
     const type = types[index];
@@ -1657,6 +1755,10 @@ function checkStackOrder(events: readonly Json[], types: readonly (string | unde
           close();
         }
         break;
+      // A relay stack's container is sent the client's own bytes (S23): Gray translates for endpoint routes alone.
+      case EVENT_REQUEST_TRANSLATED:
+        push("stack_v1_event", `event ${index} (request.translated) names a translation, which a relay-stack receipt never carries`);
+        break;
       default:
         break;
     }
@@ -1800,6 +1902,8 @@ function checkEvent(event: Json, type: string): string | null {
     schemas = [relayPolicyRefusedSchema];
   } else if (type === EVENT_REQUEST_MODIFIED) {
     schemas = [requestModifiedSchema];
+  } else if (type === EVENT_REQUEST_TRANSLATED) {
+    schemas = [requestTranslatedSchema];
   } else {
     return null;
   }

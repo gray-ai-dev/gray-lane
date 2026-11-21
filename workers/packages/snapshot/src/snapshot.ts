@@ -259,6 +259,12 @@ export interface SnapshotContent {
    */
   readonly translation: string | null;
   /**
+   * `off` when ConfigDO's ENTRY_TRANSLATION is off: the confidential entry then serves each API's own routes only
+   * (endpoint-route.ts `entryTranslationTargets`). Absent while it is on, the default, so a snapshot is the one it was
+   * before the switch existed; the catalog reads the same value for the Model page.
+   */
+  readonly entryTranslation?: "off";
+  /**
    * The control database's replay key as stored (`control_master_key_state.replay_key`): base64 of
    * nonce || AES-256-GCM(master key, the key's 64 hex digits), additional data
    * `gray.endpoint-command.replay-key.v1` (crates/gray-control/src/master_key_rotation.rs). The gateway
