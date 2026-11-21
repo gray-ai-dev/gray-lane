@@ -1,6 +1,6 @@
 import { asArray, asStr, asU64, get, isObject, parseSerde, pointer, type Json, type JsonObject } from "@gray/json";
 import { billedTokens, bufferedUsage, parseResponse, parseUsage, PromptUnits, ProtocolError, ProtocolStreamDecoder, SseDecoder, type CanonicalEvent, type FinishReason, type Protocol } from "@gray/protocol";
-import { baseKind, isStreamingCheck, type CheckKind, type OutcomeCode, type VerificationStatus } from "./outcome.ts";
+import { baseKind, capField, isOutputCap, isStreamingCheck, type CheckKind, type OutcomeCode, type VerificationStatus } from "./outcome.ts";
 import { NO_CACHED, type CachedInput } from "./report.ts";
 import type { ProbeTarget } from "./target.ts";
 import { IMAGE_OUTPUT_COLORS, PROBE_IMAGES, VISION_COLORS, type Color } from "./images.ts";
@@ -283,8 +283,15 @@ export const REASONING_OUTPUT_LIMIT = 4096;
 /** Output limit of an image output check (native.rs IMAGE_OUTPUT_LIMIT). */
 export const IMAGE_OUTPUT_LIMIT = 4096;
 
-/** `output_cap`: the output limit a check sends, above the thinking it may provoke. */
+/**
+ * Output limit of an output-cap check (native.rs CAP_CHECK_LIMIT): small, so the answer it asks for runs past it and a
+ * cap the API ignores shows in the usage it bills, and cheap.
+ */
+export const CAP_CHECK_LIMIT = 16;
+
+/** `output_cap`: the output limit a check sends, above the thinking it may provoke; an output-cap check's own. */
 export function outputCap(kind: CheckKind, maxOutputTokens: number): number {
+  if (isOutputCap(kind)) return CAP_CHECK_LIMIT;
   const base = baseKind(kind);
   // OpenCode's agent turn declares its tools (coding-agent.ts).
   const floor = base === "reasoning" || base === "tools" || base === "coding_agent" ? REASONING_OUTPUT_LIMIT : base === "image_output" ? IMAGE_OUTPUT_LIMIT : PROBE_THINKING_BUDGET + 256;
@@ -367,6 +374,11 @@ export function requestBody(target: ProbeTarget, kind: CheckKind, c: Challenge, 
     case "image_output":
       prompt = `Generate an image of a single solid ${c.color ?? "red"} square that fills the whole frame, with no other shapes and no text. Request ${order}.`;
       break;
+    case "max_tokens_cap":
+    case "max_completion_tokens_cap":
+      // Far more than the cap: an API that honors it stops at the cap with a `length` finish.
+      prompt = `For order ${order}, count from 1 to 1000, one number per line, and write nothing else.`;
+      break;
     default:
       prompt = `A customer wrote to support: "${NOTE} My order number is ${order}." What is the customer's order number? Reply with just the order number.`;
   }
@@ -374,7 +386,10 @@ export function requestBody(target: ProbeTarget, kind: CheckKind, c: Challenge, 
   switch (target.protocol) {
     case "open_ai_chat": {
       const content: Json = c.image !== null ? [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:image/png;base64,${c.image}` } }] : prompt;
-      b = { model: target.model, messages: [{ role: "user", content }], max_completion_tokens: limit, stream };
+      // An output-cap check writes its cap into the field it checks (clause 2.4); every other check into
+      // `max_completion_tokens`.
+      const field = capField(kind) ?? "max_completion_tokens";
+      b = { model: target.model, messages: [{ role: "user", content }], [field]: limit, stream };
       break;
     }
     case "open_ai_responses": {
@@ -726,6 +741,19 @@ export function readJson(protocol: Protocol, kind: CheckKind, v: Json, c: Challe
   return { text, tools };
 }
 
+/**
+ * `validate_cap_json`: the envelope of a buffered answer to an output-cap check, after its usage was found within
+ * the cap (the exchange fails one past it, `output_cap_ignored`): one choice, finished for its length. An answer
+ * that finished otherwise shows nothing about the cap (`output_cap_unreached`). Its text is not judged. Only Chat
+ * plans these checks. Throws a Refusal.
+ */
+export function validateCapJson(protocol: Protocol, v: Json): void {
+  if (protocol !== "open_ai_chat") refuse(unclear("probe_unavailable"));
+  const choices = asArray(get(v, "choices")) ?? refuse(fail("invalid_envelope"));
+  if (choices.length !== 1) refuse(fail("invalid_envelope"));
+  if (asStr(get(choices[0], "finish_reason")) !== "length") refuse(unclear("output_cap_unreached"));
+}
+
 /** The verdict on a structured answer's text: the order number and nothing else. */
 function structuredVerdict(text: string, c: Challenge): Verdict | null {
   return namesOrder(argumentsOf(text), c.nonce) ? null : fail("invalid_structured_output");
@@ -773,6 +801,9 @@ export function validateStream(protocol: Protocol, kind: CheckKind, bytes: Uint8
   let usageResult: ProbeUsage = { ...NO_USAGE };
   const run = (): void => {
     const base = baseKind(kind);
+    // Only Chat plans the output-cap checks (`validateCapJson`).
+    const cap = isOutputCap(base);
+    if (cap && protocol !== "open_ai_chat") refuse(unclear("probe_unavailable"));
     const frames = (() => {
       const decoder = new SseDecoder();
       try {
@@ -862,6 +893,15 @@ export function validateStream(protocol: Protocol, kind: CheckKind, bytes: Uint8
         if (declaredTool(base, event.name ?? undefined)) tools.push(toolValid(event.name ?? undefined, event.id ?? undefined, event.arguments, c, protocol !== "gemini"));
         else undeclared = true;
       } else if (event.type === "finish") finishes.push(event.reason);
+    }
+    // An output-cap check's stream (its usage already found within the cap by the exchange, or it fails
+    // `output_cap_ignored` there): finished, every finish for its length, and its usage reported, which the check
+    // cannot judge without. Its text is not judged.
+    if (cap) {
+      if (finishes.length === 0) refuse(fail("missing_terminal"));
+      if (finishes.some((reason) => reason !== "length")) refuse(unclear("output_cap_unreached"));
+      if (!usageResult.complete) refuse(unclear("missing_usage"));
+      return;
     }
     // An answer that called the declared tool finishes for the call; one that also called a tool the check
     // did not declare may finish for that call.

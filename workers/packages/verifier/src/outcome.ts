@@ -28,6 +28,16 @@ export const CHECK_KINDS = [
    */
   "coding_agent",
   "catalog_listed",
+  /**
+   * The output-cap checks of a Chat Completions mapping (docs/api-provider-standard clause 2.4: Chat takes both
+   * `max_tokens` and `max_completion_tokens`): one request with a small cap in the named field, asking for far more.
+   * The answer must stop at the cap with a `length` finish. Each mode's are part of what proves the mode
+   * (`provenBuffered`, `provenStreaming`): a route that ignores either field does not serve that mode.
+   */
+  "max_tokens_cap",
+  "max_completion_tokens_cap",
+  "streaming_max_tokens_cap",
+  "streaming_max_completion_tokens_cap",
 ] as const;
 export type CheckKind = (typeof CHECK_KINDS)[number];
 
@@ -38,8 +48,22 @@ export function isStreamingCheck(kind: CheckKind): boolean {
     kind === "streaming_structured_output" ||
     kind === "streaming_vision" ||
     kind === "streaming_reasoning" ||
-    kind === "streaming_image_output"
+    kind === "streaming_image_output" ||
+    kind === "streaming_max_tokens_cap" ||
+    kind === "streaming_max_completion_tokens_cap"
   );
+}
+
+/** `CheckKind::is_output_cap`: one of the four output-cap checks, buffered or streamed. */
+export function isOutputCap(kind: CheckKind): boolean {
+  return kind === "max_tokens_cap" || kind === "max_completion_tokens_cap" || kind === "streaming_max_tokens_cap" || kind === "streaming_max_completion_tokens_cap";
+}
+
+/** `CheckKind::cap_field`: the Chat member an output-cap check writes its cap into, or null for another check. */
+export function capField(kind: CheckKind): "max_tokens" | "max_completion_tokens" | null {
+  if (kind === "max_tokens_cap" || kind === "streaming_max_tokens_cap") return "max_tokens";
+  if (kind === "max_completion_tokens_cap" || kind === "streaming_max_completion_tokens_cap") return "max_completion_tokens";
+  return null;
 }
 
 /** `CheckKind::proves_streaming`: the streamed form of a mapping's basic check (`proven_streaming`). */
@@ -88,6 +112,10 @@ export function provesCapability(kind: CheckKind): boolean {
     case "embedding_dimensions":
     case "timed_transcript":
     case "cache_ttl":
+    // A streamed output-cap check decides the streamed mode only (`provenStreaming`), as the streamed basic check
+    // does; the buffered ones decide the route as the buffered basic check does (`routeStatus`, `admissible`).
+    case "streaming_max_tokens_cap":
+    case "streaming_max_completion_tokens_cap":
       return true;
     default:
       return provesStreaming(kind);
@@ -109,6 +137,10 @@ export function baseKind(kind: CheckKind): CheckKind {
       return "reasoning";
     case "streaming_image_output":
       return "image_output";
+    case "streaming_max_tokens_cap":
+      return "max_tokens_cap";
+    case "streaming_max_completion_tokens_cap":
+      return "max_completion_tokens_cap";
     default:
       return kind;
   }
@@ -146,7 +178,12 @@ export function claimOf(kind: CheckKind): Claim | null {
       return "reasoning";
     case "streaming":
     case "streaming_image_output":
+    case "streaming_max_tokens_cap":
+    case "streaming_max_completion_tokens_cap":
       return "streaming";
+    case "max_tokens_cap":
+    case "max_completion_tokens_cap":
+      return "buffered";
     case "embedding_base64":
       return "embedding_base64";
     case "embedding_dimensions":
@@ -212,6 +249,10 @@ export const OUTCOME_DETAILS = {
   /** A client check was not sent: the price it is counted at ended during the run (`BudgetError::MissingPrice`). */
   check_price_unavailable:
     "The check was not sent: the price Gray counts it at has ended. Change the offer's price; the check is sent with a later check of the model once the model has a current price.",
+  /** An output-cap check's answer ran past the cap it sent (and the declared output allowance). */
+  output_cap_ignored: "The API answered past the output cap the check sent. Clause 2.4 of the API standard: Chat Completions honors both max_tokens and max_completion_tokens.",
+  /** An output-cap check's answer finished before the cap for another reason than its length: nothing shown either way. */
+  output_cap_unreached: "The answer ended before the output cap the check sent, so it did not show whether the API honors the cap. Run checks again.",
 } as const;
 export type OutcomeCode = keyof typeof OUTCOME_DETAILS;
 export const OUTCOME_CODES = Object.keys(OUTCOME_DETAILS) as OutcomeCode[];

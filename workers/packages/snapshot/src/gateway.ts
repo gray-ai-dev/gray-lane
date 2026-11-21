@@ -2,6 +2,7 @@ import { LANE_PROTOCOLS, type LaneEndpoint, type UpstreamAuth } from "@gray/cont
 import type { Protocol } from "@gray/protocol";
 import { capabilityWords, type Capabilities } from "./capabilities.ts";
 import { ENTRY_ENDPOINT_PROTOCOLS, entryEndpointRoute } from "./endpoint-route.ts";
+import { trafficEnds } from "./expiry.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
 import type { RouteTag } from "./offers.ts";
 import { snapshotRoutes, stackRouteNamesOnly, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
@@ -333,7 +334,7 @@ export interface GatewayView {
 
 /**
  * One `lane_relay` route as the agent setups offer it at Gray's confidential VM (`laneOffersOf`; inference.rs
- * `Snapshot.lane_offers`): its (model, API), when it stops serving (Unix ms, `GatewayRouteRecord.expiresAt`), its
+ * `Snapshot.lane_offers`): its (model, API), when it stops getting traffic (Unix ms, `laneOffersOf`), its
  * approved quote (the gateway adds its platform fee, as for every route), what the lane serves its requests on and the
  * claim words that comes to, and its output allowance. Gray's checks do not run on a lane relay, so the capabilities
  * are those the lane admits a request on: its endpoint's claims for the API (`laneRouteCapabilities`), streamed and
@@ -442,16 +443,18 @@ export function laneServedKey(model: string, protocol: Protocol): string {
 
 /**
  * The (model, API) pairs the `lane_relay` routes of `snapshot` serve at Gray's confidential VM, by `laneServedKey`, each
- * with when the last of them stops serving (ms): a route the lane routes (priced, on an API the lane serves,
- * `LANE_PROTOCOLS`) until its `GatewayRouteRecord.expiresAt`. These are the verifiable routes (the `verifiable`
- * preference); the main view carries the pairs alone, never the routes (inference.rs `Snapshot.lane_served`).
+ * with when the last of them stops getting traffic (ms): a route the lane routes (priced, on an API the lane serves,
+ * `LANE_PROTOCOLS`) until its `GatewayRouteRecord.expiresAt` or its traffic limit, whichever is first (expiry.ts
+ * `trafficEnds`, the rule the lane's own routing and lists read); one that only names its relay never gets any and is
+ * left out. These are the verifiable routes (the `verifiable` preference); the main view carries the pairs alone, never
+ * the routes (inference.rs `Snapshot.lane_served`).
  */
 export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): Record<string, number> {
   const served: Record<string, number> = {};
   for (const r of snapshotRoutes(snapshot)) {
     if (r.config.auth !== "lane_relay" || r.offer === null || !LANE_PROTOCOLS.includes(r.mapping.protocol) || stackRouteNamesOnly(r)) continue;
     const key = laneServedKey(r.mapping.requested_model, r.mapping.protocol);
-    served[key] = Math.max(served[key] ?? 0, Math.min(r.expires, r.offer.eligible_until) * 1000);
+    served[key] = Math.max(served[key] ?? 0, trafficEnds(Math.min(r.expires, r.offer.eligible_until) * 1000, r.trafficUntilMs));
   }
   return served;
 }
@@ -459,7 +462,8 @@ export function laneServedOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
 /**
  * The `lane_relay` routes of `snapshot` as the agent setups offer them (`GatewayView.laneOffers`), those `laneServedOf`
  * counts (priced, on an API the lane serves), in the snapshot's route order: each as the lane's own view records it
- * (`routeRecord`), its price, capabilities and output allowance alone.
+ * (`routeRecord`), its price, capabilities and output allowance alone, offered until it stops getting traffic
+ * (`expiresAt`: expiry.ts `trafficEnds`).
  */
 export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRoutes">): GatewayLaneOffer[] {
   const offers: GatewayLaneOffer[] = [];
@@ -470,7 +474,7 @@ export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
     offers.push({
       model: record.model,
       protocol: record.protocol,
-      expiresAt: record.expiresAt,
+      expiresAt: trafficEnds(record.expiresAt, r.trafficUntilMs),
       quote: record.quote,
       streaming: record.capabilities.streaming,
       tools: record.capabilities.tools,

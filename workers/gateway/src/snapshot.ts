@@ -1,12 +1,20 @@
 import type { GatewayConfig, LocationHint } from "@gray/config";
 import { REFERENCE_LARGEST_WINDOW } from "@gray/holds";
 import type { Protocol } from "@gray/protocol";
-import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneOffer, type GatewayLaneRelay, type GatewayMode, type GatewayRecipient, type ModelFacts, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, snapshotAlertKey, within } from "@gray/snapshot";
+import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneOffer, type GatewayLaneRelay, type GatewayMode, type GatewayRecipient, type ModelFacts, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, routeTakesTraffic, snapshotAlertKey, within } from "@gray/snapshot";
 
 // The age rule lives in `@gray/snapshot` so the bridge's `snapshot.current` and the CVM's sources
 // judge an answer by the same function (bridge-3); the gateway's own importers keep the old names.
 export { confirmedAtOf, currentFor, routeServes, type AgeJudgement };
 export type { GatewayRecipient };
+
+/**
+ * Whether `route` may get traffic at `nowMs` (@gray/snapshot `routeTakesTraffic`, the one rule): it serves and its
+ * traffic limit has not passed. What routing sends to and what the model lists list.
+ */
+export function takesTraffic(route: { readonly expiresAt: number; readonly trafficUntil?: number }, nowMs: number): boolean {
+  return routeTakesTraffic(route.expiresAt, route.trafficUntil, nowMs);
+}
 import { gatewayNow } from "./clock.ts";
 import type { GatewayEnv } from "./env.ts";
 import type { FeedAnswer, FeedHave, RankingConfig, RouteTag } from "@gray/routing";
@@ -155,8 +163,10 @@ export interface RouteRecord {
    */
   readonly lane?: GatewayLaneRelay | null;
   /**
-   * A relay stack's route: until when (Unix ms) it takes traffic, while the relay's VM serves an older release than one
-   * Gray proposed since (@gray/snapshot `GatewayRouteRecord.trafficUntil`, the release traffic window). Absent: no limit.
+   * A relay stack's route: until when (Unix ms) it takes traffic (@gray/snapshot `GatewayRouteRecord.trafficUntil`): the
+   * close of its release traffic window, while the relay's VM serves an older release than one Gray proposed since, or 0
+   * for a route published only to name its relay. Absent: no limit. Read through `takesTraffic` and routes.ts
+   * `releaseOutdated` alone.
    */
   readonly trafficUntil?: number;
   /**

@@ -1335,7 +1335,11 @@ export const STACK_UNCOVERED_TRAFFIC_UNTIL_MS = 0;
  */
 export type StackDeploymentStanding = "serving" | "named" | "gone";
 
-/** Whether `r` is a relay stack's route published only to name its relay (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`): nothing offers, counts or lists it. */
+/**
+ * Whether `r` is a relay stack's route published only to name its relay (`STACK_UNCOVERED_TRAFFIC_UNTIL_MS`): nothing
+ * offers, counts or lists it. The traffic rule's case that needs no clock (expiry.ts `routeTakesTraffic`: a limit of 0
+ * has passed at every time), for the readers that have none.
+ */
 export function stackRouteNamesOnly(r: Pick<SnapshotRoute, "trafficUntilMs">): boolean {
   return r.trafficUntilMs === STACK_UNCOVERED_TRAFFIC_UNTIL_MS;
 }

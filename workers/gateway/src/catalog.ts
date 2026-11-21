@@ -6,7 +6,7 @@ import { billingUnit, endpointPath, geminiModelValue as geminiModel, isGeneratio
 import { servesGeminiImages, speaks } from "./gemini-images.ts";
 import { pricedQuoteOf } from "./money.ts";
 import { jaroWinkler } from "./similarity.ts";
-import { type GatewaySnapshot, routeServes } from "./snapshot.ts";
+import { type GatewaySnapshot, takesTraffic } from "./snapshot.ts";
 import type { TranslationRules } from "./translate.ts";
 
 /**
@@ -16,8 +16,9 @@ import type { TranslationRules } from "./translate.ts";
  * quotes and proofs, the translation policy and the model facts ConfigDO puts in it). A listing calls
  * nothing: no route, account or database is asked.
  *
- * A listed model has a live route with a customer price. A listing is not a promise that a later
- * request passes capacity, budget or capability checks.
+ * A listed model has a live route with a customer price, live being a route that may get traffic (@gray/snapshot
+ * `routeTakesTraffic`: unexpired and not past its traffic limit), as routing reads it. A listing is not a promise that a
+ * later request passes capacity, budget or capability checks.
  */
 
 /** What Gray knows of a model besides its routes (@gray/snapshot `ModelFacts`); every field optional here. */
@@ -91,14 +92,16 @@ export function sortProtocols(protocols: Iterable<Protocol>): Protocol[] {
 /**
  * `listed_in`: the models a key of `scope` may call through `protocol` (through any API for null), by id
  * in byte order; every model when `scope` is null or empty. A model is listed under a protocol when one
- * of its live, priced routes speaks it, or, when no live route of that protocol exists for it at all, when
+ * of its live, priced routes speaks it (live: `takesTraffic`), or, when no live route of that protocol exists for it at all, when
  * the translation rules (the operator's policy; the confidential entry's own rule, translate.ts `entryRules`) serve it
  * to that protocol's clients from a route's protocol, or (Gemini) its
  * image routes speak Gemini's API (`gemini_images::speaks`). A native route always wins on generation, its
  * failures included, so such a model is never listed as served otherwise.
  */
 export function listedIn(snapshot: GatewaySnapshot, policy: TranslationRules, scope: readonly string[] | null, protocol: Protocol | null, nowMs: number, feeBps: number): Map<string, Listed> {
-  const live = snapshot.routes.filter((r) => routeServes(r.expiresAt, nowMs));
+  // Live: the routes that may get traffic (snapshot.ts `takesTraffic`, the rule routing reads). One past its traffic
+  // limit is passed over by every request (`releaseOutdated`), so it lists nothing and prices nothing.
+  const live = snapshot.routes.filter((r) => takesTraffic(r, nowMs));
   const routed = new Set(protocol === null ? [] : live.filter((r) => r.protocol === protocol).map((r) => r.model));
   const models = new Map<string, Listed>();
   // Each model's coding-agent passes (`servesOpencode`), read once the routes' proofs are pooled.

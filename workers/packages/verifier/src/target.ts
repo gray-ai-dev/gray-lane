@@ -95,13 +95,17 @@ export function requiredChecks(protocol: Protocol, c: Capabilities, stream: bool
     return checks;
   }
   const image = c.image_output && protocol === "gemini";
+  // Clause 2.4 of the API standard: a Chat route honors both output-cap fields, in each mode it serves.
+  const caps = protocol === "open_ai_chat" && !image;
   const checks: CheckKind[] = [image ? "image_output" : "text_challenge"];
+  if (caps) checks.push("max_tokens_cap", "max_completion_tokens_cap");
   if (c.tools) checks.push("tools");
   if (c.structured_output) checks.push("structured_output");
   if (c.vision) checks.push("vision");
   if (c.reasoning) checks.push("reasoning");
   if (stream) {
     checks.push(image ? "streaming_image_output" : "streaming");
+    if (caps) checks.push("streaming_max_tokens_cap", "streaming_max_completion_tokens_cap");
     if (c.tools) checks.push("streaming_tools");
     if (c.structured_output) checks.push("streaming_structured_output");
     if (c.vision) checks.push("streaming_vision");

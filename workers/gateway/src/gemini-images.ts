@@ -9,7 +9,7 @@ import type { ContentBucket } from "./outbound.ts";
 import { TokenTooLong, membersTooMany, valueTooLong } from "./parse.ts";
 import { PlainCursor, SpoolBroken, type SpoolRef, spoolPlaintext } from "./spool.ts";
 import type { GatewayDeps } from "./inference.ts";
-import { type GatewaySnapshot, type RouteRecord, routeServes, snapshotTiming } from "./snapshot.ts";
+import { type GatewaySnapshot, type RouteRecord, snapshotTiming, takesTraffic } from "./snapshot.ts";
 import { type UpstreamBody, UPSTREAM_BODY_CHUNK_BYTES, heldBody, storedBody } from "./upstream.ts";
 
 /**
@@ -45,7 +45,7 @@ export function speaks(route: RouteRecord): boolean {
 
 /** `serving`: which Gemini requests of `model` the image routes among `routes` serve; null: none, the generation path serves or refuses them. */
 export function geminiImageServing(routes: readonly RouteRecord[], model: string, nowMs: number): GeminiServing | null {
-  const live = routes.filter((r) => routeServes(r.expiresAt, nowMs) && r.model === model);
+  const live = routes.filter((r) => takesTraffic(r, nowMs) && r.model === model);
   const through = (protocol: RouteRecord["protocol"]) => live.some((r) => r.protocol === protocol && speaks(r));
   // A native route counts only while it answers buffered requests: one that serves streamed requests only (decision
   // (a) of 2026-10-23, its buffered image check failed) leaves the model's Gemini requests to the image routes, as a

@@ -2,7 +2,7 @@ import { ed25519Pkcs8, ed25519PublicKey, ed25519Sign, ed25519Verify } from "@gra
 import { NO_CAPABILITIES, capabilitiesJson, satisfies, sameCapabilities, type Capabilities } from "@gray/control";
 import { PROTOCOLS, type Protocol } from "@gray/protocol";
 import { z } from "zod";
-import { CHECK_KINDS, CLAIMS, OUTCOME_CODES, VERIFICATION_STATUSES, answersBuffered, claimOf, provesCapability, provesStreaming, type CheckKind, type Claim, type OutcomeCode, type VerificationStatus } from "./outcome.ts";
+import { CHECK_KINDS, CLAIMS, OUTCOME_CODES, VERIFICATION_STATUSES, answersBuffered, claimOf, isOutputCap, isStreamingCheck, provesCapability, provesStreaming, type CheckKind, type Claim, type OutcomeCode, type VerificationStatus } from "./outcome.ts";
 import { parsePlain } from "@gray/json";
 import { F64, structJson, type StructValue } from "./struct-json.ts";
 import { checksCacheTtl, requiredChecks, targetFingerprint, type ProbeTarget } from "./target.ts";
@@ -360,20 +360,30 @@ export function routeStatus(checks: readonly CheckResult[], requireUsage: boolea
 }
 
 /**
- * `proven_streaming`: the checks proved the route streams: the streamed form of its basic check passed.
- * Serving routes a streamed request only to such a route.
+ * `proven_streaming`: the checks proved the route streams: the streamed form of its basic check passed, and so did
+ * each streamed output-cap check the report has (`capsProved`). Serving routes a streamed request only to such a route.
  */
 export function provenStreaming(checks: readonly CheckResult[], requireUsage: boolean): boolean {
-  return checks.some((c) => provesStreaming(c.kind) && proved(c, requireUsage));
+  return checks.some((c) => provesStreaming(c.kind) && proved(c, requireUsage)) && capsProved(checks, true, requireUsage);
+}
+
+/**
+ * `caps_proved`: every output-cap check of one mode in `checks` proved (clause 2.4 of the API standard: a Chat route
+ * honors both cap fields). True for a report with none, so a report recorded before the checks existed proves what it
+ * did.
+ */
+function capsProved(checks: readonly CheckResult[], streamed: boolean, requireUsage: boolean): boolean {
+  return checks.every((c) => !isOutputCap(c.kind) || isStreamingCheck(c.kind) !== streamed || proved(c, requireUsage));
 }
 
 /**
  * `proven_buffered`: the checks proved the route answers buffered requests: the buffered form of its basic check
- * passed (`answersBuffered`, `proved`). Serving routes a buffered request only to such a route, or to one whose
+ * passed (`answersBuffered`, `proved`), and so did each buffered output-cap check the report has (`capsProved`).
+ * Serving routes a buffered request only to such a route, or to one whose
  * report proved neither mode (a record without a report: plain buffered requests, as before).
  */
 export function provenBuffered(checks: readonly CheckResult[], requireUsage: boolean): boolean {
-  return checks.some((c) => answersBuffered(c.kind) && proved(c, requireUsage));
+  return checks.some((c) => answersBuffered(c.kind) && proved(c, requireUsage)) && capsProved(checks, false, requireUsage);
 }
 
 /**
@@ -499,7 +509,7 @@ export async function admissible(r: ProbeReport, nowMs: number, required: Capabi
   // Every check that decides the route passed, except the buffered basic check of a route that proved it streams,
   // which serves streamed requests only (`routeStatus`).
   const streams = provenStreaming(r.checks, requireUsage);
-  if (!r.checks.filter((c) => !provesCapability(c.kind)).every((c) => proved(c, requireUsage) || (streams && answersBuffered(c.kind)))) return false;
+  if (!r.checks.filter((c) => !provesCapability(c.kind)).every((c) => proved(c, requireUsage) || (streams && (answersBuffered(c.kind) || isOutputCap(c.kind))))) return false;
   if (!satisfies(provenCapabilities(r.checks, requireUsage, r.manifest.require_streaming), r.verified_capabilities)) return false;
   // What it says it withdrew, it does not prove.
   const proven = provenOf(r.checks, requireUsage, r.manifest.require_streaming);

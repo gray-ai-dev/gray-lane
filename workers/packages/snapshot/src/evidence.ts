@@ -156,6 +156,10 @@ const PROVES_STREAMING = new Set(["streaming", "streaming_image_output"]);
 /** CheckKind::answers_buffered: the buffered form of a basic check. */
 const ANSWERS_BUFFERED = new Set(["text_challenge", "image_output", "api_contract"]);
 
+/** The output-cap checks of each mode (CheckKind::is_output_cap): every one a report has proves its mode with the basic check. */
+const BUFFERED_CAPS = new Set(["max_tokens_cap", "max_completion_tokens_cap"]);
+const STREAMED_CAPS = new Set(["streaming_max_tokens_cap", "streaming_max_completion_tokens_cap"]);
+
 /**
  * `CheckResult::proved` (@gray/verifier `proved`): the check passed as evidence: the contract satisfied, on an
  * answer whose hash is kept for a challenge it carried, with its usage reported where the run required it.
@@ -173,8 +177,8 @@ function union(a: Capabilities, b: Capabilities): Capabilities {
 
 /**
  * The modes `report` serves and the capabilities of each, as `Proven::of_report` gives them (@gray/verifier
- * `provenOfReport`): none unless it passed; then buffered answers when its buffered basic check proved
- * (`proven_buffered`), and for each mode served the capabilities its own checks of that mode proved
+ * `provenOfReport`): none unless it passed; then buffered answers when its buffered basic check and buffered output-cap
+ * checks proved (`proven_buffered`), streamed ones likewise (`proven_streaming`), and for each mode served the capabilities its own checks of that mode proved
  * (`proven_modes`) with the verified ones, which admission holds proven in every mode served, so a report
  * verified before the modes existed keeps serving what it verified.
  */
@@ -182,8 +186,9 @@ function servedModes(report: ProbeReport): { buffered: boolean; streaming: boole
   if (report.status !== "pass") return { buffered: false, streaming: false, modes: { buffered: NO_CAPABILITIES, streamed: NO_CAPABILITIES } };
   const usage = report.requireUsage;
   const provedKind = (kind: string) => report.checks.some((c) => c.kind === kind && proved(c, usage));
-  const buffered = report.checks.some((c) => ANSWERS_BUFFERED.has(c.kind) && proved(c, usage));
-  const streaming = report.checks.some((c) => PROVES_STREAMING.has(c.kind) && proved(c, usage));
+  const capsProved = (caps: ReadonlySet<string>) => report.checks.every((c) => !caps.has(c.kind) || proved(c, usage));
+  const buffered = report.checks.some((c) => ANSWERS_BUFFERED.has(c.kind) && proved(c, usage)) && capsProved(BUFFERED_CAPS);
+  const streaming = report.checks.some((c) => PROVES_STREAMING.has(c.kind) && proved(c, usage)) && capsProved(STREAMED_CAPS);
   const bufferedCaps: Capabilities = buffered
     ? {
         tools: provedKind("tools"),

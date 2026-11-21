@@ -2,7 +2,7 @@ import { billsUnits, includeRate, rateBound, reserveOutput, tokenRates, within, 
 import { parseStrict } from "@gray/json";
 import { type CanonicalRequest, type Protocol, reasoningRequested, structured } from "@gray/protocol";
 import { measurementKeySync, Ranker, type Candidate, type Exploration, type MaxPrice, type QuotedPrice, type RankingPolicy, type RankingResult, type RestView } from "@gray/routing";
-import { imageUsageKnown as imageGate } from "@gray/snapshot";
+import { imageUsageKnown as imageGate, trafficEnded } from "@gray/snapshot";
 import { generationPriceOf } from "./money.ts";
 import { rankKeyLeases, type ProbeLeases } from "./plan-order.ts";
 import { RankingBase } from "./ranking-base.ts";
@@ -56,9 +56,12 @@ export const RELEASE_OUTDATED = "release_outdated";
  */
 export const RELAY_VM_UNAVAILABLE = "relay_vm_unavailable";
 
-/** Whether `route` is out of traffic at `nowMs` because its relay's VM still serves an older release. */
+/**
+ * Whether `route` is out of traffic at `nowMs` because its traffic limit has passed (@gray/snapshot `trafficEnded`, the
+ * rule the model lists read too): its relay's VM still serves an older release, or it is published only to name its relay.
+ */
 export function releaseOutdated(route: Pick<RouteRecord, "trafficUntil">, nowMs: number): boolean {
-  return route.trafficUntil !== undefined && nowMs >= route.trafficUntil;
+  return trafficEnded(route.trafficUntil, nowMs);
 }
 
 /** The offer service regions a preference names (crates/gray-gateway/src/provider_offers.rs `SERVICE_REGIONS`, `region_matches`). */

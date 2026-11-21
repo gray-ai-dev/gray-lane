@@ -3,15 +3,18 @@ import { compareUtf8 } from "@gray/json";
 import { type CanonicalRequest, type Protocol, endpointPath, isGeneration, reasoningRequested, structured } from "@gray/protocol";
 import { protocolTitle } from "@gray/translation";
 import { laneModel } from "./preference.ts";
-import { chatFor, type GatewaySnapshot, type ModeCapabilities, type RouteRecord, routeServes } from "./snapshot.ts";
+import { chatFor, type GatewaySnapshot, type ModeCapabilities, type RouteRecord, routeServes, takesTraffic } from "./snapshot.ts";
 import type { TranslationRules } from "./translate.ts";
 
 /**
  * What a request for a model without a usable native route is told (crates/gray-gateway/src/
  * model_resolution.rs `unrouted`): a capability no live route of the model proved; a model served
- * through another API, and which; a model that has providers but none verified now; a model only Gray's
+ * through another API, and which; a model that has providers but none verified now; a model whose routes
+ * here are all past their traffic limit (`noProviderUndated`); a model only Gray's
  * confidential VM serves, on this API there (`model_at_lane`); or a model Gray does not have. Not ported:
  * the "did you mean" suggestions, which need the live catalog.
+ *
+ * A live route is one that may get traffic (snapshot.ts `takesTraffic`), as routing and the model lists read it.
  */
 
 const NO_PROVIDER_RETRY_SECONDS = 60n;
@@ -30,6 +33,21 @@ export function noProvider(model: string, atLane: boolean): ApiError {
     .withMessage(`No verified provider can serve \`${model}\` right now. Gray re-checks providers continuously; retry in a minute, or choose another model.${lane}`)
     .withMeta("limit_source", "provider_availability")
     .withRetryAfter(NO_PROVIDER_RETRY_SECONDS);
+}
+
+/**
+ * 503 `no_available_provider` for a model whose unexpired routes on the API called are all past their traffic limit
+ * (snapshot.ts `takesTraffic`: a relay stack still on an older release past its traffic window, or one whose route only
+ * names it because no account of its relay can serve the model or its VM is not serving). No check of Gray's brings
+ * such a route back: its provider has to act, and the gateway cannot tell when. So the answer names no time, in its
+ * text or in a `retry-after`, where `noProvider` says a minute; the model lists leave the model out meanwhile
+ * (catalog.ts `listedIn`). Nothing of the provider or of what keeps it out is said.
+ */
+export function noProviderUndated(model: string, atLane: boolean): ApiError {
+  const lane = atLane ? " This model is also served at Gray's confidential VM address; the console shows it." : "";
+  return new ApiError(503, "no_available_provider")
+    .withMessage(`No verified provider can serve \`${model}\` right now, and Gray cannot say when one will. Choose another model, or retry later.${lane}`)
+    .withMeta("limit_source", "provider_availability");
 }
 
 function andList(items: readonly string[]): string {
@@ -119,7 +137,10 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
   // this gateway does not know is served there. The lane's own snapshot carries no lane pairs, so in lane mode never.
   const atLane = laneModel(snapshot, model, protocol, true, nowMs);
   const routes = snapshot.routes.filter((r) => r.model === model);
-  const live = routes.filter((r) => routeServes(r.expiresAt, nowMs));
+  const unexpired = routes.filter((r) => routeServes(r.expiresAt, nowMs));
+  // Live: the routes that may get traffic. One past its traffic limit proves nothing and names no path: no request
+  // reaches it (routes.ts `releaseOutdated`).
+  const live = unexpired.filter((r) => takesTraffic(r, nowMs));
   // The upstream protocols that could serve a request through `protocol`: itself, and the translation
   // targets the rules allow for the model (the operator's, or the confidential entry's own).
   const targets: Protocol[] = [protocol, ...(policy?.upstreams(model, protocol) ?? [])];
@@ -136,6 +157,8 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
     ].sort(compareUtf8);
     return missingCapability(model, protocol, here, request, mediaUnknown, elsewhere) ?? noProvider(model, atLane);
   }
+  // Its routes here have not expired, and every one is past its traffic limit: a pause with no time to name.
+  if (unexpired.some((r) => targets.includes(r.protocol))) return noProviderUndated(model, atLane);
   // A provider maps the model on this API (or on a translation target), but its route is not verified
   // now: a pause, not a wrong API. An image generation mapping through the Gemini adapter maps its model
   // on the Gemini API too (`GatewaySnapshot.mapped`). A snapshot without the pairs says it by its routes.

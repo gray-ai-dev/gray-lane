@@ -21,3 +21,34 @@ export function routeExpires(snapshotExpiresAt: number, evidenceExpiresAt: numbe
 export function routeServes(expiresAt: number, now: number): boolean {
   return expiresAt > now;
 }
+
+/**
+ * Whether a route may get traffic, the one rule every reader of a route's standing takes: routing (gateway routes.ts
+ * `releaseOutdated`, which names the route it passes over), the model lists and what a request without a route is told
+ * (gateway catalog.ts `listedIn`, resolution.ts `unrouted`), the pairs and offers the agent setups read
+ * (gateway.ts `laneServedOf`, `laneOffersOf`) and the console's catalog (gray-jobs catalog.ts `catalogRoutes`). A model
+ * none of whose routes may get traffic is not listed, offered or routed to.
+ *
+ * A route may get traffic while it serves (`routeServes`) and its traffic limit, when it has one, has not passed. The
+ * limit is `SnapshotRoute.trafficUntilMs` (`GatewayRouteRecord.trafficUntil`), Unix ms: the close of a relay stack's
+ * release traffic window (@gray/control release-traffic.ts), or 0 for a route published only to name its relay
+ * (snapshot.ts `STACK_UNCOVERED_TRAFFIC_UNTIL_MS`), which never gets any. Absent: no limit.
+ */
+
+/** Whether a route's traffic limit has passed at `nowMs`: at the limit and after. A route without one has none to pass. */
+export function trafficEnded(trafficUntilMs: number | undefined, nowMs: number): boolean {
+  return trafficUntilMs !== undefined && nowMs >= trafficUntilMs;
+}
+
+/**
+ * Until when (Unix ms) a route whose expiry is `expiresAtMs` may get traffic: its expiry, or its traffic limit when
+ * that comes first. What a reader without a clock keeps, for its own readers to hold against theirs (`routeServes`).
+ */
+export function trafficEnds(expiresAtMs: number, trafficUntilMs: number | undefined): number {
+  return trafficUntilMs === undefined ? expiresAtMs : Math.min(expiresAtMs, trafficUntilMs);
+}
+
+/** Whether a route may get traffic at `nowMs` (all three in Unix ms). */
+export function routeTakesTraffic(expiresAtMs: number, trafficUntilMs: number | undefined, nowMs: number): boolean {
+  return routeServes(trafficEnds(expiresAtMs, trafficUntilMs), nowMs);
+}
