@@ -37,6 +37,14 @@ const (
 	minMaxBodyBytes     = int64(1 << 20)  // 1 MiB: BODY_PARSE_MAX_BYTES min
 	maxMaxBodyBytes     = int64(16 << 20) // 16 MiB: BODY_PARSE_MAX_BYTES max
 
+	// -route-max-body-bytes is the endpoint routes' own body bound (docs/design/standard-media-at-entry.md §2.3): a
+	// /route/ request carries the entry's media forms (LANE_FORM_MAX_BYTES, proposed 25 MiB, to be measured on staging,
+	// D4) beside its JSON bodies, while the vendor, peer and stack paths keep -max-body-bytes. Unset (0) it is
+	// -max-body-bytes, the bound /route/ had before the flag. When set, it is at least -max-body-bytes, so /route/ never
+	// refuses a JSON body the lane accepts, and at most 64 MiB, the largest message egress holds whole elsewhere
+	// (-stack-max-answer-bytes' maximum), which leaves room above 25 MiB for D4's measurement.
+	maxRouteMaxBodyBytes = int64(64 << 20)
+
 	defaultPhaseTimeout = 10 * time.Minute // UPSTREAM_HEADER_MS default
 	minPhaseTimeout     = 10 * time.Minute // never shorter than the gateway's header wait
 	maxPhaseTimeout     = time.Hour        // UPSTREAM_HEADER_MS / STREAM_TOTAL_SECONDS max
@@ -204,6 +212,9 @@ type config struct {
 	// routeDenySuffixes are the deployment's own zones (-route-deny-suffix): no row's host may be one of them or under
 	// one, so no row points back at Gray. They need -routes.
 	routeDenySuffixes []string
+	// routeMaxBodyBytes is the largest /route/ request body (-route-max-body-bytes); 0 is -max-body-bytes. Read it
+	// through routeBodyBytes. It needs -routes.
+	routeMaxBodyBytes int64
 	// signInKeyDir and signInBundle (signin_ca.go, docs/design/relay-sign-in-in-vm.md D1): the egress-only memory volume
 	// the sign-in CA's key and certificate live on, and the file on the relay's read-only memory volume egress writes
 	// the trust bundle to (the system roots and the sign-in CA). Both or neither, both absolute, with -relay-listen.
@@ -245,6 +256,14 @@ func defaultConfig() config {
 		loginPersistWait:       defaultLoginPersistWait,
 		loginCallsPerMinute:    defaultLoginCallsPerMinute,
 	}
+}
+
+// routeBodyBytes is the /route/ body bound: -route-max-body-bytes, or -max-body-bytes when it is unset.
+func (c config) routeBodyBytes() int64 {
+	if c.routeMaxBodyBytes == 0 {
+		return c.maxBodyBytes
+	}
+	return c.routeMaxBodyBytes
 }
 
 // stackAppendLimits are the S18 check's append limits from the flags.
@@ -289,6 +308,7 @@ func parseConfig(args []string, out io.Writer) (config, error) {
 	fs.IntVar(&cfg.loginCallsPerMinute, "login-calls-per-minute", cfg.loginCallsPerMinute, "one account's sign-in calls in a minute before 429 login_rate_limited")
 	fs.BoolVar(&cfg.routes, "routes", cfg.routes, "serve the endpoint routes on the unix socket: /route/<id>/<path> to the host the pushed table names (an entry only; not with -relay-listen)")
 	fs.Var((*suffixList)(&cfg.routeDenySuffixes), "route-deny-suffix", "a zone no route table row's host may be or be under; repeatable or comma-separated (needs -routes)")
+	fs.Int64Var(&cfg.routeMaxBodyBytes, "route-max-body-bytes", cfg.routeMaxBodyBytes, "largest /route/ request body accepted, in bytes (0: -max-body-bytes; needs -routes)")
 	addExtraRootCAFlag(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -401,6 +421,14 @@ func (c config) validate() error {
 	}
 	if len(c.routeDenySuffixes) != 0 && !c.routes {
 		return errors.New("route-deny-suffix needs -routes")
+	}
+	if c.routeMaxBodyBytes != 0 {
+		if !c.routes {
+			return errors.New("route-max-body-bytes needs -routes")
+		}
+		if c.routeMaxBodyBytes < c.maxBodyBytes || c.routeMaxBodyBytes > maxRouteMaxBodyBytes {
+			return fmt.Errorf("route-max-body-bytes must be 0 or between max-body-bytes and %d", maxRouteMaxBodyBytes)
+		}
 	}
 	for _, suffix := range c.routeDenySuffixes {
 		if !validDNSName(suffix) {

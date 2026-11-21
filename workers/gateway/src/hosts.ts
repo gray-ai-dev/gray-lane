@@ -56,9 +56,10 @@ function internalV6(address: string): boolean {
 
 /**
  * The origins the Worker's errors name (`public_errors::Origins`): the model API's is the one the request was sent
- * to, the Worker's own; the console's is CONSOLE_ORIGIN, or the request's when it is empty, the one-origin setup that
- * row describes.
+ * to, the Worker's own, or CLIENT_CONTENT_ORIGIN while this address is closed to clients' model content (the entry's,
+ * where a client lists and sends its models); the console's is CONSOLE_ORIGIN, or the request's when it is empty, the
+ * one-origin setup that row describes.
  */
-export function originsOf(cfg: GatewayConfig, url: URL): Origins {
-  return publicOrigins(cfg.consoleOrigin === "" ? url.origin : cfg.consoleOrigin, url.origin);
+export function originsOf(cfg: Pick<GatewayConfig, "consoleOrigin" | "clientContentOrigin">, url: URL): Origins {
+  return publicOrigins(cfg.consoleOrigin === "" ? url.origin : cfg.consoleOrigin, cfg.clientContentOrigin === "" ? url.origin : cfg.clientContentOrigin);
 }

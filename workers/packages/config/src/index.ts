@@ -107,6 +107,11 @@ const rustTrimmed = (text: string): string => text.replace(/^\p{White_Space}+|\p
 /** gray-control's `valid_model_id` (@gray/control `validModelId`): what a model id may be. */
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,255}$/;
 
+/** OPENCODE_DEFAULT_MODEL's and OPENCODE_SMALL_MODEL's rule: empty, or one model id. Null when `value` follows it. */
+export function modelIdOrEmpty(value: string): string | null {
+  return value === "" || MODEL_ID.test(value) ? null : "must be empty or one Gray model id (a letter or digit, then letters, digits and ._:@+/-)";
+}
+
 /**
  * MODELTRACE_MODELS's rule (decided 2026-10-30), the server's `mixing::CheckedModels::parse`, which @gray/modeltrace
  * `CheckedModels.parse` ports (conformance target modeltrace/checked_models, which test/modeltrace-models.test.ts holds
@@ -1479,6 +1484,25 @@ export const SETTINGS: readonly SettingSpec[] = [
       "The confidential entry's origin (https://lane.usefallback.com). Set: a chat request without a verifiable routing preference is " +
       "forwarded there with this Worker's signed mark, a verifiable one is refused naming it, and every answer to a request that did not come " +
       "through the entry carries Deprecation and a successor-version Link naming it. Empty: chat is answered here, as before.",
+  },
+  {
+    name: "CLIENT_CONTENT_ORIGIN",
+    key: "clientContentOrigin",
+    workers: ["gateway"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" ? null : originProblem(v)),
+    source:
+      "The owner's decision of 2026-11-21 (docs/design/one-address.md, \"Model content at the API address\"): Gray's one customer address is " +
+      "the confidential entry's, where TLS ends in the VM and request content is not stored, so this Worker stops taking model content " +
+      "straight from clients. The deploy session sets it to the environment's entry (<env:laneStackEntryOrigin>), staging first.",
+    doc:
+      "The confidential entry's origin (https://lane.usefallback.com), where clients send model requests. Set: every request to a model " +
+      "path (chat, Gemini generation, embeddings, rerank, images, audio, video jobs and their polling, System One) that did not come " +
+      "through the entry (a verified x-gray-entry-forward mark) is answered 410 served_at_lane naming it, before its body is read, so " +
+      "nothing of it is spooled or stored; the console's model checks pass with their signed ticket over the console's service binding, and " +
+      "the errors' model listing link names it. /v1/key, the setup routes and the model listings are served as before. Empty: model " +
+      "requests are served here, as before.",
   },
   // Endpoint permits and circuits: EndpointRootDO and EndpointShardDO (workers/packages/endpoint,
   // docs/cloudflare-native/endpoint.md). The server values cited are crates/gray-gateway/src/ranking.rs
@@ -2891,6 +2915,38 @@ export const SETTINGS: readonly SettingSpec[] = [
       "audio, video, rerank and the other model APIs in the agent setups (agent.md, the setup files, the console's setups) and the console's " +
       "examples, which then name API_ORIGIN only as the older address. It overrides CUSTOMER_CHAT_ORIGIN. Unset: the setups name API_ORIGIN, " +
       "and CUSTOMER_CHAT_ORIGIN for chat",
+  },
+  {
+    name: "OPENCODE_DEFAULT_MODEL",
+    key: "opencodeDefaultModel",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: modelIdOrEmpty,
+    source:
+      "Workers only, a temporary pin (decided 2026-11-20): the server has no such setting, and its setups are the console's with it unset. " +
+      "At the confidential entry Gray records nothing that shows which models serve OpenCode's own requests there (docs/design/one-address.md, " +
+      "\"Open item: OpenCode's defaults at the entry\"), and the automatic rule named a Claude model none of whose routes served OpenCode's tool " +
+      "requests that day, so the operator names a model a walk of OpenCode at the entry showed working. Empty by default: the rule decides.",
+    doc:
+      "The Gray model id the agent setups give OpenCode as its `model` (opencode.json, agent.md, the console's setups) while it is offered at the " +
+      "address the setup names: listed for OpenCode there on a route serving now, with tool calling, its hold within a new account's welcome " +
+      "credit. Empty, or not offered: the automatic rule",
+  },
+  {
+    name: "OPENCODE_SMALL_MODEL",
+    key: "opencodeSmallModel",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: modelIdOrEmpty,
+    source:
+      "Workers only, a temporary pin beside OPENCODE_DEFAULT_MODEL (decided 2026-11-20), for the same reason: nothing Gray records shows which " +
+      "models serve OpenCode's title requests, and the automatic rule's assumption that any Responses model does failed on openai/gpt-6.1-sol, " +
+      "which refuses the reasoning effort none OpenCode sends with a title. Empty by default: the rule decides.",
+    doc:
+      "The Gray model id the agent setups give OpenCode as its `small_model`, for titles and summaries, while it is offered at the address the " +
+      "setup names (as OPENCODE_DEFAULT_MODEL's), set only beside a `model`. Empty, or not offered: the automatic rule",
   },
   {
     name: "ADMIN_WALLETS",
@@ -5670,6 +5726,8 @@ export interface GatewayConfig {
   readonly laneEntryPublicKeys: string;
   /** LANE_ENTRY_ORIGIN: the confidential entry's origin chat is forwarded to; "" to answer chat here. */
   readonly laneEntryOrigin: string;
+  /** CLIENT_CONTENT_ORIGIN: where clients send model content; set, this Worker refuses it from them (410 served_at_lane); "" to serve it here. */
+  readonly clientContentOrigin: string;
   readonly endpointReportMs: number;
   readonly endpointBreakerFailureThreshold: number;
   readonly endpointBreakerMinSamples: number;
@@ -5825,6 +5883,10 @@ export interface ConsoleConfig {
   readonly customerChatOrigin: string;
   /** CUSTOMER_API_ORIGIN: the one address customers are given for every path; empty: `apiOrigin`, and CUSTOMER_CHAT_ORIGIN for chat. */
   readonly customerApiOrigin: string;
+  /** OPENCODE_DEFAULT_MODEL: the operator's pin of OpenCode's `model` in the setups; "" when unset (the automatic rule). */
+  readonly opencodeDefaultModel: string;
+  /** OPENCODE_SMALL_MODEL: the operator's pin of OpenCode's `small_model` in the setups; "" when unset (the automatic rule). */
+  readonly opencodeSmallModel: string;
   /** Comma-separated; workers/console reads it as a list. */
   readonly adminWallets: string;
   readonly accessTeamDomain: string;

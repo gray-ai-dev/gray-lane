@@ -66,6 +66,11 @@ import { BridgeWireError } from "./error.ts";
  * `endpoint.credential` (endpoint-credential.ts; docs/design/lane-provider-routes.md section 3.2) gives an entry one
  * provider endpoint's API key, sealed by the console to an X25519 key the entry made for that request. Only an entry's
  * key may call it, and its target is the endpoint (`endpoint-credential/<endpoint id>`).
+ *
+ * `video.put`, `video.get`, `video.update` and `video.due` (video-jobs.ts; docs/design/standard-media-at-entry.md section
+ * 2.7) keep the entry's video jobs: one record per job, which holds no content, in an object of the bridge's own named
+ * by Gray's job id (target `video/<job id>`), and the environment's one due index of open jobs, their next poll and
+ * their lease (target `video-due`). Only an entry's key may call them.
  */
 export const BRIDGE_OPS = [
   "account.admit",
@@ -104,6 +109,10 @@ export const BRIDGE_OPS = [
   "acme.challenge",
   "entry.role",
   "endpoint.credential",
+  "video.put",
+  "video.get",
+  "video.update",
+  "video.due",
 ] as const;
 
 export type BridgeOp = (typeof BRIDGE_OPS)[number];
@@ -146,6 +155,10 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "acme.challenge": "POST",
   "entry.role": "POST",
   "endpoint.credential": "POST",
+  "video.put": "POST",
+  "video.get": "POST",
+  "video.update": "POST",
+  "video.due": "POST",
 });
 
 /** The base request target of each op; the snapshot read appends its two parameters (snapshot.ts). */
@@ -186,6 +199,10 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "acme.challenge": "/v1/lane-bridge/acme/challenge",
   "entry.role": "/v1/lane-bridge/entry/role",
   "endpoint.credential": "/v1/lane-bridge/endpoint/credential",
+  "video.put": "/v1/lane-bridge/video/put",
+  "video.get": "/v1/lane-bridge/video/get",
+  "video.update": "/v1/lane-bridge/video/update",
+  "video.due": "/v1/lane-bridge/video/due",
 });
 
 /**

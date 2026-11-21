@@ -48,6 +48,17 @@ import { STACK_REPORT_MAX_BYTES, stackReportAnswerSchema, stackReportSchema } fr
 import { stackRulesAnswerSchema, stackRulesRequestSchema } from "./stack-rules.ts";
 import { stackTestsAnswerSchema, stackTestsRequestSchema } from "./stack-tests.ts";
 import { ticketUseAnswerSchema, ticketUseInputSchema } from "./ticket.ts";
+import {
+  VIDEO_PUT_MAX_BYTES,
+  videoDueAnswerSchema,
+  videoDueRequestSchema,
+  videoGetAnswerSchema,
+  videoGetRequestSchema,
+  videoPutAnswerSchema,
+  videoPutRequestSchema,
+  videoUpdateAnswerSchema,
+  videoUpdateRequestSchema,
+} from "./video-jobs.ts";
 
 /**
  * The op → document registry, and the one way a document crosses the wire: written by
@@ -79,7 +90,8 @@ export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
  * ops' 64 KiB); `stack.report` has S42's 1 MiB (a relay's 1000 accounts); `stack.vault.put` carries a sealed
  * record of up to 1 MiB (`STACK_VAULT_PUT_MAX_BYTES`); `stack.vault.share` a TDX quote and its event log
  * (`STACK_VAULT_SHARE_MAX_BYTES`); `endpoint.file_rest` a rest over as many keys and roots as a root's rests cover
- * (`ENDPOINT_FILE_REST_MAX_BYTES`); every other op's document is a few KB.
+ * (`ENDPOINT_FILE_REST_MAX_BYTES`); `video.put` a job's record, its hold token, evidence and projection columns
+ * (`VIDEO_PUT_MAX_BYTES`); every other op's document is a few KB.
  */
 export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
@@ -87,6 +99,7 @@ export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "stack.report") return STACK_REPORT_MAX_BYTES;
   if (op === "stack.vault.put") return STACK_VAULT_PUT_MAX_BYTES;
   if (op === "stack.vault.share") return STACK_VAULT_SHARE_MAX_BYTES;
+  if (op === "video.put") return VIDEO_PUT_MAX_BYTES;
   return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
 }
 
@@ -168,6 +181,10 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "acme.challenge": acmeChallengeSchema,
   "entry.role": entryRoleRequestSchema,
   "endpoint.credential": endpointCredentialRequestSchema,
+  "video.put": videoPutRequestSchema,
+  "video.get": videoGetRequestSchema,
+  "video.update": videoUpdateRequestSchema,
+  "video.due": videoDueRequestSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 export const BRIDGE_RESPONSE_SCHEMAS = {
@@ -207,6 +224,10 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "acme.challenge": acmeChallengeAnswerSchema,
   "entry.role": entryRoleAnswerSchema,
   "endpoint.credential": endpointCredentialAnswerSchema,
+  "video.put": videoPutAnswerSchema,
+  "video.get": videoGetAnswerSchema,
+  "video.update": videoUpdateAnswerSchema,
+  "video.due": videoDueAnswerSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 /**

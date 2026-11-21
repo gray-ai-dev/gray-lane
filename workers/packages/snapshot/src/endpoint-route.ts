@@ -33,6 +33,30 @@ export const ENTRY_ROUTE_DENY_SUFFIXES: readonly string[] = Object.freeze(["usef
  */
 export const ENTRY_ENDPOINT_PROTOCOLS: readonly Protocol[] = Object.freeze([...LANE_PROTOCOLS, "gemini"]);
 
+/**
+ * The standard APIs the entry is to serve endpoint routes on as well (docs/design/standard-media-at-entry.md section
+ * 2.1): embeddings, rerank, image generations and edits, speech, transcriptions, translations, videos and System One.
+ * A video route's URL is its create path, and its job paths append `/<id>` and `/<id>/content`, which pass
+ * `endpointRoutePath` for every id of the standard's clause 11.10 (test/endpoint-route.test.ts).
+ *
+ * Nothing the entry runs reads this list yet. Until the entry serves these APIs itself (that design's PR 5, which adds
+ * the list to ENTRY_ENDPOINT_PROTOCOLS), their routes stay out of the lane view: admitted now, they would reach the
+ * entry's model listing, its mapped pairs and egress's route table while their requests still go to the API Worker.
+ * The rule takes the list as an argument (`entryEndpointRoute`'s `protocols`) so its tests hold these routes to
+ * egress's route cases already.
+ */
+export const ENTRY_MEDIA_PROTOCOLS: readonly Protocol[] = Object.freeze([
+  "open_ai_embeddings",
+  "rerank",
+  "open_ai_image_generations",
+  "open_ai_image_edits",
+  "open_ai_speech",
+  "open_ai_transcriptions",
+  "open_ai_translations",
+  "open_ai_videos",
+  "system_one",
+]);
+
 /** egress's routeRefusedZones: special-use and private names, none of which is a public provider's API host. */
 const REFUSED_ZONES: readonly string[] = ["invalid", "local", "internal", "localhost", "test", "example", "arpa", "onion"];
 
@@ -218,10 +242,14 @@ export interface EntryRouteFacts {
  * Whether the confidential lane's entry serves an endpoint route (design section 2): `bearer` or `protocol_native`, on
  * a protocol the entry serves endpoint routes on (`ENTRY_ENDPOINT_PROTOCOLS`: Messages, Chat, Responses and Gemini),
  * with no media adapter, and a base URL egress can carry whose row covers the route's URL. A `lane_relay` route is not
- * an endpoint route.
+ * an endpoint route. `protocols` is the entry's list; only the tests pass another (ENTRY_MEDIA_PROTOCOLS beside it).
  */
-export function entryEndpointRoute(r: EntryRouteFacts, deny: readonly string[] = ENTRY_ROUTE_DENY_SUFFIXES): boolean {
-  if ((r.auth !== "bearer" && r.auth !== "protocol_native") || !ENTRY_ENDPOINT_PROTOCOLS.includes(r.protocol) || (r.adapter ?? null) !== null) return false;
+export function entryEndpointRoute(
+  r: EntryRouteFacts,
+  deny: readonly string[] = ENTRY_ROUTE_DENY_SUFFIXES,
+  protocols: readonly Protocol[] = ENTRY_ENDPOINT_PROTOCOLS,
+): boolean {
+  if ((r.auth !== "bearer" && r.auth !== "protocol_native") || !protocols.includes(r.protocol) || (r.adapter ?? null) !== null) return false;
   const target = endpointRouteTarget(r.baseUrl, deny);
   return target !== null && endpointRoutePath(r.url, target) !== null;
 }

@@ -20,8 +20,9 @@ build="$here/build"
 context="$build/context"
 
 platform="${TEE_PLATFORM:-linux/amd64}"
-# The multi-arch index digest of node:24-bookworm-slim (Docker Hub official image, resolved 2026-10-20).
-base_image="${TEE_BASE_IMAGE:-node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5}"
+# The multi-arch index digest of node:24.22.1-bookworm-slim (Docker Hub official image, resolved 2026-11-21: Node
+# 24.22.1 is a security release, among its fixes CVE-2026-111497 in the bundled brotli).
+base_image="${TEE_BASE_IMAGE:-node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c}"
 # The multi-arch index digest of golang:1.27.2-bookworm (Docker Hub official image, resolved 2026-10-21).
 go_image="${TEE_GO_IMAGE:-golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61}"
 tag="${TEE_TAG:-gray-lane:local}"

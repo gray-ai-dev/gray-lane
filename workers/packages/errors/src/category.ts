@@ -71,6 +71,9 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "verifiable_routes_unavailable",
       // A ModelTrace probe that does not pin one route (Workers only, docs/model-authenticity-workflow.md).
       "model_check_unpinned",
+      // A model request sent to the API Worker's address once it is closed to clients' content (Workers only,
+      // docs/design/one-address.md): the client sends it to the entry instead.
+      "served_at_lane",
       "count_tokens_request_rejected",
       "count_tokens_translation_unsupported",
       "count_tokens_image_route_unsupported",

@@ -21,8 +21,9 @@ import (
 //     route.gray.invalid). An id without a live row is route_unknown, a 502, before any dial.
 //
 // The outbound call is a direct vendor call's: the image's roots, HTTP/2, no proxy, no redirect followed, the same
-// timeouts and body bound, outboundHeader, and the dial rule (dial_guard.go) after DNS, so a row whose name resolves
-// to a private or internal address is refused at the dial. The table is defence in depth: only the entry's code
+// timeouts, outboundHeader, and the dial rule (dial_guard.go) after DNS, so a row whose name resolves to a private or
+// internal address is refused at the dial. The body bound is the route kind's own, -route-max-body-bytes
+// (config.routeBodyBytes): the body is read whole before the dial, so one above it is a clean 413 with nothing sent. The table is defence in depth: only the entry's code
 // reaches the unix socket, so a row limits what a bug in the entry could do.
 const (
 	endpointRoutePrefix = "/route/"
@@ -181,7 +182,7 @@ func (s *server) serveEndpointRoute(rec *responseRecorder, r *http.Request, entr
 		refuse(code)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, err := readRequestBody(r, s.cfg.routeBodyBytes())
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)

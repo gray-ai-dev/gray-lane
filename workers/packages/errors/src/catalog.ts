@@ -86,6 +86,10 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   // it passes every check (docs/model-authenticity-workflow.md, "Probes are not billed", decided 2026-11-04); one that
   // does not pin that route this way is refused before its ticket is used. The server has no model checks.
   [["model_check_unpinned"], "A model check must name exactly one endpoint: its provider id alone in `only`, with `allow_fallbacks: false`, and no fallback `models`. Nothing was sent.", "docs"],
+  // Workers only: the API Worker's address, closed to clients' model requests once CLIENT_CONTENT_ORIGIN names the
+  // confidential entry (docs/design/one-address.md, the owner's decision of 2026-11-21). The gateway's own sentence names
+  // the entry's origin; the server has no entry and serves model requests itself.
+  [["served_at_lane"], "This address no longer serves model requests. Send the request, with the same path, key and body, to Gray's confidential entry, the API address the console gives.", "docs"],
   [["translation_invalid_request"], "This request could not be expressed in the API of the provider serving this model.", "docs"],
   [["streaming_unsupported"], "This API does not support `stream: true`.", "docs"],
   [["unsupported_request_field"], "The request contains a field this API does not accept.", "docs"],
