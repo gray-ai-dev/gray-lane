@@ -21,3 +21,14 @@ export function servedProtocol(method: string, path: string): Served | null {
   const model = geminiPathModel(gemini);
   return model === undefined ? null : { protocol: "gemini", pathModel: model };
 }
+
+/**
+ * The agent and provider setup, which gray-console serves (it has the database a claim needs) on the API Worker's host,
+ * and a relay stack's public routes (its pull-token reports and its appended texts,
+ * docs/confidential-lane-supply-implementation.md S13 and section 10), which read and write the console's tables too.
+ * None carries a prompt or a model's answer. The API Worker sends them to the console (index.ts `forwardSetup`); the
+ * confidential entry forwards them to the API Worker (lane/api-forward.ts `forwardedPath`). Both read this one rule.
+ */
+export function isSetupPath(path: string): boolean {
+  return path.startsWith("/v1/setup/") || path.startsWith("/v1/provider-setup/") || path.startsWith("/v1/lane-stack/");
+}

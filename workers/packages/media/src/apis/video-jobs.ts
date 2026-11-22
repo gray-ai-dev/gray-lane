@@ -614,12 +614,22 @@ export function mediaType(contentType: string | null): string {
   return (kind === "video" || kind === "image") && sub.length > 0 && sub.length <= 64 && /^[a-z0-9.+-]+$/.test(sub) ? essence : "application/octet-stream";
 }
 
+/** What a caller of `streamMedia` hears of the transfer: each chunk as it is handed on, and how it ended, once. */
+export interface StreamMediaHooks {
+  /** A chunk, just before it is handed to the customer's stream. */
+  readonly tap?: (bytes: Uint8Array) => void;
+  /** The transfer ended: `complete` (the upstream's end), `cut` (a bound crossed or the upstream broke) or `cancelled` (the customer left). */
+  readonly ended?: (how: "complete" | "cut" | "cancelled") => void;
+}
+
 /**
  * `stream_media`: the customer's response streaming an upstream body within `limits.bytes`, at most
  * `idleMs` between chunks and `totalMs` overall; the stream errors (a truncated transfer) when a bound
- * is crossed. A body announced larger than the limit is 502 `upstream_content_too_large`.
+ * is crossed. A body announced larger than the limit is 502 `upstream_content_too_large`. One chunk is
+ * read from the upstream each time the customer's stream asks for one, so nothing is held beyond the
+ * chunk in hand and a customer that reads slowly holds the upstream back.
  */
-export function streamMedia(upstream: Response, limits: ContentLimits): Response {
+export function streamMedia(upstream: Response, limits: ContentLimits, hooks: StreamMediaHooks = {}): Response {
   const length = upstream.headers.get("content-length");
   if (length !== null && /^[0-9]+$/.test(length) && Number(length) > limits.bytes) {
     void upstream.body?.cancel();
@@ -627,8 +637,17 @@ export function streamMedia(upstream: Response, limits: ContentLimits): Response
   }
   const headers = new Headers({ "content-type": mediaType(upstream.headers.get("content-type")) });
   if (length !== null && /^[0-9]+$/.test(length)) headers.set("content-length", length);
+  let over = false;
+  const ended = (how: "complete" | "cut" | "cancelled"): void => {
+    if (over) return;
+    over = true;
+    hooks.ended?.(how);
+  };
   const source = upstream.body;
-  if (source === null) return new Response(null, { status: 200, headers });
+  if (source === null) {
+    ended("complete");
+    return new Response(null, { status: 200, headers });
+  }
   const reader = source.getReader();
   const deadline = Date.now() + limits.totalMs;
   let received = 0;
@@ -643,27 +662,33 @@ export function streamMedia(upstream: Response, limits: ContentLimits): Response
         const next = await Promise.race([reader.read(), timeout]);
         if (next === "timeout") {
           await reader.cancel().catch(() => {});
+          ended("cut");
           controller.error(new Error("video content interrupted"));
           return;
         }
         if (next.done) {
+          ended("complete");
           controller.close();
           return;
         }
         received += next.value.length;
         if (received > limits.bytes) {
           await reader.cancel().catch(() => {});
+          ended("cut");
           controller.error(new Error("video content exceeds the limit"));
           return;
         }
+        hooks.tap?.(next.value);
         controller.enqueue(next.value);
       } catch {
+        ended("cut");
         controller.error(new Error("video content interrupted"));
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
     },
     cancel(reason) {
+      ended("cancelled");
       return reader.cancel(reason);
     },
   });

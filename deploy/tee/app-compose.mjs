@@ -27,10 +27,11 @@
 //
 // `--api-origin <https origin>` and `--api-forward-public-key <key id>:<64 hex>` (default layout only; release.mjs passes
 // environments.json's `api_url` origin and `api_forward_public_key`, docs/design/one-address.md) add lane's API_ORIGIN
-// and LANE_API_FORWARD_PUBLIC_KEY under CONSOLE_ORIGIN (or GATEWAY_FALLBACK_REGION without it): the API Worker every
-// path the entry does not serve itself is forwarded to, and the key whose x-gray-api-forward mark the entry accepts on a
-// chat request the API Worker forwarded. The committed compose has neither line, so a render without the flags measures
-// what it did before, and the entry then answers its 404 for those paths.
+// and LANE_API_FORWARD_PUBLIC_KEY under CONSOLE_ORIGIN (or GATEWAY_FALLBACK_REGION without it): the API Worker the
+// entry forwards the paths without model content to (the key's status and the setup routes, no other), and the key
+// whose x-gray-api-forward mark the entry accepts on a chat request the API Worker forwarded. The committed compose has
+// neither line, so a render without the flags measures what it did before, and the entry then answers its 404 for those
+// paths.
 //
 // Routing PR 9 (docs/confidential-lane-stack-routing.md section 9.1): `--release-public-key <64 hex>` and
 // `--release-freshness-public-key <64 hex>` (the environment's, environments.json) set lane's list keys in either

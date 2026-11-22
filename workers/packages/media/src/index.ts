@@ -151,6 +151,7 @@ export {
   type JobStatus,
   type MissingRule,
   type Observed,
+  type StreamMediaHooks,
   type VideoJob,
   type JobScalar,
   type JobValue,

@@ -74,7 +74,7 @@ export function decodeApi(protocol: Protocol, received: Received, settings: Medi
     case "open_ai_embeddings":
       return decodeEmbeddings(received, settings.responseBytes);
     case "open_ai_videos":
-      return decodeVideo(received);
+      return decodeVideo(received, entry);
     default:
       throw apiError(404, "unsupported_protocol");
   }

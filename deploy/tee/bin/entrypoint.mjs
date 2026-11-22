@@ -574,8 +574,9 @@ export function peerFragments(peers) {
 /**
  * docs/design/one-address.md: the entry's forward to the API Worker, or null when the compose sets neither of its
  * literals. `API_ORIGIN` (app-compose.mjs `--api-origin`) is an https origin written as one, where the entry forwards
- * every path it does not serve itself; the entrypoint renders it as the `api` external service (HTTPS verified against
- * the browser roots for its host, as the bridge is) and the API binding. `LANE_API_FORWARD_PUBLIC_KEY`
+ * the paths that carry no model content (the key's status and the setup routes) and no other; the entrypoint renders it
+ * as the `api` external service (HTTPS verified against the browser roots for its host, as the bridge is) and the API
+ * binding. `LANE_API_FORWARD_PUBLIC_KEY`
  * (`--api-forward-public-key`) is `<key id>:<64 lowercase hex>`, the key of the API Worker's forward mark. Neither is
  * set in the relay-stack layout: only the entry forwards to and from the API Worker. app-compose.mjs's gate holds the
  * measured compose to the same rules; this is the boot's own check.

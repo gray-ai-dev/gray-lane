@@ -34,6 +34,12 @@ export const OPENAI_DEFAULT_SECONDS = 4n;
 /** Largest `input_reference` image, decoded (10 MiB, the adapters' input image bound). */
 export const MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
 const FIELDS = ["model", "prompt", "seconds", "size", "input_reference", "user"];
+/**
+ * The fields of a create at the confidential entry (the provider standard's clause 11.12): the same, and `metadata`,
+ * the provider's own parameters, which Gray passes on as sent and does not read. `user` stays among them: the entry
+ * takes it out of the bytes it sends as a declared change (clause 11.2).
+ */
+const ENTRY_FIELDS = [...FIELDS, "metadata"];
 
 /** The fields of a create request, validated. */
 interface VideoFields {
@@ -45,8 +51,26 @@ interface VideoFields {
   readonly inputReference: string | undefined;
 }
 
-export function decodeVideo(received: Received): ApiRequest {
-  const fields = received.kind === "json" ? jsonFields(received.value) : formFields(received.parts);
+/**
+ * `entry`: as the confidential entry serves a create on a provider's own API (docs/design/standard-media-at-entry.md
+ * section 2.7). The fields are read and checked as for the API Worker, `metadata` is taken and not read, and the
+ * request holds what the hold and the price need and nothing else: the model, `seconds` and `size`. The provider is
+ * sent the client's own bytes, so no body is built here: no prompt and no reference image is kept.
+ */
+export function decodeVideo(received: Received, entry = false): ApiRequest {
+  const fields = received.kind === "json" ? jsonFields(received.value, entry) : formFields(received.parts, entry);
+  if (entry) {
+    const kept: JsonObject = { model: fields.model };
+    if (fields.seconds !== undefined) kept.seconds = fields.seconds.toString();
+    if (fields.size !== undefined) kept.size = fields.size;
+    return {
+      model: fields.model,
+      stream: false,
+      selectors: fields.size !== undefined && validSelector(fields.size) ? [fields.size] : [],
+      bound: { inputTokens: 0n, outputTokens: 0n, units: fields.seconds ?? DEFAULT_RESERVED_SECONDS },
+      body: { kind: "json", value: kept },
+    };
+  }
   const body: JsonObject = { model: fields.model, prompt: fields.prompt };
   if (fields.seconds !== undefined) body.seconds = fields.seconds.toString();
   if (fields.size !== undefined) body.size = fields.size;
@@ -63,9 +87,10 @@ export function decodeVideo(received: Received): ApiRequest {
   };
 }
 
-function jsonFields(body: Json): VideoFields {
+function jsonFields(body: Json, entry: boolean): VideoFields {
   if (!isObject(body)) throw invalid("invalid_protocol_request");
-  if (Object.keys(body).some((k) => !FIELDS.includes(k))) throw invalid("unsupported_request_field");
+  const taken = entry ? ENTRY_FIELDS : FIELDS;
+  if (Object.keys(body).some((k) => !taken.includes(k))) throw invalid("unsupported_request_field");
   const text = (name: string): string | undefined => {
     const v = get(body, name);
     if (v === undefined || v === null) return undefined;
@@ -88,15 +113,18 @@ function jsonFields(body: Json): VideoFields {
   return fields(model, text("prompt"), seconds, text("size"), inputReference);
 }
 
-function formFields(parts: readonly FormPart[]): VideoFields {
-  if (parts.some((p) => !FIELDS.includes(p.name))) throw invalid("unsupported_request_field");
+function formFields(parts: readonly FormPart[], entry: boolean): VideoFields {
+  const taken = entry ? ENTRY_FIELDS : FIELDS;
+  if (parts.some((p) => !taken.includes(p.name))) throw invalid("unsupported_request_field");
   const references = parts.filter((p) => p.name === "input_reference");
   if (references.length > 1) throw invalid("duplicate_form_field");
   let inputReference: string | undefined;
   if (references.length === 1) {
     const part = references[0] as FormPart;
     const text = partText(part);
-    inputReference = text !== undefined ? referenceFromText(text) : referenceFile(part);
+    // The entry holds a file's head only and sends the form as the client's bytes: the file is checked, not encoded.
+    if (text === undefined && entry) referenceHead(part);
+    else inputReference = text !== undefined ? referenceFromText(text) : referenceFile(part);
   }
   const model = formText(parts, "model");
   if (model === undefined || model.length === 0) throw invalid("invalid_protocol_request");
@@ -201,6 +229,12 @@ function referenceFile(part: FormPart): string {
   const sniffed = sniffImage(part.data);
   if (sniffed === undefined) throw invalid("unsupported_input_reference");
   return `data:${sniffed[0]};base64,${partBase64(part)}`;
+}
+
+/** A reference file's checks alone, as `referenceFile` makes them: its whole size and its head's type. */
+function referenceHead(part: FormPart): void {
+  if (partSize(part) > MAX_REFERENCE_BYTES) throw invalid("input_reference_too_large");
+  if (sniffImage(part.data) === undefined) throw invalid("unsupported_input_reference");
 }
 
 /** The media type and file extension of a PNG, JPEG or WebP image. */

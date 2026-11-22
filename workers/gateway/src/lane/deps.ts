@@ -27,7 +27,7 @@ import { remoteContinuation } from "./remote/continuation.ts";
 import { LaneFetchRefusal } from "./fetch-refusal.ts";
 import { gatedUpstreamAuth } from "./kms-lease.ts";
 import { endpointRowsOfSnapshot, type EntryEndpointRoutes } from "./endpoint-routes.ts";
-import type { LaneApiForward, LaneDeps, LaneGatewayDeps, LanePeers, StackTransport } from "./types.ts";
+import type { LaneDeps, LaneGatewayDeps, LanePeers, LaneVideos, StackTransport } from "./types.ts";
 import type { LaneProcessState } from "./state.ts";
 
 /**
@@ -166,12 +166,15 @@ export interface LaneRequestState {
    */
   readonly endpointRoutes?: EntryEndpointRoutes;
   /**
+   * An entry's video jobs (`video-jobs.ts`, docs/design/standard-media-at-entry.md section 2.7): the job store behind
+   * the bridge and this replica's lease index. Beside `endpointRoutes`; absent on a relay stack VM.
+   */
+  readonly videos?: LaneVideos;
+  /**
    * docs/design/one-address.md: `gray_api` when the request carries a valid mark of the API Worker (`api-arrival.ts`):
    * it reached this VM through Gray's API. Absent for a client's own connection.
    */
   readonly arrival?: "gray_api";
-  /** docs/design/one-address.md: the entry's forward of a request for a model only Gray's API serves (`LaneDeps.apiForward`). */
-  readonly apiForward?: LaneApiForward;
 }
 
 /** The process's per-isolate tables and load, bounded as the main lane bounds them. */
@@ -304,8 +307,8 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     ...stackTransportOf(env.RELAY, egressBinding),
     ...(state.peers === undefined ? {} : { peers: state.peers }),
     ...endpointRouteDeps(state.endpointRoutes),
+    ...(state.videos === undefined ? {} : { videos: state.videos }),
     ...(state.arrival === undefined ? {} : { arrival: state.arrival }),
-    ...(state.apiForward === undefined ? {} : { apiForward: state.apiForward }),
   };
   return { ...deps, lane };
 }

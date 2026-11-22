@@ -1,5 +1,5 @@
 import { ID_PATTERN } from "@gray/account";
-import { MAX_EVIDENCE_BYTES } from "@gray/ledger-keys";
+import { MAX_EVIDENCE_BYTES, USAGE_KINDS } from "@gray/ledger-keys";
 import { z } from "zod";
 import { asBigint } from "./ints.ts";
 
@@ -45,7 +45,8 @@ type FieldKind =
   | "uint_nullable"
   | "status_nullable"
   | "true"
-  | "completion"
+  | "usage_kind"
+  | "video"
   | "worst_case"
   | "cap_source";
 
@@ -57,6 +58,9 @@ interface Field {
 /** Every field of the release's detail, in a fixed order. */
 export const RELEASE_DETAIL_FIELDS: readonly Field[] = Object.freeze([
   { name: "request_id", kind: "id" },
+  // The ledger's usage kind, named only for a video job's hold (`video`): a release that names none is a completion's,
+  // as every release was before the entry served video jobs, and the projection reads it so.
+  { name: "kind", kind: "video" },
   { name: "model", kind: "text" },
   { name: "protocol", kind: "code" },
   { name: "client_key", kind: "true" },
@@ -80,7 +84,9 @@ export const RELEASE_DETAIL_FIELDS: readonly Field[] = Object.freeze([
 /** Every field of the settlement's meta, in a fixed order. */
 export const SETTLE_META_FIELDS: readonly Field[] = Object.freeze([
   { name: "request_id", kind: "id" },
-  { name: "kind", kind: "completion" },
+  // The ledger's usage kind (@gray/ledger-keys `USAGE_KINDS`): `completion`, or `video` for a video job the entry
+  // settles (docs/design/standard-media-at-entry.md section 2.7), as the API Worker's job records it.
+  { name: "kind", kind: "usage_kind" },
   { name: "evidence", kind: "evidence" },
   { name: "workspace", kind: "id" },
   { name: "public_request_id", kind: "id" },
@@ -131,8 +137,10 @@ function base(kind: FieldKind): z.ZodType {
       return z.bigint().min(100n).max(599n);
     case "true":
       return z.literal(true);
-    case "completion":
-      return z.literal("completion");
+    case "usage_kind":
+      return z.enum(USAGE_KINDS);
+    case "video":
+      return z.literal("video");
     case "worst_case":
       return z.literal("worst_case");
     case "cap_source":
@@ -190,8 +198,10 @@ function wireValue(field: Field, value: unknown): unknown {
       return typeof value === "number" && Number.isSafeInteger(value) && value >= 100 && value <= 599 ? asBigint(value, field.name) : undefined;
     case "true":
       return value === true ? true : undefined;
-    case "completion":
-      return value === "completion" ? "completion" : undefined;
+    case "usage_kind":
+      return typeof value === "string" && (USAGE_KINDS as readonly string[]).includes(value) ? value : undefined;
+    case "video":
+      return value === "video" ? "video" : undefined;
     case "worst_case":
       return value === "worst_case" ? "worst_case" : undefined;
     case "cap_source":

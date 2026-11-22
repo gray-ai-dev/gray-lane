@@ -174,7 +174,7 @@ import { type GatewaySnapshot, type KeyRecord, type RouteRecord, type SnapshotCa
 import { spoolPlaintext } from "./spool.ts";
 import { AnswerIds, RequestToolIds, StreamIds, TOOL_ID_CODES, type ToolIdIsolate, ToolIdFailure, clientBytes as toolIdClientBytes, handlesInBody, handlesInSpan, releasesAny, siteMember, toolIdIsolate, upstreamValue } from "./tool-ids.ts";
 import { originsOf } from "./hosts.ts";
-import { NO_TRANSLATION, entryRules, translationRules } from "./translate.ts";
+import { NO_TRANSLATION, translationRules } from "./translate.ts";
 import { type BodyEdits, UPSTREAM_BODY_CHUNK_BYTES, type UpstreamBody, heldBody, releasedAtEnd, sendable, storedBody, upstreamHeaders } from "./upstream.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import {
@@ -214,12 +214,11 @@ import {
 import { checkEventLog, ReceiptBuilder, type TranslatedApi } from "@gray/attest";
 import { addReceiptEvents } from "./lane/hooks.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
-import { apiUnreachable } from "./lane/api-forward.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
 import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, type RewriteDecisions } from "./lane/plan.ts";
 import { completedResponse, keptWeight } from "./lane/codex.ts";
-import type { LaneApiForward, LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
+import type { LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
 import type { AppendedText, GrayRewriteOp, LaneProtocol } from "@gray/lane";
 import { applyDeclaredChanges, checkOfficialUpstream, GRAY_LANE_TRANSLATION_V1, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
@@ -716,17 +715,6 @@ function laneFailureCode(error: unknown): string {
     if (typeof code === "string" && (LANE_CONNECTOR_CODES as readonly string[]).includes(code)) return code;
   }
   return "unknown";
-}
-
-/**
- * Whether the lane's view has a route of one of `models` on `protocol` (docs/design/one-address.md), or the entry
- * translates one of them onto an endpoint route of another text API (translate.ts `entryRules`): a route's existence,
- * not whether it serves now.
- */
-function entryRouted(snapshot: GatewaySnapshot, models: readonly string[], protocol: Protocol): boolean {
-  if (snapshot.routes.some((r) => r.protocol === protocol && models.includes(r.model))) return true;
-  const rules = entryRules(snapshot);
-  return models.some((model) => rules.upstreams(model, protocol) !== undefined);
 }
 
 /** Whether two byte strings are the same. */
@@ -2643,18 +2631,8 @@ export class InferenceRun {
     // entry has no route of here (the entry never forwards a request back): those are answered here as before.
     const entry = this.deps.entryChat;
     if (this.lane === null && entry !== undefined && !this.stripProvider && ticketHeader(this.request.headers) === null && entryServesChain(snapshot, chain, protocol)) return this.forwardToEntry(entry, body);
-    // docs/design/one-address.md: at the entry, the other direction. A request for models this entry has no route of on
-    // this API in its view and does not translate onto one of its endpoint routes (`entryRouted`; a route's existence
-    // decides, not whether it serves now, so a model whose routes are all down stays here) goes to Gray's API when the
-    // API serves one of them natively there (a Gemini image model). The API's list for the entry names the APIs it serves
-    // natively alone (translate.ts `translationRules`), so a request the API would translate is never sent through
-    // Cloudflare: the entry translates for itself. Never a verifiable preference (the body's, `x-gray-routing`, the key's
-    // or the workspace's default, all layered above), a model check, or a request that arrived through the API (it has
-    // no `apiForward`): those get the entry's own answer.
-    const toApi = this.lane?.apiForward;
-    if (toApi !== undefined && this.lane!.arrival !== "gray_api" && !layered.preference.verifiable && ticketHeader(this.request.headers) === null && !entryRouted(snapshot, chain, protocol) && (await toApi.serves(chain, protocol))) {
-      return this.forwardToApi(toApi, body);
-    }
+    // At the entry nothing is forwarded (docs/design/standard-media-at-entry.md section 2.9): a request for models the
+    // entry has no route of, and translates onto none, gets the entry's own answer below (resolution.ts `unrouted`).
     // A ModelTrace probe is a model check only with the ticket the console signed for it (`takeModelCheck`). It checks one
     // route: its own preference names that endpoint alone, with fallbacks refused, for one model; the stored defaults
     // layered over it only narrow it. Anything else is refused before anything is held or sent.
@@ -2750,45 +2728,6 @@ export class InferenceRun {
     // Its place in the count is given back once, by whoever took the request's end (`forwarded`, or `record` before it).
     const counted = this.forwarded();
     console.log(JSON.stringify({ level: "info", event: "chat_forwarded_to_entry", request_id: this.requestId, status: answer.status }));
-    return forwardedAnswer(answer, () => {
-      bodyDone();
-      if (counted) this.deps.load.leave();
-    });
-  }
-
-  /**
-   * The entry's request for a model only Gray's API serves (docs/design/one-address.md), as `forwardToEntry` sends the
-   * other way: the client's method, URL and headers, the body bytes read here (a spooled body read back as it streams,
-   * kept until the API read it or answered), and the entry's mark (`LaneApiForward.send`, `api-forward.ts` `sendToApi`).
-   * The API admits, bills, records and answers it (its record keeps no client address: the mark says it came through
-   * the entry); its answer streams back as it came, with `x-gray-served-by`. The entry writes no record and signs no
-   * receipt of it: one record per request. It counts as in flight here (`load`) until the answer ends. An API that does
-   * not answer is the client's 502 `api_unreachable`, recorded here as the entry's failure: nothing was billed.
-   */
-  private async forwardToApi(api: LaneApiForward, body: Body): Promise<Response> {
-    const headers = new Headers(this.request.headers);
-    let bodyDone!: () => void;
-    this.relayed = new Promise<void>((resolve) => (bodyDone = resolve));
-    let payload: BodyInit | null;
-    if (body.tier === "C") {
-      const opened = await this.spoolOpener(body)();
-      payload = opened === null ? null : endingWith(opened, bodyDone);
-      if (opened === null) bodyDone();
-      headers.set("content-length", String(body.length));
-    } else {
-      payload = body.bytes;
-      headers.set("content-length", String(body.bytes.length));
-      bodyDone();
-    }
-    const asked = new Request(this.request.url, { method: this.request.method, headers, body: payload, signal: this.request.signal, ...(payload instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit);
-    const answer = await api.send(asked);
-    if (answer === null) {
-      bodyDone();
-      return this.refuse(apiUnreachable(), "preference");
-    }
-    // Its place in the count is given back once, by whoever took the request's end (`forwarded`, or `record` before it).
-    const counted = this.forwarded();
-    console.log(JSON.stringify({ level: "info", event: "chat_forwarded_to_api", request_id: this.requestId, status: answer.status }));
     return forwardedAnswer(answer, () => {
       bodyDone();
       if (counted) this.deps.load.leave();

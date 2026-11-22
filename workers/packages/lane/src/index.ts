@@ -21,6 +21,9 @@
  * per-event and body digests the entry compares with the ones Gray's egress computed over the
  * vendor's bytes (`deploy/tee/egress/stack_digest.go`, shared vectors in its testdata).
  *
+ * And for a video job the entry serves (`readVideoObject`): what Gray reads of a provider's `video` object and the
+ * three changes it makes to the copy the client gets, at byte offsets (the provider standard's clause 11.14).
+ *
  * The purpose is in `workers/packages/lane/IMPLEMENTATION_NOTES.md`, the review it follows is
  * review.md (sections 2.3, 3.x, 4), and the comparison with Phala's Private AI Gateway is
  * comparison.md. Pure code: no `cloudflare:*` import, no I/O, no clock, no randomness, so the same
@@ -154,6 +157,7 @@ export {
   type LaneResponseRewriteRule,
   type StackRewritten,
 } from "./response-rewrites.ts";
+export { VIDEO_OBJECT_MAX_DEPTH, VIDEO_STATES, isHttpUrl, isVideoProviderId, readVideoObject, videoStateOf, type VideoObject, type VideoSeconds, type VideoState } from "./video-object.ts";
 export {
   applyDeclaredChanges,
   changeValueSha256,

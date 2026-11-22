@@ -32,11 +32,10 @@ export const ENTRY_ROUTE_DENY_SUFFIXES: readonly string[] = Object.freeze(["usef
  * job paths append `/<id>` and `/<id>/content`, which pass `endpointRoutePath` for every id of the standard's clause
  * 11.10 (test/endpoint-route.test.ts).
  *
- * The entry serves the synchronous ones (`ENTRY_STANDARD_PROTOCOLS`, in ENTRY_ENDPOINT_PROTOCOLS). Videos are not in
- * its list until it serves video jobs (that design's PR 6): admitted before, a video route would reach the entry's
- * model listing, its mapped pairs and egress's route table while its requests still go to the API Worker. The rule
- * takes the list as an argument (`entryEndpointRoute`'s `protocols`) so its tests hold video routes to egress's route
- * cases already.
+ * The entry serves them all (in ENTRY_ENDPOINT_PROTOCOLS): the synchronous ones within their request
+ * (`ENTRY_STANDARD_PROTOCOLS`), and video jobs, which it records behind the bridge and polls and settles itself
+ * (section 2.7 of that design). A video route is therefore in the entry's model listing, its mapped pairs and egress's
+ * route table, as the others are.
  */
 export const ENTRY_MEDIA_PROTOCOLS: readonly Protocol[] = Object.freeze([
   "open_ai_embeddings",
@@ -51,18 +50,18 @@ export const ENTRY_MEDIA_PROTOCOLS: readonly Protocol[] = Object.freeze([
 ]);
 
 /**
- * The standard APIs the entry serves itself (section 2.2 of that design): each answers within its request, as a pass
- * of the provider's own answer. Every one of ENTRY_MEDIA_PROTOCOLS but videos, whose jobs outlive a request.
+ * The standard APIs that answer within their request (section 2.2 of that design), as a pass of the provider's own
+ * answer. Every one of ENTRY_MEDIA_PROTOCOLS but videos, whose jobs outlive a request.
  */
 export const ENTRY_STANDARD_PROTOCOLS: readonly Protocol[] = Object.freeze(ENTRY_MEDIA_PROTOCOLS.filter((protocol) => protocol !== "open_ai_videos"));
 
 /**
  * The protocols the entry serves an endpoint route on (docs/design/lane-provider-routes.md sections 2 and 7;
  * docs/design/standard-media-at-entry.md section 2.1): the lane relays' three (`LANE_PROTOCOLS`: Messages, Chat
- * Completions, Responses), Gemini's generation API, and the synchronous standard APIs (`ENTRY_STANDARD_PROTOCOLS`). A
- * lane relay stays on the three: its templates and the lane's rewrite plan are defined for those alone.
+ * Completions, Responses), Gemini's generation API, and the standard APIs (`ENTRY_MEDIA_PROTOCOLS`). A lane relay
+ * stays on the three: its templates and the lane's rewrite plan are defined for those alone.
  */
-export const ENTRY_ENDPOINT_PROTOCOLS: readonly Protocol[] = Object.freeze([...LANE_PROTOCOLS, "gemini", ...ENTRY_STANDARD_PROTOCOLS]);
+export const ENTRY_ENDPOINT_PROTOCOLS: readonly Protocol[] = Object.freeze([...LANE_PROTOCOLS, "gemini", ...ENTRY_MEDIA_PROTOCOLS]);
 
 /** egress's routeRefusedZones: special-use and private names, none of which is a public provider's API host. */
 const REFUSED_ZONES: readonly string[] = ["invalid", "local", "internal", "localhost", "test", "example", "arpa", "onion"];

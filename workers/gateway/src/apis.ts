@@ -47,6 +47,8 @@ import {
   type Received,
   type VideoJob,
   CreateRejected,
+  DEFAULT_RESERVED_SECONDS,
+  VIDEO_CREATE_RESPONSE_BYTES,
   capabilityUnproved,
   decodeApi,
   decodeGeminiImages,
@@ -84,13 +86,12 @@ import { type PartSource, type ReceivedForm, memoryRefusal, multipartBody, readF
 import { type GeminiAsked, type GeminiSend, geminiAttemptBody, geminiBodyRead, speaks } from "./gemini-images.ts";
 import { originsOf } from "./hosts.ts";
 import { type GatewayDeps, InferenceRun } from "./inference.ts";
-import { forwardedAnswer } from "./entry-forward.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
-import { apiUnreachable } from "./lane/api-forward.ts";
 import { type ResponseHash, bodyHashOf, egressBeforeVendor, egressSidecarFailure, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHash, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
-import type { LaneApiForward, LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
+import type { LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
+import { type VideoJobIo, advanceVideoJob, pollVideoJob, readWhole, videoJobIo, videoJobRoute, videoJobVisible } from "./lane/video-jobs.ts";
 import { answerReader, type MediaAnswer } from "./media-answer.ts";
 import { type VideoCall, VideoJobConflict, alert, holdOf, mediaFetch, mediaRouteOf, mediaSettings, replayVideoCreate, startVideoJob, videoHoldLifetimeMs } from "./media.ts";
 import { chargeSidesMismatch, evidenceSides, pricedQuoteOf, recordedSides, safeAmount, type PricedQuote, type RecordedSides } from "./money.ts";
@@ -106,7 +107,8 @@ import { attemptMeasures, clientFields, dispatchRecord, emitRecord, FREE_NO_USAG
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import { type GatewaySnapshot, type KeyRecord, type RouteRecord, routeServes, snapshotTiming } from "./snapshot.ts";
 import { acceptingFetch, releasedAtEnd, sendable, UPSTREAM_BODY_CHUNK_BYTES, type UpstreamBody } from "./upstream.ts";
-import { LANE_BRIDGE_CALL_MS } from "@gray/lane-wire";
+import { LANE_BRIDGE_CALL_MS, type LaneVideoJob, type LaneVideoJobCreate } from "@gray/lane-wire";
+import { isVideoProviderId, readVideoObject } from "@gray/lane";
 
 /**
  * The model APIs' request path (docs/cloudflare-native/media.md 2.1; the server's
@@ -150,13 +152,15 @@ import { LANE_BRIDGE_CALL_MS } from "@gray/lane-wire";
  *
  * At the confidential entry (docs/design/standard-media-at-entry.md section 2; `deps.lane`), the same stages run with
  * the lane's dependencies for the standard APIs the entry serves itself (lane/standard-api.ts `entryStandardApi`:
- * every model API here but video creation), on a provider's own API: an endpoint route with no adapter, through
+ * every model API here), on a provider's own API: an endpoint route with no adapter, through
  * egress's `/route/` kind with the provider's key from the entry's memory. What differs is in `serveEntry`: the body is
  * held in memory within the lane's bounds and never spooled; the provider is sent the client's bytes with the entry's
  * declared changes; its answer passes as it arrives (media-answer.ts `entryAnswerReader`); the request's record
  * carries no client fingerprint; and a receipt binds what was received, forwarded and returned. A request for a model
- * the entry has no route of on its API goes to Gray's API as it came, while the entry still forwards
- * (`LaneApiForward`): a route that has a vendor adapter is the API Worker's.
+ * the entry has no route of on its API gets the entry's own answer (resolution.ts `unrouted`); a route that has a
+ * vendor adapter is not the entry's, and nothing is sent to another service. A video create's answer is the provider's
+ * `video` object, read whole and handed on with Gray's job id and state; its job is recorded behind the bridge and
+ * polled and settled by the entry (`createEntryVideo`, lane/video-jobs.ts), with no Workflow.
  *
  * A Gemini client's `generateContent` for a Gemini image model served through its image routes
  * (gemini-images.ts; gemini_images.rs on main) takes the same path as an images request (`gemini`): its
@@ -164,6 +168,10 @@ import { LANE_BRIDGE_CALL_MS } from "@gray/lane-wire";
  * the relay sent it, as one server-sent event when the client streams. A request whose path its body
  * decides that carries no image or file goes to the generation path with its body (`handOff`).
  */
+
+/** How often the entry tries to write a video job's record before it gives the job up, and the pause between two tries. */
+const VIDEO_PUT_TRIES = 4;
+const VIDEO_PUT_PAUSE_MS = 200;
 
 /** Why a request ended without a charge when its model refused it in an answer of its own (inference.rs `MODEL_REFUSED`). */
 const MODEL_REFUSED = "model_refused";
@@ -180,6 +188,9 @@ const PATHS: Readonly<Record<string, Protocol>> = {
   "/v1/audio/translations": "open_ai_translations",
   "/v1/videos": "open_ai_videos",
 };
+
+/** Every path of the model APIs' table: what a test of the paths the confidential entry forwards holds them against. */
+export const MODEL_API_PATHS: readonly string[] = Object.freeze(Object.keys(PATHS));
 
 /** The model API `method` and `path` name, or null. */
 export function modelApi(method: string, path: string): Protocol | null {
@@ -1057,9 +1068,15 @@ export class ModelApiRun {
       this.requestKey = this.requestId;
     }
 
-    // The confidential entry serves the standard APIs on a provider's own API (`serveEntry`), and nothing else here.
+    // The confidential entry serves the standard APIs on a provider's own API (`serveEntry`), and nothing else here. A
+    // video create needs the entry's job store (an entry without one, a relay stack VM, serves none).
     if (this.lane !== null) {
-      if (this.gemini !== null || !entryStandardApi(this.protocol)) return this.refuse(new ApiError(404, "unsupported_protocol"), "auth");
+      if (this.gemini !== null || !entryStandardApi(this.protocol) || (this.protocol === "open_ai_videos" && this.videoIo() === null)) return this.refuse(new ApiError(404, "unsupported_protocol"), "auth");
+      // 0. A repeated video create answers with the job its key made, before its body is read (section 2.7).
+      if (this.protocol === "open_ai_videos" && this.clientKey) {
+        const replayed = await this.replayEntryVideo(snapshot, key);
+        if (replayed !== null) return replayed;
+      }
       return this.serveEntry(snapshot, key, this.lane);
     }
 
@@ -1156,9 +1173,9 @@ export class ModelApiRun {
    *     lane's body cap, a form within LANE_FORM_MAX_BYTES and counted against the isolate's memory budget;
    *  3. the routing preference, as chat's at the entry: `x-gray-routing` and a JSON body's `provider`, layered over
    *     the key's and the workspace's defaults;
-   *  4. the model, and whether the entry serves it: a model it has no route of on this API, which Gray's API lists
-   *     there, goes to the API as the client sent it (`forwardToApi`: a route with a vendor adapter is the API
-   *     Worker's until the adapters go), never a `verifiable` request and never one that arrived through the API;
+   *  4. the model. One the entry has no route of on this API (a route with a vendor adapter is not the entry's) is
+   *     answered by `route` as any model without a route is (resolution.ts `unrouted`); nothing is forwarded
+   *     (docs/design/standard-media-at-entry.md section 2.9);
    *  5. what the entry refuses of a body it serves (`entryBodyRefusal`), and its API's own decoding in the entry's
    *     reading (@gray/media `decodeApi`): the formats and shapes Gray would have to convert are refused, nothing is
    *     sent.
@@ -1203,16 +1220,8 @@ export class ModelApiRun {
     const layered = this.layer(snapshot, key);
     if (layered !== null) return layered;
 
-    // A route's existence decides, not whether it serves now: a model whose routes are all down stays here.
-    const toApi = lane.apiForward;
-    // A route with a vendor adapter is not the entry's (@gray/snapshot `entryEndpointRoute` keeps it out of the lane's view).
-    const routed = snapshot.routes.some((r) => r.protocol === this.protocol && r.model === named.model && (r.adapter ?? null) === null);
-    if (toApi !== undefined && lane.arrival !== "gray_api" && !this.preference.verifiable && !routed && (await toApi.serves([named.model], this.protocol))) {
-      return this.forwardToApi(toApi, body);
-    }
-
     this.admission = "parse";
-    const refused = entryBodyRefusal(body);
+    const refused = entryBodyRefusal(body, this.protocol);
     if (refused !== null) return this.refuse(refused, "parse");
     let api: ApiRequest;
     try {
@@ -1225,31 +1234,6 @@ export class ModelApiRun {
     this.entryBody = body;
     this.laneReceivedHash = await entryBodyHash(body);
     return this.route(snapshot, key, api);
-  }
-
-  /**
-   * The entry's request for a model only Gray's API serves on this API (docs/design/one-address.md; inference.ts
-   * `forwardToApi`): the client's method, URL and headers, the body bytes read here, and the entry's mark. The API
-   * admits, bills, records and answers it; the entry writes no record and signs no receipt of it. It counts as in
-   * flight here until the answer ends. An API that does not answer is the client's 502 `api_unreachable`.
-   */
-  private async forwardToApi(api: LaneApiForward, body: EntryBody): Promise<Response> {
-    const headers = new Headers(this.request.headers);
-    headers.set("content-length", String(body.bytes.length));
-    const asked = new Request(this.request.url, { method: this.request.method, headers, body: body.bytes, signal: this.request.signal });
-    const answer = await api.send(asked);
-    if (answer === null) return this.refuse(apiUnreachable(), "preference");
-    // What the request holds here is let go, and nothing is recorded or counted against its key (inference.ts `forwarded`).
-    const counted = !this.recorded;
-    this.recorded = true;
-    this.pendingRecord = null;
-    this.rateOpen = false;
-    this.answerShare.release();
-    this.retained.set("request_body", 0);
-    console.log(JSON.stringify({ level: "info", event: "model_api_forwarded_to_api", request_id: this.requestId, status: answer.status }));
-    return forwardedAnswer(answer, () => {
-      if (counted) this.deps.load.leave();
-    });
   }
 
   /**
@@ -1738,7 +1722,7 @@ export class ModelApiRun {
     if (sent instanceof Response) return sent;
     const { attempt, response } = sent;
     attempt.status = response.status;
-    if (this.protocol === "open_ai_videos") return this.createVideo(api, attempt, response, deadline);
+    if (this.protocol === "open_ai_videos") return this.lane !== null ? this.createEntryVideo(api, attempt, response, deadline) : this.createVideo(api, attempt, response, deadline);
     return this.answer(api, attempt, response, deadline);
   }
 
@@ -3042,6 +3026,174 @@ export class ModelApiRun {
     this.ttfbMs = clock() - this.started;
     this.record(200, "completed", null);
     // As a repeat of this create answers (`replayVideoCreate`): the ledger request id the job settles under.
+    return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey!, "x-gray-attempt": String(attempt.index + 1) } });
+  }
+
+  // ---------------------------------------------------------------- video creation at the confidential entry
+
+  /** The job logic's dependencies for this request (lane/video-jobs.ts), its account calls through the request's outbound gate; null when the entry has no job store. */
+  private videoIo(): VideoJobIo | null {
+    return this.lane === null ? null : videoJobIo(this.deps, this.lane, this.accounts());
+  }
+
+  /**
+   * A video create repeated under its `Idempotency-Key` (docs/design/standard-media-at-entry.md section 2.7, create
+   * step 1): the job the key made, when the store holds it and the key may see it, answers as a retrieve does, with no
+   * new hold and no second job at the provider. Its body is not read, so nothing of it is forwarded and no receipt
+   * is signed for it. Null when the store holds no such job: the request goes on as a new one (a job of a route with a
+   * vendor adapter is Gray's API's, which answers its own repeat). A store that cannot be read is
+   * `503 video_store_unavailable`: going on would ask a provider for a second video.
+   */
+  private async replayEntryVideo(snapshot: GatewaySnapshot, key: KeyRecord): Promise<Response | null> {
+    const io = this.videoIo();
+    if (io === null) return null;
+    this.admission = "idempotency";
+    let job: LaneVideoJob | null;
+    try {
+      job = await io.store.get(videoJobId(key.workspaceId, this.requestKey!), Math.max(1, this.budget.preWait(LANE_BRIDGE_CALL_MS)));
+    } catch {
+      return this.refuse(new ApiError(503, "video_store_unavailable").withRetryAfter(1n), "idempotency");
+    }
+    if (job === null || job.requestId !== this.requestKey || !videoJobVisible(job, key)) return null;
+    this.model = job.model;
+    const route = videoJobRoute(snapshot, job);
+    if (route === undefined) return this.refuse(new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
+    const observed = await pollVideoJob(io, route, job);
+    const after = await advanceVideoJob(io, job, observed, false);
+    if (observed.kind !== "object") {
+      const unreadable = observed.kind === "unknown" && (observed.why === "unreadable" || observed.why === "other_job");
+      return this.refuse(unreadable ? new ApiError(502, "invalid_upstream_response") : new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
+    }
+    const body = observed.object.forClient(after.id, after.state);
+    // Answered before its body is read, as the API Worker answers its repeat: not counted against the key's minute.
+    this.rateOpen = false;
+    this.responseBytes = body.length;
+    this.responseComplete = true;
+    this.ttfbMs = this.deps.clock() - this.started;
+    this.record(200, "completed", null);
+    return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey! } });
+  }
+
+  /**
+   * Writes the job's record (create step 3), retried within what the post phase leaves, VIDEO_PUT_TRIES times at most:
+   * a put repeated after a lost answer finds the record it wrote (`same`). Null when the store did not take it.
+   */
+  private async putVideoJob(io: VideoJobIo, job: LaneVideoJobCreate): Promise<Awaited<ReturnType<VideoJobIo["store"]["put"]>> | null> {
+    const { cfg, clock } = this.deps;
+    for (let tries = 1; tries <= VIDEO_PUT_TRIES; tries += 1) {
+      const waitMs = this.budget.postWait(LANE_BRIDGE_CALL_MS);
+      if (waitMs === 0) return null;
+      try {
+        return await this.outbound.run(() => io.store.put(job, clock() + cfg.videoPollIntervalMs, waitMs));
+      } catch {
+        console.warn(JSON.stringify({ level: "warn", event: "lane_video_store_unanswered", request_id: this.requestId, job: job.id, op: "put", tries }));
+      }
+      // A short pause before the next try, within the same phase.
+      const pauseMs = Math.min(VIDEO_PUT_PAUSE_MS, this.budget.postWait(VIDEO_PUT_PAUSE_MS));
+      if (tries === VIDEO_PUT_TRIES || pauseMs === 0) return null;
+      await new Promise<void>((resolve) => setTimeout(resolve, pauseMs));
+    }
+    return null;
+  }
+
+  /**
+   * 9. A video create a provider answered, at the confidential entry (docs/design/standard-media-at-entry.md section
+   * 2.7, create steps 2 to 4). The answer must be a `video` object (the standard's clause 11.10): a string `id` in the
+   * clause's grammar and a `status` in OpenAI's words or new-api's; anything else releases the hold. The job's evidence
+   * is frozen now, priced for the held seconds; then the record is written behind the bridge (`video.put`), and the
+   * hold is the job's: any replica polls it, and the first read of a terminal state settles it. A record that cannot
+   * be written releases the hold and answers `503 video_store_unavailable`, since no replica could find the job again.
+   * The client gets the provider's object with Gray's job id, Gray's job state and no URL member, and a receipt whose
+   * `response.returned` is those bytes. An object that is terminal already settles before the answer goes.
+   *
+   * The record holds the job's ids, the hold token, the frozen evidence, the ledger columns, the held seconds and the
+   * `size`: nothing of the prompt, of `metadata`, of the provider's answer, and no URL.
+   */
+  private async createEntryVideo(api: ApiRequest, attempt: Attempt, response: Response, deadline: number): Promise<Response> {
+    const { cfg, clock } = this.deps;
+    const candidate = attempt.candidate;
+    const record = candidate.record;
+    // An answer committed: no other attempt follows, so the client's bytes are let go.
+    this.dropEntryBody();
+    const io = this.videoIo();
+    if (io === null) throw new Error("a video create at an entry without a job store");
+    const answered = await readWhole(response, VIDEO_CREATE_RESPONSE_BYTES, deadline, clock);
+    const object = answered === null ? null : readVideoObject(answered);
+    if (object === null || object.state === null || !isVideoProviderId(object.id)) {
+      const error = new ApiError(502, object === null && answered !== null ? "invalid_upstream_json" : "invalid_upstream_response");
+      this.traffic.committedFailed(attempt.evidence, error.code, clock());
+      this.endAttempt(attempt, { kind: "supplier_failure", reason: "invalid_response" }, false, error.code, { failure: countedFailure(null, error.code) });
+      return this.fail(error, error.code, attempt, 0);
+    }
+    // The evidence the job settles with, priced for the seconds held (the request's, or the default it names none of).
+    const seconds = api.bound.units ?? DEFAULT_RESERVED_SECONDS;
+    const evidence = await mediaEvidence({ model: api.model, protocol: this.protocol, record, priced: candidate.priced, platformFeeBps: cfg.platformFeeBps, ceiling: this.ceiling, usage: { ...ZERO_COUNTERS, units: seconds }, unit: "seconds", rawUsage: { seconds } });
+    const cost = usageCost(evidence.usage, customerRates(evidence));
+    const verdict = cost === "amount" || cost > this.ceiling ? { ok: false as const, why: "the held seconds cannot be priced within the request's ceiling" } : judgeEvidence(evidence, cost);
+    if (!verdict.ok) {
+      console.error(JSON.stringify(laneSafeLog({ level: "alert", event: "video_evidence_invalid", request_id: this.requestKey, endpoint: record.endpointId, why: verdict.why })));
+      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "billing_usage_invalid");
+      return this.fail(new ApiError(502, "billing_usage_invalid"), "video_evidence_invalid", attempt, 0);
+    }
+    const workspace = this.key!.workspaceId;
+    const size = api.body.kind === "json" ? get(api.body.value, "size") : undefined;
+    const createdAt = clock();
+    const create: LaneVideoJobCreate = {
+      id: videoJobId(workspace, this.requestKey!),
+      tenant: workspace,
+      keyId: this.key!.keyId,
+      model: api.model,
+      requestId: this.requestKey!,
+      requestKey: this.accountKey!,
+      hold: this.token!,
+      evidence: storedEvidence(evidence),
+      // The settlement's projection columns (the lane's allow-list keeps what it names; `request_id`, `kind` and the
+      // evidence are the record's own).
+      ledgerColumns: {
+        ...this.requestColumns(),
+        workspace,
+        public_request_id: this.requestId,
+        endpoint: record.endpointId,
+        attempt: attempt.index,
+        offer_id: record.quote.offerId,
+        offer_version: record.quote.version,
+        platform_fee_bps: cfg.platformFeeBps,
+      },
+      endpointId: record.endpointId,
+      credentialGeneration: record.credentialGeneration,
+      providerJobId: object.id,
+      secondsHeld: Number(seconds),
+      size: typeof size === "string" ? size : null,
+      state: object.state,
+      failure: object.state === "failed" ? "provider_failed" : null,
+      createdAtMs: createdAt,
+      deadlineMs: createdAt + cfg.videoJobTtlSeconds * 1000,
+    };
+    // The provider's answer is read: the record and a terminal object's settlement wait what the post phase leaves.
+    this.budget.startPost();
+    const put = await this.putVideoJob(io, create);
+    if (put === null || put.outcome === "conflict") {
+      const code = put === null ? "video_store_unavailable" : "video_job_unrecorded";
+      console.error(JSON.stringify(put === null ? { level: "alert", event: "video_job_unrecorded", request_id: this.requestKey, job: create.id } : { level: "alert", event: "video_job_conflict", request_id: this.requestKey, job: create.id }));
+      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, code);
+      // A hold the record under this id already owns stays that record's; any other is released.
+      const recorded = put?.job.hold;
+      if (recorded !== undefined && recorded.epoch === create.hold.epoch && recorded.seq === create.hold.seq && recorded.shard.workspace === create.hold.shard.workspace && recorded.shard.region === create.hold.shard.region && recorded.shard.index === create.hold.shard.index) this.holdDecided = true;
+      return this.fail(put === null ? new ApiError(503, "video_store_unavailable").withRetryAfter(1n) : new ApiError(502, "video_job_unrecorded"), code, attempt, 0);
+    }
+    // The hold is the job's from here: the first read of a terminal state settles it, on any replica.
+    this.holdDecided = true;
+    this.endAttempt(attempt, { kind: "success" }, false, null);
+    // A terminal object settles at once; an open one changes nothing of the record just written.
+    const job = await advanceVideoJob(io, put.job, { kind: "object", object }, false);
+    const body = object.forClient(job.id, job.state);
+    this.laneResponse = responseHash();
+    this.laneResponse.update(body);
+    this.responseBytes = body.length;
+    this.responseComplete = true;
+    this.ttfbMs = clock() - this.started;
+    this.record(200, "completed", null);
+    // `x-request-id` is the ledger request the job settles under, as a repeat of this create answers.
     return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey!, "x-gray-attempt": String(attempt.index + 1) } });
   }
 

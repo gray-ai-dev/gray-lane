@@ -6,7 +6,7 @@ import { type JsonObject, isObject, readSerdeBytes } from "@gray/json";
 import { GRAY_LANE_REWRITES_V2, apiChangeSegments, apiRewriteRuleFor, formBodyBoundary, formBoundaryOf, isRewriteApi, type GrayApiOp, type RewriteApi } from "@gray/lane";
 import { type FormPart, formBoundary, partText } from "@gray/media";
 import { DEFAULT_ACCEPT, OPENAI_LINKING_FIELDS, type Protocol } from "@gray/protocol";
-import { ENTRY_STANDARD_PROTOCOLS } from "@gray/snapshot";
+import { ENTRY_MEDIA_PROTOCOLS } from "@gray/snapshot";
 import { readBody } from "../body.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
@@ -15,9 +15,9 @@ import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 
 /**
  * The standard APIs the confidential entry serves itself (docs/design/standard-media-at-entry.md section 2):
- * embeddings, rerank, image generations and edits, speech, transcriptions, translations and System One, on a
- * provider's own API (an endpoint route with no adapter), as it serves chat on one. This module holds what is the
- * entry's own of such a request; the request path is `ModelApiRun`'s (apis.ts), with the lane's dependencies.
+ * embeddings, rerank, image generations and edits, speech, transcriptions, translations, video creation and System
+ * One, on a provider's own API (an endpoint route with no adapter), as it serves chat on one. This module holds what is
+ * the entry's own of such a request; the request path is `ModelApiRun`'s (apis.ts), with the lane's dependencies.
  *
  * - The body. JSON is read whole within the lane's body cap. A form is read whole within LANE_FORM_MAX_BYTES and held
  *   in memory, never written to disk: `model` may come after a file, and the route and the hold must be known before
@@ -34,9 +34,12 @@ import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
  *   as the replay does.
  */
 
-/** Whether `protocol` is one of the standard APIs the entry serves itself (@gray/snapshot `ENTRY_STANDARD_PROTOCOLS`). */
+/**
+ * Whether `protocol` is one of the standard APIs the entry serves itself (@gray/snapshot `ENTRY_MEDIA_PROTOCOLS`): the
+ * synchronous ones, and video creation, whose job the entry records, polls and settles (video-jobs.ts).
+ */
 export function entryStandardApi(protocol: Protocol): boolean {
-  return ENTRY_STANDARD_PROTOCOLS.includes(protocol);
+  return ENTRY_MEDIA_PROTOCOLS.includes(protocol);
 }
 
 /** A standard API's request body as the entry holds it: the client's bytes, and what the decoders read of them. */
@@ -187,9 +190,11 @@ export function statedModel(body: EntryBody): string | ApiError {
  * - a form that does not begin with its boundary line, or whose first line's boundary is not the `boundary` parameter
  *   of its `content-type` (`invalid_multipart`, each with its own message);
  * - a form field `safety_identifier` or `metadata`: the policy has no op that takes a form field of that name out, and
- *   the entry sends a form as the client's bytes, so it cannot drop one as the API Worker's rebuilt form did.
+ *   the entry sends a form as the client's bytes, so it cannot drop one as the API Worker's rebuilt form did. A video
+ *   create's `metadata` is the exception: the policy takes it out of no video request (the standard's clause 11.12:
+ *   the provider's own parameters, passed on as sent), so there is nothing to drop.
  */
-export function entryBodyRefusal(body: EntryBody): ApiError | null {
+export function entryBodyRefusal(body: EntryBody, protocol: Protocol): ApiError | null {
   if (body.kind === "json") return body.duplicateKeys ? laneDuplicateKey() : null;
   const first = formBodyBoundary(body.bytes);
   if (first === null) {
@@ -198,7 +203,9 @@ export function entryBodyRefusal(body: EntryBody): ApiError | null {
   if (formBoundaryOf(body.contentType) !== first) {
     return invalidMultipart("The boundary of the form's first line is not the `boundary` parameter of the request's `content-type`. Send the form with the boundary its header names.");
   }
-  const linking = body.parts.find((part) => part.name !== "user" && OPENAI_LINKING_FIELDS.includes(part.name));
+  // A video create keeps `metadata` in JSON and in a form alike: nothing is to be taken out of it.
+  const kept = (name: string): boolean => protocol === "open_ai_videos" && name === "metadata";
+  const linking = body.parts.find((part) => part.name !== "user" && OPENAI_LINKING_FIELDS.includes(part.name) && !kept(part.name));
   if (linking !== undefined) {
     return new ApiError(400, "unsupported_request_field").withMessage(`This API's form takes no \`${linking.name}\` field at this address. Leave it out.`).withParam(linking.name);
   }
