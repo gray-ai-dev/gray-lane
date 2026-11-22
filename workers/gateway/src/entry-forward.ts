@@ -183,7 +183,7 @@ export function forwardedAnswer(answer: Response, onEnd: () => void = () => {}):
 export function entryServes(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed" | "entryTranslation">, models: readonly string[], protocol: Protocol): boolean {
   const served = snapshot.laneServed ?? {};
   if (models.some((model) => Object.hasOwn(served, laneServedKey(model, protocol)))) return true;
-  const endpoint = snapshot.routes.filter((r) => r.auth !== "lane_relay" && models.includes(r.model) && entryEndpointRoute({ auth: r.auth, protocol: r.protocol, adapter: r.adapter, baseUrl: r.baseUrl, url: r.url }));
+  const endpoint = snapshot.routes.filter((r) => r.auth !== "lane_relay" && models.includes(r.model) && entryEndpointRoute({ auth: r.auth, protocol: r.protocol, baseUrl: r.baseUrl, url: r.url }));
   if (endpoint.some((r) => r.protocol === protocol)) return true;
   if (snapshot.entryTranslation === "off") return false;
   // No route of the pair at the entry (above): a model with an endpoint route there on another text API is translated.

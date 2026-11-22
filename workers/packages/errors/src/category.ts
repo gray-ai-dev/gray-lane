@@ -54,7 +54,6 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "context_length_exceeded",
       "provider_request_rejected",
       "model_refused",
-      "image_not_generated",
       "setup_code_invalid",
       "setup_code_expired",
       "setup_code_used",
@@ -76,7 +75,6 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "served_at_lane",
       "count_tokens_request_rejected",
       "count_tokens_translation_unsupported",
-      "count_tokens_image_route_unsupported",
       "streaming_unsupported",
       "multipart_form_required",
       "duplicate_form_field",
@@ -128,8 +126,6 @@ const MEDIA_AND_SETUP: ReadonlyMap<string, ErrorCategory> = new Map<string, Erro
   ...(
     [
       "model_refused",
-      "image_not_generated",
-      "count_tokens_image_route_unsupported",
       "provider_token_missing",
       "provider_token_invalid",
       "provider_token_expired",

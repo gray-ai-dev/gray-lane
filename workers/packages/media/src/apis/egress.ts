@@ -1,7 +1,7 @@
 /**
- * Fetching what a vendor hands back by URL (an image result, a video file): without credentials,
- * redirects followed by hand and each hop vetted again, bounded in size and time
- * (crates/gray-gateway/src/apis/images.rs `download`, apis/video/content.rs).
+ * Fetching what an upstream hands back by URL (a video file): without credentials, redirects followed
+ * by hand and each hop vetted again, bounded in size and time (crates/gray-gateway/src/apis/video/content.rs);
+ * and what an inline image must carry.
  *
  * The server version resolves and pins every hop's addresses to public networks. A Worker cannot
  * choose addresses (docs/cloudflare-native.md section 7), so a hop is vetted by URL instead: https
@@ -59,9 +59,9 @@ export function isImage(bytes: Uint8Array): boolean {
 }
 
 /**
- * `is_inline_image`: an inline image held to the rule a downloaded one meets. Its first 16
- * characters, decoded as standard base64 with canonical padding (bits past the last byte left
- * unchecked, as Rust's engine is configured), carry a PNG, JPEG or WebP signature. A data URI,
+ * `is_inline_image`: an image an answer carries inline. Its first 16 characters, decoded as standard
+ * base64 with canonical padding (bits past the last byte left unchecked, as Rust's engine is
+ * configured), carry a PNG, JPEG or WebP signature (`isImage`). A data URI,
  * URL-safe base64, a GIF or text is no image. The decode is the platform's `atob` (WHATWG
  * forgiving-base64, which ignores trailing bits) after the alphabet and padding checks Rust makes.
  */
@@ -89,13 +89,7 @@ export function base64Encode(bytes: Uint8Array): string {
 /** The fetch the gateway sends on: the platform's, or a test's. */
 export type Fetcher = (input: Request) => Promise<Response>;
 
-/** What is left of one answer's download budget (`DOWNLOAD_LIMIT`), shared by its images. */
-export interface Budget {
-  remaining: number;
-}
-
 const unavailable = () => new ApiError(502, "upstream_media_unavailable");
-const tooLarge = () => new ApiError(502, "upstream_media_too_large");
 
 /** Milliseconds left before `deadlineMs`, at least 1 so a timer can fire. */
 function left(deadlineMs: number): number {
@@ -148,57 +142,4 @@ export async function readCapped(response: Response, limit: number, deadlineMs: 
     at += c.length;
   }
   return out;
-}
-
-/**
- * `download`: one image fetched without credentials. Every hop is vetted (`vetUrl`), at most
- * `maxRedirects` redirects are followed, the bytes count against `budget`, and the result must be
- * a PNG, JPEG or WebP image. Codes: `upstream_media_unavailable`, `upstream_media_too_large`,
- * `invalid_upstream_response` (not an image).
- */
-export async function downloadImage(
-  fetcher: Fetcher,
-  raw: string,
-  policy: EgressPolicy,
-  budget: Budget,
-  deadlineMs: number,
-  maxRedirects: number,
-): Promise<Uint8Array> {
-  let target: URL | undefined;
-  try {
-    target = new URL(raw);
-  } catch {
-    throw unavailable();
-  }
-  for (let hop = 0; hop <= maxRedirects; hop += 1) {
-    const vetted = vetUrl(target.toString(), policy);
-    if (vetted === undefined) throw unavailable();
-    let response: Response;
-    try {
-      response = await fetcher(new Request(vetted.toString(), { method: "GET", redirect: "manual", signal: AbortSignal.timeout(left(deadlineMs)) }));
-    } catch {
-      throw unavailable();
-    }
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      await response.body?.cancel();
-      if (location === null) throw unavailable();
-      try {
-        target = new URL(location, vetted);
-      } catch {
-        throw unavailable();
-      }
-      continue;
-    }
-    if (response.status < 200 || response.status >= 300) {
-      await response.body?.cancel();
-      throw unavailable();
-    }
-    const bytes = await readCapped(response, budget.remaining, deadlineMs);
-    if (bytes === undefined) throw tooLarge();
-    if (!isImage(bytes)) throw new ApiError(502, "invalid_upstream_response");
-    budget.remaining -= bytes.length;
-    return bytes;
-  }
-  throw unavailable();
 }

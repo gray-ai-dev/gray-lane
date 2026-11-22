@@ -4,30 +4,20 @@
  * (crates/gray-gateway/src/apis/audio.rs; the module docs there give every rule's reason).
  *
  * Speech takes OpenAI's JSON, checked against OpenAI's limits before anything is sent, and is
- * billed in characters only: Gray counts `input` plus `instructions` on an OpenAI-compatible route;
- * a vendor route bills the vendor's confirmed count. The character bound counts one per ASCII
- * character and two per other character. The audio is buffered within the response limit;
- * uncompressed audio of a long input at a slow speaking rate is refused up front.
+ * billed in characters only: Gray counts `input` plus `instructions`. Uncompressed audio of a long
+ * input at a slow speaking rate is refused up front.
  *
- * Transcription and translation take OpenAI's multipart form and answer in each of its formats:
- * `json` (and `text`) is asked upstream for a transcription's `text`, `verbose_json` for `srt` and
- * `vtt` and for every translation, and the answer is converted back. Billing reads `usage`
- * (`duration` seconds or `tokens`), else a `verbose_json` duration on a unit-priced route.
+ * Transcription and translation take OpenAI's multipart form. Billing reads `usage` (`duration`
+ * seconds or `tokens`), else a `verbose_json` duration on a unit-priced route.
  */
 import { ApiError } from "@gray/errors";
 import { type Protocol, type UsageCounters, OPENAI_LINKING_FIELDS, ZERO_COUNTERS, nestedCounter, rustTrim, textInputTokens } from "@gray/protocol";
-import { type Json, type JsonObject, get, isObject, toJsonString } from "@gray/json";
-import { authHeaders, build } from "../adapters.ts";
-import { AdapterError } from "../error.ts";
-import type { HttpCall } from "../types.ts";
-import { parseRustF64, parseSerdeSlice } from "../util.ts";
+import { type Json, type JsonObject, JsonError, get, isObject, parseSerdeBytes } from "@gray/json";
 import {
   type Billed,
   UsageError,
   UsageUnreported,
   apiError,
-  checkMetered,
-  countedUnits,
   metered,
   missing,
   formText,
@@ -37,16 +27,9 @@ import {
   capabilityUnproved,
   preferProvingAll,
   retainServing,
-  strictJson,
   tokenUsage,
-  vendorAnswer,
-  vendorFor,
-  vendorRequest,
-  type Outgoing,
 } from "./common.ts";
-import type { Answered } from "./images.ts";
-import { readUpstream } from "./read.ts";
-import { type ApiRequest, type Clock, type FormPart, type MediaRoute, type Metered, type Received, UNBOUNDED, nowUnix, partSize, partText } from "./types.ts";
+import { type ApiRequest, type FormPart, type MediaRoute, type Metered, type Received, UNBOUNDED, partSize, partText } from "./types.ts";
 
 const SPEECH_FIELDS = ["model", "input", "voice", "instructions", "response_format", "speed", "stream_format"];
 const SPEECH_FORMATS = ["mp3", "opus", "aac", "flac", "wav", "pcm"];
@@ -83,9 +66,6 @@ const TRANSLATION_FIELDS = ["file", "model", "prompt", "response_format", "tempe
 const MAX_CONTENT_TYPE = 128;
 /** Longest billed duration read from an answer (a day of audio). */
 const MAX_SECONDS = 86_400;
-const JSON_TYPE = "application/json";
-const TEXT_TYPE = "text/plain; charset=utf-8";
-const VTT_TYPE = "text/vtt; charset=utf-8";
 
 /**
  * `decode` for the audio APIs. `responseBytes` is the media answer limit the speech size check holds to.
@@ -95,7 +75,7 @@ const VTT_TYPE = "text/vtt; charset=utf-8";
  * Gray converts no format:
  *
  * - speech streamed as events (`stream_format: "sse"`) is taken, and the hold is the characters Gray counts, which is
- *   the charge (the wider `characterBound` was for vendors that count differently);
+ *   the charge (`characterBound` holds more);
  * - a transcription streamed as events (`stream` `true`) is taken, and so is `diarized_json`;
  * - `text`, `srt` and `vtt`, which have nowhere to report usage, are refused with 400 `unsupported_response_format`.
  */
@@ -168,7 +148,7 @@ function decodeSpeech(value: Json, responseBytes: number, entry: boolean): ApiRe
   return { model, stream: entry && streamFormat === "sse", selectors: [], bound: { inputTokens: 0n, outputTokens: 0n, units }, body: { kind: "json", value: body } };
 }
 
-/** `character_bound`: most characters a vendor may bill: one per ASCII character, two per other character. */
+/** `character_bound`: one per ASCII character, two per other character (the API Worker's speech hold). */
 export function characterBound(input: string): bigint {
   let n = 0n;
   for (const ch of input) n += (ch.codePointAt(0) as number) < 0x80 ? 1n : 2n;
@@ -311,24 +291,6 @@ function timed(format: Transcript): boolean {
   return format === "verbose_json" || format === "srt" || format === "vtt";
 }
 
-/**
- * `Transcript::upstream`: the format asked upstream, an answer that carries usage and the segments
- * subtitles are built from. A translation always asks `verbose_json`.
- */
-export function upstreamTranscript(format: Transcript, protocol: Protocol): "json" | "verbose_json" {
-  return (format === "json" || format === "text") && protocol === "open_ai_transcriptions" ? "json" : "verbose_json";
-}
-
-/** `forwarded_parts`: the form sent upstream asks the format its answer is billed and built from. */
-export function forwardedParts(protocol: Protocol, parts: readonly FormPart[]): readonly FormPart[] {
-  if (protocol !== "open_ai_transcriptions" && protocol !== "open_ai_translations") return parts;
-  const format = upstreamTranscript(askedTranscript(parts), protocol);
-  return [
-    ...parts.filter((p) => p.name !== "response_format"),
-    { name: "response_format", fileName: undefined, contentType: undefined, data: new TextEncoder().encode(format) },
-  ];
-}
-
 /** Speech and translations settle in units only (characters, seconds). */
 function settlesInUnits(protocol: Protocol): boolean {
   return protocol === "open_ai_speech" || protocol === "open_ai_translations";
@@ -357,125 +319,9 @@ export function timedTranscripts(api: ApiRequest, routes: readonly MediaRoute[])
   return retainServing(sorted.routes, (route) => (route.billsUnits === false ? [400, "unsupported_response_format"] : undefined));
 }
 
-/** `require_unit_price`: the attempt's frozen rate must still price units (502 `unit_price_missing`). */
-export function requireUnitPrice(protocol: Protocol, billsUnits: boolean): void {
-  if (settlesInUnits(protocol) && !billsUnits) throw apiError(502, "unit_price_missing");
-}
-
-/** The speech call on a vendor route, mapped from the client's request. */
-function vendorCall(route: MediaRoute, api: ApiRequest): HttpCall {
-  const vendor = vendorFor(route, "speech");
-  if (vendor === undefined) throw new AdapterError({ kind: "unsupported_operation", message: "no speech vendor" });
-  if (api.body.kind !== "json") throw new AdapterError({ kind: "invalid_request", message: "speech takes JSON" });
-  return build(vendor, "speech", route.upstreamModel, api.body.value);
-}
-
-/** `refused`: how a vendor's refusal to map the request answers. */
-function refused(error: unknown): readonly [number, string] {
-  if (error instanceof AdapterError) {
-    if (error.detail.kind === "unsupported") return [400, "unsupported_request_field"];
-    if (error.detail.kind === "invalid_request") return [400, "invalid_protocol_request"];
-  }
-  return [502, "invalid_vendor_call"];
-}
-
-/**
- * `serviceable` for speech: drops the routes without a unit price, and the adapter routes whose
- * vendor cannot take the request or its credential. When none is left, a vendor's refusal of the
- * request itself answers (400), else the route's problem (503).
- */
-export function serviceableSpeech(api: ApiRequest, routes: readonly MediaRoute[], clock: Clock): MediaRoute[] {
-  return retainServing(retainUnitPriced("open_ai_speech", routes), (route) => {
-    if (route.adapter === undefined) return undefined;
-    const vendor = vendorFor(route, "speech");
-    if (vendor === undefined) return [503, "unsupported_adapter"];
-    try {
-      authHeaders(vendor, route.auth, route.credential, nowUnix(clock));
-    } catch {
-      return [503, "invalid_provider_credential"];
-    }
-    try {
-      vendorCall(route, api);
-      return undefined;
-    } catch (error) {
-      const [status, code] = refused(error);
-      return status === 400 ? [400, code] : [503, code];
-    }
-  });
-}
-
-/** `vendor_upstream` for speech on an adapter route. */
-export function speechVendorUpstream(api: ApiRequest, route: MediaRoute, clock: Clock): Outgoing {
-  const vendor = vendorFor(route, "speech");
-  if (vendor === undefined) throw apiError(502, "unsupported_adapter");
-  let call: HttpCall;
-  try {
-    call = vendorCall(route, api);
-  } catch (error) {
-    const [status, code] = refused(error);
-    throw apiError(status, code);
-  }
-  return vendorRequest(route, vendor, call, nowUnix(clock));
-}
-
-export interface AudioAttempt {
-  readonly protocol: Protocol;
-  readonly billsUnits: boolean;
-  readonly deadlineMs: number;
-  /** The largest answer read (MEDIA_RESPONSE_BYTES). */
-  readonly responseBytes: number;
-  /** Reads a vendor's JSON answer within `limit` bytes (images.ts `ImagesAttempt.readJson`): whole by default. */
-  readonly readJson?: (upstream: Response, limit: number) => Promise<Uint8Array>;
-}
-
-/** `respond` for the audio APIs: the answer metered (and checked as `settle` checks it) and ready to return. */
-export async function respondAudio(api: ApiRequest, route: MediaRoute, upstream: Response, attempt: AudioAttempt): Promise<Answered> {
-  let answered: Answered;
-  if (attempt.protocol === "open_ai_speech") {
-    answered = route.adapter !== undefined ? await vendorSpeech(api, route, upstream, attempt) : await speech(api, upstream, attempt);
-  } else if (attempt.protocol === "open_ai_transcriptions" || attempt.protocol === "open_ai_translations") {
-    answered = await transcription(api, upstream, attempt);
-  } else {
-    throw apiError(502, "unsupported_protocol");
-  }
-  if (answered.billed.kind === "metered") checkMetered(attempt.protocol, api.bound, answered.billed.metered, attempt.billsUnits);
-  return answered;
-}
-
-/** An OpenAI-compatible speech answer: audio bytes billed at the characters Gray counted from the request. */
-async function speech(api: ApiRequest, upstream: Response, attempt: AudioAttempt): Promise<Answered> {
-  const contentType = audioContentType(upstream.headers.get("content-type"));
-  if (contentType === undefined) {
-    await upstream.body?.cancel();
-    throw apiError(502, "invalid_upstream_response");
-  }
-  const audio = await readUpstream(upstream, attempt.responseBytes, attempt.deadlineMs);
-  const characters = speechCharacters(api);
-  if (characters === undefined || audio.length === 0) throw apiError(502, "invalid_upstream_response");
-  return { body: audio, contentType, billed: metered(countedUnits("characters", characters)) };
-}
-
-/** A vendor speech answer: the decoded audio, billed at the characters the vendor confirmed. */
-async function vendorSpeech(api: ApiRequest, route: MediaRoute, upstream: Response, attempt: AudioAttempt): Promise<Answered> {
-  const vendor = vendorFor(route, "speech");
-  if (vendor === undefined) throw apiError(502, "unsupported_adapter");
-  let sent: HttpCall;
-  try {
-    // The mapping is deterministic: this is the call that was sent.
-    sent = vendorCall(route, api);
-  } catch {
-    throw apiError(502, "invalid_vendor_call");
-  }
-  const limit = 64 * 1024 * 1024;
-  const bytes = attempt.readJson !== undefined ? await attempt.readJson(upstream, limit) : await readUpstream(upstream, limit, attempt.deadlineMs);
-  const parsed = vendorAnswer(vendor, "speech", sent, upstream.status, bytes);
-  if (parsed.kind !== "speech") throw apiError(502, "invalid_upstream_response");
-  if (parsed.usage.unit !== "characters" || parsed.audio.length === 0) throw apiError(502, "invalid_upstream_response");
-  return {
-    body: parsed.audio,
-    contentType: parsed.contentType,
-    billed: metered({ counters: { ...ZERO_COUNTERS, units: parsed.usage.units }, raw: parsed.usage.raw, unit: "characters" }),
-  };
+/** `serviceable` for speech: drops the routes without a unit price. */
+export function serviceableSpeech(routes: readonly MediaRoute[]): MediaRoute[] {
+  return retainUnitPriced("open_ai_speech", routes);
 }
 
 /** `audio_content_type`: `audio/*`, or the `application/octet-stream` some servers send raw PCM as. */
@@ -488,47 +334,9 @@ export function audioContentType(value: string | null): string | undefined {
 }
 
 /**
- * A transcription or translation answer, billed from its usage, in the client's format: the JSON as
- * received, `{"text"}` for a translation asked as `json`, the text alone for `text`, or subtitles
- * built from the `verbose_json` segments for `srt` and `vtt`.
- */
-async function transcription(api: ApiRequest, upstream: Response, attempt: AudioAttempt): Promise<Answered> {
-  const bytes = await readUpstream(upstream, attempt.responseBytes, attempt.deadlineMs);
-  const value = strictJson(bytes);
-  const text = get(value, "text");
-  if (typeof text !== "string") throw apiError(502, "invalid_upstream_response");
-  const asked = api.body.kind === "multipart" ? askedTranscript(api.body.parts) : "json";
-  const utf8 = new TextEncoder();
-  let answer: [Uint8Array, string] | undefined;
-  switch (asked) {
-    case "json":
-      answer = attempt.protocol === "open_ai_translations" ? [utf8.encode(toJsonString({ text })), JSON_TYPE] : [bytes, JSON_TYPE];
-      break;
-    case "verbose_json":
-      answer = [bytes, JSON_TYPE];
-      break;
-    case "text":
-      answer = [utf8.encode(text), TEXT_TYPE];
-      break;
-    case "srt": {
-      const srt = subtitles(value, false);
-      answer = srt === undefined ? undefined : [utf8.encode(srt), TEXT_TYPE];
-      break;
-    }
-    case "vtt": {
-      const vtt = subtitles(value, true);
-      answer = vtt === undefined ? undefined : [utf8.encode(vtt), VTT_TYPE];
-      break;
-    }
-  }
-  if (answer === undefined) throw apiError(502, "invalid_upstream_response");
-  return { body: answer[0], contentType: answer[1], billed: transcriptionBilled(value, attempt.billsUnits) };
-}
-
-/**
- * What a transcription or translation answer is billed by (`transcription_usage`), on the parsed
- * answer or on a streamed answer's projection (which keeps its usage and duration): its usage, or the
- * missing usage when it reports none. A malformed usage is 502 `billing_usage_invalid`.
+ * What a transcription or translation answer is billed by (`transcription_usage`), on the answer's
+ * projection (which keeps its usage and duration): its usage, or the missing usage when it reports
+ * none. A malformed usage is 502 `billing_usage_invalid`.
  */
 export function transcriptionBilled(value: Json, billsUnits: boolean): Billed {
   let m: Metered | undefined;
@@ -541,66 +349,10 @@ export function transcriptionBilled(value: Json, billsUnits: boolean): Billed {
   return m === undefined ? missing("usage missing", get(value, "usage") ?? null) : metered(m);
 }
 
-/** Whether the client's answer is the upstream's JSON as received (`json` for a transcription, `verbose_json`), so it can pass as it arrives; the other formats are made from the whole answer. */
-export function transcriptPassesThrough(protocol: Protocol, api: ApiRequest): boolean {
-  const asked = api.body.kind === "multipart" ? askedTranscript(api.body.parts) : "json";
-  return asked === "verbose_json" || (asked === "json" && protocol === "open_ai_transcriptions");
-}
-
-/** The checks of an answer that passes as it arrives (`transcriptPassesThrough`): `text` is a string, and what it is billed by. */
+/** The checks of a transcript answer that passes as it arrives: `text` is a string, and what it is billed by. */
 export function transcriptAnswer(value: Json, billsUnits: boolean): Billed {
   if (typeof get(value, "text") !== "string") throw apiError(502, "invalid_upstream_response");
   return transcriptionBilled(value, billsUnits);
-}
-
-/**
- * `subtitles`: SubRip (numbered) or WebVTT cues, one per `verbose_json` segment with text, at its
- * `start` and `end` (seconds, rounded to milliseconds). Undefined when the segments are missing or a
- * segment is not timed.
- */
-export function subtitles(answer: Json, vtt: boolean): string | undefined {
-  let out = vtt ? "WEBVTT\n\n" : "";
-  let cues = 0;
-  const segments = get(answer, "segments");
-  if (!Array.isArray(segments)) return undefined;
-  for (const segment of segments) {
-    const startValue = get(segment, "start");
-    const endValue = get(segment, "end");
-    if (startValue === undefined || endValue === undefined) return undefined;
-    const start = cueTime(startValue);
-    const end = cueTime(endValue);
-    if (start === undefined || end === undefined || end < start) return undefined;
-    const textValue = get(segment, "text");
-    if (typeof textValue !== "string") return undefined;
-    // `str::lines` then `trim`: a blank line would end the cue.
-    const lines = textValue
-      .split("\n")
-      .map((line) => rustTrim(line.endsWith("\r") ? line.slice(0, -1) : line))
-      .filter((line) => line.length > 0);
-    if (lines.length === 0) continue;
-    cues += 1;
-    const text = lines.join("\n");
-    if (vtt) {
-      const escaped = text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-      out += `${timestamp(start, ".")} --> ${timestamp(end, ".")}\n${escaped}\n\n`;
-    } else {
-      out += `${cues}\n${timestamp(start, ",")} --> ${timestamp(end, ",")}\n${text}\n\n`;
-    }
-  }
-  return out;
-}
-
-/** `cue_time`: a segment time in seconds, within a day, as milliseconds (rounded half away from zero). */
-function cueTime(seconds: Json): number | undefined {
-  const s = typeof seconds === "number" ? seconds : typeof seconds === "bigint" ? Number(seconds) : undefined;
-  if (s === undefined || !Number.isFinite(s) || s < 0 || s > MAX_SECONDS) return undefined;
-  return Math.round(s * 1000);
-}
-
-/** `HH:MM:SS` and milliseconds after `separator` (`,` in SubRip, `.` in WebVTT). */
-function timestamp(ms: number, separator: string): string {
-  const pad = (n: number, width: number) => String(n).padStart(width, "0");
-  return `${pad(Math.floor(ms / 3_600_000), 2)}:${pad(Math.floor(ms / 60_000) % 60, 2)}:${pad(Math.floor(ms / 1000) % 60, 2)}${separator}${pad(ms % 1000, 3)}`;
 }
 
 /**
@@ -663,6 +415,33 @@ function audioTokenUsage(usage: Json): Metered {
     if (sum > U64_MAX || total !== sum) throw new UsageError("usage.total_tokens is not input plus output");
   }
   return { counters, raw: usage, unit: undefined };
+}
+
+/**
+ * `serde_json::from_slice::<Value>`: what serde_json accepts (a duplicate key keeps its last value),
+ * or `undefined`. Integers within u64/i64 are `bigint`, other numbers `number`.
+ */
+function parseSerdeSlice(body: Uint8Array): Json | undefined {
+  try {
+    return parseSerdeBytes(body);
+  } catch (error) {
+    if (error instanceof JsonError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * `str::parse::<f64>`: the value of Rust's float grammar (core::num, `dec2flt`: a sign, then `inf`,
+ * `infinity`, `nan` or a decimal number with an optional exponent, case-insensitive), or undefined.
+ * Its value is the correctly rounded double, which `Number()` computes for the same text.
+ */
+function parseRustF64(s: string): number | undefined {
+  if (!/^[+-]?(?:inf|infinity|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$/i.test(s)) return undefined;
+  const lower = s.toLowerCase().replace(/^\+/, "");
+  if (lower === "inf" || lower === "infinity") return Infinity;
+  if (lower === "-inf" || lower === "-infinity") return -Infinity;
+  if (lower === "nan" || lower === "-nan") return NaN;
+  return Number(s);
 }
 
 export { ApiError };

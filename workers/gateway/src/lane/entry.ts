@@ -10,7 +10,7 @@ import { allowedOrigin, EXPOSED, preflight, withCors } from "../cors.ts";
 import type { GatewayEnv } from "../env.ts";
 import { originsOf } from "../hosts.ts";
 import { servedProtocol } from "../paths.ts";
-import { type MediaDeps, ModelApiRun, modelApi } from "../apis.ts";
+import { ModelApiRun, modelApi } from "../apis.ts";
 import { entryStandardApi } from "./standard-api.ts";
 import { InferenceRun } from "../inference.ts";
 import { livez } from "../health.ts";
@@ -1311,9 +1311,8 @@ async function route(
   }
   if (standard !== null) {
     // The model APIs' request path with the lane's dependencies. A video job it creates is recorded behind the bridge
-    // (`lane.videos`), never in a job object or a Workflow of this Worker, so it reads no job binding.
-    const media: MediaDeps = { ...deps, videos: env as unknown as MediaDeps["videos"] };
-    const answered = await new ModelApiRun(request, standard, media, ctx, declared).serve();
+    // (`lane.videos`).
+    const answered = await new ModelApiRun(request, standard, deps, ctx, declared).serve();
     liveAnswers.add(answered);
     return answered;
   }

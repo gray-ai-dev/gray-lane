@@ -12,7 +12,6 @@
  */
 import { ApiError } from "@gray/errors";
 import contentType from "content-type";
-import { isControl } from "../text.ts";
 import type { FormPart } from "./types.ts";
 
 /** Most fields a multipart request may carry (mod.rs `MAX_PARTS`). */
@@ -34,6 +33,11 @@ export function formBoundary(value: string | null): string | undefined {
 }
 
 const invalidMultipart = () => new ApiError(400, "invalid_multipart");
+
+/** Rust's `char::is_control`: the general category Cc, exactly U+0000..=U+001F and U+007F..=U+009F. */
+function isControl(code: number): boolean {
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+}
 
 /** A field name, file name or content type: non-empty, at most 256 bytes, no control character. */
 function label(s: string): string | undefined {

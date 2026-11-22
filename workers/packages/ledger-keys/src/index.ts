@@ -93,8 +93,8 @@ export function newProviderAddress(workspace: string): { readonly workspace: str
   return { workspace, address: creditProviderAddress(salt, workspace), salt: hex0x(salt) };
 }
 
-/** The usage kinds an admission may have (usage.rs UsageKind, `completion` and `video`). */
-export const USAGE_KINDS = ["completion", "video"] as const;
+/** The usage kinds an admission may have (usage.rs UsageKind, `completion`, `video` and `vm_hosting`). */
+export const USAGE_KINDS = ["completion", "video", "vm_hosting"] as const;
 /** How a hold was sized (usage.rs HoldMode). */
 export const HOLD_MODES = ["worst_case", "expected"] as const;
 /** Who wrote the output limit sent upstream (usage.rs OutputCapSource). */
@@ -151,7 +151,7 @@ export interface AdmissionProblem {
  */
 export function admissionProblem(a: Admission): AdmissionProblem | null {
   const transition = (message: string): AdmissionProblem => ({ kind: "transition", message });
-  if (!(USAGE_KINDS as readonly string[]).includes(a.kind)) return transition("kind must be completion or video");
+  if (!(USAGE_KINDS as readonly string[]).includes(a.kind)) return transition("kind must be completion, video or vm_hosting");
   if (a.holdMode !== null && !(HOLD_MODES as readonly string[]).includes(a.holdMode)) return transition("hold_mode must be worst_case or expected");
   if (a.outputCapSource !== null && !(OUTPUT_CAP_SOURCES as readonly string[]).includes(a.outputCapSource)) return transition("output_cap_source must be client or gray");
   if (!isLabel(a.tenant)) return transition("tenant must be a label (1-256 bytes, no control characters)");

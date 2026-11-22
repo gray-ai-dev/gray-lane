@@ -144,7 +144,9 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
   // The upstream protocols that could serve a request through `protocol`: itself, and the translation
   // targets the rules allow for the model (the operator's, or the confidential entry's own).
   const targets: Protocol[] = [protocol, ...(policy?.upstreams(model, protocol) ?? [])];
-  const here = live.filter((r) => targets.includes(r.protocol));
+  // A lane relay's route serves its own API only, never a translation (translate.ts `entryRules`): on a target API it
+  // proves nothing for this request. Only the confidential entry's snapshot has such routes.
+  const here = live.filter((r) => r.protocol === protocol || (targets.includes(r.protocol) && r.auth !== "lane_relay"));
   if (here.length > 0) {
     // Where else the model takes images: an image edits route, or a generation route of another API that
     // proved image input (model_resolution.rs on main), each path once, in order.
@@ -160,8 +162,7 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
   // Its routes here have not expired, and every one is past its traffic limit: a pause with no time to name.
   if (unexpired.some((r) => targets.includes(r.protocol))) return noProviderUndated(model, atLane);
   // A provider maps the model on this API (or on a translation target), but its route is not verified
-  // now: a pause, not a wrong API. An image generation mapping through the Gemini adapter maps its model
-  // on the Gemini API too (`GatewaySnapshot.mapped`). A snapshot without the pairs says it by its routes.
+  // now: a pause, not a wrong API (`GatewaySnapshot.mapped`). A snapshot without the pairs says it by its routes.
   const mapped = snapshot.mapped;
   const mappedHere = mapped !== undefined ? mapped.some((m) => m.model === model && targets.includes(m.protocol)) : routes.some((r) => r.protocol === protocol);
   if (mappedHere) return noProvider(model, atLane);

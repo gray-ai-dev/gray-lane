@@ -39,7 +39,6 @@ export type Body =
 export type BodyRead = { readonly ok: true; readonly body: Body } | { readonly ok: false; readonly error: ApiError };
 
 export { SPOOL_PART_BYTES, SPOOL_PREFIX } from "./spool.ts";
-export { PLAIN_SPOOL_PREFIX } from "./spool-prefix.ts";
 
 export interface BodyLimits {
   readonly protocol: Protocol;

@@ -1,4 +1,5 @@
 import { CLAIMS, type Claim } from "@gray/control";
+import type { Protocol } from "@gray/protocol";
 /**
  * The checks a probe run makes and the outcome codes it reports (crates/gray-verifier/src/lib.rs
  * `CheckKind`, `OutcomeCode`, `OutcomeCode::detail`).
@@ -29,15 +30,27 @@ export const CHECK_KINDS = [
   "coding_agent",
   "catalog_listed",
   /**
-   * The output-cap checks of a Chat Completions mapping (docs/api-provider-standard clause 2.4: Chat takes both
-   * `max_tokens` and `max_completion_tokens`): one request with a small cap in the named field, asking for far more.
-   * The answer must stop at the cap with a `length` finish. Each mode's are part of what proves the mode
-   * (`provenBuffered`, `provenStreaming`): a route that ignores either field does not serve that mode.
+   * The output-cap checks of a text mapping (docs/api-provider-standard clause 2.4: every text protocol honors the
+   * output cap a request sets, and Chat both `max_tokens` and `max_completion_tokens`): one request with a small cap
+   * in the named field, asking for far more. The answer must stop at the cap, ending for its length. `max_tokens` is
+   * Chat's and Anthropic Messages' field, `max_output_tokens` Responses' and Gemini's (`generationConfig.maxOutputTokens`).
+   * Each mode's are part of what proves the mode (`provenBuffered`, `provenStreaming`): a route that ignores a field
+   * does not serve that mode.
    */
   "max_tokens_cap",
   "max_completion_tokens_cap",
   "streaming_max_tokens_cap",
   "streaming_max_completion_tokens_cap",
+  "max_output_tokens_cap",
+  "streaming_max_output_tokens_cap",
+  /**
+   * The streamed form of an image, speech or transcription API's contract check (`api_contract`), asked only of a
+   * mapping that declared that its model streams (`Declared.streaming`, `checksApiStreaming`): the same request with
+   * the API's own streaming field, whose answer must be a well-formed event stream that ends as serving reads it and
+   * reports what serving bills. A capability check (`provesCapability`): it decides only whether streamed requests are
+   * sent to the route (`provenStreaming`'s `streaming_api_contract` part), never whether the route passes.
+   */
+  "streaming_api_contract",
 ] as const;
 export type CheckKind = (typeof CHECK_KINDS)[number];
 
@@ -50,20 +63,32 @@ export function isStreamingCheck(kind: CheckKind): boolean {
     kind === "streaming_reasoning" ||
     kind === "streaming_image_output" ||
     kind === "streaming_max_tokens_cap" ||
-    kind === "streaming_max_completion_tokens_cap"
+    kind === "streaming_max_completion_tokens_cap" ||
+    kind === "streaming_max_output_tokens_cap" ||
+    kind === "streaming_api_contract"
   );
 }
 
-/** `CheckKind::is_output_cap`: one of the four output-cap checks, buffered or streamed. */
+/** `CheckKind::is_output_cap`: one of the output-cap checks, buffered or streamed. */
 export function isOutputCap(kind: CheckKind): boolean {
-  return kind === "max_tokens_cap" || kind === "max_completion_tokens_cap" || kind === "streaming_max_tokens_cap" || kind === "streaming_max_completion_tokens_cap";
+  return capField(kind) !== null;
 }
 
-/** `CheckKind::cap_field`: the Chat member an output-cap check writes its cap into, or null for another check. */
-export function capField(kind: CheckKind): "max_tokens" | "max_completion_tokens" | null {
+/** `CheckKind::cap_field`: the field an output-cap check writes its cap into, as its kind names it, or null for another check. */
+export function capField(kind: CheckKind): "max_tokens" | "max_completion_tokens" | "max_output_tokens" | null {
   if (kind === "max_tokens_cap" || kind === "streaming_max_tokens_cap") return "max_tokens";
   if (kind === "max_completion_tokens_cap" || kind === "streaming_max_completion_tokens_cap") return "max_completion_tokens";
+  if (kind === "max_output_tokens_cap" || kind === "streaming_max_output_tokens_cap") return "max_output_tokens";
   return null;
+}
+
+/**
+ * `CheckKind::cap_member`: the member an output-cap check of a mapping of `protocol` writes its cap into, as that
+ * protocol's requests spell it: `capField`, and Gemini's `generationConfig.maxOutputTokens`. Null for another check.
+ */
+export function capMember(kind: CheckKind, protocol: Protocol): string | null {
+  const field = capField(kind);
+  return field === "max_output_tokens" && protocol === "gemini" ? "generationConfig.maxOutputTokens" : field;
 }
 
 /** `CheckKind::proves_streaming`: the streamed form of a mapping's basic check (`proven_streaming`). */
@@ -116,6 +141,9 @@ export function provesCapability(kind: CheckKind): boolean {
     // does; the buffered ones decide the route as the buffered basic check does (`routeStatus`, `admissible`).
     case "streaming_max_tokens_cap":
     case "streaming_max_completion_tokens_cap":
+    case "streaming_max_output_tokens_cap":
+    // A media API's streamed form withdraws only the streamed requests: the route still serves buffered ones.
+    case "streaming_api_contract":
       return true;
     default:
       return provesStreaming(kind);
@@ -141,6 +169,10 @@ export function baseKind(kind: CheckKind): CheckKind {
       return "max_tokens_cap";
     case "streaming_max_completion_tokens_cap":
       return "max_completion_tokens_cap";
+    case "streaming_max_output_tokens_cap":
+      return "max_output_tokens_cap";
+    case "streaming_api_contract":
+      return "api_contract";
     default:
       return kind;
   }
@@ -180,9 +212,12 @@ export function claimOf(kind: CheckKind): Claim | null {
     case "streaming_image_output":
     case "streaming_max_tokens_cap":
     case "streaming_max_completion_tokens_cap":
+    case "streaming_max_output_tokens_cap":
+    case "streaming_api_contract":
       return "streaming";
     case "max_tokens_cap":
     case "max_completion_tokens_cap":
+    case "max_output_tokens_cap":
       return "buffered";
     case "embedding_base64":
       return "embedding_base64";
@@ -250,7 +285,8 @@ export const OUTCOME_DETAILS = {
   check_price_unavailable:
     "The check was not sent: the price Gray counts it at has ended. Change the offer's price; the check is sent with a later check of the model once the model has a current price.",
   /** An output-cap check's answer ran past the cap it sent (and the declared output allowance). */
-  output_cap_ignored: "The API answered past the output cap the check sent. Clause 2.4 of the API standard: Chat Completions honors both max_tokens and max_completion_tokens.",
+  output_cap_ignored:
+    "The API answered past the output cap the check sent. Clause 2.4 of the API standard: every text protocol honors the output cap a request sets, and Chat Completions both max_tokens and max_completion_tokens.",
   /** An output-cap check's answer finished before the cap for another reason than its length: nothing shown either way. */
   output_cap_unreached: "The answer ended before the output cap the check sent, so it did not show whether the API honors the cap. Run checks again.",
 } as const;

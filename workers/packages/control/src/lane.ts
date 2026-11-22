@@ -111,14 +111,11 @@ export function laneProtocolsOf(baseUrl: string): readonly Protocol[] {
 
 /**
  * Whether `mapping` is one a lane relay may map: its protocol is its vendor's, its native path is the
- * vendor's own path for that protocol (exactly, so no other path and no second origin slips in), and it
- * runs through no vendor adapter (the lane forwards the vendor's own API; an adapter would be Gray-side
- * translation).
+ * vendor's own path for that protocol (exactly, so no other path and no second origin slips in).
  */
-export function laneMappingAllowed(baseUrl: string, mapping: Pick<ModelMapping, "protocol" | "native_path" | "adapter">): boolean {
+export function laneMappingAllowed(baseUrl: string, mapping: Pick<ModelMapping, "protocol" | "native_path">): boolean {
   const vendor = laneVendorOf(baseUrl);
   if (vendor === null) return false;
-  if (mapping.adapter !== null) return false;
   const served = LANE_VENDOR_PATHS[vendor].some((p) => p.protocol === mapping.protocol && p.nativePath === mapping.native_path);
   if (!served) return false;
   // Defence in depth: the URL the snapshot builds joins the path onto the base; it must still be the

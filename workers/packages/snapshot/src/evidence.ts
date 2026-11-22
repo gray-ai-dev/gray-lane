@@ -157,8 +157,8 @@ const PROVES_STREAMING = new Set(["streaming", "streaming_image_output"]);
 const ANSWERS_BUFFERED = new Set(["text_challenge", "image_output", "api_contract"]);
 
 /** The output-cap checks of each mode (CheckKind::is_output_cap): every one a report has proves its mode with the basic check. */
-const BUFFERED_CAPS = new Set(["max_tokens_cap", "max_completion_tokens_cap"]);
-const STREAMED_CAPS = new Set(["streaming_max_tokens_cap", "streaming_max_completion_tokens_cap"]);
+const BUFFERED_CAPS = new Set(["max_tokens_cap", "max_completion_tokens_cap", "max_output_tokens_cap"]);
+const STREAMED_CAPS = new Set(["streaming_max_tokens_cap", "streaming_max_completion_tokens_cap", "streaming_max_output_tokens_cap"]);
 
 /**
  * `CheckResult::proved` (@gray/verifier `proved`): the check passed as evidence: the contract satisfied, on an
@@ -188,7 +188,9 @@ function servedModes(report: ProbeReport): { buffered: boolean; streaming: boole
   const provedKind = (kind: string) => report.checks.some((c) => c.kind === kind && proved(c, usage));
   const capsProved = (caps: ReadonlySet<string>) => report.checks.every((c) => !caps.has(c.kind) || proved(c, usage));
   const buffered = report.checks.some((c) => ANSWERS_BUFFERED.has(c.kind) && proved(c, usage)) && capsProved(BUFFERED_CAPS);
-  const streaming = report.checks.some((c) => PROVES_STREAMING.has(c.kind) && proved(c, usage)) && capsProved(STREAMED_CAPS);
+  // The route streams: its streamed basic check proved, or, on a media API whose mapping declared streaming, the streamed
+  // form of its contract check (`provenApiStreaming`), a capability that never decides the report's status.
+  const streaming = (report.checks.some((c) => PROVES_STREAMING.has(c.kind) && proved(c, usage)) && capsProved(STREAMED_CAPS)) || provedKind("streaming_api_contract");
   const bufferedCaps: Capabilities = buffered
     ? {
         tools: provedKind("tools"),

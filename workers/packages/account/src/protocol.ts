@@ -490,12 +490,75 @@ export interface ChargePoint {
   readonly chain: string;
 }
 
+/** Upper bound on rolling charge checkpoints stored per shard row or carried in one exchange before coalescing. */
+export const MAX_CHARGE_CHECKPOINTS = 512;
+
+/** A shard's charges as one report stated them: charges 1..seq, their chain, and the money settled with them. */
+export interface ReportedCharges {
+  readonly seq: number;
+  readonly chain: string;
+  readonly settled: number;
+}
+
 function chargePoint(v: unknown, field: string): ChargePoint | null {
   if (v === null || v === undefined) return null;
   const o = object(v, field);
   const seq = uint(o.seq, `${field}.seq`);
   if (typeof o.chain !== "string" || !/^0x[0-9a-f]{64}$/.test(o.chain)) throw new InvalidInput(`${field}.chain`, "must be 0x and 64 lowercase hex digits");
   return { seq, chain: o.chain };
+}
+
+function chargeCheckpoints(v: unknown, field: string, latest: ChargePoint | null, settled: number): readonly ReportedCharges[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v)) throw new InvalidInput(field, "must be a list");
+  if (v.length === 0) return undefined;
+  if (v.length > MAX_CHARGE_CHECKPOINTS) throw new InvalidInput(field, `must have at most ${MAX_CHARGE_CHECKPOINTS} entries`);
+  if (latest === null) throw new InvalidInput(field, "requires charges");
+  const out: ReportedCharges[] = [];
+  let prev: ReportedCharges | null = null;
+  for (let i = 0; i < v.length; i++) {
+    const o = object(v[i], `${field}[${i}]`);
+    const seq = uint(o.seq, `${field}[${i}].seq`);
+    if (seq === 0 || seq > latest.seq) throw new InvalidInput(`${field}[${i}].seq`, `must be between 1 and ${latest.seq}`);
+    if (typeof o.chain !== "string" || !/^0x[0-9a-f]{64}$/.test(o.chain)) throw new InvalidInput(`${field}[${i}].chain`, "must be 0x and 64 lowercase hex digits");
+    const s = amount(o.settled, `${field}[${i}].settled`);
+    if (s > settled) throw new InvalidInput(`${field}[${i}].settled`, `must be at most ${settled}`);
+    if (prev !== null) {
+      if (seq <= prev.seq) throw new InvalidInput(`${field}[${i}].seq`, "must be strictly increasing");
+      if (s - prev.settled < seq - prev.seq) throw new InvalidInput(`${field}[${i}].settled`, "must advance by at least 1 per charge");
+    }
+    if (seq === latest.seq && (o.chain !== latest.chain || s !== settled)) {
+      throw new InvalidInput(`${field}[${i}]`, "must match charges and settled at latest seq");
+    }
+    if (seq < latest.seq && settled - s < latest.seq - seq) {
+      throw new InvalidInput(`${field}[${i}].settled`, "leaves less than 1 per remaining charge");
+    }
+    const entry: ReportedCharges = { seq, chain: o.chain, settled: s };
+    out.push(entry);
+    prev = entry;
+  }
+  return out;
+}
+
+/**
+ * A report's checkpoints as `reportedCheckpoints` reads them: the list, or why it was refused. A malformed list
+ * costs the report its checkpoints alone: its money, grants and latest charges stand, and the root logs the refusal
+ * (root.ts `refusedCheckpoints`). Refusing the whole report would stop the shard's leases over a hint for sealing.
+ */
+interface CheckpointsRead {
+  readonly chargeCheckpoints?: readonly ReportedCharges[];
+  /** Why the shard's checkpoints were left out of this report. */
+  readonly chargeCheckpointsRefused?: string;
+}
+
+function reportedCheckpoints(v: unknown, latest: ChargePoint | null, settled: number): CheckpointsRead {
+  try {
+    const checkpoints = chargeCheckpoints(v, "chargeCheckpoints", latest, settled);
+    return checkpoints ? { chargeCheckpoints: checkpoints } : {};
+  } catch (err) {
+    if (err instanceof InvalidInput) return { chargeCheckpointsRefused: err.message };
+    throw err;
+  }
 }
 
 export interface ExchangeRequest {
@@ -515,6 +578,14 @@ export interface ExchangeRequest {
   readonly settled: number;
   /** The shard's charges written with that money: what the root seals into the hourly entries. */
   readonly charges?: ChargePoint | null;
+  /**
+   * Unreported intermediate charge boundaries `(seq, chain, settled)` recorded by the shard since the last
+   * root acknowledgement, so `RootEntries` can slice across multiple entries even if a shard settled more
+   * than `MAX_ENTRY_AMOUNT_MICRO` between two exchanges. Absent from older shards or when no chain is kept.
+   */
+  readonly chargeCheckpoints?: readonly ReportedCharges[];
+  /** The checkpoints the shard sent were malformed and left out; the rest of the exchange stands. */
+  readonly chargeCheckpointsRefused?: string;
   readonly pools: Readonly<Record<PoolId, PoolReport>>;
   /** Admits a second over the recent window, for K. */
   readonly rate: number;
@@ -588,6 +659,11 @@ export interface ExchangeResponse {
    * M4). Absent when there are none, and from an older root.
    */
   readonly unreachable?: readonly PoolId[];
+  /**
+   * The root's on-chain entry ceiling (`MAX_ENTRY_AMOUNT_MICRO`), when configured, so a shard compacting
+   * unreported charge checkpoints keeps every coalesced span within half the ceiling. Absent from older roots.
+   */
+  readonly maxEntryAmountMicro?: number;
 }
 
 /** A shard's books as written (shard.ts `books`): what a root whose storage started over takes back (root.ts `endRebuild`). */
@@ -598,6 +674,8 @@ export interface ShardBooks {
   readonly version: number;
   readonly settled: number;
   readonly charges: ChargePoint | null;
+  readonly chargeCheckpoints?: readonly ReportedCharges[];
+  readonly chargeCheckpointsRefused?: string;
   readonly lastBatch?: number;
   readonly lastChargeSeq?: number;
   readonly pools: Readonly<Record<PoolId, PoolGrant>>;
@@ -621,12 +699,16 @@ function grants(v: unknown, field: string): Record<PoolId, PoolGrant> {
 
 export function parseBooks(v: unknown): ShardBooks {
   const o = object(v, "books");
+  const settled = amount(o.settled, "settled");
+  const charges = chargePoint(o.charges, "charges");
+  const checkpoints = reportedCheckpoints(o.chargeCheckpoints, charges, settled);
   return {
     incarnation: incarnation(o.incarnation, "incarnation") ?? null,
     epoch: uint(o.epoch, "epoch"),
     version: uint(o.version, "version"),
-    settled: amount(o.settled, "settled"),
-    charges: chargePoint(o.charges, "charges"),
+    settled,
+    charges,
+    ...checkpoints,
     ...(o.lastBatch === undefined || o.lastBatch === null ? {} : { lastBatch: uint(o.lastBatch, "lastBatch") }),
     ...(o.lastChargeSeq === undefined || o.lastChargeSeq === null ? {} : { lastChargeSeq: uint(o.lastChargeSeq, "lastChargeSeq") }),
     pools: grants(o.pools, "pools"),
@@ -654,14 +736,18 @@ export function parseExchange(v: unknown): ExchangeRequest {
   const rate = o.rate;
   if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0) throw new InvalidInput("rate", "must be a non-negative number");
   if (!isRegion(o.home)) throw new InvalidInput("home", `must be one of ${REGIONS.join(", ")}`);
+  const settled = amount(o.settled, "settled");
+  const charges = chargePoint(o.charges, "charges");
+  const checkpoints = reportedCheckpoints(o.chargeCheckpoints, charges, settled);
   return {
     shard: shardAddress(o.shard, "shard"),
     home: o.home,
     epoch: uint(o.epoch, "epoch"),
     call: uint(o.call, "call"),
     version: uint(o.version, "version"),
-    settled: amount(o.settled, "settled"),
-    charges: chargePoint(o.charges, "charges"),
+    settled,
+    charges,
+    ...checkpoints,
     pools,
     rate,
     ...(o.incarnation === undefined || o.incarnation === null ? {} : { incarnation: incarnation(o.incarnation, "incarnation")! }),
@@ -700,6 +786,8 @@ export interface RecallReport {
   readonly pools: Readonly<Record<PoolId, { readonly granted: number; readonly returned: number; readonly used: number }>>;
   readonly settled: number;
   readonly charges?: ChargePoint | null;
+  readonly chargeCheckpoints?: readonly ReportedCharges[];
+  readonly chargeCheckpointsRefused?: string;
 }
 
 export function parseRecallReport(v: unknown): RecallReport {
@@ -710,7 +798,10 @@ export function parseRecallReport(v: unknown): RecallReport {
     const p = object(raw, `pools.${pool}`);
     pools[pool] = { granted: amount(p.granted, `pools.${pool}.granted`), returned: amount(p.returned, `pools.${pool}.returned`), used: amount(p.used, `pools.${pool}.used`) };
   }
-  return { pools, settled: amount(o.settled, "settled"), charges: chargePoint(o.charges, "charges") };
+  const settled = amount(o.settled, "settled");
+  const charges = chargePoint(o.charges, "charges");
+  const checkpoints = reportedCheckpoints(o.chargeCheckpoints, charges, settled);
+  return { pools, settled, charges, ...checkpoints };
 }
 
 /** A snapshot passed from shard to shard (a claim, an arbitration): checked like any input. */

@@ -13,9 +13,7 @@
 import { ApiError } from "@gray/errors";
 import { ZERO_COUNTERS } from "@gray/protocol";
 import { type Json, type JsonObject, get, isObject } from "@gray/json";
-import { type Billed, UsageError, apiError, checkMetered, invalid, jsonModel, metered, missing, optionalCounter, capabilityUnproved, preferProvingAll, strictJson } from "./common.ts";
-import type { Answered } from "./images.ts";
-import { readUpstream } from "./read.ts";
+import { type Billed, UsageError, apiError, checkMetered, invalid, jsonModel, metered, missing, optionalCounter, capabilityUnproved, preferProvingAll } from "./common.ts";
 import type { ApiRequest, MediaRoute, Received } from "./types.ts";
 
 /** Most inputs one request may embed (OpenAI's limit). */
@@ -183,15 +181,9 @@ export function serviceableEmbeddings(api: ApiRequest, routes: readonly MediaRou
   );
 }
 
-export interface EmbeddingsAttempt {
-  readonly billsUnits: boolean;
-  readonly deadlineMs: number;
-  readonly responseBytes: number;
-}
-
 /**
- * The checks and metering of an embeddings answer (`respond`), on its shape (`embeddingsShapeOf` of
- * the parsed answer, or what a streamed answer's projection counts of it without holding a vector):
+ * The checks and metering of an embeddings answer, on its shape (`embeddingsShapeOf` of the parsed
+ * answer, or what the answer's projection counts of it without holding a vector):
  * one embedding per input of the asked encoding and width, usage counters that agree. Throws the
  * answer's refusal as an ApiError.
  */
@@ -222,13 +214,6 @@ export function embeddingsAnswer(api: ApiRequest, shape: EmbeddingsShape, billsU
   checkMetered("open_ai_embeddings", api.bound, m, billsUnits);
   if (expected.dimensions === undefined && WIDTHS.get(api.model) !== width) WIDTHS.set(api.model, width);
   return metered(m);
-}
-
-/** `respond`: one embedding per input, agreeing usage; the body goes back as received. */
-export async function respondEmbeddings(api: ApiRequest, _route: MediaRoute, upstream: Response, attempt: EmbeddingsAttempt): Promise<Answered> {
-  const bytes = await readUpstream(upstream, attempt.responseBytes, attempt.deadlineMs);
-  const billed = embeddingsAnswer(api, embeddingsShapeOf(strictJson(bytes)), attempt.billsUnits);
-  return { body: bytes, contentType: "application/json", billed };
 }
 
 /** An embedding as the width check reads it: a list of `count` numbers, base64 text of `bytes` decoded bytes (undefined: not base64), or anything else. */

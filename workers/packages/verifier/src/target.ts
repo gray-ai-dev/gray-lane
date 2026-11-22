@@ -1,4 +1,4 @@
-import { RESERVED_PROMPT_OVERHEAD_TOKENS, capabilitiesJson, isGeneration, type Capabilities, type EndpointConfig, outputOverhead, promptOverhead } from "@gray/control";
+import { RESERVED_PROMPT_OVERHEAD_TOKENS, capabilitiesJson, isGeneration, mappingStreams, streamsMedia, type Capabilities, type EndpointConfig, type ModelMapping, outputOverhead, promptOverhead } from "@gray/control";
 import type { Protocol } from "@gray/protocol";
 import { structJson } from "./struct-json.ts";
 import type { CheckKind } from "./outcome.ts";
@@ -18,28 +18,43 @@ export interface Declared {
   readonly prompt_overhead_tokens: number;
   readonly output_overhead_tokens: number;
   readonly cache_ttl_as_requested: boolean;
+  /**
+   * The mapping declared that its model streams on its API (`ModelMapping.streaming`), so its plan checks the streamed
+   * form too (`streaming_api_contract`). Absent is false, as serde reads it.
+   */
+  readonly streaming?: boolean;
 }
 
 export const DEFAULT_DECLARED: Declared = Object.freeze({ prompt_overhead_tokens: RESERVED_PROMPT_OVERHEAD_TOKENS, output_overhead_tokens: 0, cache_ttl_as_requested: false });
 
 export function isDefaultDeclared(d: Declared): boolean {
-  return d.prompt_overhead_tokens === RESERVED_PROMPT_OVERHEAD_TOKENS && d.output_overhead_tokens === 0 && !d.cache_ttl_as_requested;
+  return d.prompt_overhead_tokens === RESERVED_PROMPT_OVERHEAD_TOKENS && d.output_overhead_tokens === 0 && !d.cache_ttl_as_requested && d.streaming !== true;
 }
 
-/** `EndpointConfig::declared` (crates/gray-control/src/lib.rs): the same for every mapping of the endpoint. */
-export function declaredFor(config: EndpointConfig): Declared {
-  return {
+/** `Declared`'s equality: what a check judged answers by, field by field (absent `streaming` is false). */
+export function sameDeclared(a: Declared, b: Declared): boolean {
+  return a.prompt_overhead_tokens === b.prompt_overhead_tokens && a.output_overhead_tokens === b.output_overhead_tokens && a.cache_ttl_as_requested === b.cache_ttl_as_requested && (a.streaming === true) === (b.streaming === true);
+}
+
+/**
+ * `EndpointConfig::declared` (crates/gray-control/src/lib.rs): the allowances and the cache lifetime declaration, the
+ * same for every mapping of the endpoint, and, for `mapping`, whether it declared that it streams.
+ */
+export function declaredFor(config: EndpointConfig, mapping: Pick<ModelMapping, "streaming"> | null): Declared {
+  const declared: Declared = {
     prompt_overhead_tokens: promptOverhead(config),
     output_overhead_tokens: outputOverhead(config),
     cache_ttl_as_requested: config.cache_ttl_as_requested,
   };
+  return mapping !== null && mappingStreams(mapping) ? { ...declared, streaming: true } : declared;
 }
 
-/** serde's writing of a `Declared` (both optional fields skipped at their defaults). */
+/** serde's writing of a `Declared` (the optional fields skipped at their defaults). */
 function declaredValue(d: Declared): Record<string, unknown> {
   const out: Record<string, unknown> = { prompt_overhead_tokens: d.prompt_overhead_tokens };
   if (d.output_overhead_tokens !== 0) out.output_overhead_tokens = d.output_overhead_tokens;
   if (d.cache_ttl_as_requested) out.cache_ttl_as_requested = true;
+  if (d.streaming === true) out.streaming = true;
   return out;
 }
 
@@ -52,7 +67,6 @@ export interface ProbeTarget {
   readonly base_url: string;
   readonly required_capabilities: Capabilities;
   readonly auth: "protocol_native" | "bearer";
-  readonly adapter: string | null;
   readonly declared: Declared;
 }
 
@@ -69,16 +83,13 @@ function trimTrailingSlashes(text: string): string {
 }
 
 /**
- * `ProbeTarget::fingerprint`: binds evidence to the endpoint configuration, never to the key. Targets
- * without an adapter keep their earlier fingerprint, and targets with the default declaration theirs.
+ * `ProbeTarget::fingerprint`: binds evidence to the endpoint configuration, never to the key. A target with the
+ * default declaration hashes the target alone; any other hashes it with a null, where the retired adapter stood, and
+ * its declaration. Every target keeps the fingerprint it had.
  */
 export function targetFingerprint(t: ProbeTarget): Promise<string> {
   const target = [t.provider_id, t.endpoint_id, t.model, t.protocol, trimTrailingSlashes(t.base_url), capabilitiesJson(t.required_capabilities)];
-  const defaultDeclared = isDefaultDeclared(t.declared);
-  let value: unknown;
-  if (t.adapter === null && defaultDeclared) value = target;
-  else if (defaultDeclared) value = [target, t.adapter];
-  else value = [target, t.adapter, declaredValue(t.declared)];
+  const value: unknown = isDefaultDeclared(t.declared) ? target : [target, null, declaredValue(t.declared)];
   return sha256Hex(structJson(value as never));
 }
 
@@ -95,17 +106,18 @@ export function requiredChecks(protocol: Protocol, c: Capabilities, stream: bool
     return checks;
   }
   const image = c.image_output && protocol === "gemini";
-  // Clause 2.4 of the API standard: a Chat route honors both output-cap fields, in each mode it serves.
-  const caps = protocol === "open_ai_chat" && !image;
+  // Clause 2.4 of the API standard: every text route honors its protocol's output-cap fields, a Chat route both of
+  // its two, in each mode it serves. An image output check asks for an image, which a count cannot stand in for.
+  const caps = image ? [] : outputCaps(protocol);
   const checks: CheckKind[] = [image ? "image_output" : "text_challenge"];
-  if (caps) checks.push("max_tokens_cap", "max_completion_tokens_cap");
+  checks.push(...caps);
   if (c.tools) checks.push("tools");
   if (c.structured_output) checks.push("structured_output");
   if (c.vision) checks.push("vision");
   if (c.reasoning) checks.push("reasoning");
   if (stream) {
     checks.push(image ? "streaming_image_output" : "streaming");
-    if (caps) checks.push("streaming_max_tokens_cap", "streaming_max_completion_tokens_cap");
+    checks.push(...caps.map(streamedCap));
     if (c.tools) checks.push("streaming_tools");
     if (c.structured_output) checks.push("streaming_structured_output");
     if (c.vision) checks.push("streaming_vision");
@@ -114,14 +126,48 @@ export function requiredChecks(protocol: Protocol, c: Capabilities, stream: bool
   return checks;
 }
 
+/** `ProbeManifest::output_caps`: the buffered output-cap checks of a text mapping, one per cap field of its protocol. */
+export function outputCaps(protocol: Protocol): CheckKind[] {
+  switch (protocol) {
+    case "open_ai_chat":
+      return ["max_tokens_cap", "max_completion_tokens_cap"];
+    case "anthropic_messages":
+      return ["max_tokens_cap"];
+    case "open_ai_responses":
+    case "gemini":
+      return ["max_output_tokens_cap"];
+    default:
+      return [];
+  }
+}
+
+/** `CheckKind::streamed`: the streamed twin of a buffered output-cap check. */
+function streamedCap(kind: CheckKind): CheckKind {
+  return kind === "max_tokens_cap" ? "streaming_max_tokens_cap" : kind === "max_completion_tokens_cap" ? "streaming_max_completion_tokens_cap" : "streaming_max_output_tokens_cap";
+}
+
 /** `ProbeManifest::checks_cache_ttl`: only Anthropic reports the lifetime of a cache write. */
 export function checksCacheTtl(protocol: Protocol, declared: boolean): boolean {
   return declared && protocol === "anthropic_messages";
 }
 
-/** `ProbeManifest::planned_checks`. */
+/**
+ * `ProbeManifest::checks_api_streaming`: a mapping that declared streaming on an API of the standard's section 13 with
+ * a streamed form is asked for that form too, when the run checks streaming at all.
+ */
+export function checksApiStreaming(protocol: Protocol, declared: boolean, stream: boolean): boolean {
+  return declared && stream && streamsMedia(protocol);
+}
+
+/**
+ * `ProbeManifest::planned_checks`: the checks the capabilities require, then the cache lifetime check of an Anthropic
+ * mapping that declared it, then the streamed form of a media API whose mapping declared that it streams. Both
+ * declarations are bound into the target's fingerprint, so a report made without either never stands for a target
+ * that declared it.
+ */
 export function plannedChecks(target: ProbeTarget, stream: boolean): CheckKind[] {
   const checks = requiredChecks(target.protocol, target.required_capabilities, stream);
   if (checksCacheTtl(target.protocol, target.declared.cache_ttl_as_requested)) checks.push("cache_ttl");
+  if (checksApiStreaming(target.protocol, target.declared.streaming === true, stream)) checks.push("streaming_api_contract");
   return checks;
 }

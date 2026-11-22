@@ -376,7 +376,8 @@ export function requestBody(target: ProbeTarget, kind: CheckKind, c: Challenge, 
       break;
     case "max_tokens_cap":
     case "max_completion_tokens_cap":
-      // Far more than the cap: an API that honors it stops at the cap with a `length` finish.
+    case "max_output_tokens_cap":
+      // Far more than the cap: an API that honors it stops at the cap, ending for its length.
       prompt = `For order ${order}, count from 1 to 1000, one number per line, and write nothing else.`;
       break;
     default:
@@ -742,16 +743,37 @@ export function readJson(protocol: Protocol, kind: CheckKind, v: Json, c: Challe
 }
 
 /**
- * `validate_cap_json`: the envelope of a buffered answer to an output-cap check, after its usage was found within
- * the cap (the exchange fails one past it, `output_cap_ignored`): one choice, finished for its length. An answer
- * that finished otherwise shows nothing about the cap (`output_cap_unreached`). Its text is not judged. Only Chat
- * plans these checks. Throws a Refusal.
+ * `cap_verdict`: the envelope of a buffered answer to an output-cap check, after its usage was found within the cap
+ * (the exchange fails one past it, `output_cap_ignored`): finished for its length, in its protocol's words (clause
+ * 2.4): one Chat choice with `finish_reason` `length`, a Responses `status` `incomplete` for `max_output_tokens`, a
+ * Messages `stop_reason` `max_tokens`, or one Gemini candidate with `finishReason` `MAX_TOKENS`. An answer that
+ * finished otherwise shows nothing about the cap (`output_cap_unreached`). Its text is not judged. Only the text
+ * protocols plan these checks. Throws a Refusal.
  */
 export function validateCapJson(protocol: Protocol, v: Json): void {
-  if (protocol !== "open_ai_chat") refuse(unclear("probe_unavailable"));
-  const choices = asArray(get(v, "choices")) ?? refuse(fail("invalid_envelope"));
-  if (choices.length !== 1) refuse(fail("invalid_envelope"));
-  if (asStr(get(choices[0], "finish_reason")) !== "length") refuse(unclear("output_cap_unreached"));
+  const one = (key: string): Json => {
+    const all = asArray(get(v, key));
+    if (all === undefined || all.length !== 1) return refuse(fail("invalid_envelope"));
+    return all[0]!;
+  };
+  let cut: boolean;
+  switch (protocol) {
+    case "open_ai_chat":
+      cut = asStr(get(one("choices"), "finish_reason")) === "length";
+      break;
+    case "open_ai_responses":
+      cut = get(v, "status") === "incomplete" && asStr(get(get(v, "incomplete_details"), "reason")) === "max_output_tokens";
+      break;
+    case "anthropic_messages":
+      cut = asStr(get(v, "stop_reason")) === "max_tokens";
+      break;
+    case "gemini":
+      cut = asStr(get(one("candidates"), "finishReason")) === "MAX_TOKENS";
+      break;
+    default:
+      return refuse(unclear("probe_unavailable"));
+  }
+  if (!cut) refuse(unclear("output_cap_unreached"));
 }
 
 /** The verdict on a structured answer's text: the order number and nothing else. */
@@ -765,6 +787,7 @@ function structuredVerdict(text: string, c: Challenge): Verdict | null {
  * parameters, never that the model chose to reason. Throws a Refusal.
  */
 export function validateJson(protocol: Protocol, kind: CheckKind, v: Json, c: Challenge): void {
+  if (isOutputCap(kind)) return validateCapJson(protocol, v);
   const { text, tools } = readJson(protocol, kind, v, c);
   let verdict: Verdict | null;
   if (kind === "tools") verdict = toolVerdict(tools);
@@ -801,9 +824,7 @@ export function validateStream(protocol: Protocol, kind: CheckKind, bytes: Uint8
   let usageResult: ProbeUsage = { ...NO_USAGE };
   const run = (): void => {
     const base = baseKind(kind);
-    // Only Chat plans the output-cap checks (`validateCapJson`).
     const cap = isOutputCap(base);
-    if (cap && protocol !== "open_ai_chat") refuse(unclear("probe_unavailable"));
     const frames = (() => {
       const decoder = new SseDecoder();
       try {
@@ -832,8 +853,9 @@ export function validateStream(protocol: Protocol, kind: CheckKind, bytes: Uint8
         case "open_ai_responses": {
           // The draw's usage is recorded before its answer is judged, as the other protocols record it: an
           // answer without the challenge is drawn again, and the check bills what every draw reported. The
-          // answer's verdict still comes before a usage refusal.
-          if (get(v, "type") === "response.completed") {
+          // answer's verdict still comes before a usage refusal. An output-cap check's stream ends with
+          // `response.incomplete`, which carries its usage as `response.completed` does.
+          if (get(v, "type") === "response.completed" || (cap && get(v, "type") === "response.incomplete")) {
             const response = get(v, "response") ?? null;
             let refused: Refusal | null = null;
             try {

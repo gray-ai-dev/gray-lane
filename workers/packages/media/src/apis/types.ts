@@ -6,10 +6,8 @@
  * stages (authentication, routing, the reservation, ranking, failover, settlement) are the
  * gateway's; this package only decides what is specific to each API.
  */
-import { type UsageCounters } from "@gray/protocol";
+import { type UpstreamAuth, type UsageCounters } from "@gray/protocol";
 import type { Json, JsonObject } from "@gray/json";
-import type { UpstreamAuth } from "../types.ts";
-import type { GeminiImageBody, GeminiOfferTerms } from "./gemini-images.ts";
 
 /**
  * One multipart form field. Fields without a file name are UTF-8 text. A file the gateway does not
@@ -60,9 +58,7 @@ function base64Of(bytes: Uint8Array): string {
 /**
  * Standard base64 of a field's whole bytes. A deferred file's is the base64 of its head followed by
  * its marker: the gateway replaces the marker with the base64 of the rest when it sends the request
- * (the head is a multiple of three bytes, so the two encodings join into the whole file's). The
- * vendor adapters check such a string's alphabet and length and sniff its first 64 characters, which
- * the head's encoding is.
+ * (the head is a multiple of three bytes, so the two encodings join into the whole file's).
  */
 export function partBase64(part: FormPart): string {
   if (!isDeferred(part)) return base64Of(part.data);
@@ -84,12 +80,8 @@ export function partText(part: FormPart): string | undefined {
 /** A client body as received: one JSON value, or a multipart form's fields in order. */
 export type Received = { readonly kind: "json"; readonly value: Json } | { readonly kind: "form"; readonly parts: readonly FormPart[] };
 
-/**
- * The request body as forwarded, before the upstream model is set: a JSON object, a form's fields in
- * order, or a Gemini client's own `generateContent` request for an image model, sent to an image
- * route's Gemini API as it came (gemini-images.ts).
- */
-export type ApiBody = { readonly kind: "json"; readonly value: JsonObject } | { readonly kind: "multipart"; readonly parts: readonly FormPart[] } | GeminiImageBody;
+/** The request body as forwarded, before the upstream model is set: a JSON object, or a form's fields in order. */
+export type ApiBody = { readonly kind: "json"; readonly value: JsonObject } | { readonly kind: "multipart"; readonly parts: readonly FormPart[] };
 
 /**
  * Upper bounds on what a request can consume; `undefined` means the request does not bound that
@@ -139,7 +131,7 @@ export interface Metered {
 export interface MediaRoute {
   readonly endpointId: string;
   readonly providerWorkspace: string;
-  /** The endpoint's base URL, which carries the vendor's API version (`.../v1`, `.../v1beta`). */
+  /** The endpoint's base URL. */
   readonly baseUrl: string;
   /** The protocol's upstream URL on an OpenAI-compatible route (`{base}/images/generations`, ...). */
   readonly url: string;
@@ -148,8 +140,6 @@ export interface MediaRoute {
   /** The capabilities the endpoint states (`streaming`, `timed_transcripts`, `embedding_base64`, ...). */
   readonly capabilities: readonly string[];
   readonly upstreamModel: string;
-  /** The mapping's vendor adapter (`gemini`, `volcengine`, `minimax`, `kling`, `fal`); undefined for an OpenAI-compatible API. */
-  readonly adapter: string | undefined;
   /**
    * Whether the price this route has for the request (`priced_rate`) sets a unit price; undefined
    * when the route is unpriced (pricing then refuses it).
@@ -162,20 +152,11 @@ export interface MediaRoute {
    * whose check withdrew it (`preferProvingAll`).
    */
   readonly proved: readonly string[];
-  /**
-   * What the route's per-image offer says of a Gemini client's answer beyond its images; undefined on a
-   * route priced by tokens or without an offer (gemini-images.ts `retainPriced`).
-   */
-  readonly geminiTerms?: GeminiOfferTerms;
 }
 
-/** The two clocks the APIs read: unix seconds (vendor tokens, `created`) and milliseconds (deadlines). */
+/** The clock the APIs read, in milliseconds. */
 export interface Clock {
   nowMs(): number;
 }
 
 export const SYSTEM_CLOCK: Clock = { nowMs: () => Date.now() };
-
-export function nowUnix(clock: Clock): bigint {
-  return BigInt(Math.floor(clock.nowMs() / 1000));
-}

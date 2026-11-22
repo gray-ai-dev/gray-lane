@@ -2344,9 +2344,9 @@ export const SETTINGS: readonly SettingSpec[] = [
       "How long the gateway waits for a request's tool-call id shards: a lookup with no answer is 503 tool_call_id_lookup_unavailable before " +
       "any provider sees the request; a write with no answer fails the answer with tool_call_id_store_unavailable, not charged.",
   },
-  // The model APIs and video jobs (workers/packages/media, workers/gateway/src/media.ts and
-  // src/workflows/video-job.ts; docs/cloudflare-native/media.md). The server values cited are
-  // crates/gray-gateway/src/inference.rs, apis/images.rs, apis/video.rs, apis/video/poll.rs and
+  // The model APIs and video jobs (workers/packages/media, workers/gateway/src/media.ts and, at the confidential entry,
+  // src/lane/video-jobs.ts and src/lane/video-routes.ts; docs/design/standard-media-at-entry.md section 2.7). The server
+  // values cited are crates/gray-gateway/src/inference.rs, apis/images.rs, apis/video.rs, apis/video/poll.rs and
   // apis/video/content.rs.
   {
     name: "MEDIA_RESPONSE_BYTES",
@@ -2363,66 +2363,9 @@ export const SETTINGS: readonly SettingSpec[] = [
       "one embedding at the widest `dimensions` still fits (16,384 floats at 33 bytes each plus the item and envelope bytes, apis/embeddings.rs " +
       "MAX_DIMENSIONS, FLOAT_BYTES, ITEM_BYTES, ENVELOPE_BYTES, about 0.5 MiB); below it the embeddings API would refuse every request.",
     doc:
-      "The largest answer the model APIs read whole: speech audio, embeddings, image answers with their inlined downloads, transcriptions, " +
+      "The largest answer the model APIs read whole: speech audio, embeddings, image answers, transcriptions, " +
       "video creates excepted (1 MiB, a contract constant shared with the admission probe). It also sizes the largest embeddings batch. " +
       "The console's checks read a speech or image answer under the same bound, so that admission reads what serving reads: set it alike on both.",
-  },
-  {
-    name: "MEDIA_DOWNLOAD_BYTES",
-    key: "mediaDownloadBytes",
-    // The console's image checks download an answer's media under the same budget.
-    workers: ["gateway", "console"],
-    type: "int",
-    default: "25165824",
-    min: 1048576,
-    max: 25165824,
-    source:
-      "Today's server value, 24 MiB (apis/images.rs DOWNLOAD_LIMIT: the base64 of the downloads then stays within the 32 MiB answer limit, " +
-      "a cross check here). Maximum: the server value, for the same reason as MEDIA_RESPONSE_BYTES. Minimum: one 1024x1024 PNG, the size " +
-      "every OpenAI image model offers (a few MB), still downloads.",
-    doc:
-      "Most bytes downloaded for one answer's URL-only images, which the gateway inlines so the customer never sees a vendor URL. The console's " +
-      "image checks download an answer's images under the same budget, as serving would before it delivered the answer: set it alike on both.",
-  },
-  {
-    name: "MEDIA_DOWNLOAD_REDIRECTS",
-    key: "mediaDownloadRedirects",
-    // The console's image checks follow as many.
-    workers: ["gateway", "console"],
-    type: "int",
-    default: "3",
-    min: 0,
-    max: 20,
-    source:
-      "Today's server value (apis/images.rs MAX_REDIRECTS; each hop is vetted again). Maximum: the Fetch standard's own limit of 20 redirects " +
-      "(https://fetch.spec.whatwg.org/#http-redirect-fetch, step 5).",
-    doc:
-      "Redirects followed by hand when downloading one image or a video result; each hop passes the egress rules again. The console's image " +
-      "checks follow as many when they download an answer's images: set it alike on both.",
-  },
-  {
-    name: "MEDIA_JOB_POLL_START_MS",
-    key: "mediaJobPollStartMs",
-    workers: ["gateway"],
-    type: "int",
-    default: "250",
-    min: 250,
-    max: 2500,
-    source:
-      "Today's server value (apis/images.rs POLL_START). Range: the server value to ten times it; faster would poll vendors harder than the " +
-      "server ever has, slower keeps a finished image waiting longer within the request's deadline.",
-    doc: "The first pause between two polls of a vendor's image job (fal, Kling) inside one images request; it doubles up to MEDIA_JOB_POLL_MAX_MS.",
-  },
-  {
-    name: "MEDIA_JOB_POLL_MAX_MS",
-    key: "mediaJobPollMaxMs",
-    workers: ["gateway"],
-    type: "int",
-    default: "2000",
-    min: 250,
-    max: 20000,
-    source: "Today's server value (apis/images.rs POLL_MAX). Range: as MEDIA_JOB_POLL_START_MS, up to ten times the server value.",
-    doc: "The longest pause between two polls of a vendor's image job inside one images request.",
   },
   {
     name: "VIDEO_POLL_INTERVAL_MS",
@@ -2435,8 +2378,8 @@ export const SETTINGS: readonly SettingSpec[] = [
     source:
       "Today's server cadence: the reconciler advances every pending video job every 5 s (crates/gray-gateway/src/main.rs:101-117). Minimum: " +
       "the server's least time between two polls of one job (apis/video/poll.rs POLL_INTERVAL_MS, 1 s). Maximum: a minute, so a finished " +
-      "job is settled within a minute. A cross check keeps one job's polls within the steps a Workflow instance may take.",
-    doc: "How long a video job's Workflow sleeps between two upstream polls.",
+      "job is settled within a minute.",
+    doc: "How long after one upstream poll a video job at the confidential entry is due again for the next.",
   },
   {
     name: "VIDEO_POLL_MIN_MS",
@@ -2450,8 +2393,8 @@ export const SETTINGS: readonly SettingSpec[] = [
       "Today's server value (apis/video/poll.rs POLL_INTERVAL_MS: least time between two upstream polls of one job). Range: as " +
       "VIDEO_POLL_INTERVAL_MS, and at most it (a cross check).",
     doc:
-      "The least time between two upstream polls of one job, whoever polls: a customer's GET /v1/videos/{id} polls when the last poll is " +
-      "this old, the Workflow otherwise.",
+      "The least time between two rounds of an entry replica's due video jobs: each round asks the lane bridge for the jobs whose poll is " +
+      "due and polls them.",
   },
   {
     name: "VIDEO_JOB_TTL_SECONDS",
@@ -2462,70 +2405,9 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 600,
     max: 21600,
     source:
-      "Today's server value, 6 hours (apis/video.rs JOB_TTL_SECONDS). Maximum: the server value; with VIDEO_POLL_INTERVAL_MS at 5 s it takes " +
-      "at most 8,644 Workflow steps, under the 10,000 a Workflow instance takes by default (https://developers.cloudflare.com/workflows/reference/limits/, " +
-      "docs/cloudflare-native/research/cloudflare-facts.md section 3); a cross check holds that. Minimum: the 10 minutes of " +
+      "Today's server value, 6 hours (apis/video.rs JOB_TTL_SECONDS). Maximum: the server value. Minimum: the 10 minutes of " +
       "VIDEO_MISSING_GRACE_SECONDS, so a missing job can fail as missing before it expires.",
     doc: "A video job not finished this long after creation fails as `expired` after one last poll, and its hold is released.",
-  },
-  {
-    name: "VIDEO_WATCHDOG_MS",
-    key: "videoWatchdogMs",
-    workers: ["gateway"],
-    type: "int",
-    default: "60000",
-    min: 5000,
-    max: 60000,
-    source:
-      "The server settles a finished job within its reconciler's 5 s (crates/gray-gateway/src/main.rs:101-117) for as long as the job is " +
-      "pending; VIDEO_POLL_INTERVAL_MS's maximum keeps a finished job settled within a minute. The watchdog bounds a lost Workflow to " +
-      "the same minute. Minimum: the server's 5 s. Maximum: that minute.",
-    doc:
-      "While a video job's hold is pending, its record (VideoJobDO) checks this often that the job's Workflow exists and has not " +
-      "stopped, and starts or restarts it otherwise.",
-  },
-  {
-    name: "VIDEO_STEP_RETRIES",
-    key: "videoStepRetries",
-    workers: ["gateway"],
-    type: "int",
-    default: "5",
-    min: 0,
-    max: 10000,
-    source:
-      "The Workflows default step retry limit, 5 (https://developers.cloudflare.com/workflows/build/sleeping-and-retrying/, read " +
-      "2026-10-17). Maximum: the 10,000 retries per step that page allows. Zero is allowed: an instance whose step ran out of retries " +
-      "is restarted by the watchdog (VIDEO_WATCHDOG_MS).",
-    doc: "How often a video job Workflow step (register, poll, settle) is retried before it fails.",
-  },
-  {
-    name: "VIDEO_STEP_RETRY_DELAY_MS",
-    key: "videoStepRetryDelayMs",
-    workers: ["gateway"],
-    type: "int",
-    default: "10000",
-    min: 1000,
-    max: 60000,
-    source:
-      "The Workflows default first retry delay, 10 s, doubling (https://developers.cloudflare.com/workflows/build/sleeping-and-retrying/, " +
-      "read 2026-10-17). Minimum: the server's least time between two polls of one job (VIDEO_POLL_MIN_MS's 1 s). Maximum: a minute, " +
-      "within which a finished job should be settled (VIDEO_POLL_INTERVAL_MS source).",
-    doc: "The first wait before a failed video job Workflow step is retried; each further retry waits twice as long.",
-  },
-  {
-    name: "VIDEO_STEP_TIMEOUT_MS",
-    key: "videoStepTimeoutMs",
-    workers: ["gateway"],
-    type: "int",
-    default: "600000",
-    min: 60000,
-    max: 600000,
-    source:
-      "The Workflows default step timeout, 10 minutes (https://developers.cloudflare.com/workflows/build/sleeping-and-retrying/, read " +
-      "2026-10-17); a step's own calls are bounded below it (the poll's 15 s exchange, VIDEO_POLL_TIMEOUT_MS; the settlement's account " +
-      "calls, ACCOUNT_ADMIT_BUDGET_MS each). Minimum: a settle step settles and may then release, each within the admission budget, " +
-      "whose maximum is 30 s: 2 x 30 s. Maximum: the default.",
-    doc: "How long one attempt of a video job Workflow step may run before it counts as failed.",
   },
   {
     name: "VIDEO_MISSING_POLLS",
@@ -2600,19 +2482,6 @@ export const SETTINGS: readonly SettingSpec[] = [
       "Today's server value, 10 minutes (apis/video/content.rs TOTAL_TIMEOUT). Maximum: 20 minutes, what a Worker request keeps when the runtime " +
       "is updated (C1, C18 in docs/cloudflare-native.md section 5.6).",
     doc: "The longest whole download of a finished video.",
-  },
-  {
-    name: "VIDEO_CONTENT_HOPS",
-    key: "videoContentHops",
-    workers: ["gateway"],
-    type: "int",
-    default: "3",
-    min: 1,
-    max: 20,
-    source:
-      "Today's server value (apis/video/content.rs MAX_HOPS: vendor content steps and redirects followed at most). Maximum: the Fetch " +
-      "standard's 20 redirects, as MEDIA_DOWNLOAD_REDIRECTS.",
-    doc: "Vendor content steps (a JSON answer naming the next call) and redirects followed at most to reach a finished video's bytes.",
   },
   // Snapshot, projection, request index and reconciliation: gray-jobs (workers/jobs,
   // docs/cloudflare-native/jobs.md), and the gateway's side of the snapshot (@gray/snapshot).
@@ -4342,6 +4211,76 @@ export const SETTINGS: readonly SettingSpec[] = [
       "operators' reclaim is not held by it.",
   },
   {
+    name: "LANE_STACK_VM_PREPAID",
+    key: "laneStackVmPrepaid",
+    workers: ["console"],
+    type: "enum",
+    values: ["off", "on"],
+    default: "off",
+    source:
+      "Supplier-paid prepaid relay-stack CVMs: off by default so staging and production stay on LANE_STACK_AUTO_VM_QUOTA until cutover. " +
+      "Mutually exclusive with LANE_STACK_AUTO_VM_QUOTA (checked in console settings.ts derive).",
+    doc:
+      "Whether relay-stack VMs are self-service prepaid from the supplier's workspace credit balance (kind vm_hosting). On approves a relay's " +
+      "VM quota with payer=relay once funds cover one cycle, charges upfront on Deploy, and renews automatically before each cycle ends.",
+  },
+  {
+    name: "LANE_STACK_VM_PREPAID_PERIOD_DAYS",
+    key: "laneStackVmPrepaidPeriodDays",
+    workers: ["console"],
+    type: "int",
+    default: "7",
+    min: 1,
+    max: 14,
+    source:
+      "A cycle's price is its hours at the instance type's hourly rate (LANE_STACK_VM_PREPAID_HOURLY_MICROUSD), so every length costs the " +
+      "same per day. One charge stays within GrayCredit.maxEntryAmount (100 USD): the console refuses a length whose hours plus the grace " +
+      "hours would cost more at any configured rate (tdx.large at 0.2348 USD/hr: 7 days plus 48 hours is 50.72 USD).",
+    doc: "Length of one prepaid relay-stack VM billing cycle, in days (1 to 14; default 7).",
+  },
+  {
+    name: "LANE_STACK_VM_PREPAID_HOURLY_MICROUSD",
+    key: "laneStackVmPrepaidHourlyMicroUsd",
+    workers: ["console"],
+    type: "text",
+    default: "tdx.small=60780,tdx.medium=118800,tdx.large=234800",
+    textCheck: (v) => prepaidVmRatesProblem(v),
+    source:
+      "Phala Cloud's measured hourly cost of each CVM type, compute and disk: tdx.large 0.2348 USD (Phala's API, 2026-11-14), tdx.medium " +
+      "0.1188 USD (0.116 compute plus 0.0028 disk, Phala's rates read 2026-11-14), tdx.small 0.06078 USD " +
+      "(deploy/tee/probe/routing-measure/README.md). A type with no rate is not billed (503 lane_stack_vm_billing_unavailable) until one is " +
+      "set. A cycle costs its hours at this rate, and hours a VM ran after its paid time ended cost the same rate.",
+    doc:
+      "Comma-separated `<instance_type>=<micro-USD per hour>` rates for prepaid relay-stack VMs; each rate is a positive integer. A cycle's " +
+      "price is the rate times 24 times LANE_STACK_VM_PREPAID_PERIOD_DAYS.",
+  },
+  {
+    name: "LANE_STACK_VM_PREPAID_RENEW_LEAD_HOURS",
+    key: "laneStackVmPrepaidRenewLeadHours",
+    workers: ["console"],
+    type: "int",
+    default: "24",
+    min: 1,
+    max: 72,
+    source:
+      "How many hours before paid_until_ms the console attempts automatic renewal so a relay operator gets early notice (vm_billing_past_due) " +
+      "and time to top up before the paid period expires.",
+    doc: "Hours before a prepaid relay-stack VM cycle ends when automatic renewal starts trying (1 to 72; default 24).",
+  },
+  {
+    name: "LANE_STACK_VM_PREPAID_GRACE_HOURS",
+    key: "laneStackVmPrepaidGraceHours",
+    workers: ["console"],
+    type: "int",
+    default: "48",
+    min: 1,
+    max: 168,
+    source:
+      "How many hours after paid_until_ms a past-due prepaid relay-stack VM keeps running while renewal retries hourly before automatic " +
+      "reclaim (requested_by = service:vm-billing).",
+    doc: "Hours of grace after a prepaid relay-stack VM cycle expires before automatic reclaim (1 to 168; default 48).",
+  },
+  {
     name: "LANE_STACK_ALERT_FROM",
     key: "laneStackAlertFrom",
     workers: ["console"],
@@ -5508,34 +5447,10 @@ export const CROSS_CHECKS: readonly CrossCheck[] = [
     source: "A keep-alive covers an upstream's silence; one no sooner than the silence limit would never be written before the stream fails.",
   },
   {
-    workers: ["gateway", "console"],
-    names: ["MEDIA_DOWNLOAD_BYTES", "MEDIA_RESPONSE_BYTES"],
-    check: (a, b) => (Math.ceil(a / 3) * 4 <= b ? null : `the base64 of ${a} bytes is above MEDIA_RESPONSE_BYTES (${b})`),
-    source: "Inlined downloads are sent back as base64 within the answer limit (apis/images.rs DOWNLOAD_LIMIT): 24 MiB of images is 32 MiB of base64.",
-  },
-  {
-    workers: ["gateway"],
-    names: ["MEDIA_JOB_POLL_START_MS", "MEDIA_JOB_POLL_MAX_MS"],
-    check: (a, b) => (a <= b ? null : `${a} must be at most MEDIA_JOB_POLL_MAX_MS (${b})`),
-    source: "The pause starts at the first value and doubles up to the second (apis/images.rs POLL_START, POLL_MAX).",
-  },
-  {
     workers: ["gateway"],
     names: ["VIDEO_POLL_MIN_MS", "VIDEO_POLL_INTERVAL_MS"],
     check: (a, b) => (a <= b ? null : `${a} must be at most VIDEO_POLL_INTERVAL_MS (${b})`),
-    source: "The Workflow's own polls are due after the interval; a least time above it would make every scheduled poll find the job not yet due.",
-  },
-  {
-    workers: ["gateway"],
-    names: ["VIDEO_JOB_TTL_SECONDS", "VIDEO_POLL_INTERVAL_MS"],
-    check: (a, b) => {
-      const steps = videoWorkflowSteps(a, b);
-      return steps <= WORKFLOW_MAX_STEPS ? null : `a job polled every ${b} ms for ${a} s takes ${steps} Workflow steps, above ${WORKFLOW_MAX_STEPS}`;
-    },
-    source:
-      "A Workflow instance takes at most 10,000 steps by default (https://developers.cloudflare.com/workflows/reference/limits/, read 2026-09-21 in " +
-      "docs/cloudflare-native/research/cloudflare-facts.md section 3; workers-sdk workflows-shared DEFAULT_STEP_LIMIT, as miniflare runs it). " +
-      "videoWorkflowSteps counts what a video job's Workflow takes at most (workers/gateway/src/workflows/video-job.ts).",
+    source: "A job's next poll is due the interval after its last; a least time above it would leave due jobs unpolled for longer than the interval.",
   },
   {
     workers: ["gateway"],
@@ -5591,12 +5506,6 @@ export const TEXT_CROSS_CHECKS: readonly TextCrossCheck[] = [
 ];
 
 /**
- * The most steps a Workflow instance takes by default (https://developers.cloudflare.com/workflows/reference/limits/,
- * docs/cloudflare-native/research/cloudflare-facts.md section 3).
- */
-export const WORKFLOW_MAX_STEPS = 10_000;
-
-/**
  * `idle_in_transaction_session_timeout` of every transaction a Worker opens on PostgreSQL (`SET LOCAL` at its
  * `BEGIN`; never a session `SET`: Hyperdrive pools in transaction mode, docs/cloudflare-native/m0/database.md),
  * in ms: Hyperdrive ends any one statement after 60 s (https://developers.cloudflare.com/hyperdrive/platform/
@@ -5612,17 +5521,6 @@ export const PG_IDLE_IN_TRANSACTION_MS = 60_000;
 
 /** What a Worker sends after `BEGIN` in the same round trip: the transaction's idle limit (`PG_IDLE_IN_TRANSACTION_MS`). */
 export const PG_TRANSACTION_SETTINGS = `SET LOCAL idle_in_transaction_session_timeout = ${PG_IDLE_IN_TRANSACTION_MS}`;
-
-/**
- * The steps a video job's Workflow takes at most (workers/gateway/src/workflows/video-job.ts):
- * `register`, a sleep and a poll per interval until the job expires (the last poll at the deadline),
- * one more pair when a customer's read took the poll that was due, and `settle`. Sleeps are counted
- * although the local engine counts only `step.do` (workers-sdk workflows-shared), to stay on the safe
- * side of the documented limit.
- */
-export function videoWorkflowSteps(ttlSeconds: number, pollIntervalMs: number): number {
-  return 1 + 2 * (Math.ceil((ttlSeconds * 1000) / pollIntervalMs) + 1) + 1;
-}
 
 export class ConfigError extends Error {
   readonly problems: readonly Problem[];
@@ -5867,24 +5765,15 @@ export interface GatewayConfig {
   readonly toolCallIdCacheBytes: number;
   readonly toolCallIdCallTimeoutMs: number;
   readonly mediaResponseBytes: number;
-  readonly mediaDownloadBytes: number;
-  readonly mediaDownloadRedirects: number;
-  readonly mediaJobPollStartMs: number;
-  readonly mediaJobPollMaxMs: number;
   readonly videoPollIntervalMs: number;
   readonly videoPollMinMs: number;
   readonly videoJobTtlSeconds: number;
-  readonly videoWatchdogMs: number;
-  readonly videoStepRetries: number;
-  readonly videoStepRetryDelayMs: number;
-  readonly videoStepTimeoutMs: number;
   readonly videoMissingPolls: number;
   readonly videoMissingGraceSeconds: number;
   readonly videoContentBytes: number;
   readonly videoContentHeadersMs: number;
   readonly videoContentIdleMs: number;
   readonly videoContentTotalMs: number;
-  readonly videoContentHops: number;
   readonly configReplicasPerRegion: number;
   readonly configCallTimeoutMs: number;
   readonly configHedgeMs: number;
@@ -5951,6 +5840,69 @@ export interface JobsConfig extends LedgerJobsConfig {
 }
 export { LEDGER_JOBS_KEYS, type LedgerJobsConfig } from "./ledger.ts";
 
+/** The most one prepaid VM charge may be: GrayCredit.maxEntryAmount ($100 in micro-USD). */
+export const PREPAID_VM_MAX_CHARGE_MICROUSD = 100_000_000;
+
+const PREPAID_VM_INSTANCE_TYPE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const PREPAID_VM_RATE_INT = /^[1-9][0-9]{0,8}$/;
+
+/**
+ * Parses `LANE_STACK_VM_PREPAID_HOURLY_MICROUSD` (`<instance_type>=<micro-USD per hour>`, comma-separated, each a positive
+ * integer of at most 100,000,000). A problem message when invalid, else the frozen rate map.
+ */
+function parsePrepaidVmRates(raw: string): { readonly ok: true; readonly rates: Readonly<Record<string, number>> } | { readonly ok: false; readonly message: string } {
+  if (raw.trim() === "") return { ok: false, message: "must list at least one <instance_type>=<micro-USD per hour> entry" };
+  const out: Record<string, number> = {};
+  for (const part of raw.split(",")) {
+    const item = part.trim();
+    if (item === "") return { ok: false, message: "contains an empty entry" };
+    const parts = item.split("=");
+    if (parts.length !== 2) return { ok: false, message: `${JSON.stringify(item)} must be <instance_type>=<micro-USD per hour>` };
+    const instanceType = parts[0]!.trim();
+    const rateText = parts[1]!.trim();
+    if (!PREPAID_VM_INSTANCE_TYPE.test(instanceType)) return { ok: false, message: `${JSON.stringify(instanceType)} is not a Phala instance type` };
+    const rate = Number(rateText);
+    if (!PREPAID_VM_RATE_INT.test(rateText) || !Number.isSafeInteger(rate) || rate > PREPAID_VM_MAX_CHARGE_MICROUSD) {
+      return { ok: false, message: `${JSON.stringify(rateText)} for ${instanceType} must be a whole number of micro-USD an hour, 1 to ${PREPAID_VM_MAX_CHARGE_MICROUSD}` };
+    }
+    if (Object.hasOwn(out, instanceType)) return { ok: false, message: `duplicate instance type ${JSON.stringify(instanceType)}` };
+    out[instanceType] = rate;
+  }
+  return { ok: true, rates: Object.freeze(out) };
+}
+
+/** Validation rule for `LANE_STACK_VM_PREPAID_HOURLY_MICROUSD`: null when valid, otherwise a concise error message. */
+export function prepaidVmRatesProblem(raw: string): string | null {
+  const parsed = parsePrepaidVmRates(raw);
+  return parsed.ok ? null : parsed.message;
+}
+
+/** Parses and validates `LANE_STACK_VM_PREPAID_HOURLY_MICROUSD`, throwing an Error on any malformed or out-of-range entry. */
+export function prepaidVmRates(raw: string): Record<string, number> {
+  const parsed = parsePrepaidVmRates(raw);
+  if (!parsed.ok) throw new Error(`LANE_STACK_VM_PREPAID_HOURLY_MICROUSD: ${parsed.message}`);
+  return { ...parsed.rates };
+}
+
+/** One prepaid cycle's price: its hours at the type's hourly rate, so every cycle length costs the same per day. */
+export function prepaidVmCyclePrice(hourlyMicroUsd: number, periodDays: number): number {
+  return hourlyMicroUsd * 24 * periodDays;
+}
+
+/**
+ * Whether the rates, cycle length and grace hours fit one charge: a cycle plus a whole grace period of hours a VM ran
+ * unpaid (added to the next charge) must cost at most PREPAID_VM_MAX_CHARGE_MICROUSD at every rate. Null when they do.
+ */
+export function prepaidVmChargeProblem(rates: Readonly<Record<string, number>>, periodDays: number, graceHours: number): string | null {
+  for (const [instanceType, rate] of Object.entries(rates)) {
+    const most = rate * (periodDays * 24 + graceHours);
+    if (most > PREPAID_VM_MAX_CHARGE_MICROUSD) {
+      return `${instanceType} at ${rate} micro-USD an hour costs ${most} micro-USD for ${periodDays} days plus ${graceHours} grace hours, above one charge's limit of ${PREPAID_VM_MAX_CHARGE_MICROUSD} (GrayCredit.maxEntryAmount); shorten LANE_STACK_VM_PREPAID_PERIOD_DAYS or LANE_STACK_VM_PREPAID_GRACE_HOURS`;
+    }
+  }
+  return null;
+}
+
 export interface ConsoleConfig {
   readonly deployEnv: DeployEnv;
   readonly endpointRootLocationHint: LocationHint;
@@ -6013,6 +5965,16 @@ export interface ConsoleConfig {
   readonly laneStackAutoVmHoldDays: number;
   /** LANE_STACK_DEPLOY_RETRY_SECONDS: how long after a failed Deploy another is refused; 0: no wait. */
   readonly laneStackDeployRetrySeconds: number;
+  /** LANE_STACK_VM_PREPAID: whether relay-stack VMs use self-service prepaid billing from workspace balance. */
+  readonly laneStackVmPrepaid: "off" | "on";
+  /** LANE_STACK_VM_PREPAID_PERIOD_DAYS: length of one prepaid VM cycle in days (1..14). */
+  readonly laneStackVmPrepaidPeriodDays: number;
+  /** LANE_STACK_VM_PREPAID_HOURLY_MICROUSD: comma-separated `<instance_type>=<micro-USD per hour>` rates (`prepaidVmRates` reads it). */
+  readonly laneStackVmPrepaidHourlyMicroUsd: string;
+  /** LANE_STACK_VM_PREPAID_RENEW_LEAD_HOURS: hours before `paid_until_ms` when automatic renewal begins. */
+  readonly laneStackVmPrepaidRenewLeadHours: number;
+  /** LANE_STACK_VM_PREPAID_GRACE_HOURS: hours after `paid_until_ms` before an unpaid VM is automatically reclaimed. */
+  readonly laneStackVmPrepaidGraceHours: number;
   /** LANE_STACK_ALERT_FROM: the sender of relay alert e-mails; empty: none sent. */
   readonly laneStackAlertFrom: string;
   /** LANE_STACK_TUNNEL_ZONE: the relays zone of Gray's tunnel rendezvous; empty: none. */
@@ -6118,10 +6080,8 @@ export interface ConsoleConfig {
   /** ALLOW_PRIVATE_UPSTREAMS, as set; `allowPrivateUpstreams` says whether it applies. */
   readonly allowPrivateUpstreams: PrivateUpstreamSwitch;
   readonly probeRequestTimeoutMs: number;
-  /** The gateway's MEDIA_RESPONSE_BYTES, MEDIA_DOWNLOAD_BYTES and MEDIA_DOWNLOAD_REDIRECTS: a model-API check reads and downloads as serving does. */
+  /** The gateway's MEDIA_RESPONSE_BYTES: a model-API check reads an answer as serving does. */
   readonly mediaResponseBytes: number;
-  readonly mediaDownloadBytes: number;
-  readonly mediaDownloadRedirects: number;
   readonly evidenceRefreshSeconds: number;
   readonly evidenceTtlSeconds: number;
   readonly paidEvidenceRefreshSeconds: number;

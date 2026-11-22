@@ -18,45 +18,34 @@ import {
   isInlineImage,
   metered,
   missing,
-  rerankAnswer,
-  rerankMayCut,
-  respondApi,
   speechCharacters,
   systemOneAnswer,
   transcriptAnswer,
-  transcriptPassesThrough,
 } from "@gray/media";
 import { type Protocol, type ScanListener, type ScanString, StrictJsonScan, ZERO_COUNTERS } from "@gray/protocol";
 import { type ClientPresence, ClientStream, type StreamTimers } from "./client.ts";
-import { OWN_ZONES, mediaSettings } from "./media.ts";
-import type { ContentBucket } from "./outbound.ts";
 import { UpstreamReader } from "./relay.ts";
 import type { AnswerShare, Retained } from "./retained.ts";
-import { rebuiltAnswer } from "./media-rebuilt.ts";
 
 /**
- * The answer of a model API request (docs/cloudflare-native/media.md 2.1), never held whole (the
- * owner's rule, 128 MB an isolate): read as it arrives, checked and metered by @gray/media's rules for
- * its API (`systemOneAnswer`, `embeddingsAnswer`, ...), and handed to the client as soon as it may go.
+ * The answer of a model API request the confidential entry serves on a provider's own API
+ * (docs/design/standard-media-at-entry.md section 2.5), never held whole (the owner's rule, 128 MB an isolate): read as
+ * it arrives, checked and metered by @gray/media's rules for its API (`systemOneAnswer`, `embeddingsAnswer`, ...), and
+ * handed to the client as soon as it may go, its last byte after the checks and the charge.
  *
- * - An answer the client gets as the upstream sent it (System One, embeddings, rerank, a transcription
- *   in `json` or `verbose_json`) passes as it arrives (`JsonPassAnswer`): a strict JSON scan keeps a
- *   projection of what the checks read (`KeepProjection`: the usage, an embedding's length and never
- *   its numbers; not the model the answer names, which is not read, owner 2026-10-16), nothing goes before ANSWER_PRIME_BYTES may go, and the closing bracket
- *   waits for the checks and the charge, as a non-streaming generation answer does (answer.ts).
- * - Speech from an OpenAI-compatible route passes as it arrives too (`AudioPassAnswer`): it is billed
- *   at the characters Gray counted from the request, and its last bytes wait for the charge.
- * - An answer the gateway makes from the whole upstream answer (a ranking cut to the client's limit, a
- *   transcript turned into text or subtitles) is read whole within BODY_PARSE_MAX_BYTES, the most of
- *   one document the gateway parses whole, as a translated generation answer is (`WholeAnswer`;
- *   gateway.md 13 item 14); a longer one is 502 `upstream_body_limit`, Gray's limit, not charged.
- * - Images, and speech from a vendor, are rebuilt with their media streamed from where it is
- *   (media-rebuilt.ts).
+ * - JSON (System One, embeddings, rerank, images, transcriptions, translations) passes as it arrives
+ *   (`JsonPassAnswer`): a strict JSON scan keeps a projection of what the checks read (`KeepProjection`: the usage, an
+ *   embedding's length and never its numbers; not the model the answer names, which is not read, owner 2026-10-16),
+ *   nothing goes before ANSWER_PRIME_BYTES may go, and the closing bracket waits for the checks and the charge, as a
+ *   non-streaming generation answer does (answer.ts).
+ * - Speech passes as it arrives too (`AudioPassAnswer`): it is billed at the characters Gray counted from the request,
+ *   and its last bytes wait for the charge.
+ * - Events (streamed images, transcriptions and speech) pass as they arrive (`SsePassAnswer`).
  *
- * A client that leaves ends the upstream at once, and the answer is free, unless the upstream's
- * answer is already whole (docs/cloudflare-native.md 5.6).
+ * Nothing is rebuilt: no image is fetched from a link, no transcript converted, no ranking cut. A client that leaves
+ * ends the upstream at once, and the answer is free, unless the upstream's answer is already whole
+ * (docs/cloudflare-native.md 5.6).
  */
-
 export interface MediaAnswerInput {
   readonly protocol: Protocol;
   readonly api: ApiRequest;
@@ -70,10 +59,6 @@ export interface MediaAnswerInput {
   readonly deadline: number;
   readonly silenceMs: number;
   readonly cfg: GatewayConfig;
-  /** The request's fetch (outbound.ts), for what an answer names by URL. */
-  readonly fetch: (input: string, init: RequestInit) => Promise<Response>;
-  /** The content bucket, through the request's connections. */
-  readonly bucket: ContentBucket;
   readonly retained: Retained;
   /** The isolate's shared answer memory pool (`deps.load.answers.share()`), when bounded across requests. */
   readonly isolate?: AnswerShare;
@@ -83,12 +68,6 @@ export interface MediaAnswerInput {
   readonly start: (body: ReadableStream<Uint8Array>, headers: Headers) => void;
   /** The serving endpoint's name and base URL, which a model's refusal is cleaned of before Gray repeats it (`ModelRefused`). */
   readonly endpoint: { readonly name: string; readonly baseUrl: string };
-  /**
-   * The request is served at the confidential entry on a provider's own API (docs/design/standard-media-at-entry.md
-   * section 2.5): every answer passes as it arrives, JSON, audio or events, and none is rebuilt, converted or cut
-   * (`entryAnswerReader`).
-   */
-  readonly entry?: true;
   /** Hears every byte the client's stream queues (client.ts `ClientStream`): the entry's receipt hashes what its client was sent. */
   readonly tap?: (bytes: Uint8Array) => void;
 }
@@ -130,45 +109,14 @@ export interface MediaAnswer {
   readonly heldMost: number;
 }
 
-/** The answer reader for a request's API and route. */
-export function answerReader(o: MediaAnswerInput): MediaAnswer {
-  if (o.entry === true) return entryAnswerReader(o);
-  switch (o.protocol) {
-    case "system_one":
-      return new JsonPassAnswer(o, SYSTEM_ONE, (projection) => systemOneAnswer(projection, billsUnits(o)));
-    case "open_ai_embeddings":
-      return new JsonPassAnswer(o, EMBEDDINGS, (projection) => embeddingsAnswer(o.api, embeddingsShape(projection), billsUnits(o)), EMBEDDING_SPILL_BYTES);
-    case "rerank":
-      if (rerankMayCut(o.api)) return new WholeAnswer(o, wholeLimit(o.cfg));
-      return new JsonPassAnswer(o, RERANK, (projection) => rerankAnswer(o.api, projection, billsUnits(o)).billed);
-    case "open_ai_transcriptions":
-    case "open_ai_translations":
-      if (transcriptPassesThrough(o.protocol, o.api)) return new JsonPassAnswer(o, TRANSCRIPT, (projection) => transcriptAnswer(projection, billsUnits(o)));
-      return new WholeAnswer(o, wholeLimit(o.cfg));
-    case "open_ai_speech":
-      if (o.route.adapter === undefined) return new AudioPassAnswer(o);
-      return rebuiltAnswer(o);
-    case "open_ai_image_generations":
-    case "open_ai_image_edits":
-      return rebuiltAnswer(o);
-    default:
-      return new WholeAnswer(o, wholeLimit(o.cfg));
-  }
-}
-
 function billsUnits(o: MediaAnswerInput): boolean {
   return o.route.billsUnits === true;
-}
-
-/** What an answer the gateway makes from the whole upstream answer may take: MEDIA_RESPONSE_BYTES, at most BODY_PARSE_MAX_BYTES (one document parsed whole). */
-function wholeLimit(cfg: GatewayConfig): { readonly bytes: number; readonly memory: boolean } {
-  return { bytes: Math.min(cfg.mediaResponseBytes, cfg.bodyParseMaxBytes), memory: cfg.bodyParseMaxBytes < cfg.mediaResponseBytes };
 }
 
 /**
  * The strings a projection keeps whole: past this they spill (StrictJsonScan `spillBytes`), so no
  * value an upstream sends is held whole beyond it. 64 KiB: above every value a check reads by value
- * (a URL is at most 16 KiB, adapters `opaque_url`; models, codes and statuses are short), the size of
+ * (a URL is at most 16 KiB; models, codes and statuses are short), the size of
  * the scan's own string buffer (`STRING_BUFFER_BYTES`).
  */
 export const SPILL_BYTES = 64 * 1024;
@@ -205,16 +153,6 @@ const EMBEDDINGS: KeepRule = (path) => {
   if (a !== "data") return "skip";
   if (path.length === 2) return typeof b === "number" ? "descend" : "skip";
   if (path.length === 3) return c === "index" || c === "object" ? "whole" : c === "embedding" ? "shape" : "skip";
-  return "skip";
-};
-
-const RERANK: KeepRule = (path) => {
-  const [a, , c] = path;
-  if (path.length === 0) return "descend";
-  if (path.length === 1) return a === "meta" || a === "usage" ? "whole" : a === "results" || a === "data" ? "descend" : "skip";
-  if (a !== "results" && a !== "data") return "skip";
-  if (path.length === 2) return "descend";
-  if (path.length === 3) return c === "index" || c === "relevance_score" ? "whole" : c === "document" ? "kind" : "skip";
   return "skip";
 };
 
@@ -746,19 +684,8 @@ function asPriced(o: MediaAnswerInput, judged: Billed): Billed {
   return judged;
 }
 
-/**
- * The answer reader of a request the confidential entry serves on a provider's own API
- * (docs/design/standard-media-at-entry.md section 2.5). Every answer passes as it arrives, its last byte after the
- * checks and the charge:
- *
- * - JSON (System One, embeddings, rerank, images, transcriptions, translations): `JsonPassAnswer`, with the
- *   projection its billing fields need;
- * - audio (speech): `AudioPassAnswer`, billed at the characters Gray counted from the request;
- * - events (streamed images, transcriptions and speech): `SsePassAnswer`.
- *
- * Nothing is rebuilt: no image is fetched from a link, no transcript converted, no ranking cut.
- */
-export function entryAnswerReader(o: MediaAnswerInput): MediaAnswer {
+/** The answer reader for a request's API (the file comment): JSON, audio or events, each with the projection its billing fields need. */
+export function answerReader(o: MediaAnswerInput): MediaAnswer {
   switch (o.protocol) {
     case "system_one":
       return new JsonPassAnswer(o, SYSTEM_ONE, (projection) => systemOneAnswer(projection, billsUnits(o)));
@@ -1090,88 +1017,6 @@ export class SsePassAnswer extends Relay {
 
   deliver(): Promise<MediaDelivery> {
     return this.finish(new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache" }));
-  }
-}
-
-/**
- * An answer the gateway makes from the whole upstream answer: read within `limit`, then made by the
- * API's own respond (@gray/media `respondApi`), never started before it is whole (`deliver` hands it
- * back with its length). A longer answer is 502 `upstream_body_limit`: Gray's limit (`gateway_memory`)
- * when the limit is the parse bound, the API's otherwise; not charged.
- */
-export class WholeAnswer extends Relay {
-  private readonly limit: { readonly bytes: number; readonly memory: boolean };
-  private body: Uint8Array | null = null;
-  private contentType = "application/json";
-
-  constructor(o: MediaAnswerInput, limit: { readonly bytes: number; readonly memory: boolean }) {
-    super(o);
-    this.limit = limit;
-  }
-
-  async read(): Promise<MediaRead> {
-    for (;;) {
-      const next = await this.next();
-      if (next.kind === "eof") break;
-      if (next.kind !== "chunk") return next;
-      this.received += next.bytes.length;
-      if (this.received > this.limit.bytes) {
-        this.upstream.cancel();
-        const error = this.limit.memory
-          ? new ApiError(502, "upstream_body_limit")
-              .withMessage(`Gray makes this answer from the whole upstream answer and reads at most ${this.limit.bytes} bytes of it; the provider's answer was larger. You are not charged for it.`)
-              .withMeta("limit_bytes", BigInt(this.limit.bytes))
-              .withMeta("limit_source", "gateway_memory")
-          : new ApiError(502, "upstream_body_limit");
-        return this.failed(error, "upstream_body_limit", `the answer passed ${this.limit.bytes} bytes`, this.limit.memory ? null : "invalid_response", true);
-      }
-      this.pending.push(next.bytes);
-      this.pendingBytes += next.bytes.length;
-      if (this.pendingBytes > this.heldMost) this.heldMost = this.pendingBytes;
-      this.o.retained.set("held", this.pendingBytes);
-      if (this.o.isolate !== undefined && !this.o.isolate.hold(this.pendingBytes, this.o.cfg.answerHeldMaxBytes)) {
-        this.upstream.cancel();
-        return this.failed(
-          new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory"),
-          "gateway_capacity",
-          `the answers in flight in this isolate would keep more than the ${this.o.cfg.answerHeldMaxBytes} bytes the gateway holds of them together`,
-          null,
-          true,
-        );
-      }
-    }
-    this.ended = true;
-    const whole = join(this.pending);
-    this.pending = [];
-    this.pendingBytes = 0;
-    const settings = mediaSettings(this.o.cfg);
-    const headers = new Headers(this.o.response.headers);
-    try {
-      const answered = await respondApi(this.o.protocol, this.o.api, this.o.route, new Response(whole, { status: this.o.response.status, headers }), {
-        billsUnits: this.o.route.billsUnits === true,
-        deadlineMs: this.o.deadline,
-        fetch: (request) => this.o.fetch(request.url, { method: request.method, headers: request.headers, body: request.body, redirect: "manual", signal: request.signal }),
-        egress: { allowPrivate: this.o.cfg.deployEnv === "local", ownZones: OWN_ZONES },
-        clock: { nowMs: this.o.clock },
-        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-        settings,
-      });
-      this.body = answered.body;
-      this.contentType = answered.contentType;
-      this.o.retained.set("held", answered.body.length);
-      this.o.isolate?.record(answered.body.length);
-      return { kind: "complete", billed: answered.billed };
-    } catch (error) {
-      if (!(error instanceof ApiError)) throw error;
-      return this.failed(error, error.code === "billing_usage_invalid" ? "upstream_usage_invalid" : error.code, `the answer failed its checks (${error.code})`, "invalid_response", false);
-    }
-  }
-
-  async deliver(): Promise<MediaDelivery> {
-    const bytes = this.body ?? new Uint8Array(0);
-    this.body = null;
-    this.o.retained.set("held", 0);
-    return { kind: "whole", bytes, headers: new Headers({ "content-type": this.contentType }) };
   }
 }
 

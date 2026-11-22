@@ -30,8 +30,8 @@ export interface ModelMapping {
   readonly upstream_model: string;
   readonly protocol: Protocol;
   readonly native_path: string;
-  /** A vendor-native adapter (`gemini`, `volcengine`, `minimax`, `kling`, `fal`), or null. */
-  readonly adapter: string | null;
+  /** The model streams on its API (`@gray/control` `ModelMapping.streaming`); read and written only when true, as serde writes it. */
+  readonly streaming?: boolean;
 }
 
 export interface EndpointConfig {
@@ -124,19 +124,20 @@ function protocol(v: unknown, what: string): Protocol {
 
 /**
  * `serde_json::from_value::<ModelMapping>`: unknown fields are ignored. A stored mapping that still names
- * `response_model_aliases` (any value, null too) reads, is written and is fingerprinted without them, as
- * gray-control does since Gray stopped reading the model an answer names.
+ * `response_model_aliases` or the retired `adapter` (any value, null too) reads, is written and is fingerprinted
+ * without them, as gray-control does.
  */
 export function parseMapping(v: unknown, what = "mapping"): ModelMapping {
   const o = obj(v, what);
-  const adapter = o.adapter;
-  if (adapter !== undefined && adapter !== null && typeof adapter !== "string") throw new RecordError(`${what}.adapter must be a string`);
+  // `#[serde(default)] streaming: bool`: absent is false, an explicit null a type error.
+  const streaming = o.streaming === undefined ? false : o.streaming;
+  if (typeof streaming !== "boolean") throw new RecordError(`${what}.streaming must be a boolean`);
   return {
     requested_model: str(o, "requested_model", what),
     upstream_model: str(o, "upstream_model", what),
     protocol: protocol(o.protocol, `${what}.protocol`),
     native_path: str(o, "native_path", what),
-    adapter: typeof adapter === "string" ? adapter : null,
+    ...(streaming ? { streaming: true as const } : {}),
   };
 }
 
@@ -226,9 +227,8 @@ export function parseVerification(v: unknown): VerificationRecord {
 const s = (v: string) => JSON.stringify(v);
 
 export function serializeMapping(m: ModelMapping): string {
-  let out = `{"requested_model":${s(m.requested_model)},"upstream_model":${s(m.upstream_model)},"protocol":${s(m.protocol)},"native_path":${s(m.native_path)}`;
-  if (m.adapter !== null) out += `,"adapter":${s(m.adapter)}`;
-  return `${out}}`;
+  const out = `{"requested_model":${s(m.requested_model)},"upstream_model":${s(m.upstream_model)},"protocol":${s(m.protocol)},"native_path":${s(m.native_path)}`;
+  return m.streaming === true ? `${out},"streaming":true}` : `${out}}`;
 }
 
 /** `serde_json::to_string(&config)`. */
@@ -255,10 +255,11 @@ export function configFingerprint(c: EndpointConfig, generation: number): string
 
 /**
  * provider_offers::mapping_fingerprint: hex SHA-256 of the JSON array ("gray.offer-mapping.v1",
- * endpoint id, requested model, protocol, upstream model, native path, adapter or null).
+ * endpoint id, requested model, protocol, upstream model, native path, null). The last member named the
+ * retired adapter; it stays null so every offer bound to a mapping keeps its fingerprint.
  */
 export function mappingFingerprint(endpointId: string, m: ModelMapping): string {
-  return sha256Hex(JSON.stringify(["gray.offer-mapping.v1", endpointId, m.requested_model, m.protocol, m.upstream_model, m.native_path, m.adapter]));
+  return sha256Hex(JSON.stringify(["gray.offer-mapping.v1", endpointId, m.requested_model, m.protocol, m.upstream_model, m.native_path, null]));
 }
 
 /** ControlStore::endpoint_row: a control_endpoints row (config as stored JSON text) as a ProviderEndpoint. */
@@ -295,32 +296,6 @@ export function registeredRefs(endpoints: Iterable<readonly [workspaceId: string
   return out;
 }
 
-/** gray_media_adapters ADAPTERS and Vendor::for_adapter / supports, for `adapter_serves` (crates/gray-control/src/lib.rs). */
-export function adapterServes(adapter: string, p: Protocol): boolean {
-  const op = p === "open_ai_image_generations" ? "image_generation" : p === "open_ai_image_edits" ? "image_edit" : p === "open_ai_speech" ? "speech" : p === "open_ai_videos" ? "video_create" : null;
-  if (op === null) return false;
-  switch (adapter) {
-    case "gemini":
-      // Gemini's video operations are Veo's; image generation and edits are Imagen's; no speech.
-      return op !== "speech";
-    case "volcengine":
-      return op !== "speech";
-    case "minimax":
-      return true;
-    case "kling":
-    case "fal":
-      return op !== "speech";
-    default:
-      return false;
-  }
-}
-
-/** Whether an image API is served through an adapter other than Gemini's, which reports image counts and no tokens (provider_offers::adapter_reports_image_counts). */
-export function adapterReportsImageCounts(p: Protocol, adapter: string | null): boolean {
-  if (p !== "open_ai_image_generations" && p !== "open_ai_image_edits") return false;
-  return adapter !== null && adapter !== "gemini" && adapterServes(adapter, p);
-}
-
 /** ControlStore::validate_endpoint_shape: what a stored configuration must keep passing to be published. */
 export function validEndpointShape(c: EndpointConfig): boolean {
   if (c.name.trim().length === 0 || utf8Bytes(c.base_url) > 2048 || !(c.base_url.startsWith("https://") || c.base_url.startsWith("http://"))) return false;
@@ -329,7 +304,6 @@ export function validEndpointShape(c: EndpointConfig): boolean {
   for (const m of c.mappings) {
     if (m.requested_model.trim().length === 0 || m.requested_model === "*" || m.upstream_model.trim().length === 0) return false;
     if (!m.native_path.startsWith("/") || m.native_path.startsWith("//") || /[?#]/.test(m.native_path)) return false;
-    if (m.adapter !== null && !adapterServes(m.adapter, m.protocol)) return false;
     const key = `${m.requested_model}\u0000${m.protocol}`;
     if (seen.has(key)) return false;
     seen.add(key);

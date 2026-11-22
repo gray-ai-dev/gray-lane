@@ -1,4 +1,4 @@
-import { entryTranslations, type EntryOffer } from "@gray/snapshot";
+import { entryTranslations, entryTranslationTargets, type EntryOffer } from "@gray/snapshot";
 import type { Protocol } from "@gray/protocol";
 import { PolicyError, TranslationPolicy } from "@gray/translation";
 import type { GatewaySnapshot } from "./snapshot.ts";
@@ -70,6 +70,25 @@ export function entryRules(snapshot: GatewaySnapshot): TranslationRules {
   );
   entry = { snapshot, rules };
   return rules;
+}
+
+/**
+ * The entry's rule for a request whose native routes the capability filter left out (routes.ts `capable`): `entryRules`
+ * gives a (model, API) pair no targets while the model has a route of its own on that API at the entry, so that a native
+ * route comes first, its failures included. A route that cannot carry the request in its mode (one proved for buffered
+ * answers only, taking a streamed request) is no native route for that request, and the request's native set is empty
+ * after filtering (docs/design/cross-protocol-translation.md, "When to translate"). It is then translated onto the APIs
+ * `entryRules` would name if the model had no route on `client` there: each other text API on which the model has an
+ * endpoint route at the entry, never a lane relay's route. Every other pair reads `entryRules`. None while the snapshot's
+ * switch is off. The caller decides that the capability filter, and nothing else, left the request no native route.
+ */
+export function entryRulesWithout(snapshot: GatewaySnapshot, model: string, client: Protocol): TranslationRules {
+  const rules = entryRules(snapshot);
+  if (snapshot.entryTranslation === "off") return rules;
+  const endpoint = (api: Protocol) => snapshot.routes.some((r) => r.model === model && r.protocol === api && r.auth !== "lane_relay");
+  const targets = entryTranslationTargets(client, () => false, endpoint);
+  if (targets.length === 0) return rules;
+  return { upstreams: (m, c) => (m === model && c === client ? targets : rules.upstreams(m, c)) };
 }
 
 /**

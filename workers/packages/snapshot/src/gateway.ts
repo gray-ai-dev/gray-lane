@@ -79,14 +79,6 @@ export interface GatewayMediaTerms {
   readonly imageOutput: number | null;
   readonly audioOutput: number | null;
   readonly unitPrices: Readonly<Record<string, number>>;
-  /**
-   * What a per-image price of a Gemini image model's route covers of a Gemini client's answer beyond
-   * its images (offers.ts `OfferMediaTerms`): an answer without an image as one image, Google Search
-   * grounding included, thought images billed. Absent or null: the provider has not said.
-   */
-  readonly textAnswer?: "one_image" | null;
-  readonly grounding?: "included" | null;
-  readonly thoughtImages?: "billed" | null;
 }
 
 export interface GatewayQuote {
@@ -209,8 +201,6 @@ export interface GatewayRouteRecord {
   readonly expiresAt: number;
   /** The name of the endpoint root and shards this route's permits come from (@gray/snapshot `capacityKey`). */
   readonly capacityKey: string;
-  /** The mapping's vendor adapter (`gemini`, `volcengine`, `minimax`, `kling`, `fal`); null for an OpenAI-compatible API. */
-  readonly adapter: string | null;
   /** The capabilities the endpoint states (its configuration's `capabilities`: `timed_transcripts`, `embedding_base64`, ...), which a model API prefers routes by. */
   readonly claims: readonly string[];
   /** What the route's probe report proved of those claims for its API, as claim words (`catalog::capability_words`). */
@@ -399,17 +389,12 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
         imageOutput: t.media.image_output_microusd_per_million,
         audioOutput: t.media.audio_output_microusd_per_million,
         unitPrices: { ...t.media.unit_prices },
-        // Only what the offer says: an offer without them reads as before.
-        ...(t.media.text_answer === null ? {} : { textAnswer: t.media.text_answer }),
-        ...(t.media.grounding === null ? {} : { grounding: t.media.grounding }),
-        ...(t.media.thought_images === null ? {} : { thoughtImages: t.media.thought_images }),
       },
     },
     serviceRegion: t.service_region,
     // The server drops a quote past its eligibility (inference.rs `quote`: eligible_until > now).
     expiresAt: Math.min(r.expires, offer.eligible_until) * 1000,
     capacityKey: r.capacityKey,
-    adapter: r.mapping.adapter,
     claims: [...r.config.capabilities],
     proved: capabilityWords(r.capabilities.chat),
     ...(r.recovering == null ? {} : { recovering: [...r.recovering.words], recoveringUntil: r.recovering.untilMs }),
@@ -425,7 +410,7 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
  * Whether a route of `snapshot` belongs to the lane whose mode is `mode`. The main mode: every route but a
  * `lane_relay` one, so Gray's public gateway never sends to a relay (design v2 section B). The lane mode: every
  * `lane_relay` route, and the endpoint routes the lane's entry serves (docs/design/lane-provider-routes.md section 2,
- * `entryEndpointRoute`: `bearer` or `protocol_native` on one of ENTRY_ENDPOINT_PROTOCOLS, no adapter, a base URL egress's
+ * `entryEndpointRoute`: `bearer` or `protocol_native` on one of ENTRY_ENDPOINT_PROTOCOLS, a base URL egress's
  * `/route/` kind carries). An endpoint route is in both modes: the `api` address keeps serving it.
  *
  * Which routes are confidential is not this: the catalog marks `lane_relay` routes alone (gray-jobs src/catalog.ts
@@ -433,7 +418,7 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
  */
 export function routeInMode(r: SnapshotRoute, mode: GatewayMode): boolean {
   if (r.config.auth === "lane_relay") return mode === "lane";
-  return mode === "main" || entryEndpointRoute({ auth: r.config.auth, protocol: r.mapping.protocol, adapter: r.mapping.adapter, baseUrl: r.config.base_url, url: r.url });
+  return mode === "main" || entryEndpointRoute({ auth: r.config.auth, protocol: r.mapping.protocol, baseUrl: r.config.base_url, url: r.url });
 }
 
 /** A (model, API) pair's key in `GatewayView.laneServed`. */
@@ -497,7 +482,7 @@ export function laneOffersOf(snapshot: Pick<Snapshot, "routes" | "streamedOnlyRo
  * `translation` unset (the entry's translations follow its own rule, `entryTranslationTargets`, never an operator's
  * policy); `contentRecipients` empty (the lane captures no
  * content); `mapped` the lane relays' mappings and the direct mappings on a protocol the entry speaks (the lane answers
- * 503 for a known model with no live route). A pair carries no base URL or adapter, so a direct pair is kept by its
+ * 503 for a known model with no live route). A pair carries no base URL, so a direct pair is kept by its
  * protocol alone: a model only an endpoint the entry cannot carry maps answers 503 there rather than 404. Every other
  * field is a normal snapshot's: `keys` authenticate the customer, `workspaces` carry the region preference.
  *

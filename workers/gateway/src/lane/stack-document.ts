@@ -35,7 +35,9 @@ import type { StackRelayAppend, StackRelayCap, StackRelayConfig, StackRelayRoute
  * header; the vendor gets the client's own and the relay's): an `identity` the configuration still names
  * is ignored. A panel account that declares a `credential_type` other than the
  * sealed credential's is not served (`invalid_credential`): the relay's container would send a form
- * the declaration does not name, and the panel's test profile would be another class's.
+ * the declaration does not name, and the panel's test profile would be another class's. A `password`
+ * or `sign_in` account serves with the access token its sign-in in the VM makes, so its type here is
+ * `oauth_access_token`, the type `stack-ops.ts` pushes to egress and the report names.
  *
  * **Routes and appends (S21a).** At most one route per (`protocol`, `requested_model`): two the panel
  * gives that agree are served once (visible if either is), two that disagree are both left out, since
@@ -283,8 +285,8 @@ export function buildStackDocument(input: StackDocumentInput): StackDocument {
       if (sealed === undefined) return "not_sealed";
       if (sealed.vendor !== account.vendor) return "vendor_mismatch";
       if (sealed.version < BigInt(account.credential_version)) return "credential_waiting";
-      // A password account serves with its sign-in's access token: the panel's type for it is that.
-      const servedType = sealed.login === undefined ? sealed.credential.type : "oauth_access_token";
+      // A password or sign_in account serves with its sign-in's access token: the panel's type for it is that.
+      const servedType = sealed.login === undefined && sealed.credential.type !== "sign_in" ? sealed.credential.type : "oauth_access_token";
       if (account.credential_type !== undefined && account.credential_type !== servedType) return "invalid_credential";
       if (account.proxy_id === null) return sealed.egress === undefined ? null : "proxy_mismatch";
       const proxy = proxies.get(account.proxy_id);

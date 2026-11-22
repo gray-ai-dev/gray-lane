@@ -17,7 +17,7 @@ import type { LaneDeps, LaneEndpointCredentials } from "./types.ts";
  * is decided, once.
  *
  * - **The route.** The record names the endpoint and the model. The route is the lane view's endpoint route of that
- *   endpoint, API and model with no adapter: its URL is the create path, and the job's retrieve and content paths
+ *   endpoint, API and model: its URL is the create path, and the job's retrieve and content paths
  *   append `/<provider id>` and `/<provider id>/content`. The request goes through egress's `/route/` kind under the
  *   endpoint's row, so every replica reaches the host and path prefix the create used, with the provider's key at the
  *   route's current generation.
@@ -115,12 +115,12 @@ export function videoJobTerminal(job: Pick<LaneVideoJob, "state">): boolean {
 }
 
 /**
- * The route a job runs on, from the lane view: the endpoint route of the job's endpoint and model on the video API,
- * with no adapter. Whether the route serves new requests now is not asked: a job already running is followed to its
+ * The route a job runs on, from the lane view: the endpoint route of the job's endpoint and model on the video API.
+ * Whether the route serves new requests now is not asked: a job already running is followed to its
  * end. Undefined when the view holds no such route (the endpoint left, or its mapping changed).
  */
 export function videoJobRoute(snapshot: GatewaySnapshot, job: Pick<LaneVideoJob, "endpointId" | "model">): RouteRecord | undefined {
-  return snapshot.routes.find((r) => r.endpointId === job.endpointId && r.protocol === "open_ai_videos" && r.model === job.model && r.auth !== "lane_relay" && (r.adapter ?? null) === null);
+  return snapshot.routes.find((r) => r.endpointId === job.endpointId && r.protocol === "open_ai_videos" && r.model === job.model && r.auth !== "lane_relay");
 }
 
 /** `<create path>/<provider id>` and `<create path>/<provider id>/content` of a job on its route. */

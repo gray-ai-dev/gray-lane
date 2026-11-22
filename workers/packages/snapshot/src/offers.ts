@@ -1,6 +1,6 @@
 import { isProtocol, type Protocol } from "@gray/protocol";
 import { parsePlain } from "@gray/json";
-import { adapterReportsImageCounts, mappingFingerprint, type ProviderEndpoint, type VerificationRecord } from "./control.ts";
+import { mappingFingerprint, type ProviderEndpoint, type VerificationRecord } from "./control.ts";
 import type { ProbeCost } from "./evidence.ts";
 
 /**
@@ -102,15 +102,6 @@ export interface OfferMediaTerms {
   readonly image_output_microusd_per_million: number | null;
   readonly audio_output_microusd_per_million: number | null;
   readonly unit_prices: Readonly<Record<string, number>>;
-  /**
-   * What a per-image price of a Gemini image model's route through the Gemini adapter covers beyond
-   * its images (provider_offers.rs on main): an answer without an image costs one image, Google Search
-   * grounding is included, and each thought image an answer carries is billed as an image. Null: the
-   * provider has not said.
-   */
-  readonly text_answer: "one_image" | null;
-  readonly grounding: "included" | null;
-  readonly thought_images: "billed" | null;
 }
 
 export interface OfferTerms {
@@ -205,13 +196,6 @@ function parseLimits(v: unknown): ProviderLimits | null {
   };
 }
 
-/** A unit variant of a serde enum (`#[serde(rename_all = "snake_case")]`): absent or null is unset, any other value refused. */
-function optVariant<T extends string>(v: unknown, what: string, variant: T): T | null {
-  if (v === undefined || v === null) return null;
-  if (v !== variant) throw new OfferError(`${what} is not a known value`);
-  return variant;
-}
-
 function parseMedia(v: unknown): OfferMediaTerms {
   const o =
     v === undefined
@@ -222,9 +206,6 @@ function parseMedia(v: unknown): OfferMediaTerms {
           "image_output_microusd_per_million",
           "audio_output_microusd_per_million",
           "unit_prices",
-          "text_answer",
-          "grounding",
-          "thought_images",
         ]);
   const units: Record<string, number> = {};
   if (o.unit_prices !== undefined) {
@@ -237,20 +218,7 @@ function parseMedia(v: unknown): OfferMediaTerms {
     image_output_microusd_per_million: optInt(o.image_output_microusd_per_million, "media.image_output", I64_MIN, I64_MAX),
     audio_output_microusd_per_million: optInt(o.audio_output_microusd_per_million, "media.audio_output", I64_MIN, I64_MAX),
     unit_prices: units,
-    text_answer: optVariant(o.text_answer, "media.text_answer", "one_image"),
-    grounding: optVariant(o.grounding, "media.grounding", "included"),
-    thought_images: optVariant(o.thought_images, "media.thought_images", "billed"),
   };
-}
-
-/** `OfferMediaTerms::declares_gemini_answers`. */
-export function declaresGeminiAnswers(m: OfferMediaTerms): boolean {
-  return m.text_answer !== null || m.grounding !== null || m.thought_images !== null;
-}
-
-/** `OfferMediaTerms::misplaces_gemini_answers`: said of anything but a price per image of an image API. */
-function misplacesGeminiAnswers(m: OfferMediaTerms, p: Protocol): boolean {
-  return declaresGeminiAnswers(m) && (Object.keys(m.unit_prices).length === 0 || (p !== "open_ai_image_generations" && p !== "open_ai_image_edits"));
 }
 
 const TERMS_FIELDS = [
@@ -357,7 +325,6 @@ function mediaValid(m: OfferMediaTerms, p: Protocol): boolean {
   const units = Object.entries(m.unit_prices);
   return (
     !(settlesInUnitsAlone(p) && !("*" in m.unit_prices)) &&
-    !misplacesGeminiAnswers(m, p) &&
     tokenRate(m.image_input_microusd_per_million) &&
     tokenRate(m.audio_input_microusd_per_million) &&
     tokenRate(m.image_output_microusd_per_million) &&
@@ -422,22 +389,9 @@ export function bindingHolds(e: ProviderEndpoint, t: OfferTerms): boolean {
   return e.enabled && pricesMapping(e, t);
 }
 
-/** `adapter_needs_unit_price`: a token-priced image offer on an adapter that reports image counts alone. */
-function adapterNeedsUnitPrice(e: ProviderEndpoint, t: OfferTerms): boolean {
-  return Object.keys(t.media.unit_prices).length === 0 && e.config.mappings.some((m) => m.requested_model === t.model && m.protocol === t.protocol && adapterReportsImageCounts(t.protocol, m.adapter));
-}
-
-/**
- * `through_gemini_adapter`: the offered mapping's adapter is the one serving image generation through
- * Gemini's API (`Vendor::for_adapter(adapter, ImageGeneration) == GeminiImagen`: the `gemini` label).
- */
-function throughGeminiAdapter(e: ProviderEndpoint, t: OfferTerms): boolean {
-  return e.config.mappings.find((x) => x.requested_model === t.model && x.protocol === t.protocol)?.adapter === "gemini";
-}
-
-/** `validate_record_binding` (`validate_binding`: what a per-image price covers of a Gemini answer is said of a Gemini adapter's image route only). */
+/** `validate_record_binding`. */
 export function recordBindingHolds(e: ProviderEndpoint, r: OfferVersion): boolean {
-  return bindingHolds(e, r.terms) && !adapterNeedsUnitPrice(e, r.terms) && !(declaresGeminiAnswers(r.terms.media) && !throughGeminiAdapter(e, r.terms)) && e.workspace_id === r.workspace_id;
+  return bindingHolds(e, r.terms) && e.workspace_id === r.workspace_id;
 }
 
 /** `current_pass`: the newest evidence of an offer's pair when it is a current pass of the endpoint as it is now. */

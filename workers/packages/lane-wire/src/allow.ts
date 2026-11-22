@@ -81,10 +81,16 @@ export const RELEASE_DETAIL_FIELDS: readonly Field[] = Object.freeze([
   { name: "silence_ms", kind: "uint_nullable" },
 ]);
 
+/**
+ * The usage kinds a lane's request settles under: @gray/ledger-keys `USAGE_KINDS` without `vm_hosting`, the console's
+ * prepaid VM charges, which no lane request is (workers/console/src/lane-stack/vm-billing.ts).
+ */
+const LANE_USAGE_KINDS = ["completion", "video"] as const satisfies readonly (typeof USAGE_KINDS)[number][];
+
 /** Every field of the settlement's meta, in a fixed order. */
 export const SETTLE_META_FIELDS: readonly Field[] = Object.freeze([
   { name: "request_id", kind: "id" },
-  // The ledger's usage kind (@gray/ledger-keys `USAGE_KINDS`): `completion`, or `video` for a video job the entry
+  // The ledger's usage kind (LANE_USAGE_KINDS): `completion`, or `video` for a video job the entry
   // settles (docs/design/standard-media-at-entry.md section 2.7), as the API Worker's job records it.
   { name: "kind", kind: "usage_kind" },
   { name: "evidence", kind: "evidence" },
@@ -138,7 +144,7 @@ function base(kind: FieldKind): z.ZodType {
     case "true":
       return z.literal(true);
     case "usage_kind":
-      return z.enum(USAGE_KINDS);
+      return z.enum(LANE_USAGE_KINDS);
     case "video":
       return z.literal("video");
     case "worst_case":
@@ -199,7 +205,7 @@ function wireValue(field: Field, value: unknown): unknown {
     case "true":
       return value === true ? true : undefined;
     case "usage_kind":
-      return typeof value === "string" && (USAGE_KINDS as readonly string[]).includes(value) ? value : undefined;
+      return typeof value === "string" && (LANE_USAGE_KINDS as readonly string[]).includes(value) ? value : undefined;
     case "video":
       return value === "video" ? "video" : undefined;
     case "worst_case":

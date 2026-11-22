@@ -198,8 +198,12 @@ export function codeFailure(code: string): AttemptFailure {
 
 /**
  * Defect codes an answer of the provider's fails with (`implicates_provider`'s protocol failures). A text answer past
- * its answer limit is Gray's own limit (relay.ts `LimitSource`), not counted, so it never comes here; the limit codes
- * stand for a model API's answer past its media limit, which stays the provider's.
+ * its answer limit is Gray's own limit (relay.ts `LimitSource`), which its circuit does not count, so it never comes
+ * here; a buffered one past the bytes its output cap allows (`upstream_answer_exceeds_limit`) is evidence of its own
+ * (`pastOutputLimit`), and listed so gray-jobs' copy may count it (jobs/src/traffic-evidence.ts). The limit codes
+ * stand for a model API's answer past its media limit, which stays the provider's. An answer whose usage reports more
+ * output than the request's cap plus its route's output allowance (`upstream_usage_exceeds_limit`) is a route that
+ * did not honour the cap (docs/api-provider-standard.en.md, 2.4), the failure the output-cap checks look for.
  */
 const PROVIDER_DEFECTS: ReadonlySet<string> = new Set([
   "upstream_attempt_failed",
@@ -216,6 +220,8 @@ const PROVIDER_DEFECTS: ReadonlySet<string> = new Set([
   "upstream_stream_empty",
   "upstream_usage_missing",
   "billing_usage_invalid",
+  "upstream_usage_exceeds_limit",
+  "upstream_answer_exceeds_limit",
   "invalid_upstream_response",
 ]);
 
@@ -307,6 +313,16 @@ export class RequestEvidence {
   /** An image route's upstream drew no image for the same request a second time, saying each time to send it again (`drew_no_image_again`). */
   drewNoImageAgain(attempt: AttemptEvidence, at: number): void {
     this.buffer.note(attempt.binding, ["provider_failure"], at);
+  }
+
+  /**
+   * A buffered answer of `attempt` passed the bytes its request's output limit allows (`upstream_answer_exceeds_limit`,
+   * `past_output_limit`): its route did not honour the cap, as an answer whose usage passes it
+   * (`upstream_usage_exceeds_limit`) did not. Its circuit
+   * counts nothing (the cut is Gray's limit), so it comes here and not through `failed`. Once per endpoint and request.
+   */
+  pastOutputLimit(attempt: AttemptEvidence, at: number): void {
+    if (this.first(attempt)) this.buffer.note(attempt.binding, ["provider_failure"], at);
   }
 
   /** A billed answer of an API that is no text generation (`answered`): evidence of its base check alone. */

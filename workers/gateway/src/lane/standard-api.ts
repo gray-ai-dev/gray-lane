@@ -16,7 +16,7 @@ import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 /**
  * The standard APIs the confidential entry serves itself (docs/design/standard-media-at-entry.md section 2):
  * embeddings, rerank, image generations and edits, speech, transcriptions, translations, video creation and System
- * One, on a provider's own API (an endpoint route with no adapter), as it serves chat on one. This module holds what is
+ * One, on a provider's own API (an endpoint route), as it serves chat on one. This module holds what is
  * the entry's own of such a request; the request path is `ModelApiRun`'s (apis.ts), with the lane's dependencies.
  *
  * - The body. JSON is read whole within the lane's body cap. A form is read whole within LANE_FORM_MAX_BYTES and held
@@ -145,12 +145,8 @@ export async function readEntryBody(request: Request, protocol: Protocol, form: 
   const bytes = read.body.bytes;
   share.holdBody(bytes.length, limits.pooledBytes);
   held(bytes.length);
-  // The fields and the file heads, by the parser the API Worker reads a form with (form.ts): no file's bytes are copied.
-  const parsed = await readForm(
-    { headers: new Headers({ "content-type": contentType, "content-length": String(bytes.length) }), body: viewsOf(bytes, ENTRY_FORM_CHUNK_BYTES) },
-    { bytes: Number.MAX_SAFE_INTEGER, textBytes: limits.jsonBytes, holdBytes: Number.MAX_SAFE_INTEGER, waitMs: limits.waitMs, files: "heads" },
-    undefined,
-  );
+  // The fields and the file heads (form.ts): no file's bytes are copied.
+  const parsed = await readForm({ headers: new Headers({ "content-type": contentType, "content-length": String(bytes.length) }), body: viewsOf(bytes, ENTRY_FORM_CHUNK_BYTES) }, { textBytes: limits.jsonBytes, waitMs: limits.waitMs });
   if (!parsed.ok) return letGo(parsed.error);
   return { kind: "form", bytes, contentType, parts: parsed.form.parts };
 }

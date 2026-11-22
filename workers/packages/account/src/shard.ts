@@ -46,16 +46,18 @@ import {
   type ShardBooks,
   type OpenView,
   type Outcome,
+  MAX_CHARGE_CHECKPOINTS,
   type PoolId,
   type PoolReport,
   type PushMessage,
   type RecallReport,
   type ReleaseResult,
+  type ReportedCharges,
   type SettleResult,
   type Snapshot,
   type SpendNow,
 } from "./protocol.ts";
-import { MAX_CLOCK_SKEW_MS, startClass } from "./root.ts";
+import { compactCheckpoints, MAX_CLOCK_SKEW_MS, startClass } from "./root.ts";
 import { checkCompletion, completionOutcome, type PriorClose } from "./rules.ts";
 import { chainStep, isHex32, leafOfItem, ZERO_HASH, type Keccak256 } from "./segments.ts";
 import type { AccountSettings } from "./settings.ts";
@@ -190,6 +192,14 @@ interface LeaseBody {
    * (ShardDeps.keccak256). Absent in rows written before it existed, and in a shard that keeps none.
    */
   chain?: string;
+  /**
+   * Rolling unreported charge checkpoints `(seq, chain, settled)` recorded in `flush()` since `reported`,
+   * sent on exchanges/recalls/books and pruned once acknowledged by the root so `RootEntries` can slice
+   * cleanly at `<= MAX_ENTRY_AMOUNT_MICRO` even when a shard settles multiple charges before exchanging.
+   */
+  chargeCheckpoints?: ReportedCharges[];
+  /** Entry ceiling learned from `ExchangeResponse.maxEntryAmountMicro`, used to size local compaction. */
+  maxEntryAmountMicro?: number;
   /** Settled money the root has recorded (production change 1: the catch-up after a restart reports the rest). */
   reported: number;
   /** The last batch handed to the projection queue. */
@@ -2211,7 +2221,7 @@ export class AccountShard {
         pools: this.pools.durableAfterFlush(),
         settled: add(this.durable.settled, total, "settled"),
         chargeSeq: this.durable.chargeSeq + charges,
-        ...(this.keccak !== null ? { chain: this.chainAfter(items) } : {}),
+        ...(this.keccak !== null ? this.advanceCharges(items) : {}),
         nextBatch: seq + 1,
         lastBatchAt: at,
         busy: this.open.size > 0 ? 1 : 0,
@@ -2263,14 +2273,26 @@ export class AccountShard {
   }
 
   /**
-   * The hash chain after the charges among `items`, which are in charge order, continuing from the
-   * chain the last batch wrote (segments.ts): one keccak256 per charge, no row of its own.
+   * The hash chain and rolling unreported checkpoints after the charges among `items`, which are in
+   * charge order, continuing from the chain the last batch wrote (segments.ts): one keccak256 per charge,
+   * stored on the lease row so the root can slice across `MAX_ENTRY_AMOUNT_MICRO` even if multiple charges
+   * settle before the next exchange.
    */
-  private chainAfter(items: readonly BatchItem[]): string {
+  private advanceCharges(items: readonly BatchItem[]): { readonly chain: string; readonly chargeCheckpoints?: ReportedCharges[] } {
     const keccak = this.keccak!;
     let chain = this.durable.chain ?? ZERO_HASH;
-    for (const i of items) if (i.outcome === "charged" && i.chargeSeq !== null) chain = chainStep(keccak, chain, leafOfItem(keccak, this.address, i));
-    return chain;
+    let settled = this.durable.settled;
+    const history: ReportedCharges[] = this.durable.chargeCheckpoints ? [...this.durable.chargeCheckpoints] : [];
+    for (const i of items) {
+      if (i.outcome !== "charged" || i.chargeSeq === null) continue;
+      chain = chainStep(keccak, chain, leafOfItem(keccak, this.address, i));
+      settled = add(settled, i.amount, "settled");
+      if (history.length === 0 || history[history.length - 1]!.seq < i.chargeSeq) {
+        history.push({ seq: i.chargeSeq, chain, settled });
+      }
+    }
+    const compacted = history.length > MAX_CHARGE_CHECKPOINTS ? compactCheckpoints(history, this.durable.maxEntryAmountMicro ?? null) : history;
+    return compacted.length > 0 ? { chain, chargeCheckpoints: compacted } : { chain };
   }
 
   /** Where the written charges stand (protocol.ts ChargePoint), from the lease row; null without a chain. */
@@ -2652,6 +2674,7 @@ export class AccountShard {
       version: snap?.version ?? 0,
       settled: this.durable.settled,
       charges: this.chargePoint(),
+      ...(this.keccak !== null && this.durable.chargeCheckpoints && this.durable.chargeCheckpoints.length > 0 ? { chargeCheckpoints: this.durable.chargeCheckpoints } : {}),
       pools,
       rate: this.admits.perSecond(now),
       ...(this.durable.incarnation ? { incarnation: this.durable.incarnation } : {}),
@@ -2668,6 +2691,14 @@ export class AccountShard {
     // Covers arrive inside the discount pool's grant: the overdraft they paid stays used.
     for (const [pool, g] of Object.entries(r.pools)) if (this.pools.applyGranted(pool, g.granted) > 0) this.short.delete(pool);
     this.durable.reported = Math.max(this.durable.reported, r.settled);
+    if (r.maxEntryAmountMicro !== undefined && Number.isFinite(r.maxEntryAmountMicro) && r.maxEntryAmountMicro > 0) {
+      this.durable.maxEntryAmountMicro = Math.floor(r.maxEntryAmountMicro);
+    }
+    if (this.durable.chargeCheckpoints && this.durable.chargeCheckpoints.length > 0) {
+      const remaining = this.durable.chargeCheckpoints.filter((cp) => cp.settled > this.durable.reported);
+      if (remaining.length > 0) this.durable.chargeCheckpoints = remaining;
+      else delete this.durable.chargeCheckpoints;
+    }
     if (r.snapshot && (this.snapshot === null || r.snapshot.version > this.snapshot.version)) this.applySnapshot(r.snapshot);
     if (this.snapshot && r.version === this.snapshot.version) this.durable.confirmedAt = now;
     this.durable.callInDoubt = 0;
@@ -2826,7 +2857,12 @@ export class AccountShard {
       const d = this.pools.durable.get(pool);
       if (d) pools[pool] = { granted: d.granted, returned: d.returned, used: d.used };
     }
-    return { pools, settled: this.durable.settled, charges: this.chargePoint() };
+    return {
+      pools,
+      settled: this.durable.settled,
+      charges: this.chargePoint(),
+      ...(this.keccak !== null && this.durable.chargeCheckpoints && this.durable.chargeCheckpoints.length > 0 ? { chargeCheckpoints: this.durable.chargeCheckpoints } : {}),
+    };
   }
 
   /**
@@ -2858,6 +2894,7 @@ export class AccountShard {
       version: this.snapshot?.version ?? 0,
       settled: this.durable.settled,
       charges: this.chargePoint(),
+      ...(this.keccak !== null && this.durable.chargeCheckpoints && this.durable.chargeCheckpoints.length > 0 ? { chargeCheckpoints: this.durable.chargeCheckpoints } : {}),
       ...(this.durable.nextBatch > 1 ? { lastBatch: this.durable.nextBatch - 1 } : {}),
       ...(this.durable.chargeSeq > 0 ? { lastChargeSeq: this.durable.chargeSeq } : {}),
       pools,

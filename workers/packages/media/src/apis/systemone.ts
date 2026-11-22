@@ -5,10 +5,8 @@
  * answers under a new one).
  */
 import { type Json, get, isObject } from "@gray/json";
-import { type Billed, apiError, billedBy, checkMetered, invalid, jsonModel, missing, strictJson, tokenUsage } from "./common.ts";
-import type { Answered } from "./images.ts";
-import { readUpstream } from "./read.ts";
-import { type ApiRequest, type MediaRoute, type Received, UNBOUNDED } from "./types.ts";
+import { type Billed, apiError, billedBy, checkMetered, invalid, jsonModel, missing, tokenUsage } from "./common.ts";
+import { type ApiRequest, type Received, UNBOUNDED } from "./types.ts";
 
 const FIELDS = ["model", "state", "questions", "stream"];
 
@@ -29,16 +27,10 @@ export function decodeSystemOne(received: Received): ApiRequest {
   return { model, stream: false, selectors: [], bound: UNBOUNDED, body: { kind: "json", value: body } };
 }
 
-export interface SystemOneAttempt {
-  readonly billsUnits: boolean;
-  readonly deadlineMs: number;
-  readonly responseBytes: number;
-}
-
 /**
- * The checks and metering of a System One answer (`respond`, on the parsed answer or on a streamed
- * answer's projection, which keeps the type of `answers` and the whole usage): an `answers` object and
- * token usage. Throws the answer's refusal as an ApiError.
+ * The checks and metering of a System One answer, on the answer's projection, which keeps the type of
+ * `answers` and the whole usage: an `answers` object and token usage. Throws the answer's refusal as
+ * an ApiError.
  */
 export function systemOneAnswer(value: Json, billsUnits: boolean): Billed {
   if (!isObject(get(value, "answers"))) throw apiError(502, "invalid_upstream_response");
@@ -47,10 +39,4 @@ export function systemOneAnswer(value: Json, billsUnits: boolean): Billed {
   const billed = billedBy(() => ({ counters: tokenUsage(usage, "input_tokens", "output_tokens"), raw: usage, unit: undefined }), usage);
   if (billed.kind === "metered") checkMetered("system_one", UNBOUNDED, billed.metered, billsUnits);
   return billed;
-}
-
-/** `respond`: an `answers` object and token usage; the body goes back as received. */
-export async function respondSystemOne(_api: ApiRequest, _route: MediaRoute, upstream: Response, attempt: SystemOneAttempt): Promise<Answered> {
-  const bytes = await readUpstream(upstream, attempt.responseBytes, attempt.deadlineMs);
-  return { body: bytes, contentType: "application/json", billed: systemOneAnswer(strictJson(bytes), attempt.billsUnits) };
 }

@@ -83,8 +83,8 @@ export type Priced =
  * Whether a route may serve under its quote (`image_gate`, then `image_usage_known`, @gray/snapshot
  * image-gate.ts): what the gate reads of the route is its own protocol, whether its report proved
  * `image_output` (which requires an `IMAGE` entry in `candidatesTokensDetails`) and whether its quote
- * prices image output tokens. Its route view says `image_usage_unproved`. The image APIs bill through
- * their own adapters (apis.ts) and never come here.
+ * prices image output tokens. Its route view says `image_usage_unproved`. The image APIs bill by their own
+ * meters (apis.ts) and never come here.
  */
 export function imageUsageKnown(record: RouteRecord): boolean {
   return imageGate(record.protocol, (record.proved ?? []).includes("image_output"), record.quote.media.imageOutput !== null);

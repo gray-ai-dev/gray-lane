@@ -6,6 +6,7 @@ import {
   DISCOUNT,
   isKeyScoped,
   isSharePool,
+  MAX_CHARGE_CHECKPOINTS,
   parseExchange,
   parsePoolId,
   parsePutKey,
@@ -13,11 +14,13 @@ import {
   parseTopUpIds,
   rpmWindowStart,
   SPEND,
+  type ChargePoint,
   type Closed,
   type ExchangeResponse,
   type Handover,
   type Incarnation,
   parseBooks,
+  type ReportedCharges,
   type ShardBooks,
   type KeyConfig,
   type PoolGrant,
@@ -91,6 +94,12 @@ export interface RootDeps {
    * hourly entries then (their sealed points are gone with the storage).
    */
   readonly onStartedOver?: (at: number) => void;
+  /**
+   * The on-chain entry ceiling (MAX_ENTRY_AMOUNT_MICRO), or a reader for it. When set (> 0), it sizes
+   * checkpoint coalescing (`compactCheckpoints` uses half the ceiling) and is sent to shards on
+   * `ExchangeResponse` so shard-side unreported charge checkpoints coalesce to the same bound.
+   */
+  readonly maxEntryAmountMicro?: number | (() => number);
 }
 
 /**
@@ -168,6 +177,12 @@ interface LeaseRow {
    * hourly entries (segments.ts). Absent until a shard that keeps a chain reports.
    */
   charges?: ReportedCharges | null;
+  /**
+   * Rolling monotonic checkpoints `(seq, settled, chain)` reported by the shard (always ending at
+   * `charges`), used by `RootEntries` to slice unsealed charges at `<= MAX_ENTRY_AMOUNT_MICRO`
+   * across multiple entries. Pruned once earlier entries confirm on chain.
+   */
+  chargeHistory?: ReportedCharges[];
   /** Overdraft paid from the balance; included in the discount pool's `granted`. */
   covered: number;
   /** The shard reported more used and returned than it was granted: no grants until an operator looks. */
@@ -188,17 +203,18 @@ interface LeaseRow {
   version?: number;
 }
 
-/** A shard's charges as one report stated them: charges 1..seq, their chain, and the money settled with them. */
-export interface ReportedCharges {
-  readonly seq: number;
-  readonly chain: string;
-  readonly settled: number;
-}
-
 /** A shard's reported charges, by shard (AccountRoot `chargePoints`). */
 export interface ShardCharges extends ReportedCharges {
   readonly shard: ShardAddress;
   readonly name: string;
+}
+
+/** A shard's latest reported charges plus its rolling slice checkpoints (AccountRoot `chargeCheckpoints`). */
+export interface ShardChargeCheckpoints {
+  readonly shard: ShardAddress;
+  readonly name: string;
+  readonly latest: ReportedCharges;
+  readonly checkpoints: readonly ReportedCharges[];
 }
 
 interface RegionState {
@@ -316,6 +332,7 @@ export class AccountRoot {
   async exchange(raw: unknown): Promise<ExchangeResponse> {
     const req = parseExchange(raw);
     if (req.shard.workspace !== this.meta.workspace) throw new InvalidInput("shard.workspace", "belongs to another workspace");
+    this.refusedCheckpoints(shardName(req.shard), "exchange", req.chargeCheckpointsRefused);
     const whole = !this.meta.rebuilding;
     const first = this.step(req, null);
     // A rebuild this report started asks every other shard address for its books, once, in the background (`probe`); the
@@ -456,7 +473,7 @@ export class AccountRoot {
     row.settled = Math.max(row.settled, req.settled);
     if (req.lastBatch !== undefined) row.lastBatch = Math.max(row.lastBatch ?? 0, req.lastBatch);
     if (req.lastChargeSeq !== undefined || req.charges) row.lastChargeSeq = Math.max(row.lastChargeSeq ?? 0, req.lastChargeSeq ?? 0, req.charges?.seq ?? 0);
-    if (req.charges) this.mergeCharges(row, { seq: req.charges.seq, chain: req.charges.chain, settled: req.settled });
+    if (req.charges) this.mergeChargeReport(row, req.charges, req.settled, req.chargeCheckpoints);
     if (!stale) {
       row.epoch = req.epoch;
       row.call = req.call;
@@ -486,9 +503,11 @@ export class AccountRoot {
         if (want === 0) continue;
         const kind = parsePoolId(pool);
         let grant = 0;
-        if (kind?.kind === "spend") grant = Math.min(want, Math.max(0, meta.balance - spendCommitted(leases)));
-        else if (kind?.kind === "discount") grant = Math.min(want, Math.max(0, meta.exposure - discountCommitted(leases)));
-        else if (isKeyScoped(kind)) {
+        if (kind?.kind === "spend") {
+          grant = Math.min(want, Math.max(0, meta.balance - spendCommitted(leases)));
+        } else if (kind?.kind === "discount") {
+          grant = Math.min(want, Math.max(0, meta.exposure - discountCommitted(leases)));
+        } else if (isKeyScoped(kind)) {
           // A key's limit is leased like the allowance (docs/cloudflare-native.md 4.1): what is granted
           // over all shards and regions never passes the limit; what waits is served first.
           grant = limitGrant({ want, need, free: this.limitFree(kind, pool, leases, now), percent: this.settings.limitGrantPercent });
@@ -508,6 +527,7 @@ export class AccountRoot {
   private answer(row: LeaseRow, meta: RootMeta, req: ExchangeRequest, rebuilding: boolean): ExchangeResponse {
     const pools: Record<PoolId, PoolGrant> = {};
     for (const [pool, p] of Object.entries(row.pools)) pools[pool] = { granted: p.granted, returned: p.returned, used: p.used };
+    const maxEntryAmountMicro = this.entryCap();
     return {
       // While rebuilding no version is confirmed (0 is none a shard holds) and no snapshot sent: the key list is not whole.
       version: rebuilding ? 0 : meta.version,
@@ -517,6 +537,7 @@ export class AccountRoot {
       pools,
       ...(row.handover ? { handover: row.handover } : {}),
       ...(rebuilding ? { rebuilding: true as const } : {}),
+      ...(maxEntryAmountMicro !== null ? { maxEntryAmountMicro } : {}),
     };
   }
 
@@ -559,7 +580,6 @@ export class AccountRoot {
       lastSeenAt: now,
       rate: req.rate,
       settled: req.settled,
-      ...(req.charges ? { charges: { seq: req.charges.seq, chain: req.charges.chain, settled: req.settled } } : {}),
       ...(req.lastBatch !== undefined ? { lastBatch: req.lastBatch } : {}),
       ...(req.lastChargeSeq !== undefined || req.charges ? { lastChargeSeq: Math.max(req.lastChargeSeq ?? 0, req.charges?.seq ?? 0) } : {}),
       covered: pools[DISCOUNT]?.used ?? 0,
@@ -568,6 +588,7 @@ export class AccountRoot {
       ...(req.incarnation ? { incarnation: req.incarnation } : {}),
       version: req.version,
     };
+    if (req.charges) this.mergeChargeReport(row, req.charges, req.settled, req.chargeCheckpoints);
     leases.set(name, row);
     const meta = clone(this.meta);
     if (meta.home === undefined || meta.home === null) meta.home = req.home;
@@ -603,6 +624,7 @@ export class AccountRoot {
         return;
       }
       answered.add(n);
+      this.refusedCheckpoints(n, "books", books.chargeCheckpointsRefused);
       if (this.recordBooks(leases, parseShardName(n)!, books)) changed.add(n);
     });
     const rebuilding = this.meta.rebuilding;
@@ -622,13 +644,12 @@ export class AccountRoot {
       if (!history) return false;
       const pools: Record<PoolId, PoolRow> = {};
       for (const [pool, p] of Object.entries(books.pools)) if (p.granted + p.returned + p.used > 0) pools[pool] = { ...p };
-      leases.set(name, {
+      const row: LeaseRow = {
         shard,
         epoch: books.epoch,
         lastSeenAt: this.deps.clock(),
         rate: 0,
         settled: books.settled,
-        ...(books.charges ? { charges: { seq: books.charges.seq, chain: books.charges.chain, settled: books.settled } } : {}),
         ...(books.lastBatch !== undefined ? { lastBatch: books.lastBatch } : {}),
         ...(books.lastChargeSeq !== undefined || books.charges ? { lastChargeSeq: Math.max(books.lastChargeSeq ?? 0, books.charges?.seq ?? 0) } : {}),
         covered: pools[DISCOUNT]?.used ?? 0,
@@ -636,7 +657,11 @@ export class AccountRoot {
         pools,
         ...(books.incarnation ? { incarnation: books.incarnation } : {}),
         version: books.version,
-      });
+      };
+      // The shard's unreported checkpoints too, as `adoptReport` takes them: without them the root holds only the
+      // latest point, and an unsealed span past MAX_ENTRY_AMOUNT_MICRO cannot be cut until the shard reports again.
+      if (books.charges) this.mergeChargeReport(row, books.charges, books.settled, books.chargeCheckpoints);
+      leases.set(name, row);
       return true;
     }
     const row = clone(prior);
@@ -650,7 +675,7 @@ export class AccountRoot {
     if (books.lastBatch !== undefined) row.lastBatch = Math.max(row.lastBatch ?? 0, books.lastBatch);
     if (books.lastChargeSeq !== undefined || books.charges) row.lastChargeSeq = Math.max(row.lastChargeSeq ?? 0, books.lastChargeSeq ?? 0, books.charges?.seq ?? 0);
     row.version = Math.max(row.version ?? 0, books.version);
-    if (books.charges) this.mergeCharges(row, { seq: books.charges.seq, chain: books.charges.chain, settled: books.settled });
+    if (books.charges) this.mergeChargeReport(row, books.charges, books.settled, books.chargeCheckpoints);
     leases.set(name, row);
     return true;
   }
@@ -696,13 +721,39 @@ export class AccountRoot {
     return grew;
   }
 
+  /** Configured on-chain entry ceiling (MAX_ENTRY_AMOUNT_MICRO), or null when unconfigured. */
+  private entryCap(): number | null {
+    const raw = typeof this.deps.maxEntryAmountMicro === "function" ? this.deps.maxEntryAmountMicro() : this.deps.maxEntryAmountMicro;
+    if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return null;
+    return Math.floor(raw);
+  }
+
   /**
-   * Keeps the furthest report of a shard's charges. A shard's charge numbers, chain and settled money
-   * only move forward together (one write of its lease row), and every charge is at least 1 micro-USD
-   * (a settlement of 0 is free, not a charge), so a report with more charges and more money replaces
-   * the one kept and an older one changes nothing. More charges for no more money, or the same charge
-   * number with another chain or another amount, is a shard that rewrote its charges: reported, never
-   * taken.
+   * A shard's checkpoints left out of a report because they did not read (protocol.ts `reportedCheckpoints`): the
+   * report is taken without them, and this says so. Its money, grants and latest charges still count. The shard drops
+   * its points once the answer records its settled money, so sealing cuts at the points the root holds; a span past
+   * MAX_ENTRY_AMOUNT_MICRO it cannot cut halts sealing as before (`segment_over_entry_cap`).
+   */
+  private refusedCheckpoints(shard: string, via: "exchange" | "books" | "recall", why: string | undefined): void {
+    if (why !== undefined) this.log({ level: "alert", event: "shard_charge_checkpoints_refused", shard, via, message: why });
+  }
+
+  /** Merges optional intermediate checkpoints reported by a shard before merging its latest charge point. */
+  private mergeChargeReport(row: LeaseRow, latest: ChargePoint, settled: number, checkpoints?: readonly ReportedCharges[]): void {
+    if (checkpoints) {
+      for (const cp of checkpoints) this.mergeCharges(row, cp);
+    }
+    this.mergeCharges(row, { seq: latest.seq, chain: latest.chain, settled });
+  }
+
+  /**
+   * Keeps the furthest report of a shard's charges and appends rolling monotonic checkpoints so
+   * `RootEntries` can slice unsealed usage across multiple entries at `<= MAX_ENTRY_AMOUNT_MICRO`.
+   * A shard's charge numbers, chain and settled money only move forward together (one write of its
+   * lease row), and every charge is at least 1 micro-USD (a settlement of 0 is free, not a charge),
+   * so a report with more charges and more money replaces the one kept and an older one changes
+   * nothing. More charges for no more money, or the same charge number with another chain or another
+   * amount, is a shard that rewrote its charges: reported, never taken.
    */
   private mergeCharges(row: LeaseRow, report: ReportedCharges): void {
     const kept = row.charges ?? null;
@@ -710,6 +761,13 @@ export class AccountRoot {
       if (kept !== null && report.settled - kept.settled < report.seq - kept.seq) {
         this.log({ level: "alert", event: "shard_charges_went_back", shard: shardName(row.shard), seq: report.seq, settled: report.settled, kept });
         return;
+      }
+      const history: ReportedCharges[] = row.chargeHistory ? [...row.chargeHistory] : kept !== null ? [kept] : [];
+      if (history.length === 0 || history[history.length - 1]!.seq < report.seq) history.push(report);
+      if (history.length > MAX_CHARGE_CHECKPOINTS) {
+        row.chargeHistory = compactCheckpoints(history, this.entryCap());
+      } else {
+        row.chargeHistory = history;
       }
       row.charges = report;
       return;
@@ -786,7 +844,9 @@ export class AccountRoot {
         return;
       }
       try {
-        if (this.recordRecall(t.shard, parseRecallReport(r.value))) back = true;
+        const report = parseRecallReport(r.value);
+        this.refusedCheckpoints(shardName(t.shard), "recall", report.chargeCheckpointsRefused);
+        if (this.recordRecall(t.shard, report)) back = true;
       } catch (err) {
         this.log({ level: "alert", event: "recall_report_refused", shard: shardName(t.shard), message: String(err) });
       }
@@ -810,7 +870,7 @@ export class AccountRoot {
       if (this.mergePool(row, pool, rep)) back = true;
     }
     row.settled = Math.max(row.settled, report.settled);
-    if (report.charges) this.mergeCharges(row, { seq: report.charges.seq, chain: report.charges.chain, settled: report.settled });
+    if (report.charges) this.mergeChargeReport(row, report.charges, report.settled, report.chargeCheckpoints);
     for (const n of this.absorb(leases, this.meta.balance, name)) changed.add(n);
     const meta = clone(this.meta);
     this.publish(meta, leases, this.deps.clock());
@@ -1086,6 +1146,38 @@ export class AccountRoot {
     return out;
   }
 
+  /**
+   * Every shard's latest reported charges and its rolling checkpoints `(seq, settled, chain)` in name
+   * order: what `RootEntries` reads so it can slice unsealed charges across entries at or below
+   * `MAX_ENTRY_AMOUNT_MICRO`.
+   */
+  chargeCheckpoints(): ShardChargeCheckpoints[] {
+    const out: ShardChargeCheckpoints[] = [];
+    for (const [name, r] of [...this.leases].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      if (!r.charges) continue;
+      const raw = r.chargeHistory && r.chargeHistory.length > 0 ? r.chargeHistory : [r.charges];
+      const checkpoints = raw[raw.length - 1]!.seq === r.charges.seq ? raw : [...raw, r.charges];
+      out.push({ shard: r.shard, name, latest: r.charges, checkpoints });
+    }
+    return out;
+  }
+
+  /**
+   * Drops rolling charge checkpoints up through `throughSeq` once their entry has confirmed on chain,
+   * keeping `row.charges` intact. Safe to call repeatedly.
+   */
+  pruneChargeCheckpoints(shard: string, throughSeq: number): void {
+    const prior = this.leases.get(shard);
+    if (!prior || !prior.chargeHistory || prior.chargeHistory.length === 0) return;
+    const filtered = prior.chargeHistory.filter((cp) => cp.seq > throughSeq);
+    const nextHistory = filtered.length > 0 ? filtered : prior.charges ? [prior.charges] : [];
+    if (nextHistory.length === prior.chargeHistory.length) return;
+    const row = clone(prior);
+    row.chargeHistory = nextHistory;
+    this.ctx.storage.transactionSync(() => this.writeLease(shard, row));
+    this.leases.set(shard, row);
+  }
+
   balance(): RootBalance {
     const settled = [...this.leases.values()].reduce((s, r) => s + r.settled, 0);
     const committed = spendCommitted(this.leases);
@@ -1260,6 +1352,51 @@ export class AccountRoot {
   private writeMeta(meta: RootMeta): void {
     this.sql.exec("INSERT INTO meta (id, body) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body", JSON.stringify(meta));
   }
+}
+
+/**
+ * Coalesces redundant intermediate checkpoints when a shard accumulates many small exchanges before an
+ * entry confirms: anchors at `history[0]` and merges adjacent checkpoints whose combined span stays
+ * within half of `stepCap` (so any gap before `history[0]` plus one coalesced interval stays within
+ * `maxEntryAmountMicro`, even after high prior lifetime `settled`), always preserving the first and
+ * final checkpoints and both sides of any single jump larger than the coalescing span.
+ */
+export function compactCheckpoints(history: readonly ReportedCharges[], stepCap: number | null): ReportedCharges[] {
+  if (history.length <= MAX_CHARGE_CHECKPOINTS) return [...history];
+  const out: ReportedCharges[] = [];
+  if (stepCap !== null && stepCap > 0) {
+    const span = Math.max(1, Math.floor(stepCap / 2));
+    const first = history[0]!;
+    out.push(first);
+    let baseSettled = first.settled;
+    let candidate: ReportedCharges | null = null;
+    for (let i = 1; i < history.length; i++) {
+      const next = history[i]!;
+      if (next.settled - baseSettled <= span) {
+        candidate = next;
+        continue;
+      }
+      if (candidate !== null) {
+        out.push(candidate);
+        baseSettled = candidate.settled;
+        if (next.settled - baseSettled <= span) {
+          candidate = next;
+          continue;
+        }
+      }
+      out.push(next);
+      baseSettled = next.settled;
+      candidate = null;
+    }
+    if (candidate !== null) out.push(candidate);
+    if (out.length <= MAX_CHARGE_CHECKPOINTS) return out;
+  }
+  const src = out.length > 0 ? out : history;
+  const trimmed: ReportedCharges[] = [src[0]!];
+  const stride = Math.ceil((src.length - 1) / (MAX_CHARGE_CHECKPOINTS - 1));
+  for (let i = stride; i < src.length - 1; i += stride) trimmed.push(src[i]!);
+  trimmed.push(src[src.length - 1]!);
+  return trimmed;
 }
 
 /** Whether a shard's report holds anything only a root can have given it: a grant, or what came of one. */

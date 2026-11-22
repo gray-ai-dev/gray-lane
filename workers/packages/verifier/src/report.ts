@@ -5,7 +5,7 @@ import { z } from "zod";
 import { CHECK_KINDS, CLAIMS, OUTCOME_CODES, VERIFICATION_STATUSES, answersBuffered, claimOf, isOutputCap, isStreamingCheck, provesCapability, provesStreaming, type CheckKind, type Claim, type OutcomeCode, type VerificationStatus } from "./outcome.ts";
 import { parsePlain } from "@gray/json";
 import { F64, structJson, type StructValue } from "./struct-json.ts";
-import { checksCacheTtl, requiredChecks, targetFingerprint, type ProbeTarget } from "./target.ts";
+import { checksApiStreaming, checksCacheTtl, requiredChecks, targetFingerprint, type ProbeTarget } from "./target.ts";
 
 /**
  * A probe run's signed evidence (crates/gray-verifier/src/lib.rs `ProbeReport` and its parts,
@@ -368,6 +368,16 @@ export function provenStreaming(checks: readonly CheckResult[], requireUsage: bo
 }
 
 /**
+ * `proven_api_streaming`: the streamed form of a media API's contract check proved (`streaming_api_contract`), which a
+ * mapping that declared streaming is asked: serving sends a streamed request of that API only to such a route. It is
+ * a capability of the route, never its streamed basic check: the route's status and its buffered requests stand on its
+ * contract check alone (`routeStatus`).
+ */
+export function provenApiStreaming(checks: readonly CheckResult[], requireUsage: boolean): boolean {
+  return checks.some((c) => c.kind === "streaming_api_contract" && proved(c, requireUsage));
+}
+
+/**
  * `caps_proved`: every output-cap check of one mode in `checks` proved (clause 2.4 of the API standard: a Chat route
  * honors both cap fields). True for a report with none, so a report recorded before the checks existed proves what it
  * did.
@@ -502,7 +512,12 @@ export async function admissible(r: ProbeReport, nowMs: number, required: Capabi
   const planned = requiredChecks(e.protocol, r.manifest.required_capabilities, r.manifest.require_streaming);
   const checks = r.manifest.checks;
   const samePlan = (a: readonly CheckKind[], b: readonly CheckKind[]) => a.length === b.length && a.every((k, i) => k === b[i]);
-  const planOk = samePlan(checks, planned) || (checksCacheTtl(e.protocol, true) && checks.at(-1) === "cache_ttl" && samePlan(checks.slice(0, -1), planned));
+  // A declaration adds its one check at the plan's end (`plannedChecks`); the target's fingerprint binds which.
+  const declaredTail = (kind: CheckKind, applies: boolean) => applies && checks.at(-1) === kind && samePlan(checks.slice(0, -1), planned);
+  const planOk =
+    samePlan(checks, planned) ||
+    declaredTail("cache_ttl", checksCacheTtl(e.protocol, true)) ||
+    declaredTail("streaming_api_contract", checksApiStreaming(e.protocol, true, r.manifest.require_streaming));
   if (!planOk || r.checks.length === 0 || r.checks.length !== checks.length) return false;
   if (!r.checks.every((c, i) => c.kind === checks[i])) return false;
   const requireUsage = r.manifest.require_usage;
@@ -581,7 +596,8 @@ export function provenOf(checks: readonly CheckResult[], requireUsage: boolean, 
   return {
     capabilities: provenCapabilities(checks, requireUsage, requireStreaming),
     buffered: provenBuffered(checks, requireUsage),
-    streaming: provenStreaming(checks, requireUsage),
+    // The route streams: its streamed basic check proved, or, on a media API, the streamed form of its contract check.
+    streaming: provenStreaming(checks, requireUsage) || provenApiStreaming(checks, requireUsage),
     cache_ttl: checks.some((c) => c.kind === "cache_ttl" && proved(c, requireUsage)),
     modes: provenModes(checks, requireUsage, requireStreaming),
   };

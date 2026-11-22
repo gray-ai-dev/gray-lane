@@ -238,8 +238,6 @@ export function endpointRoutePath(url: string, target: EndpointRouteTarget): str
 export interface EntryRouteFacts {
   readonly auth: string;
   readonly protocol: Protocol;
-  /** The mapping's media adapter; absent in a snapshot stored before mappings carried it, which is none. */
-  readonly adapter?: string | null;
   readonly baseUrl: string;
   readonly url: string;
 }
@@ -247,7 +245,7 @@ export interface EntryRouteFacts {
 /**
  * Whether the confidential lane's entry serves an endpoint route (design section 2): `bearer` or `protocol_native`, on
  * a protocol the entry serves endpoint routes on (`ENTRY_ENDPOINT_PROTOCOLS`: Messages, Chat, Responses, Gemini and the
- * synchronous standard APIs), with no media adapter, and a base URL egress can carry whose row covers the route's URL.
+ * synchronous standard APIs), and a base URL egress can carry whose row covers the route's URL.
  * A `lane_relay` route is not an endpoint route. `protocols` is the entry's list; only the tests pass another
  * (ENTRY_MEDIA_PROTOCOLS beside it, for the video routes).
  */
@@ -256,7 +254,7 @@ export function entryEndpointRoute(
   deny: readonly string[] = ENTRY_ROUTE_DENY_SUFFIXES,
   protocols: readonly Protocol[] = ENTRY_ENDPOINT_PROTOCOLS,
 ): boolean {
-  if ((r.auth !== "bearer" && r.auth !== "protocol_native") || !protocols.includes(r.protocol) || (r.adapter ?? null) !== null) return false;
+  if ((r.auth !== "bearer" && r.auth !== "protocol_native") || !protocols.includes(r.protocol)) return false;
   const target = endpointRouteTarget(r.baseUrl, deny);
   return target !== null && endpointRoutePath(r.url, target) !== null;
 }

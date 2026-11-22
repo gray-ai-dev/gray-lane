@@ -6,21 +6,19 @@
  *
  * The state moves `queued` -> `in_progress` -> `completed` | `failed` and never leaves a terminal
  * state; every settlement is decided from the terminal state, so every settler reaches the same
- * decision. Billing moves `pending` -> `settled` | `released` once. On Workers one Workflow per job
- * polls and settles (workers/gateway/src/workflows/video-job.ts) and one Durable Object per job
- * holds this record (`VideoJobDO`); the functions here are the rules both run.
+ * decision. Billing moves `pending` -> `settled` | `released` once. The API Worker's video jobs, which ran these
+ * rules in a Workflow per job, are deleted (docs/design/standard-media-at-entry.md section 3); the confidential entry
+ * keeps its jobs behind the lane bridge with rules of its own (workers/gateway/src/lane/video-jobs.ts).
  */
 import { ApiError } from "@gray/errors";
 import { type Protocol, upstreamAuthHeaders } from "@gray/protocol";
 import { type Json, type SerdeObject, get, parseStrictBytes } from "@gray/json";
 import { checkEvidence, customerRates, parseEvidence, storedEvidence, usageCost } from "@gray/ledger-keys";
 import { sha256 } from "@noble/hashes/sha2";
-import { build, namesJob, parseSent } from "../adapters.ts";
-import type { HttpCall, Vendor, VendorJob } from "../types.ts";
-import { VIDEO_POLL_RESPONSE_BYTES, VIDEO_POLL_TIMEOUT_MS } from "../util.ts";
-import { apiError, vendorFor, vendorRequest, type Outgoing } from "./common.ts";
+import { apiError, type Outgoing } from "./common.ts";
 import { type EgressPolicy, type Fetcher, readCapped, vetUrl } from "./egress.ts";
-import { type Clock, type MediaRoute, nowUnix } from "./types.ts";
+import type { MediaRoute } from "./types.ts";
+import { VIDEO_POLL_RESPONSE_BYTES, VIDEO_POLL_TIMEOUT_MS } from "./video.ts";
 
 export type JobStatus = "queued" | "in_progress" | "completed" | "failed";
 /**
@@ -66,10 +64,8 @@ export interface VideoJob {
   readonly model: string;
   readonly endpointId: string;
   readonly providerWorkspace: string;
-  /** The mapping's vendor adapter; null for an OpenAI-compatible endpoint. */
-  readonly adapter: string | null;
   readonly upstreamModel: string;
-  /** The vendor's opaque job handle. */
+  /** The upstream's opaque job handle. */
   readonly vendorJob: string;
   readonly size: string | null;
   readonly secondsRequested: number;
@@ -226,26 +222,11 @@ export function jobUrl(route: MediaRoute, segments: readonly string[]): string |
   return url.toString();
 }
 
-/** The poll request of a job on its route: the vendor's `video_poll` call, or `GET {url}/{id}` on an OpenAI-compatible endpoint. */
-export function pollRequest(route: MediaRoute, job: VideoJob, clock: Clock): { readonly outgoing: Outgoing & { readonly body: undefined | Uint8Array }; readonly sent: HttpCall | undefined; readonly vendor: Vendor | undefined } | undefined {
-  if (job.adapter !== null) {
-    const vendor = vendorFor(route, "video_poll");
-    if (vendor === undefined) return undefined;
-    let call: HttpCall;
-    try {
-      call = build(vendor, "video_poll", job.upstreamModel, null, { id: job.vendorJob });
-    } catch {
-      return undefined;
-    }
-    try {
-      return { outgoing: vendorRequest(route, vendor, call, nowUnix(clock)), sent: call, vendor };
-    } catch {
-      return undefined;
-    }
-  }
+/** The poll request of a job on its route: `GET {url}/{id}`. */
+export function pollRequest(route: MediaRoute, job: VideoJob): (Outgoing & { readonly body: undefined }) | undefined {
   const url = jobUrl(route, [job.vendorJob]);
   if (url === undefined) return undefined;
-  return { outgoing: { url, method: "GET", headers: upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers()), body: undefined }, sent: undefined, vendor: undefined };
+  return { url, method: "GET", headers: upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers()), body: undefined };
 }
 
 /** `poll_openai`'s reading of an answer. */
@@ -280,36 +261,6 @@ export function observeOpenAi(job: VideoJob, status: number, body: Uint8Array): 
     }
     default:
       return { kind: "unknown" };
-  }
-}
-
-/**
- * `observe_vendor`: `poll_vendor`'s reading of an answer to `sent`, the poll of the job `polled`. Only an answer about
- * that job decides anything (`namesJob`): one naming another job (an earlier job's answer replayed, a vendor's mix-up
- * of two tasks) is no news, as an OpenAI-compatible poll reads an answer whose `id` is another job's (`observeOpenAi`),
- * and as the admission probe reads it (decision of 2026-10-23, release 4 item 14).
- */
-export function observeVendor(vendor: Vendor, polled: VendorJob, sent: HttpCall, status: number, body: Uint8Array): Observed {
-  if (status === 404 || status === 410) return { kind: "missing" };
-  let parsed;
-  try {
-    parsed = parseSent(vendor, "video_poll", sent, status, body);
-  } catch {
-    // Vendor errors (authentication, rate limits, internal codes) say nothing about the job itself.
-    return { kind: "unknown" };
-  }
-  if (parsed.kind !== "job" || !namesJob(vendor, polled, parsed.job)) return { kind: "unknown" };
-  switch (parsed.state.kind) {
-    case "queued":
-      return { kind: "open", running: false, progress: 0 };
-    case "running":
-      return { kind: "open", running: true, progress: 0 };
-    case "succeeded": {
-      const usage = parsed.usage;
-      return { kind: "completed", seconds: usage !== undefined && usage.unit === "seconds" ? usage.units : parsed.state.seconds };
-    }
-    case "failed":
-      return { kind: "failed", code: "video_generation_failed" };
   }
 }
 
@@ -429,12 +380,9 @@ export interface ContentLimits {
   readonly idleMs: number;
   /** Longest whole download. */
   readonly totalMs: number;
-  /** Vendor content steps (a JSON answer naming the next call) and redirects followed at most. */
+  /** Redirects followed at most. */
   readonly hops: number;
 }
-
-/** Largest JSON answer of a content step (video/content.rs `STEP_RESPONSE_LIMIT`). */
-const STEP_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 const badGateway = (code: string) => new ApiError(502, code);
 
@@ -502,7 +450,7 @@ async function mediaAnswer(fetcher: Fetcher, response: Response, requestUrl: str
   throw badGateway("upstream_content_unavailable");
 }
 
-function toRequest(outgoing: Outgoing & { readonly body: Uint8Array | undefined }): Request {
+function toRequest(outgoing: Outgoing): Request {
   return new Request(outgoing.url, { method: outgoing.method, headers: outgoing.headers as [string, string][], body: outgoing.body ?? null, redirect: "manual" });
 }
 
@@ -525,25 +473,20 @@ async function exchange(fetcher: Fetcher, request: Request, limit: number): Prom
 const UNKNOWN: Observed = { kind: "unknown" };
 
 /**
- * `poll`: one upstream poll of a job on the route it was created on (`poll_openai`, `poll_vendor`).
- * Never throws: an answer that is not the upstream's own word about the job (no connection, a
- * timeout, an unusable route or credential) is `unknown` and decides nothing.
+ * `poll`: one upstream poll of a job on the route it was created on (`poll_openai`). Never throws:
+ * an answer that is not the upstream's own word about the job (no connection, a timeout, an
+ * unusable route or credential) is `unknown` and decides nothing.
  */
-export async function pollUpstream(fetcher: Fetcher, route: MediaRoute, job: VideoJob, clock: Clock): Promise<Observed> {
-  const request = pollRequest(route, job, clock);
+export async function pollUpstream(fetcher: Fetcher, route: MediaRoute, job: VideoJob): Promise<Observed> {
+  const request = pollRequest(route, job);
   if (request === undefined) return UNKNOWN;
-  const answer = await exchange(fetcher, toRequest(request.outgoing), VIDEO_POLL_RESPONSE_BYTES);
+  const answer = await exchange(fetcher, toRequest(request), VIDEO_POLL_RESPONSE_BYTES);
   if (answer === undefined) return UNKNOWN;
-  if (request.vendor !== undefined && request.sent !== undefined) return observeVendor(request.vendor, { id: job.vendorJob }, request.sent, answer.status, answer.body);
   return observeOpenAi(job, answer.status, answer.body);
 }
 
-/**
- * `delete_upstream`: asks an OpenAI-compatible upstream to delete a job's video, best effort (a
- * vendor route keeps its own retention). Never throws.
- */
+/** `delete_upstream`: asks the upstream to delete a job's video, best effort. Never throws. */
 export async function deleteUpstream(fetcher: Fetcher, route: MediaRoute, job: VideoJob): Promise<void> {
-  if (job.adapter !== null) return;
   const url = jobUrl(route, [job.vendorJob]);
   if (url === undefined) return;
   const headers = upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers());
@@ -551,56 +494,18 @@ export async function deleteUpstream(fetcher: Fetcher, route: MediaRoute, job: V
 }
 
 /**
- * The upstream answer carrying a finished job's bytes (video/content.rs `vendor_source` and
- * `openai_source`): vendor content steps with the credential until a media answer or a result URL
- * (fetched without it); or the OpenAI-compatible `{url}/{id}/content`. The variant is `video`,
- * `thumbnail` or `spritesheet` (vendor routes serve `video` only).
+ * The upstream answer carrying a finished job's bytes (video/content.rs `openai_source`): the
+ * provider's `{url}/{id}/content`, a redirect it names fetched without the credential. The variant is
+ * `video`, `thumbnail` or `spritesheet`.
  */
-export async function contentSource(
-  fetcher: Fetcher,
-  route: MediaRoute,
-  job: VideoJob,
-  variant: string,
-  egress: EgressPolicy,
-  limits: ContentLimits,
-  clock: Clock,
-): Promise<Response> {
-  if (job.adapter === null) {
-    const base = jobUrl(route, [job.vendorJob, "content"]);
-    if (base === undefined) throw badGateway("upstream_content_unavailable");
-    const url = new URL(base);
-    if (variant !== "video") url.searchParams.append("variant", variant);
-    const headers = upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers());
-    const response = await headersWithin(fetcher, new Request(url.toString(), { method: "GET", headers, redirect: "manual" }), limits.headersMs);
-    return mediaAnswer(fetcher, response, url.toString(), egress, limits);
-  }
-  const vendor = vendorFor(route, "video_content");
-  if (vendor === undefined) throw badGateway("unsupported_adapter");
-  let call: HttpCall;
-  try {
-    call = build(vendor, "video_content", job.upstreamModel, null, { id: job.vendorJob });
-  } catch {
-    throw badGateway("upstream_content_unavailable");
-  }
-  for (let hop = 0; hop < limits.hops; hop += 1) {
-    const outgoing = vendorRequest(route, vendor, call, nowUnix(clock));
-    if (call.response === "media") {
-      const response = await headersWithin(fetcher, toRequest(outgoing), limits.headersMs);
-      return mediaAnswer(fetcher, response, outgoing.url, egress, limits);
-    }
-    const answer = await exchange(fetcher, toRequest(outgoing), STEP_RESPONSE_BYTES);
-    if (answer === undefined) throw badGateway("upstream_unavailable");
-    let parsed;
-    try {
-      parsed = parseSent(vendor, "video_content", call, answer.status, answer.body);
-    } catch {
-      throw badGateway("upstream_content_unavailable");
-    }
-    if (parsed.kind !== "content") throw badGateway("upstream_content_unavailable");
-    if (parsed.source.kind === "url") return fetchResultUrl(fetcher, parsed.source.url, egress, limits);
-    call = parsed.source.call;
-  }
-  throw badGateway("upstream_content_unavailable");
+export async function contentSource(fetcher: Fetcher, route: MediaRoute, job: VideoJob, variant: string, egress: EgressPolicy, limits: ContentLimits): Promise<Response> {
+  const base = jobUrl(route, [job.vendorJob, "content"]);
+  if (base === undefined) throw badGateway("upstream_content_unavailable");
+  const url = new URL(base);
+  if (variant !== "video") url.searchParams.append("variant", variant);
+  const headers = upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers());
+  const response = await headersWithin(fetcher, new Request(url.toString(), { method: "GET", headers, redirect: "manual" }), limits.headersMs);
+  return mediaAnswer(fetcher, response, url.toString(), egress, limits);
 }
 
 /** `media_type`: a video or image type without parameters, else `application/octet-stream`. */

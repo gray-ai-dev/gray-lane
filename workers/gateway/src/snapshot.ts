@@ -69,15 +69,6 @@ export interface MediaTerms {
   readonly imageOutput: number | null;
   readonly audioOutput: number | null;
   readonly unitPrices: Readonly<Record<string, number>>;
-  /**
-   * What a per-image price of a Gemini image model's route covers of a Gemini client's answer beyond its
-   * images (provider_offers.rs `OfferMediaTerms` on main): an answer without an image costs one image
-   * (`one_image`), Google Search grounding is included (`included`), the relay bills thought images
-   * (`billed`). Absent or null: the provider has not said (gemini-images.ts).
-   */
-  readonly textAnswer?: "one_image" | null;
-  readonly grounding?: "included" | null;
-  readonly thoughtImages?: "billed" | null;
 }
 
 /** No image, audio or unit price: a text offer. */
@@ -194,8 +185,6 @@ export interface RouteRecord {
    * configures each root under it, so a permit is asked for under it, never under the endpoint id.
    */
   readonly capacityKey: string;
-  /** The mapping's vendor adapter (`gemini`, `volcengine`, `minimax`, `kling`, `fal`); null for an OpenAI-compatible API. */
-  readonly adapter: string | null;
   /** The capabilities the endpoint states (its configuration's `capabilities`), which a model API reads with what was proved (@gray/media `preferProvingAll`). */
   readonly claims: readonly string[];
   /**
@@ -278,9 +267,7 @@ export interface GatewaySnapshot {
   /**
    * The (model, API) pairs the enabled endpoints map, verified or not (inference.rs `Snapshot.mapped`):
    * a model mapped on an API without a live route there is known and momentarily unserved (503
-   * `no_available_provider`), not one served elsewhere. An image generation mapping through the Gemini
-   * adapter maps its model on the Gemini API as well, whose requests its route serves. Absent in a
-   * snapshot older than the field: only the routes it holds say what is mapped (resolution.ts).
+   * `no_available_provider`), not one served elsewhere. Absent in a snapshot older than the field: only the routes it holds say what is mapped (resolution.ts).
    */
   readonly mapped?: readonly { readonly model: string; readonly protocol: Protocol }[];
   /**
@@ -893,7 +880,7 @@ const consoleLog: SnapshotLog = (event) => (event.level === "alert" ? console.er
 
 /**
  * A read of the copy. `stale`: the copy is older than CONFIG_ALERT_AGE_MS (still served); a route
- * that reaches no account shard then checks the key with its account root (videos.ts).
+ * that reaches no account shard then checks the key with its account root (listings.ts, `GET /v1/key`).
  */
 /**
  * What a request reads. `gapMs` (from `read`): the time since this isolate's previous read, null at its first; a check

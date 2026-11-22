@@ -161,19 +161,30 @@ export function bytesPerToken(protocol: Protocol): bigint {
 }
 
 /**
- * What an answer sends besides its tokens, measured: the largest `response_bytes - bytes per token
- * x output_tokens` of the successful streams on the test machine (read-only SQL of `request_logs`,
- * 2026-10-15; Anthropic n=34 taken at 135 B per token, Chat n=4, Gemini n=7). Responses has its own
- * rule (`RESPONSES_FIXED_BYTES` and `answerEchoBytes`).
+ * What an answer sends besides its tokens, for each candidate (`answerCandidates`). Anthropic: measured,
+ * the largest `response_bytes - bytes per token x output_tokens` of the successful streams on the test
+ * machine (read-only SQL of `request_logs`, 2026-10-15; n=34, taken at 135 B per token). Chat and
+ * Gemini: twice the framing (the answer less its text) of the largest documented answer of one
+ * one-token candidate, written with the indentation the providers' own APIs use for a buffered answer:
+ * - Chat 4,716 B, 2 x 2,358: Azure OpenAI's answer, with its `prompt_filter_results` and a choice's
+ *   `content_filter_results` naming a protected-material citation, besides `usage` with both details,
+ *   `service_tier` and `system_fingerprint`. OpenAI's own answer frames 813 B, OpenRouter's with its
+ *   cost details 1,194 B.
+ * - Gemini 3,558 B, 2 x 1,779: Vertex AI's answer, with four safety ratings and their scores,
+ *   `avgLogprobs`, the usage details, `createTime` and `responseId`.
+ * The values before (629 and 614, measured on streams, Chat n=4, Gemini n=7) were below these: a
+ * buffered answer to a cap of 1 to 3 tokens could pass its limit with an answer of the cap
+ * (docs/limits.md, section 4). Responses has its own rule (`RESPONSES_FIXED_BYTES` and
+ * `answerEchoBytes`).
  */
 export function fixedAnswerBytes(protocol: Protocol): bigint {
   switch (protocol) {
     case "anthropic_messages":
       return 1_232n;
     case "open_ai_chat":
-      return 629n;
+      return 4_716n;
     case "gemini":
-      return 614n;
+      return 3_558n;
     case "open_ai_responses":
       return RESPONSES_FIXED_BYTES;
     default:
@@ -303,7 +314,8 @@ export class AnswerBytes {
     if (requestsAudio(protocol, body)) perToken = saturatingAdd(perToken, AUDIO_BYTES_PER_TOKEN);
     const top = logprobsRequested(protocol, body);
     if (top !== undefined) perToken = saturatingAdd(perToken, logprobBytesPerToken(protocol, top));
-    const fixed = saturatingAdd(saturatingAdd(fixedAnswerBytes(protocol), answerEchoBytes(protocol, body)), images ? IMAGE_SIGNATURE_BYTES : 0n);
+    const framing = saturatingMul(fixedAnswerBytes(protocol), answerCandidates(protocol, body));
+    const fixed = saturatingAdd(saturatingAdd(framing, answerEchoBytes(protocol, body)), images ? IMAGE_SIGNATURE_BYTES : 0n);
     return new AnswerBytes(perToken, fixed);
   }
 
@@ -379,6 +391,20 @@ function names(value: Json | undefined, wanted: string): boolean {
     const text = asStr(entry);
     return text !== undefined && eqIgnoreAsciiCase(text, wanted);
   }) ?? false;
+}
+
+/**
+ * How many candidates the answer to `body` carries, each framed on its own: Chat `n`, Gemini
+ * `generationConfig.candidateCount` under either spelling; 1 when absent, 0 or not a u64, and for the
+ * other APIs. A choice's framing is more than one token's bytes (an Azure choice with its filter
+ * results, 1,009 B written with indentation; a Vertex candidate with its safety ratings, 1,262 B), so
+ * a fixed part counted once would run out at a few candidates of a token each.
+ */
+export function answerCandidates(protocol: Protocol, body: Json): bigint {
+  let count: bigint | undefined;
+  if (protocol === "open_ai_chat") count = asU64(get(body, "n"));
+  else if (protocol === "gemini") count = asU64(geminiField(geminiField(body, "generationConfig"), "candidateCount"));
+  return count === undefined || count === 0n ? 1n : count;
 }
 
 /** Whether a request asks for audio output: Chat `modalities` naming `audio`, Gemini `generationConfig.responseModalities` naming `AUDIO`. */

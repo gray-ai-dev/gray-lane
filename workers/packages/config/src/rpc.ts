@@ -52,7 +52,7 @@ export const RPC_SURFACES = {
     callee: "credit-api",
     target: "AccountShardDO",
     kind: "object",
-    callers: ["gateway", "jobs", "lane-bridge", "credit-api"],
+    callers: ["gateway", "jobs", "lane-bridge", "credit-api", "console"],
     calls: ["admit", "count", "settle", "release", "push", "recall", "spendNow", "claim", "arbitrate", "drain", "refill", "audit", "storedItems", "books"],
   },
   accountRoot: {
@@ -60,7 +60,7 @@ export const RPC_SURFACES = {
     target: "AccountDO",
     kind: "object",
     callers: ["gateway", "jobs", "console", "credit-signer", "credit-api"],
-    calls: ["handle", "applyChainEvents", "exchange", "sealNow", "entries", "topUp", "heldTopUps", "putKey", "revokeKey", "keyRevoked", "balance", "liveBalance", "audit"],
+    calls: ["handle", "applyChainEvents", "exchange", "sealNow", "entries", "topUp", "heldTopUps", "putKey", "revokeKey", "keyRevoked", "balance", "liveBalance", "audit", "opsView"],
     // The tests' seams: the relayer stub of a lane, and the clock (an instance field, which RPC does not reach).
     hooks: ["relayer", "clock"],
   },
@@ -74,7 +74,7 @@ export const RPC_SURFACES = {
     target: "ConfigDO",
     kind: "object",
     callers: ["gateway", "lane-bridge", "console", "jobs"],
-    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain", "videoJobEndpoint"],
+    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain"],
   },
   configReplica: { callee: "jobs", target: "ConfigReplicaDO", kind: "object", callers: ["gateway", "lane-bridge", "jobs"], calls: ["current", "version", "snapshot", "gatewaySnapshot", "debtMode"] },
   round: {
@@ -103,8 +103,6 @@ export const RPC_SURFACES = {
   continuation: { callee: "gateway", target: "ContinuationDO", kind: "object", callers: ["gateway"], calls: ["lookup", "bind", "stats"] },
   toolCallIds: { callee: "gateway", target: "ToolCallIdDO", kind: "object", callers: ["gateway"], calls: ["find", "issue", "lookup", "write", "import", "deleteBefore", "close", "stats"] },
   toolCallIdDeletions: { callee: "gateway", target: "ToolCallIdDeletionDO", kind: "object", callers: ["console", "gateway"], calls: ["request", "status"] },
-  videoJob: { callee: "gateway", target: "VideoJobDO", kind: "object", callers: ["gateway"], calls: ["create", "get", "claimPoll", "observe", "settled", "hide"] },
-  videoIndex: { callee: "gateway", target: "VideoIndexDO", kind: "object", callers: ["gateway"], calls: ["add", "hide", "page"] },
   setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog"] },
   publicSetup: { callee: "console", target: "PublicSetup", kind: "entrypoint", callers: ["gateway"], calls: ["fetch", "keyStatus"] },
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
@@ -124,15 +122,15 @@ export type RpcSurfaceId = keyof typeof RPC_SURFACES;
  * from workers/) that shows its callers' answer when an older callee lacks it. test/rpc.test.ts finds the test.
  */
 export const ADDED_CALLS: Readonly<Record<string, string>> = {
+  // An operator's read of a workspace's account root (gray-console GET /api/v1/ops/credit/roots/{workspace}): a
+  // gray-credit-api of a release before `opsView` throws, and the console answers 503 credit_unavailable.
+  "accountRoot.opsView": "console/test/workerd/ops-credit-roots.test.ts > a root of a release before opsView answers that it has no such method: 503 credit_unavailable",
   // A root whose storage started over asks every shard address for its books (docs/request-path-availability.md M12): one
   // of a release before `books` stays missing, and the operator's end of the rebuild is refused until it answers.
   "accountShard.books": "packages/account/test/workerd/storage-loss.test.ts > a shard of a release before books keeps the rebuild open",
   // An endpoint root whose storage started over asks ConfigDO to tell it its terms again (M12): a gray-jobs of a release
   // before `tellAgain` throws, and the root waits for the hourly re-send as before.
   "config.tellAgain": "gateway/test/workerd/endpoint.test.ts > a root whose storage started over waits for the hourly re-send when gray-jobs is of a release before tellAgain",
-  // A video job whose route left the snapshot is polled on its endpoint's record (docs/cloudflare-native/media.md 3.2
-  // rule 11): a gray-jobs of a release before `videoJobEndpoint` throws, and the job has no route, as before.
-  "config.videoJobEndpoint": "gateway/test/workerd/video-jobs.test.ts > has no route when gray-jobs is of a release before videoJobEndpoint: the poll decides nothing, as before",
   // The lane bridge asks a lane route's shard to hold its standing permit before the route's first request (M13): a shard
   // of a release before `warm` throws, the bridge answers unavailable, and the lane serves as before (its first request borrows).
   "endpointShard.warm": "lane-bridge/test/workerd/bridge.test.ts > a shard of a release before warm answers that it has no such method: unavailable, and the lane serves as before",
@@ -159,7 +157,21 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
 };
 
 /** Each call taken off a list since the previous release's lists, as `<surface>.<call>`: why no release that runs calls it. */
-export const RETIRED_CALLS: Readonly<Record<string, string>> = {};
+export const RETIRED_CALLS: Readonly<Record<string, string>> = {
+  // The API Worker's video jobs (docs/design/standard-media-at-entry.md section 3): VideoJobDO and VideoIndexDO had the
+  // gateway alone as caller, from its request path, its job routes and its video Workflow. The release that drops them
+  // deletes both classes (migration v5-video-jobs-deleted), so no version that runs calls them; the entry's jobs live
+  // behind the lane bridge (LaneVideoJobDO).
+  "videoJob.create": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoJob.get": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoJob.claimPoll": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoJob.observe": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoJob.settled": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoJob.hide": "deleted with VideoJobDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoIndex.add": "deleted with VideoIndexDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoIndex.hide": "deleted with VideoIndexDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+  "videoIndex.page": "deleted with VideoIndexDO (migration v5-video-jobs-deleted); the gateway was its one caller",
+};
 
 /** A type's methods by name (a `never` member, the platform's brand, is none). */
 export type MethodNames<T> = { [K in keyof T]-?: [T[K]] extends [never] ? never : T[K] extends (...args: never[]) => unknown ? K : never }[keyof T] & string;

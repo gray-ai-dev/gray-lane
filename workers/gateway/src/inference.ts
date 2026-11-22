@@ -63,7 +63,7 @@ import { type DetailsRecord, type Placement, type WriterResult, notWritten } fro
 import type { OpencodeThinking } from "@gray/control";
 import { type Json, type JsonObject, cloneJson, get, isObject, parseStrictBytes, readSerdeBytes, toJsonString } from "@gray/json";
 import { accrualId, evidenceHash, fallbackRequestId, generatedIdSeed, newRequestId, requestKey as ledgerRequestKey } from "@gray/ledger-keys";
-import { AnswerBytes, requestLimit, requestLimitSource } from "@gray/limits";
+import { AnswerBytes, eqIgnoreAsciiCase, requestLimit, requestLimitSource, requestsImages } from "@gray/limits";
 import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import {
   type AnswerChecks,
@@ -174,7 +174,7 @@ import { type GatewaySnapshot, type KeyRecord, type RouteRecord, type SnapshotCa
 import { spoolPlaintext } from "./spool.ts";
 import { AnswerIds, RequestToolIds, StreamIds, TOOL_ID_CODES, type ToolIdIsolate, ToolIdFailure, clientBytes as toolIdClientBytes, handlesInBody, handlesInSpan, releasesAny, siteMember, toolIdIsolate, upstreamValue } from "./tool-ids.ts";
 import { originsOf } from "./hosts.ts";
-import { NO_TRANSLATION, translationRules } from "./translate.ts";
+import { entryRulesWithout, NO_TRANSLATION, translationRules } from "./translate.ts";
 import { type BodyEdits, UPSTREAM_BODY_CHUNK_BYTES, type UpstreamBody, heldBody, releasedAtEnd, sendable, storedBody, upstreamHeaders } from "./upstream.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import {
@@ -323,20 +323,6 @@ export interface TransferMeter {
   readonly clientQueued?: (bytes: number) => void;
   /** A tier C body took its R2 connection (`attemptBody`): a test gate, not a timing. */
   readonly bodyHeld?: () => void;
-}
-
-/**
- * A body read before the request came to this path (gemini_images.rs `ReadAhead` on main): a Gemini
- * request for an image model whose path its body decides, which carried no image or file. Read by the
- * Gemini image path under the limits this path reads a Gemini body with; this path takes it over, a
- * spooled one included, and the request's arrival with it.
- */
-export interface ReadAhead {
-  readonly body: Body;
-  /** When the request arrived (epoch ms). */
-  readonly started: number;
-  /** How long its body took to arrive. */
-  readonly bodyReadMs: number;
 }
 
 export interface GatewayDeps {
@@ -748,8 +734,6 @@ export class InferenceRun {
    * recovery probe).
    */
   private readonly budget: RequestBudget;
-  /** A body another path read before it handed the request here (`ReadAhead`). */
-  private readonly readAhead: ReadAhead | null;
   private readonly presence: ClientPresence;
   private readonly path: string;
   /** The origins its errors name (hosts.ts `originsOf`). */
@@ -1220,7 +1204,7 @@ export class InferenceRun {
    * `declared`: the request came under a client's base URL, `/v1/client/<client>/v1/...` (@gray/client-apps
    * `declaredPath`): it is served and recorded as the public path, and its client is the one the URL names.
    */
-  constructor(request: Request, served: Served | GenerationProtocol, deps: GatewayDeps, ctx: ExecutionContext, declared: Declared | null = null, readAhead: ReadAhead | null = null) {
+  constructor(request: Request, served: Served | GenerationProtocol, deps: GatewayDeps, ctx: ExecutionContext, declared: Declared | null = null) {
     this.request = request;
     const s = typeof served === "string" ? { protocol: served, pathModel: null } : served;
     this.protocol = s.protocol;
@@ -1236,8 +1220,7 @@ export class InferenceRun {
     // F2 hooks-4: the header race waits for this before it starts (never resolves when no lane body is
     // forwarded, and the dispatch's own end settles the race instead).
     this.laneSent = new Promise<void>((resolve) => (this.markLaneSent = resolve));
-    this.readAhead = readAhead;
-    this.started = readAhead?.started ?? Math.floor(deps.clock());
+    this.started = Math.floor(deps.clock());
     this.requestId = newRequestId(this.started);
     // The pre phase runs from the arrival: the snapshot's read is its first wait (snapshot.ts `SnapshotCache.read`).
     this.budget = new RequestBudget(deps.clock, deps.cfg.requestPreBudgetMs, deps.cfg.requestPostBudgetMs, this.started);
@@ -2397,20 +2380,6 @@ export class InferenceRun {
   private async receive(snapshot: GatewaySnapshot, key: KeyRecord): Promise<Response> {
     const { cfg, clock } = this.deps;
     this.admission = "body";
-    const ahead = this.readAhead;
-    if (ahead !== null) {
-      // Read by the Gemini image path, under the same limits (apis.ts `handOff`), its REQUEST_BODY_MS from no earlier than
-      // the request's arrival.
-      const body = ahead.body;
-      this.bodyDeadline = this.started + cfg.requestBodyMs;
-      this.requestComplete = true;
-      this.bodyReadMs = ahead.bodyReadMs;
-      this.bodyTier = body.tier;
-      this.requestBytes = body.length;
-      this.retained.set("request_body", body.tier === "C" ? 0 : body.length);
-      this.bodyContent(body);
-      return this.afterBody(snapshot, key, body, this.started + ahead.bodyReadMs);
-    }
     const limit = Number(requestLimit(this.protocol));
     // Whether the body can hold a tool-call id handle, as it arrives (tool-ids.ts): one without is not walked.
     const handles = new HandleWatch();
@@ -3038,7 +3007,18 @@ export class InferenceRun {
       // fallback there, and never for a verifiable preference: an endpoint route is not one. A request the entry
       // forwarded to this gateway is not translated here either (`translationRules`): the entry translates for itself.
       const viaEntry = !laneMode && viaEntryOf(this.request.headers) !== null;
-      const rules = laneMode && this.preference.verifiable ? NO_TRANSLATION : translationRules(snapshot, laneMode, viaEntry);
+      let rules = laneMode && this.preference.verifiable ? NO_TRANSLATION : translationRules(snapshot, laneMode, viaEntry);
+      // At the entry, a model with routes of its own on this API gets no targets from `entryRules`. When the capability
+      // filter alone left the request none (each of its unexpired routes here lacks what the request needs in its mode,
+      // as a Chat route proved for buffered answers only lacks a stream), its native set is empty after filtering and it
+      // is translated onto the model's endpoint routes of the other text APIs (`entryRulesWithout`). A native route that
+      // could carry it and was left out for another reason (its traffic limit, its relay's VM, the customer's filter)
+      // keeps its own answer. A body not read whole, which no translation takes, and a continuation of an earlier
+      // response, which no translation carries, keep the native answer too.
+      if (laneMode && !this.preference.verifiable && parsed.whole && rules.upstreams(canonical.model, protocol) === undefined && !continuesEarlierResponse(protocol, parsed.value)) {
+        const offered = (r: RouteRecord) => routeServes(r.expiresAt, now) && r.model === canonical.model && r.protocol === protocol && tierAdmitted(this.preference, r);
+        if (snapshot.routes.some(offered) && !snapshot.routes.some((r) => offered(r) && capable(r, canonical, false))) rules = entryRulesWithout(snapshot, canonical.model, protocol);
+      }
       const targets = translationTargets(rules, laneMode || viaEntry ? "off" : cfg.translationFallback, canonical.model, protocol, responsesMapped, live, laneMode ? "entry" : "operator");
       if (targets === null) {
         return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, rules), "routes");
@@ -4153,8 +4133,9 @@ export class InferenceRun {
    */
   private answerLimitCut(route: Route, code: string, limitBytes: number | null, received: number): void {
     // The bound from the request's output limit (@gray/limits `answerLimit`) ended an answer: Gray's limit, free, and not
-    // the supplier's failure. A real answer that passes it means the bound is too small for that API's answers
-    // (docs/limits.md section 6): a warning with what it read, so a bound to raise is seen.
+    // the supplier's failure in its circuit (a buffered one is evidence that the route did not honour the cap,
+    // `bodyPastOutputLimit`). A real answer of the cap that passes it means the bound is too small for that API's
+    // answers (docs/limits.md section 6): a warning with what it read, so a bound to raise is seen.
     const line = { level: "warn", event: "answer_limit_cut", request_id: this.requestId, code, limit_bytes: limitBytes, bytes_received: received, endpoint: route.record.endpointId };
     console.warn(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
   }
@@ -6005,6 +5986,24 @@ export class InferenceRun {
   }
 
   /**
+   * `attempt`'s buffered answer passed the bytes its request's output limit allows (`limit_source:
+   * request_output_limit`), and the code the request ends with. An answer of the cap fits that limit whatever its
+   * provider writes around the tokens (docs/limits.md section 4), so its route did not honour the cap, the failure the
+   * output-cap checks look for: `upstream_answer_exceeds_limit`, and evidence against the route's mapping that brings
+   * its next check forward, as `upstream_usage_exceeds_limit` is (traffic-evidence.ts `pastOutputLimit`). Its circuit
+   * still counts nothing, the cut being Gray's limit. The code is what the confidential entry's record carries out of
+   * the TEE, where no evidence is kept: gray-jobs reads the defect from it (jobs/src/traffic-evidence.ts `rowDefect`).
+   * A request that declares a tool its upstream runs itself (`side_effect`) ends with `upstream_body_limit` and is no
+   * evidence: its answer carries the tool's results (search results, fetched pages, a generated image), which no
+   * output token pays for.
+   */
+  private bodyPastOutputLimit(attempt: Attempt): "upstream_answer_exceeds_limit" | "upstream_body_limit" {
+    if (this.dispatcher?.plan.scope === "side_effect") return "upstream_body_limit";
+    if (this.traffic !== null && attempt.evidence !== undefined) this.traffic.pastOutputLimit(attempt.evidence, this.deps.clock());
+    return "upstream_answer_exceeds_limit";
+  }
+
+  /**
    * Closes the attempt that failed before its answer committed (`fail`): the dispatcher notes it and says
    * how its permit goes back, and the record keeps the class, the refusal's signature and the disposition.
    * A refusal held before it and replaced by this one is dropped. `errorBody`: the upstream's error body as
@@ -6827,10 +6826,22 @@ export class InferenceRun {
     return { maxOutputTokens: a.outputCap, allowance: BigInt(route.record.outputOverheadTokens ?? 0), candidateCount: a.candidates };
   }
 
-  /** The most bytes the answer may take (`answer_limit`): from the output the hold covers, the serving endpoints' allowance and the candidates, under the upstream's protocol. */
+  /**
+   * The most bytes the answer may take (`answer_limit`): from the output the hold covers, the serving endpoints' allowance
+   * and the candidates, under the upstream's protocol, with generated images when the answer may carry them (`images`).
+   */
   private answerLimit(o: Dispatch): number {
-    const limit = this.answerSizes(o.parsed).upstream.limit(this.answerTokens(o.sizing, o.routes, o.snapshot, o.canonical.model, o.candidates));
+    const limit = this.answerSizes(o.parsed, InferenceRun.outputsImages(o.snapshot, o.canonical.model)).upstream.limit(this.answerTokens(o.sizing, o.routes, o.snapshot, o.canonical.model, o.candidates));
     return limit > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(limit);
+  }
+
+  /**
+   * Whether the model's facts list image output (inference.rs `model_outputs_images`): its answers may carry generated
+   * images, which the answer limit counts at the largest documented image per token (@gray/limits `IMAGE_BYTES_PER_TOKEN`).
+   * Counted as text before, a Gemini image answer passed its limit and was cut.
+   */
+  private static outputsImages(snapshot: GatewaySnapshot, model: string): boolean {
+    return snapshot.facts?.[model]?.output_modalities.some((m) => eqIgnoreAsciiCase(m, "image")) === true;
   }
 
   /** The output tokens an answer may take: what the hold covers (at most the largest window when nothing bounds it), plus the endpoints' allowance, per candidate. */
@@ -6843,11 +6854,16 @@ export class InferenceRun {
     return (output + allowance) * BigInt(candidates);
   }
 
-  /** How many bytes a token of the answer takes as the upstream sends it, and as the client gets it (they differ when translated). */
-  private answerSizes(parsed: ParsedRequest): { upstream: AnswerBytes; client: AnswerBytes } {
-    const client = AnswerBytes.of(this.protocol, parsed.value, false);
+  /**
+   * How many bytes a token of the answer takes as the upstream sends it, and as the client gets it (they differ when
+   * translated). `modelImages`: the model outputs images; the answer may carry them then, or when the upstream's request
+   * asks for them itself (inference.rs `images`, read from the upstream's request).
+   */
+  private answerSizes(parsed: ParsedRequest, modelImages: boolean): { upstream: AnswerBytes; client: AnswerBytes } {
     const t = this.translation;
-    return { upstream: t === null ? client : AnswerBytes.of(t.upstream, t.body, false), client };
+    const images = modelImages || (t === null ? requestsImages(this.protocol, parsed.value) : requestsImages(t.upstream, t.body));
+    const client = AnswerBytes.of(this.protocol, parsed.value, images);
+    return { upstream: t === null ? client : AnswerBytes.of(t.upstream, t.body, images), client };
   }
 
 
@@ -7753,17 +7769,19 @@ export class InferenceRun {
         // allows: Gray's limit too, said as a held stream's is. None is the supplier's, and no other attempt
         // would hold more (a stream's `final`): the request ends here.
         if (read.code === "gateway_capacity" || read.limitSource !== undefined) {
+          // Past the bytes its output cap allows: a route that did not honour the cap, said in a code of its own.
+          const code = read.limitSource === "request_output_limit" ? this.bodyPastOutputLimit(attempt) : read.code;
           const error =
             read.code === "gateway_capacity"
               ? new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory")
-              : new ApiError(502, read.code).withMeta("limit_bytes", BigInt(read.limitSource === "request_output_limit" ? a.answerLimit : cfg.answerHeldMaxBytes)).withMeta("limit_source", read.limitSource!);
-          failed(read.code, read.code, read.why, read.supplierFailure, {
+              : new ApiError(502, code).withMeta("limit_bytes", BigInt(read.limitSource === "request_output_limit" ? a.answerLimit : cfg.answerHeldMaxBytes)).withMeta("limit_source", read.limitSource!);
+          failed(code, code, read.why, read.supplierFailure, {
             upstreamMayStillWork: read.upstreamMayStillWork,
             error,
             ...(read.limitSource === undefined ? {} : { limitSource: read.limitSource }),
           });
           if (read.limitSource === "gateway_memory") this.heldLimitAlert(route);
-          if (read.limitSource === "request_output_limit") this.answerLimitCut(route, read.code, a.answerLimit, read.received);
+          if (read.limitSource === "request_output_limit") this.answerLimitCut(route, code, a.answerLimit, read.received);
           return;
         }
         if (uncommitted(this.defect(attempt, read.code, read.upstreamMayStillWork))) return;
@@ -7913,7 +7931,9 @@ export class InferenceRun {
    * Steps 8-10 for a translated non-streaming answer: read whole (the translator makes the client's
    * document from the whole upstream document, @gray/translation `translateAnswer`), at most
    * BODY_PARSE_MAX_BYTES of it, the most of one document the gateway parses whole (m0/memory.md); a
-   * longer answer is refused, Gray's limit and not the supplier's fault, and not charged. The answer
+   * longer answer is refused, Gray's limit and not the supplier's fault, and not charged. So is one past
+   * the bytes its request's output limit allows, as a native answer is, which shows its route did not
+   * honour the cap (`bodyPastOutputLimit`). The answer
    * commits once it is read, checked, translated and its usage settled: every failure before is
    * `uncommitted`, and the dispatcher may send the next attempt; Gray's own limits are not, since no
    * other attempt would hold less.
@@ -7936,7 +7956,7 @@ export class InferenceRun {
       reason: string,
       why: string,
       supplier: "timeout" | "upstream_error" | "invalid_response" | null,
-      extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: "gateway_memory" } = {},
+      extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: LimitSource } = {},
     ): BufferedResult => {
       this.answerFailed({ attempt, relay: null, handOver, code, reason, why, supplier, ...extra });
       return { kind: "response", response: handed! };
@@ -7992,10 +8012,18 @@ export class InferenceRun {
           .withMeta("limit_source", "gateway_memory");
         return failed(read.code, read.code, read.why, null, { upstreamMayStillWork: true, error, limitSource: "gateway_memory" });
       }
+      if (read.code === "upstream_body_limit") {
+        // Past the bytes its request's output limit allows, the read's bound here: as a native answer past it (answer.ts),
+        // Gray's limit, which no other route lifts, never its route's failure in the circuit (inference.rs
+        // `gray_answer_limit`); and a route that did not honour the cap (`bodyPastOutputLimit`).
+        const code = this.bodyPastOutputLimit(attempt);
+        this.answerLimitCut(route, code, a.answerLimit, read.received ?? 0);
+        const error = new ApiError(502, code).withMeta("limit_bytes", BigInt(a.answerLimit)).withMeta("limit_source", "request_output_limit");
+        return failed(code, code, read.why, null, { upstreamMayStillWork: true, error, limitSource: "request_output_limit" });
+      }
       // The isolate's answers hold too much together: Gray's limit, a 429 the client may retry.
       if (read.code === "gateway_capacity") return failed(read.code, read.code, read.why, null, { upstreamMayStillWork: true, error: capacity() });
-      const stillWorking = read.code === "upstream_body_incomplete" || read.code === "upstream_body_limit";
-      return uncommitted(this.defect(attempt, read.code, stillWorking));
+      return uncommitted(this.defect(attempt, read.code, read.code === "upstream_body_incomplete"));
     }
     const upstream = a.protocol;
     let bytes = read.bytes;

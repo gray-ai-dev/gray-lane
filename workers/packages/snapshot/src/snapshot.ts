@@ -4,6 +4,7 @@ import type { Protocol } from "@gray/protocol";
 import { parsePlain } from "@gray/json";
 // The subpath, not the package: the gateway bundles this package, and @gray/control's other modules bring zod.
 import { binds, kept, recordFromRow, type CodingAgentRecord, type CodingAgentRow, type OpencodeThinking } from "@gray/control/coding-agent";
+import { streamsMedia } from "@gray/control";
 import { both, capabilityWords, CLAIM_WORDS, fromClaims, mappingCapabilities, NO_CAPABILITIES, type Capabilities } from "./capabilities.ts";
 import { endpointRow, parseVerification, providerRef, registeredRefs, supplierRef, type EndpointConfig, type ModelMapping, type ProviderEndpoint, type VerificationRecord } from "./control.ts";
 import { parseSignedProbeReport, probeEvidence, type ModeCapabilities, type ProbeEvidence } from "./evidence.ts";
@@ -897,6 +898,26 @@ export function routeCapabilities(e: ProviderEndpoint, protocol: Protocol, recor
 }
 
 /**
+ * The endpoint configuration a route of `mapping` carries in the snapshot (inference.rs `RouteRecord::claims`): the
+ * endpoint's own, except that a route of an API with a streamed form (@gray/control `STREAMED_MEDIA_PROTOCOLS`) claims
+ * `streaming` exactly when its mapping declared that the model streams (`mappingStreams`) and the report of its current
+ * pass proved the streamed form (`capabilities.streaming`, the `streaming_api_contract` check). An endpoint-wide
+ * `streaming` or `stream` claim says nothing for such a route, and is left out of its configuration.
+ *
+ * Every entry sends a streamed request of these APIs only to a route whose configuration claims `streaming` (gateway
+ * apis.ts `streams`, which reads the route's `config.capabilities`, in every lane release since the standard APIs), so
+ * the rule takes effect with the snapshot, whatever release an entry runs. The route's configuration fingerprint is
+ * the endpoint's, computed from what is stored.
+ */
+export function routeConfig(config: EndpointConfig, mapping: ModelMapping, capabilities: Pick<RouteCapabilities, "streaming">): EndpointConfig {
+  if (!streamsMedia(mapping.protocol)) return config;
+  const others = config.capabilities.filter((claim) => claim !== "streaming" && claim !== "stream");
+  const claims = mapping.streaming === true && capabilities.streaming ? [...others, "streaming"] : others;
+  if (claims.length === config.capabilities.length && claims.every((claim, i) => claim === config.capabilities[i])) return config;
+  return { ...config, capabilities: claims };
+}
+
+/**
  * inference.rs `mode_capabilities`: the chat capabilities a route serves each mode with, null for a mode it does not
  * serve, from what `routeCapabilities` gives serving. A pass without a report serves plain buffered requests.
  */
@@ -1089,10 +1110,6 @@ export async function buildSnapshot(
     for (const m of e.config.mappings) {
       const pair = (model: string, protocol: Protocol): SnapshotMapped => (lane ? { model, protocol, lane: true } : { model, protocol });
       mapped.set(`${m.requested_model}\u0000${m.protocol}\u0000${lane ? 1 : 0}`, pair(m.requested_model, m.protocol));
-      // An image generation mapping through the Gemini adapter maps its model on the Gemini API too,
-      // whose requests its live route serves (gemini_images.rs `maps_gemini_requests` on main): while
-      // that route is not live a Gemini request for the model is a pause, not a request to the wrong API.
-      if (mapsGeminiRequests(m)) mapped.set(`${m.requested_model}\u0000gemini\u0000${lane ? 1 : 0}`, pair(m.requested_model, "gemini"));
     }
   }
 
@@ -1228,6 +1245,7 @@ export async function buildSnapshot(
       if (lane && quote === null) continue;
       // A relay stack's route takes traffic by an account that can serve it too; without one it only names its relay.
       const uncovered = deployment === "named" || (covered !== null && e.config.lane?.mode === "stack" && !covered(e.config.lane.relay_id, e.config.base_url, m.upstream_model));
+      const capabilities = lane ? laneRouteCapabilities(e, m.protocol, reference?.capabilities?.(m.requested_model) ?? null) : routeCapabilities(e, m.protocol, v!, proofs.get(v!.id));
       routes.push({
         capacityKey: capacityKey(e.id, m.requested_model, m.protocol),
         endpointId: e.id,
@@ -1235,7 +1253,7 @@ export async function buildSnapshot(
         ownerUserId: e.owner_user_id,
         credentialGeneration: e.credential_generation,
         configFingerprint: e.config_fingerprint,
-        config,
+        config: routeConfig(config, m, capabilities),
         mapping: m,
         url,
         credential,
@@ -1245,7 +1263,7 @@ export async function buildSnapshot(
         expires: lane ? (quote === null ? 0 : Math.min(snapshot.expires_at, quote.eligible_until)) : found!.expires,
         offer: quote,
         maxConcurrency: quote ? quote.terms.max_concurrency : UNQUOTED_CONCURRENCY,
-        capabilities: lane ? laneRouteCapabilities(e, m.protocol, reference?.capabilities?.(m.requested_model) ?? null) : routeCapabilities(e, m.protocol, v!, proofs.get(v!.id)),
+        capabilities,
         evidenceId: lane ? "" : v!.id,
         behavioralScore: weights.get(capacityKey(e.id, m.requested_model, m.protocol)) ?? null,
         providerRef: providerRef(e.workspace_id, e.id),
@@ -1455,13 +1473,4 @@ async function routedModels(
     if (!noLimits(bounds)) limits.push({ model, ...bounds });
   }
   return { facts, limits };
-}
-
-/**
- * `maps_gemini_requests`: whether `mapping`, verified or not, is one whose live route serves every
- * Gemini request of its model: an image generation mapping through the Gemini adapter (whose image
- * vendor speaks Gemini's `generateContent`).
- */
-export function mapsGeminiRequests(mapping: { readonly protocol: Protocol; readonly adapter: string | null }): boolean {
-  return mapping.protocol === "open_ai_image_generations" && mapping.adapter === "gemini";
 }

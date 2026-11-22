@@ -35,36 +35,23 @@ import {
   type Stop,
 } from "@gray/errors";
 import { accountInDebt, includeRate, insufficientBalance, keySpendLimit, rateBound, requestCeiling, UNDECODED, type RateBound } from "@gray/holds";
-import { type Json, type JsonObject, get, isObject, parseSerdeBytes } from "@gray/json";
+import { get } from "@gray/json";
 import { accrualId, customerRates, evidenceHash, newRequestId, requestKey as ledgerRequestKey, storedEvidence, usageCost } from "@gray/ledger-keys";
-import { requestLimit } from "@gray/limits";
 import {
   type ApiRequest,
   type Billed,
   type MediaRoute,
   type Metered,
-  type Outgoing,
-  type Received,
-  type VideoJob,
-  CreateRejected,
   DEFAULT_RESERVED_SECONDS,
   VIDEO_CREATE_RESPONSE_BYTES,
-  capabilityUnproved,
   decodeApi,
-  decodeGeminiImages,
-  deleteUpstream,
-  geminiImagesBound,
   isMediaProtocol,
   reservation,
   serviceableApi,
   takesForm,
-  upstreamApi,
-  videoCreated,
   videoJobId,
-  videoObject,
 } from "@gray/media";
-import { toJsonString } from "@gray/json";
-import { ZERO_COUNTERS, withDefaultAccept } from "@gray/protocol";
+import { ZERO_COUNTERS } from "@gray/protocol";
 import type { CanonicalRequest, Protocol } from "@gray/protocol";
 import { FREE_DELIVERY, type AccountBlockGates, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type OutcomeMeasure, type Pattern, type PermitToken } from "@gray/endpoint";
 import { accountBlockIsolate, blockGates } from "./account-blocks.ts";
@@ -73,19 +60,14 @@ import { layeredOver, tierAdmitted, untagged, planPreference, preferenceFacts, r
 import { type DispatchPermit, Preference } from "@gray/routing";
 import { admitOnce } from "./admission.ts";
 import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
-import { type Body, readBody, spoolReadBack } from "./body.ts";
-import { RequestBudget, withinPhase } from "./budget.ts";
+import { RequestBudget } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, platformTimers } from "./client.ts";
 import { logWithheld, resolveWithheld, settledBy, withheldBilling, type WithheldEnd } from "./withheld.ts";
-import { openCredential } from "./crypto.ts";
 import { Dispatcher, countedFailure, noRouteRetryAfter, servedLater, skipLabel, type AttemptEnd, type BlockGates, type ColdPass, type HeldRefusal, type PassFacts } from "./dispatcher.ts";
 import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releasePermit, releaseRetry, reserveRetry, settledWithin, shardFor, type ReleaseFacts, type ShardChoice } from "./endpoints.ts";
-import type { GatewayEnv } from "./env.ts";
 import { judgeEvidence, mediaEvidence } from "./evidence.ts";
-import { type PartSource, type ReceivedForm, memoryRefusal, multipartBody, readForm, readThrough, splicedBody } from "./form.ts";
-import { type GeminiAsked, type GeminiSend, geminiAttemptBody, geminiBodyRead, speaks } from "./gemini-images.ts";
 import { originsOf } from "./hosts.ts";
-import { type GatewayDeps, InferenceRun } from "./inference.ts";
+import type { GatewayDeps } from "./inference.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { type ResponseHash, bodyHashOf, egressBeforeVendor, egressSidecarFailure, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
@@ -93,80 +75,57 @@ import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHas
 import type { LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
 import { type VideoJobIo, advanceVideoJob, pollVideoJob, readWhole, videoJobIo, videoJobRoute, videoJobVisible } from "./lane/video-jobs.ts";
 import { answerReader, type MediaAnswer } from "./media-answer.ts";
-import { type VideoCall, VideoJobConflict, alert, holdOf, mediaFetch, mediaRouteOf, mediaSettings, replayVideoCreate, startVideoJob, videoHoldLifetimeMs } from "./media.ts";
+import { mediaRouteOf, mediaSettings, videoHoldLifetimeMs } from "./media.ts";
 import { chargeSidesMismatch, evidenceSides, pricedQuoteOf, recordedSides, safeAmount, type PricedQuote, type RecordedSides } from "./money.ts";
 import { MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
 import { unrouted } from "./resolution.ts";
-import { translationPolicy } from "./translate.ts";
 import { type AnswerShare, Retained } from "./retained.ts";
-import { fileRest, rankKey, recoveryRefusal, REST_EGRESS_REGION, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView } from "./rests.ts";
+import { fileRest, rankKey, recoveryRefusal, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView } from "./rests.ts";
 import { dispatchExploratory, rank, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, releaseOutdated, routeProbeLeases, withinBound, withinMaxPrice, type Route } from "./routes.ts";
 import { notWritten } from "@gray/content";
 import { AttemptEvidence, RequestEvidence } from "./traffic-evidence.ts";
 import { attemptMeasures, clientFields, dispatchRecord, emitRecord, FREE_NO_USAGE, recordDelivery, type AdmissionStage, type AttemptRecord, type BillingOutcome, type FreeReason, type RequestOutcome, type RequestRecord, type RetryEvent } from "./sinks.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import { type GatewaySnapshot, type KeyRecord, type RouteRecord, routeServes, snapshotTiming } from "./snapshot.ts";
-import { acceptingFetch, releasedAtEnd, sendable, UPSTREAM_BODY_CHUNK_BYTES, type UpstreamBody } from "./upstream.ts";
+import { sendable, UPSTREAM_BODY_CHUNK_BYTES } from "./upstream.ts";
 import { LANE_BRIDGE_CALL_MS, type LaneVideoJob, type LaneVideoJobCreate } from "@gray/lane-wire";
 import { isVideoProviderId, readVideoObject } from "@gray/lane";
 
 /**
- * The model APIs' request path (docs/cloudflare-native/media.md 2.1; the server's
- * crates/gray-gateway/src/apis/mod.rs `forward_traced`): System One, embeddings, rerank, image
- * generation and edits, speech, transcription and translation, and video creation. Each API's own part
- * is @gray/media's (decode, serviceable routes, the upstream request, the answer's checks and
- * metering); the shared stages are the request path's, as for the generation APIs (inference.ts):
+ * The model APIs' request path at the confidential entry (docs/design/standard-media-at-entry.md section 2; the
+ * server's crates/gray-gateway/src/apis/mod.rs `forward_traced`): System One, embeddings, rerank, image generation and
+ * edits, speech, transcription and translation, and video creation, each on a provider's own API: an endpoint route,
+ * through egress's `/route/` kind with the provider's key from the entry's memory. Each API's own part
+ * is @gray/media's (decode, serviceable routes, the answer's checks and metering); the shared stages are the request
+ * path's, as for the generation APIs (inference.ts):
  *
- *  0. a video create with an Idempotency-Key whose job the caller can see answers with that job;
+ *  0. a video create with an Idempotency-Key whose job the caller can see answers with that job (`replayEntryVideo`);
  *  1. the key, from the snapshot;
- *  2. the body: these APIs state no body size, so Gray sets none of its own (apis/mod.rs on main): a
- *     multipart form is read as it arrives within REQUEST_BODY_MS, its files never held whole (form.ts),
- *     and a JSON body, which its API's rules read whole, is parsed within BODY_PARSE_MAX_BYTES, the most
- *     of one document an isolate parses whole (m0/memory.md, the 128 MB isolate): a Content-Length above
- *     it is refused before anything is read (413 `request_body_limit`, `gateway_memory`). A Gemini
- *     client's request for an image model served through its image routes is read as the Gemini API's
- *     bodies are, by tier (gemini-images.ts);
- *  3. the customer's routing preference, taken out of a JSON body or read from the `x-gray-routing` header
- *     (a multipart form's only place for it), and layered over the key's and the workspace's defaults, as the
- *     generation APIs take it (preference.ts); it narrows the routes (5), bounds their price (6) and orders
- *     them and the failover (7);
- *  4. decode (@gray/media `decodeApi`);
- *  5. the routes: live ones of the model and API, in the workspace's region, each with its credential
- *     opened and its price for the request's selectors, kept when the API's `serviceable` keeps them;
- *  6. the request key, the price bound over the eligible routes and the reservation (`reservation`, at
- *     most the model API ceiling), admitted on the account shards with no refit (a media request's hold
- *     is its stated bound); a video create asks for a token that outlives its job;
- *  7. a permit per attempt; the upstream request (@gray/media `upstreamApi`), its body streamed with
- *     its exact length: a form written as it is sent, a JSON body with each deferred upload's base64
- *     encoded in as it is sent (form.ts); retries and route switching by the generation APIs' dispatch
- *     rules (dispatcher.ts), the answer committing at its 2xx (apis/mod.rs `dispatch`);
- *  8. the answer (media-answer.ts): read, checked and metered as it arrives, passed on to the client
- *     when its API's answer is the upstream's own, held to its end when the gateway makes it; then
- *     charged with the ledger's evidence (evidence.ts `mediaEvidence`), or released with the reason;
- *  9. a video create records its job and hands the hold to the job's Workflow (video-create.ts).
+ *  2. the body, held in memory within the lane's bounds and never spooled (lane/standard-api.ts `readEntryBody`);
+ *  3. the customer's routing preference, taken out of a JSON body or read from the `x-gray-routing` header (a
+ *     multipart form's only place for it), and layered over the key's and the workspace's defaults, as the generation
+ *     APIs take it (preference.ts); it narrows the routes (5), bounds their price (6) and orders them and the
+ *     failover (7);
+ *  4. what the entry refuses of a body it serves, and its API's decoding (@gray/media `decodeApi`);
+ *  5. the routes: live ones of the model and API, in the workspace's region, each the entry's (`entryRoute`) and
+ *     priced for the request's selectors, kept when the API's `serviceable` keeps them;
+ *  6. the request key, the price bound over the eligible routes and the reservation (`reservation`, at most the model
+ *     API ceiling), admitted on the account shards with no refit (a media request's hold is its stated bound); a video
+ *     create asks for a token that outlives its job;
+ *  7. a permit per attempt; the client's bytes with the entry's declared changes, sent to the route's URL; retries and
+ *     route switching by the generation APIs' dispatch rules (dispatcher.ts), the answer committing at its 2xx
+ *     (apis/mod.rs `dispatch`);
+ *  8. the answer (media-answer.ts): read, checked and metered as it arrives and passed on as the provider sent it;
+ *     then charged with the ledger's evidence (evidence.ts `mediaEvidence`), or released with the reason;
+ *  9. a video create records its job behind the lane bridge and hands the hold to it (`createEntryVideo`): any
+ *     replica polls and settles it (lane/video-jobs.ts).
  *
- * A client that leaves ends the upstream at once and pays nothing, unless the upstream's answer is
- * already whole (docs/cloudflare-native.md 5.6). An answer that reports no usage is delivered free
- * (USAGE_MISSING `free`, the owner's rule of 2026-10-16) or refused (`refuse`). The model's refusal of
- * the request is delivered as it came, charged nothing and neither for nor against the route.
- *
- * At the confidential entry (docs/design/standard-media-at-entry.md section 2; `deps.lane`), the same stages run with
- * the lane's dependencies for the standard APIs the entry serves itself (lane/standard-api.ts `entryStandardApi`:
- * every model API here), on a provider's own API: an endpoint route with no adapter, through
- * egress's `/route/` kind with the provider's key from the entry's memory. What differs is in `serveEntry`: the body is
- * held in memory within the lane's bounds and never spooled; the provider is sent the client's bytes with the entry's
- * declared changes; its answer passes as it arrives (media-answer.ts `entryAnswerReader`); the request's record
- * carries no client fingerprint; and a receipt binds what was received, forwarded and returned. A request for a model
- * the entry has no route of on its API gets the entry's own answer (resolution.ts `unrouted`); a route that has a
- * vendor adapter is not the entry's, and nothing is sent to another service. A video create's answer is the provider's
- * `video` object, read whole and handed on with Gray's job id and state; its job is recorded behind the bridge and
- * polled and settled by the entry (`createEntryVideo`, lane/video-jobs.ts), with no Workflow.
- *
- * A Gemini client's `generateContent` for a Gemini image model served through its image routes
- * (gemini-images.ts; gemini_images.rs on main) takes the same path as an images request (`gemini`): its
- * body is the Gemini API's, sent to the route's Gemini image API as it came; its answer goes back as
- * the relay sent it, as one server-sent event when the client streams. A request whose path its body
- * decides that carries no image or file goes to the generation path with its body (`handOff`).
+ * A client that leaves ends the upstream at once and pays nothing, unless the upstream's answer is already whole
+ * (docs/cloudflare-native.md 5.6). An answer that reports no usage is delivered free (USAGE_MISSING `free`, the owner's
+ * rule of 2026-10-16) or refused (`refuse`). The model's refusal of the request is delivered as it came, charged
+ * nothing and neither for nor against the route. The request's record carries no client fingerprint, and a receipt
+ * binds what was received, forwarded and returned. A request for a model the entry has no route of on its API gets the
+ * entry's own answer (resolution.ts `unrouted`); nothing is sent to another service.
  */
 
 /** How often the entry tries to write a video job's record before it gives the job up, and the pause between two tries. */
@@ -199,12 +158,10 @@ export function modelApi(method: string, path: string): Protocol | null {
   return protocol !== undefined && isMediaProtocol(protocol) ? protocol : null;
 }
 
-/** What the media request path needs beyond the generation path's dependencies: the video jobs' bindings. */
-export interface MediaDeps extends GatewayDeps {
-  readonly videos: Pick<GatewayEnv, "VIDEO_JOB" | "VIDEO_INDEX" | "VIDEO_JOBS">;
-}
+/** What the model APIs' request path runs with: the request path's dependencies and the confidential entry's. */
+export type EntryDeps = GatewayDeps & { readonly lane: LaneDeps };
 
-/** A route that may serve this request: its record, its media view (credential opened), and its price for the request's selectors. */
+/** A route that may serve this request: its record, its media view, and its price for the request's selectors. */
 export interface MediaCandidate {
   readonly record: RouteRecord;
   readonly media: MediaRoute;
@@ -239,8 +196,8 @@ interface Attempt {
   dispatch?: DispatchPermit;
   /** When its dispatch went out (`send`), for its dispatch's point. */
   dispatchedAtMs?: number;
-  /** At the confidential entry: the provider's key, and the attempt's own fetch through egress's `/route/` kind. */
-  entry?: { readonly credential: string; readonly fetch: (input: string, init: RequestInit) => Promise<Response> };
+  /** The provider's key, and the attempt's own fetch through egress's `/route/` kind. */
+  readonly entry: { readonly credential: string; readonly fetch: (input: string, init: RequestInit) => Promise<Response> };
   /** Its receipt draft (lane/hooks.ts `receiptDraft`): dropped with a failed attempt, adopted when its answer commits. */
   laneDraft?: LaneReceiptDraft;
 }
@@ -278,11 +235,9 @@ function retryConfig(cfg: GatewayDeps["cfg"]): RetryConfig {
 /**
  * What a repeat of a model API request could do to the supplier (apis/mod.rs `scope`): an image, audio or
  * video generation may already have been paid for (`no_work_proven`); embeddings, rerank and System One
- * follow the text rules (`generation`). A Gemini client's request on an image route that declares Google
- * Search grounding is a side-effect request, as on the Gemini API itself: the search may already have run.
+ * follow the text rules (`generation`).
  */
-function apiScope(protocol: Protocol, api: ApiRequest): Scope {
-  if (api.body.kind === "gemini" && api.body.asks.grounding) return "side_effect";
+function apiScope(protocol: Protocol): Scope {
   return scopeOf(protocol, null);
 }
 
@@ -330,15 +285,10 @@ export class ModelApiRun {
   private readonly retained = new Retained();
   private readonly isolateInFlight: number;
   private readonly request: Request;
-  /** The API the request is served by: its path's, or for a Gemini image request the image API its body decides. */
-  private protocol: Protocol;
-  private readonly deps: MediaDeps;
+  /** The API the request is served by: its path's. */
+  private readonly protocol: Protocol;
+  private readonly deps: EntryDeps;
   private readonly ctx: ExecutionContext;
-  private readonly declared: { readonly path: string; readonly client: string } | null;
-  /** A Gemini client's request served through image routes (gemini-images.ts); null for every other. */
-  private readonly gemini: GeminiAsked | null;
-  /** How an attempt sends a Gemini image request's body (gemini-images.ts `GeminiSend`). */
-  private geminiSend: GeminiSend | null = null;
 
   // What the record says, filled in as the request goes.
   private requestKey: string | null = null;
@@ -442,8 +392,6 @@ export class ModelApiRun {
   private modelTag: string | null = null;
   /** What the request log records of the layered preference (`preference_facts`); null until it was layered. */
   private preferenceRecord: PreferenceFacts | null = null;
-  /** A Gemini image request's body named `provider`: its attempts leave the member out (`geminiAttemptBody`). */
-  private geminiStripProvider = false;
   /** Admission's steering moved another route to the head of the plan (`routing_head_reason` `account_block`). */
   private steeredHead = false;
   /** The suppliers admission steered the request away from (`Plan::steered`). */
@@ -470,19 +418,10 @@ export class ModelApiRun {
   private withheld: Promise<void> | null = null;
   private boundM = 0n;
   private ceiling = 0n;
-  /** The R2 objects of a spooled form, deleted once the request is done with them. */
-  private spooled: readonly string[] = [];
-  /** Deferred uploads by marker (form.ts). */
-  private sources: ReadonlyMap<string, PartSource> = new Map();
-  /** The answer's work after the response went (a streamed answer), which a spooled form waits for. */
-  private relayed: Promise<void> = Promise.resolve();
-  /** The R2 connections the attempts' stored bodies hold (`send`), each given back when its stream ends, all at the record. */
-  private readonly holds: (() => void)[] = [];
-  private bodyHeld = 0;
   private readonly answerShare: AnswerShare;
-  // The confidential entry (docs/design/standard-media-at-entry.md section 2): absent on the main gateway.
-  private readonly lane: LaneDeps | null;
-  /** The egress region of its routes' rank keys (inference.ts `rankRegion`): the entry's own at the entry. */
+  // The confidential entry (docs/design/standard-media-at-entry.md section 2).
+  private readonly lane: LaneDeps;
+  /** The egress region of its routes' rank keys (inference.ts `rankRegion`): the entry's own. */
   private readonly rankRegion: string;
   private readonly rankRegionOf = (): string => this.rankRegion;
   /** The client's body as the entry holds it until an answer commits (`serveEntry`), and its hash for the receipt. */
@@ -505,13 +444,11 @@ export class ModelApiRun {
   private markResponded!: () => void;
   private readonly responded: Promise<void>;
 
-  constructor(request: Request, protocol: Protocol, deps: MediaDeps, ctx: ExecutionContext, declared: { readonly path: string; readonly client: string } | null = null, gemini: GeminiAsked | null = null) {
+  constructor(request: Request, protocol: Protocol, deps: EntryDeps, ctx: ExecutionContext, declared: { readonly path: string; readonly client: string } | null = null) {
     this.request = request;
     this.protocol = protocol;
     this.deps = deps;
     this.ctx = ctx;
-    this.declared = declared;
-    this.gemini = gemini;
     this.started = Math.floor(deps.clock());
     this.requestId = newRequestId(this.started);
     // As inference.ts: the pre phase runs from the arrival, the snapshot's read its first wait.
@@ -521,11 +458,11 @@ export class ModelApiRun {
     this.path = declared?.path ?? url.pathname;
     this.origins = originsOf(deps.cfg, url);
     this.client = clientFields(request.headers, declared?.client ?? null);
-    this.lane = deps.lane ?? null;
-    this.rankRegion = this.lane === null ? REST_EGRESS_REGION : `lane-${deps.cfg.deployEnv}`;
+    this.lane = deps.lane;
+    this.rankRegion = `lane-${deps.cfg.deployEnv}`;
     this.responded = new Promise<void>((resolve) => (this.markResponded = resolve));
     // The client's name leaves the confidential VM in no record, a gate's pattern among them.
-    this.pattern = { client: this.lane === null ? (this.client.client ?? "") : "", tools: false };
+    this.pattern = { client: "", tools: false };
     this.isolateInFlight = deps.load.enter();
     this.answerShare = deps.load.answers.share();
     this.outbound = new Outbound(MAX_WAITING_CONNECTIONS, deps.clock);
@@ -536,22 +473,15 @@ export class ModelApiRun {
     return this.outbound.peak;
   }
 
-  /** The connections its stored bodies hold now (`send`; the connection tests' seam, as inference.ts's). */
-  get bodyConnections(): number {
-    return this.bodyHeld;
-  }
-
   // ---------------------------------------------------------------- responses and the record
 
   private errorResponse(error: ApiError): Response {
     const rendered = error.render({ shape: shapeOf(this.path), origins: this.origins, requestId: this.requestId });
     const body = encoder.encode(rendered.body);
     this.responseBytes = body.length;
-    if (this.lane !== null) {
-      // The bytes the client gets: the receipt's `response.returned`, should one be signed for this request.
-      this.laneResponse = responseHash();
-      this.laneResponse.update(body);
-    }
+    // The bytes the client gets: the receipt's `response.returned`, should one be signed for this request.
+    this.laneResponse = responseHash();
+    this.laneResponse.update(body);
     return new Response(body, { status: rendered.status, headers: rendered.headers });
   }
 
@@ -574,7 +504,6 @@ export class ModelApiRun {
     // the client, and is dropped otherwise (`close_request`).
     this.settleHeld(outcome === "completed");
     this.recorded = true;
-    for (const release of this.holds) release();
     this.answerShare.release();
     this.deps.load.leave();
     const finishedAt = this.deps.clock();
@@ -585,10 +514,9 @@ export class ModelApiRun {
       finishedAt,
       method: this.request.method,
       path: this.path,
-      // The API the client spoke (`client_protocol`): Gemini for a Gemini image request, served by an image API.
-      protocol: this.gemini === null ? this.protocol : "gemini",
+      protocol: this.protocol,
       model: this.model,
-      stream: this.gemini?.stream ?? false,
+      stream: false,
       region: this.deps.region,
       authResult: this.authResult,
       authScheme: this.authScheme,
@@ -635,7 +563,6 @@ export class ModelApiRun {
       trustRequestViolations: [],
       trustResponseViolations: [],
       trustRejected: false,
-      // Not a translation: a Gemini image request is served by an image route that speaks Gemini.
       upstreamProtocol: null,
       admissionDegraded: this.admissionDegraded,
       admissions: [...this.admissions],
@@ -666,7 +593,7 @@ export class ModelApiRun {
     this.entryForwards = null;
     const sinks = this.outbound.sinks(this.deps.sinks);
     // A record of the confidential entry carries no client fingerprint (lane/hooks.ts `laneSafeRecord`).
-    const safe = this.lane === null ? record : laneSafeRecord(record);
+    const safe = laneSafeRecord(record);
     // No content of the model APIs is sealed yet (docs/cloudflare-native/gateway.md section 13): their row says so.
     // The platform's 30 s run from the answer's end, or from the client's leaving when that came first.
     const end = Math.min(finishedAt, this.presence.at ?? finishedAt) + AFTER_CLIENT_LEFT_MS;
@@ -675,17 +602,15 @@ export class ModelApiRun {
     const emitted = (async () => {
       // The entry's receipt is signed and stored as soon as the answer has ended, beside the record's own work and never
       // after its sends (inference.ts `record`): a client that verifies at once finds it.
-      const receipt = this.lane === null ? null : this.responded.then(() => this.laneReceipt());
+      const receipt = this.responded.then(() => this.laneReceipt());
       // A withheld answer's record says how its hold's resolution ended (`withhold`), when that ends while the record
       // still has its reserve (CONTENT_TAIL_RESERVE_MS, as on the inference path); past it the record says unsettled.
       const timers = this.deps.waitTimers ?? this.deps.timers ?? platformTimers;
       const ended = withheld !== null && (await settledBy(withheld, end - this.deps.cfg.contentTailReserveMs, this.deps.clock, timers)) ? { ...safe, billing: this.billing, releaseReason: this.releaseReason } : safe;
       await emitRecord({ record: ended, sinks, content: notWritten("failed", null), service: this.deps.service, evidence: this.traffic.buffer.wire(), delivery });
-      if (receipt !== null) {
-        await receipt;
-        // The lane's sinks buffer: the request's point and service events exist from here on (lane/remote/sinks.ts).
-        await flushSinks(this.deps.sinks as unknown as { flush?: () => Promise<unknown> });
-      }
+      await receipt;
+      // The lane's sinks buffer: the request's point and service events exist from here on (lane/remote/sinks.ts).
+      await flushSinks(this.deps.sinks as unknown as { flush?: () => Promise<unknown> });
     })().catch(() => {});
     this.ctx.waitUntil(emitted);
   }
@@ -731,8 +656,7 @@ export class ModelApiRun {
       kind: this.kind,
       model: this.model,
       protocol: this.protocol,
-      // The client application; never from the confidential entry, whose records name no client (inference.ts).
-      ...(this.lane === null ? { client: this.client.client, client_version: this.client.clientVersion } : {}),
+      // No client application: the confidential entry's records name no client (inference.ts).
       // A model API request is held for its stated bound (apis/mod.rs `Admit`: no expected cost).
       hold_mode: "worst_case",
       ...(this.clientKey ? { client_key: true } : {}),
@@ -882,7 +806,7 @@ export class ModelApiRun {
   private abandon(error: unknown, event: string): void {
     const line = { level: "error", event, request_id: this.requestId, stage: this.admission, message: error instanceof Error ? error.message : String(error) };
     // A lane's log line carries no free text, which may quote a request (lane/hooks.ts `laneSafeLog`).
-    console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
+    console.error(JSON.stringify(laneSafeLog(line)));
     const attempt = this.current;
     if (attempt !== null) {
       attempt.controller.abort("internal_error");
@@ -947,7 +871,7 @@ export class ModelApiRun {
    */
   private named(response: Response): Response {
     const lane = this.lane;
-    if (lane === null || this.laneReceiptId === null || (this.laneDraft ?? this.laneForwardedDraft) === null || this.laneOwner === null) return response;
+    if (this.laneReceiptId === null || (this.laneDraft ?? this.laneForwardedDraft) === null || this.laneOwner === null) return response;
     const headers = new Headers(response.headers);
     headers.set("x-receipt-id", this.laneReceiptId);
     lane.state.receipts.announce(this.laneReceiptId, this.laneOwner);
@@ -963,7 +887,6 @@ export class ModelApiRun {
    */
   private async laneReceipt(): Promise<void> {
     const lane = this.lane;
-    if (lane === null) return;
     const receiptId = this.laneReceiptId;
     try {
       const draft = this.laneDraft ?? this.laneForwardedDraft;
@@ -1000,13 +923,6 @@ export class ModelApiRun {
       }
       this.abandon(error, "request_failed");
       return await this.closeRate(this.refuse(new ApiError(500, "internal_error"), this.admission));
-    } finally {
-      const spooled = this.spooled;
-      if (spooled.length > 0) {
-        // The uploads are needed until the last attempt sent them; a lifecycle rule on spool/v1/ removes what a lost delete leaves.
-        const content = this.deps.env.CONTENT;
-        this.ctx.waitUntil(this.relayed.then(() => Promise.all(spooled.map((key) => content.delete(key).catch(() => {})))).catch(() => {}));
-      }
     }
   }
 
@@ -1068,77 +984,15 @@ export class ModelApiRun {
       this.requestKey = this.requestId;
     }
 
-    // The confidential entry serves the standard APIs on a provider's own API (`serveEntry`), and nothing else here. A
-    // video create needs the entry's job store (an entry without one, a relay stack VM, serves none).
-    if (this.lane !== null) {
-      if (this.gemini !== null || !entryStandardApi(this.protocol) || (this.protocol === "open_ai_videos" && this.videoIo() === null)) return this.refuse(new ApiError(404, "unsupported_protocol"), "auth");
-      // 0. A repeated video create answers with the job its key made, before its body is read (section 2.7).
-      if (this.protocol === "open_ai_videos" && this.clientKey) {
-        const replayed = await this.replayEntryVideo(snapshot, key);
-        if (replayed !== null) return replayed;
-      }
-      return this.serveEntry(snapshot, key, this.lane);
-    }
-
-    // A Gemini image request: the Gemini API's body, decoded as the image API it is served by.
-    if (this.gemini !== null) return this.serveGemini(snapshot, key, this.gemini);
-
-    // 0. A repeated video create answers with the job its key made (apis/video.rs `create`), before its body is read.
+    // The entry serves the standard APIs on a provider's own API (`serveEntry`), and nothing else here. A video create
+    // needs the entry's job store (an entry without one, a relay stack VM, serves none).
+    if (!entryStandardApi(this.protocol) || (this.protocol === "open_ai_videos" && this.videoIo() === null)) return this.refuse(new ApiError(404, "unsupported_protocol"), "auth");
+    // 0. A repeated video create answers with the job its key made, before its body is read (section 2.7).
     if (this.protocol === "open_ai_videos" && this.clientKey) {
-      // Where a repeated request's key is looked up (record.rs `Stage::Idempotency`).
-      this.admission = "idempotency";
-      const replayed = await replayVideoCreate(this.deps.videos, { workspace: key.workspaceId, models: key.models }, this.requestKey, this.videoCall("pre"));
-      if (replayed !== undefined) {
-        // Answered before its body is read, as the server answers it before its preflight (apis/video.rs `create`): not counted.
-        this.rateOpen = false;
-        this.responseBytes = Number(replayed.headers.get("content-length") ?? 0);
-        this.responseComplete = true;
-        this.record(200, "completed", null);
-        return replayed;
-      }
+      const replayed = await this.replayEntryVideo(snapshot, key);
+      if (replayed !== null) return replayed;
     }
-
-    // 2. The body.
-    this.admission = "body";
-    // The client's upload is REQUEST_BODY_MS's, not the pre phase's.
-    this.budget.pause();
-    const received = await this.receive();
-    this.budget.resume();
-    if (received instanceof ApiError) return this.refuse(received, "body");
-
-    // 3. The same routing preference the generation APIs take (apis/mod.rs). A JSON body carries it like theirs and
-    // it is removed before the body is decoded: every API's decoder refuses a field its API does not define, as
-    // the first-party API would. A multipart form has no place for it, so only the header form applies there.
-    this.admission = "preference";
-    if (received.kind === "json") {
-      const taken = Preference.take(received.value, this.request.headers);
-      if (!taken.ok) return this.refuse(unreadablePreference(taken.code), "preference");
-      this.preference = taken.preference;
-    } else {
-      const read = Preference.fromHeader(this.request.headers);
-      if (typeof read === "string") return this.refuse(unreadablePreference(read), "preference");
-      this.preference = read;
-    }
-
-    // 4. Decode.
-    this.admission = "parse";
-    let api: ApiRequest;
-    try {
-      api = decodeApi(this.protocol, received, mediaSettings(cfg));
-    } catch (error) {
-      if (error instanceof ApiError) return this.refuse(error, "parse");
-      throw error;
-    }
-    const named = untagged(snapshot, api.model);
-    if (!named.ok) return this.refuse(unreadablePreference(named.code), "preference");
-    if (named.tag !== null) api = { ...api, model: named.model };
-    this.modelTag = named.tag;
-    this.model = api.model;
-    const scope = modelScopeRefusal(key, api.model);
-    if (scope !== null) return this.refuse(scope, "model_scope");
-    const layered = this.layer(snapshot, key);
-    if (layered !== null) return layered;
-    return this.route(snapshot, key, api);
+    return this.serveEntry(snapshot, key, this.lane);
   }
 
   /**
@@ -1152,15 +1006,13 @@ export class ModelApiRun {
     if (!layered.ok) return this.refuse(unreadableDefault(layered.code), "preference");
     this.preference = layered.preference;
     this.preferenceRecord = preferenceFacts(layered.preference, layered.sources);
-    // No route of this gateway is verifiable, and Gray's confidential VM serves no model API: a `verifiable` request is
-    // answered here, before any route is looked at (`verifiableUpFront`).
     const models = this.model === null ? [] : [this.model];
     // A request that reached the confidential VM through Gray's API had its TLS ended at Cloudflare: nothing here
     // verifies it end to end (inference.ts, docs/design/one-address.md).
-    if (this.lane?.arrival === "gray_api" && layered.preference.verifiable) return this.refuse(verifiableViaApi(new URL(this.request.url).origin), "preference");
+    if (this.lane.arrival === "gray_api" && layered.preference.verifiable) return this.refuse(verifiableViaApi(new URL(this.request.url).origin), "preference");
     // At the entry a `verifiable` request is answered once its routes are read (`route`): no lane relay serves a model
     // API, so none is left.
-    const upFront = verifiableUpFront(this.lane !== null, snapshot, registeredOf(snapshot), layered.preference, models, this.protocol, false, this.deps.clock());
+    const upFront = verifiableUpFront(true, snapshot, registeredOf(snapshot), layered.preference, models, this.protocol, false, this.deps.clock());
     if (upFront !== null) return this.refuse(new ApiError(400, upFront), "preference");
     return null;
   }
@@ -1173,14 +1025,13 @@ export class ModelApiRun {
    *     lane's body cap, a form within LANE_FORM_MAX_BYTES and counted against the isolate's memory budget;
    *  3. the routing preference, as chat's at the entry: `x-gray-routing` and a JSON body's `provider`, layered over
    *     the key's and the workspace's defaults;
-   *  4. the model. One the entry has no route of on this API (a route with a vendor adapter is not the entry's) is
-   *     answered by `route` as any model without a route is (resolution.ts `unrouted`); nothing is forwarded
+   *  4. the model. One the entry has no route of on this API is answered by `route` as any model without a route is (resolution.ts `unrouted`); nothing is forwarded
    *     (docs/design/standard-media-at-entry.md section 2.9);
    *  5. what the entry refuses of a body it serves (`entryBodyRefusal`), and its API's own decoding in the entry's
    *     reading (@gray/media `decodeApi`): the formats and shapes Gray would have to convert are refused, nothing is
    *     sent.
    *
-   * Then the routes, the hold, the attempts and the answer, as for the API Worker (`route`).
+   * Then the routes, the hold, the attempts and the answer (`route`).
    */
   private async serveEntry(snapshot: GatewaySnapshot, key: KeyRecord, lane: LaneDeps): Promise<Response> {
     const { cfg, clock } = this.deps;
@@ -1236,188 +1087,41 @@ export class ModelApiRun {
     return this.route(snapshot, key, api);
   }
 
-  /**
-   * Reads the body: a JSON object, or a multipart form (form.ts). Its refusal as an ApiError. These APIs
-   * state no body size, so Gray sets none of its own (`limits::request_limit` on main): a form streams,
-   * its files never held whole, within REQUEST_BODY_MS as any body; a JSON body, which its API's rules
-   * read whole, is held within BODY_PARSE_MAX_BYTES, the most of one document an isolate parses whole
-   * (m0/memory.md): what an idle gateway holds of one request, so a body declaring more is refused
-   * before any of it is read, and one of unknown length once it passes it (`memoryRefusal`).
-   */
-  private async receive(): Promise<Received | ApiError> {
-    const { cfg, clock } = this.deps;
-    const bucket = this.outbound.bucket(this.deps.env.CONTENT);
-    if (takesForm(this.protocol, this.request.headers.get("content-type"))) {
-      const read = await readForm(
-        this.request,
-        { bytes: Number.MAX_SAFE_INTEGER, textBytes: cfg.bodyParseMaxBytes, holdBytes: cfg.bodyParseMaxBytes, waitMs: cfg.requestBodyMs },
-        bucket,
-        (bytes) => this.retained.set("request_body", bytes),
-      );
-      if (!read.ok) return read.error;
-      const form: ReceivedForm = read.form;
-      this.spooled = form.spooled;
-      this.sources = form.sources;
-      this.requestComplete = true;
-      this.requestBytes = form.length;
-      this.bodyTier = form.spooled.length > 0 ? "C" : "A";
-      this.bodyReadMs = clock() - this.started;
-      return { kind: "form", parts: form.parts };
-    }
-    const limit = cfg.bodyParseMaxBytes;
-    const declared = this.request.headers.get("content-length");
-    if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > limit) return memoryRefusal(limit);
-    const read = await readBody(this.request, { protocol: this.protocol, limit, parseMax: limit, rawMax: limit, waitMs: cfg.requestBodyMs }, undefined, (bytes) => this.retained.set("request_body", bytes));
-    if (!read.ok) return read.error.code === "request_body_limit" ? memoryRefusal(limit) : read.error;
-    if (read.body.tier === "C") return new ApiError(500, "internal_error");
-    this.requestComplete = true;
-    this.requestBytes = read.body.length;
-    this.bodyTier = "A";
-    this.bodyReadMs = clock() - this.started;
-    let value: Json;
-    try {
-      // serde_json's reading, as the server's `parse_body`: the same key twice, the last one counts.
-      value = parseSerdeBytes(read.body.bytes);
-    } catch {
-      return new ApiError(400, "invalid_json");
-    }
-    this.retained.set("request_body", 0);
-    if (!isObject(value)) return new ApiError(400, "invalid_protocol_request");
-    return { kind: "json", value: value as JsonObject };
-  }
-
-  /**
-   * A Gemini client's request for an image model served through its image routes (gemini-images.ts):
-   * its body read by tier, as the Gemini API's bodies are (within the Gemini API's 100 MB, a body past
-   * BODY_PARSE_MAX_BYTES never parsed whole); a request whose path its body decides goes to the
-   * generation path when it carries no image or file (`handOff`); then decoded as the image API it is
-   * served by (@gray/media `decodeGeminiImages`), and routed, priced and answered as an images request.
-   */
-  private async serveGemini(snapshot: GatewaySnapshot, key: KeyRecord, gemini: GeminiAsked): Promise<Response> {
-    const { cfg, clock } = this.deps;
-    this.admission = "body";
-    const bucket = this.outbound.bucket(this.deps.env.CONTENT);
-    // The client's upload and its spool are REQUEST_BODY_MS's, not the pre phase's.
-    const bodyDeadline = clock() + cfg.requestBodyMs;
-    this.budget.pause();
-    const read = await readBody(
-      this.request,
-      { protocol: "gemini", limit: Number(requestLimit("gemini")), parseMax: cfg.bodyParseMaxBytes, rawMax: cfg.bodyRawMaxBytes, waitMs: cfg.requestBodyMs },
-      bucket,
-      (bytes) => this.retained.set("request_body", bytes),
-    );
-    this.budget.resume();
-    if (!read.ok) return this.refuse(read.error, "body");
-    const body = read.body;
-    this.requestComplete = true;
-    this.requestBytes = body.length;
-    this.bodyTier = body.tier;
-    this.bodyReadMs = clock() - this.started;
-    if (body.tier === "C") this.spooled = [body.key];
-    this.retained.set("request_body", body.tier === "C" ? 0 : body.length);
-    this.admission = "parse";
-    // A body that is no JSON object goes to the generation path too when its body decides the path: it
-    // refuses the body as it refuses any (gemini_images.rs `read_ahead`).
-    // A spooled body is read back twice from its start: the body's time, within its deadline (body.ts `spoolReadBack`).
-    const reading = () => geminiBodyRead(body, bucket, { smallMax: cfg.bodyParseMaxBytes, tokenMax: cfg.bodyRawMaxBytes });
-    const viewed =
-      body.tier === "C"
-        ? await spoolReadBack(reading, { budget: this.budget, deadline: bodyDeadline, clock, ...(this.deps.waitTimers === undefined ? {} : { timers: this.deps.waitTimers }) })
-        : await reading();
-    if (gemini.byBody && (viewed instanceof ApiError || viewed.view.parts.kind !== "ok" || !viewed.view.parts.media)) return this.handOff(gemini, body);
-    if (viewed instanceof ApiError) return this.refuse(viewed, "parse");
-    // The routing preference, taken out of the body before it is decoded, as a JSON body's (apis/mod.rs).
-    this.admission = "preference";
-    const stated = viewed.view.members.some((m) => m.key === "provider");
-    const carried: JsonObject = stated ? { provider: viewed.view.value("provider") ?? null } : {};
-    const taken = Preference.take(carried, this.request.headers);
-    if (!taken.ok) return this.refuse(unreadablePreference(taken.code), "preference");
-    this.preference = taken.preference;
-    this.geminiStripProvider = stated;
-    const view = stated ? { ...viewed.view, members: viewed.view.members.filter((m) => m.key !== "provider"), value: (member: string) => (member === "provider" ? undefined : viewed.view.value(member)) } : viewed.view;
-    this.admission = "parse";
-    let decoded: { readonly protocol: Protocol; readonly api: ApiRequest };
-    try {
-      decoded = decodeGeminiImages(gemini.model, gemini.stream, view);
-    } catch (error) {
-      if (error instanceof ApiError) return this.refuse(error, "parse");
-      throw error;
-    }
-    this.protocol = decoded.protocol;
-    this.geminiSend = viewed.send;
-    const named = untagged(snapshot, decoded.api.model);
-    if (!named.ok) return this.refuse(unreadablePreference(named.code), "preference");
-    const api = named.tag === null ? decoded.api : { ...decoded.api, model: named.model };
-    this.modelTag = named.tag;
-    this.model = api.model;
-    const scope = modelScopeRefusal(key, api.model);
-    if (scope !== null) return this.refuse(scope, "model_scope");
-    const layered = this.layer(snapshot, key);
-    if (layered !== null) return layered;
-    return this.route(snapshot, key, api);
-  }
-
-  /**
-   * A Gemini request whose path its body decides, carrying no image or file: the generation path serves
-   * it with the body already read (gemini_images.rs `generate`: the body goes to its path with what it
-   * holds). This run records nothing and leaves the spooled body to the generation path.
-   */
-  private handOff(gemini: GeminiAsked, body: Body): Promise<Response> {
-    this.recorded = true;
-    // The generation path counts the request (its own `rateOpen`), as the server's read-ahead hands it over counted once.
-    this.rateOpen = false;
-    this.deps.load.leave();
-    this.spooled = [];
-    this.retained.set("request_body", 0);
-    const run = new InferenceRun(this.request, { protocol: "gemini", pathModel: gemini.model }, this.deps, this.ctx, this.declared, { body, started: this.started, bodyReadMs: this.bodyReadMs ?? 0 });
-    return run.serve();
-  }
-
-  /** 5. The routes that can serve the request, each with its credential and its price for the request's selectors. */
+  /** 5. The routes that can serve the request, each the entry's and priced for the request's selectors. */
   private async route(snapshot: GatewaySnapshot, key: KeyRecord, api: ApiRequest): Promise<Response> {
     const { cfg, clock } = this.deps;
     this.admission = "routes";
     const now = clock();
-    // A Gemini image request goes to an image route whose adapter speaks Gemini (gemini_images.rs `speaks`).
-    const gemini = this.gemini !== null;
-    const live = snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === api.model && r.protocol === this.protocol && (!gemini || speaks(r)) && tierAdmitted(this.preference, r));
+    const live = snapshot.routes.filter((r) => routeServes(r.expiresAt, now) && !releaseOutdated(r, now) && r.model === api.model && r.protocol === this.protocol && tierAdmitted(this.preference, r));
     const records = live.filter((r) => !api.stream || streams(r));
-    if (records.length === 0) {
-      // A Gemini image request no live image route takes (gemini_images.rs `unrouted`): an image or file to
-      // edit where the model has no live edits route through the Gemini adapter, else why the model has no
-      // route on the Gemini API.
-      if (gemini && this.protocol === "open_ai_image_edits") return this.refuse(capabilityUnproved(api.model, ["image or file input"], "contents"), "routes");
-      if (gemini) return this.refuse(unrouted(snapshot, contract(api.model, "gemini"), "gemini", now, false, translationPolicy(snapshot)), "routes");
-      return this.refuse(unrouted(snapshot, contract(api.model, this.protocol), this.protocol, now, false), "routes");
-    }
+    // A streamed request that only routes without streaming could take is told which capability it needs (400
+    // `unsupported_capability` naming streaming, apis/mod.rs `capability_unproved`), not to retry for a provider.
+    if (records.length === 0) return this.refuse(unrouted(snapshot, { ...contract(api.model, this.protocol), stream: api.stream }, this.protocol, now, false), "routes");
     // The customer's own filter, applied as the generation path applies it (`retain_admitted`): a reference
-    // naming nothing registered, or a filter that leaves no route, refuses the request (400). A model API never runs
-    // in lane mode, and no verifiable route serves one: a `verifiable` request is told none serves it.
-    const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf, verifiableRoute, unverifiable(this.lane !== null, false));
+    // naming nothing registered, or a filter that leaves no route, refuses the request (400). No lane relay serves a
+    // model API, so no verifiable route does: a `verifiable` request is told none serves it.
+    const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf, verifiableRoute, unverifiable(true, false));
     if (!admitted.ok) return this.refuse(new ApiError(400, admitted.code), "routes");
     const region = snapshot.workspaces[key.workspaceId]?.region ?? "any";
     const inRegion = admitted.routes.filter((r) => regionMatches(region, r.serviceRegion));
     if (inRegion.length === 0) return this.refuse(new ApiError(503, "region_unavailable"), "region");
     // The entry opens no Gray-sealed credential: an attempt takes its provider's key from the entry's own table
     // (`entryKey`), and a lane without that table (a relay stack VM) serves none of these routes.
-    const master = this.lane === null ? await this.deps.master() : null;
     const candidates: MediaCandidate[] = [];
     const unpriced: RouteRecord[] = [];
     for (const record of inRegion) {
-      const credential = this.lane !== null ? (this.entryRoute(record) ? "" : null) : master === null ? null : await openCredential(master, record.endpointId, record.credential);
-      // A route whose credential the gateway cannot open serves nothing (the server drops it at refresh).
-      if (credential === null) continue;
+      if (!this.entryRoute(record)) continue;
       const priced = pricedQuoteOf(record.quote, cfg.platformFeeBps, api.selectors);
       if (priced === undefined) {
         unpriced.push(record);
         continue;
       }
-      candidates.push({ record, media: mediaRouteOf(record, credential, priced.rate.media.unit !== undefined), priced });
+      candidates.push({ record, media: mediaRouteOf(record, priced.rate.media.unit !== undefined), priced });
     }
     if (candidates.length === 0) return this.refuse(new ApiError(503, unpriced.length > 0 ? "supplier_quote_unavailable" : "provider_capacity_or_quote_unavailable"), "routes");
     let kept: MediaRoute[];
     try {
-      kept = serviceableApi(this.protocol, api, candidates.map((c) => c.media), { nowMs: clock });
+      kept = serviceableApi(this.protocol, api, candidates.map((c) => c.media));
     } catch (error) {
       if (error instanceof ApiError) return this.refuse(error, "routes");
       throw error;
@@ -1448,8 +1152,6 @@ export class ModelApiRun {
     const info = snapshot.models[api.model] ?? {};
     this.ceiling = requestCeiling(info.maxRequestMicrousd === undefined ? undefined : BigInt(info.maxRequestMicrousd), this.protocol);
     this.admission = "cost_ceiling";
-    // A Gemini image request holds the images its ceiling buys at the dearest route's image price (gemini_images.rs `bound`).
-    if (this.gemini !== null) api = { ...api, bound: geminiImagesBound(api, bound.unit, this.ceiling) };
     let reserved: bigint;
     try {
       reserved = reservation(api.bound, { input: bound.input, output: bound.output, unit: bound.unit }, this.ceiling);
@@ -1676,13 +1378,14 @@ export class ModelApiRun {
     const until = restUntil(BigInt(sinceMs), decided.lengthMs);
     const untilMs = until > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(until);
     const r = attempt.route.record;
-    const scopeId = restScopeId(decided.scope, r.endpointId, r.model, r.configFingerprint, r.credentialGeneration, known.key);
+    // The entry's failure rests the entry's keys alone, never the API address's (rests.ts `fileRest`).
+    const scopeId = restScopeId(decided.scope, r.endpointId, r.model, r.configFingerprint, r.credentialGeneration, known.key, this.rankRegion);
     const inForce = restInForce({ scopeId, cause: decided.cause, untilMs }, known.rests, sinceMs);
     if (inForce !== undefined) attempt.rest = inForce;
     const roots = this.endpointRoots();
     if (roots === null || untilMs <= sinceMs) return;
     const routes = (this.snapshot?.routes ?? []).filter((route) => route.endpointId === r.endpointId);
-    const filing = fileRest(roots, routes, r, known.key, decided, { sinceMs, untilMs, status: status ?? null, said: reading.said ?? null });
+    const filing = fileRest(roots, routes, r, known.key, decided, { sinceMs, untilMs, status: status ?? null, said: reading.said ?? null }, this.rankRegion);
     this.restFilings.add(restRoots(routes, r, decided.scope), filing);
     this.ctx.waitUntil(filing);
   }
@@ -1722,7 +1425,7 @@ export class ModelApiRun {
     if (sent instanceof Response) return sent;
     const { attempt, response } = sent;
     attempt.status = response.status;
-    if (this.protocol === "open_ai_videos") return this.lane !== null ? this.createEntryVideo(api, attempt, response, deadline) : this.createVideo(api, attempt, response, deadline);
+    if (this.protocol === "open_ai_videos") return this.createEntryVideo(api, attempt, response, deadline);
     return this.answer(api, attempt, response, deadline);
   }
 
@@ -1748,7 +1451,7 @@ export class ModelApiRun {
       // failover follows, as admission ordered the plan.
       otherOperators: this.preference.allowsOtherOperators(),
       order: this.preference.order,
-      scope: apiScope(this.protocol, api),
+      scope: apiScope(this.protocol),
       clientRetrying: clientRetrying(this.request.headers.get("x-stainless-retry-count")),
       stream: api.stream,
       issued: () => false,
@@ -1811,21 +1514,18 @@ export class ModelApiRun {
         retest = got.retest;
         dispatch = got.dispatch;
       }
-      // At the entry, the provider's key from the entry's memory, or one `endpoint.credential` call within the attempt's
-      // own bound (`entryKey`); none in time passes the route over, and nothing is sent.
-      let entry: Attempt["entry"];
-      if (this.lane !== null) {
-        const credential = await this.entryKey(route.record, deadline);
-        const fetchFor = this.lane.endpointFetch;
-        if (credential === null || fetchFor === undefined) {
-          if (retest !== null) this.gates.drop(retest);
-          dispatch?.drop();
-          this.ctx.waitUntil(releasePermit(this.endpoints(), this.deps.region, permit, { kind: "not_counted", reason: "not_dispatched" }, false));
-          this.passRoute(d, route, "route_inactive");
-          continue;
-        }
-        entry = { credential, fetch: fetchFor(route.record) };
+      // The provider's key from the entry's memory, or one `endpoint.credential` call within the attempt's own bound
+      // (`entryKey`); none in time passes the route over, and nothing is sent.
+      const credential = await this.entryKey(route.record, deadline);
+      const fetchFor = this.lane.endpointFetch;
+      if (credential === null || fetchFor === undefined) {
+        if (retest !== null) this.gates.drop(retest);
+        dispatch?.drop();
+        this.ctx.waitUntil(releasePermit(this.endpoints(), this.deps.region, permit, { kind: "not_counted", reason: "not_dispatched" }, false));
+        this.passRoute(d, route, "route_inactive");
+        continue;
       }
+      const entry: Attempt["entry"] = { credential, fetch: fetchFor(route.record) };
       const failure = d.last?.outcome.class;
       if (failure !== undefined && next !== "none") this.retryEvents.push({ kind: "retry", next, cls: failure });
       const index = d.tried.attempts;
@@ -1853,22 +1553,20 @@ export class ModelApiRun {
       const r = route.record;
       // A model API's answer is evidence of its base check alone (`answered`): no JSON output, no coding agent.
       const evidence = new AttemptEvidence({ endpointId: r.endpointId, credentialGeneration: r.credentialGeneration, configFingerprint: r.configFingerprint, model: r.model, protocol: r.protocol }, false, null);
-      const attempt: Attempt = { candidate: byId.get(route.record.endpointId)!, route, index, permit, startedAt: clock(), controller: new AbortController(), status: null, ended: false, next, committed: false, retest, evidence, ...(dispatch === undefined ? {} : { dispatch }), ...(entry === undefined ? {} : { entry }) };
+      const attempt: Attempt = { candidate: byId.get(route.record.endpointId)!, route, index, permit, startedAt: clock(), controller: new AbortController(), status: null, ended: false, next, committed: false, retest, evidence, entry, ...(dispatch === undefined ? {} : { dispatch }) };
       this.current = attempt;
       // The receipt id and forwarded draft this attempt may replace, kept so a failure of egress before it connected the
       // provider puts them back as they were (inference.ts, D72).
       const laneBefore = { receiptId: this.laneReceiptId, forwardedDraft: this.laneForwardedDraft };
       // The attempt's own wait is its upstream's, not the pre phase's.
       this.budget.pause();
-      const result = await this.send(api, attempt, deadline);
+      const result = await this.send(attempt, deadline);
       this.budget.resume();
       switch (result.kind) {
         case "answered":
           // The committed attempt's receipt draft is adopted: the receipt describes the bytes this provider was sent.
-          if (attempt.entry !== undefined) {
-            this.laneDraft = attempt.laneDraft ?? null;
-            this.laneReceiptId ??= newReceiptId();
-          }
+          this.laneDraft = attempt.laneDraft ?? null;
+          this.laneReceiptId ??= newReceiptId();
           // The answer commits at its 2xx: it is served, and no other attempt follows (`commit`). A recovery
           // probe's waiters go on as trials.
           d.commit();
@@ -1909,10 +1607,10 @@ export class ModelApiRun {
           attempt.evidence.upstreamStatus = status;
           // Bounded by the deadline and a small byte budget; its end also ends the attempt's transport.
           const body = await errorBody(result.response, Math.min(deadline, clock() + ERROR_BODY_WAIT_MS), clock);
-          // An entry's attempt goes through egress's `/route/` kind: its fixed 502s are egress's own, not the
-          // provider's. One from before egress connected the provider sent the provider nothing: no receipt names it
-          // (inference.ts `openAttempt`, D72).
-          if (attempt.entry !== undefined && egressSidecarFailure(status, body)) {
+          // An attempt goes through egress's `/route/` kind: its fixed 502s are egress's own, not the provider's. One
+          // from before egress connected the provider sent the provider nothing: no receipt names it (inference.ts
+          // `openAttempt`, D72).
+          if (egressSidecarFailure(status, body)) {
             const unsent = egressBeforeVendor(status, body);
             if (unsent) {
               this.laneReceiptId = laneBefore.receiptId;
@@ -2396,116 +2094,12 @@ export class ModelApiRun {
   }
 
   /**
-   * A video job's calls (media.ts `VideoCall`): through the request's outbound gate, each waiting at most what `phase`
-   * leaves (`RequestBudget`), on the request's wait timers; one that does not answer in time goes on in the background.
-   */
-  private videoCall(phase: "pre" | "post"): VideoCall {
-    return (work) => {
-      const call = this.outbound.run(work);
-      this.ctx.waitUntil(call.catch(() => {}));
-      const waitMs = phase === "pre" ? this.budget.preWait(Number.POSITIVE_INFINITY) : this.budget.postWait(Number.POSITIVE_INFINITY);
-      return withinPhase(call, waitMs, this.deps.waitTimers ?? this.deps.timers ?? platformTimers);
-    };
-  }
-
-  /**
-   * The body of one attempt: a JSON body with its deferred uploads spliced in, or a form written as it is
-   * sent; a Gemini image request's body too large to parse whole as the client's bytes with its
-   * generation config spelled (gemini-images.ts `geminiAttemptBody`).
-   */
-  private attemptBody(api: ApiRequest, outgoing: Outgoing): { readonly body: UpstreamBody & { readonly stored: boolean }; readonly contentType: string | null } | null {
-    // A stored body is read under the connection `send` holds for it (outbound.ts `hold`): through the
-    // unwrapped binding, not the request's queue, where it would wait behind the calls the hold got past.
-    const bucket = this.deps.env.CONTENT;
-    if (this.geminiSend !== null && api.body.kind === "gemini") {
-      const spliced = geminiAttemptBody(this.geminiSend, api.body, bucket, this.geminiStripProvider ? ["provider"] : []);
-      if (spliced !== null) return { body: { ...spliced, stored: this.geminiSend.tier === "C" }, contentType: null };
-    }
-    const body = outgoing.body;
-    if (body === undefined) return null;
-    const sources = readThrough(this.sources, bucket);
-    if (body instanceof Uint8Array) return { body: splicedBody(body, sources), contentType: null };
-    const form = multipartBody(body, sources);
-    return { body: form.body, contentType: form.contentType };
-  }
-
-  /** One upstream call, until its response headers (D5's deadline, the client's leaving). */
-  private async send(api: ApiRequest, attempt: Attempt, deadline: number): Promise<SendResult> {
-    const { clock } = this.deps;
-    if (attempt.entry !== undefined) return this.sendEntry(attempt, attempt.entry, deadline);
-    const media = attempt.candidate.media;
-    let outgoing: Outgoing;
-    try {
-      outgoing = upstreamApi(this.protocol, api, media, { billsUnits: media.billsUnits === true, clock: { nowMs: clock }, clientHeaders: this.request.headers });
-    } catch (error) {
-      if (error instanceof ApiError) return { kind: "refused", error };
-      throw error;
-    }
-    // A recovery probe goes out from here: its spell's clock runs whatever becomes of its lease (the server's `probe_sent`).
-    const permit = attempt.permit;
-    if (permit.probeId !== null && permit.trial !== true) this.ctx.waitUntil(probeSent(this.endpoints(), this.deps.region, permit));
-    // The attempt's dispatch counts in its group's exploration budget from here (`mark_dispatched`).
-    if (attempt.dispatch !== undefined) {
-      attempt.dispatch.commit();
-      attempt.dispatchedAtMs = this.deps.clock();
-    }
-    let timedOut = false;
-    const timer = setTimeout(
-      () => {
-        timedOut = true;
-        attempt.controller.abort("attempt_deadline");
-      },
-      Math.max(0, deadline - clock()),
-    );
-    const unsubscribe = this.presence.onLeave(() => attempt.controller.abort("client_left"));
-    let release: (() => void) | null = null;
-    // Whether the upstream took any of the body: a fetch that fails before is a refused connection (`connect`).
-    let taken = false;
-    /** The fetch got its connection and was made: before that the request never left the gateway. */
-    let started = false;
-    let body: ReadableStream<Uint8Array> | null = null;
-    try {
-      const made = this.attemptBody(api, outgoing);
-      // The vendor call's own headers, and the Accept the server's HTTP client adds when they name none.
-      const headers = withDefaultAccept(new Headers(outgoing.headers as [string, string][]));
-      if (made !== null) {
-        if (made.contentType !== null) headers.set("content-type", made.contentType);
-        let upload: UpstreamBody = made.body;
-        if (made.body.stored) {
-          // An upload read from R2 while the upstream reads it takes a connection of its own, held until its stream
-          // ends (inference.ts `attemptBody`): a form's next file is opened only as the upstream reaches it, which an
-          // upstream that answers early does after its response headers.
-          release = this.heldBody(await this.outbound.hold(attempt.controller.signal));
-          upload = releasedAtEnd(made.body, release);
-        }
-        body = sendable(upload, () => (taken = true));
-      }
-      const response = await this.outbound.fetch(this.deps.fetch)(outgoing.url, { method: outgoing.method, headers, body, signal: attempt.controller.signal, redirect: "manual" }, () => (started = true));
-      if (response.status >= 200 && response.status <= 299) return { kind: "answered", response };
-      // Not answered: a stored body's R2 connection goes back now, before the next attempt asks for one.
-      release?.();
-      return { kind: "status", response };
-    } catch {
-      // A body the fetch never read to its end is cancelled, and with it the R2 read it opened (inference.ts `send`).
-      body?.cancel().catch(() => {});
-      release?.();
-      if (this.presence.gone) return { kind: "left" };
-      if (timedOut) return { kind: started ? "timeout" : "unsent" };
-      // A request without a body reached the upstream or not: what it did is unknown.
-      return { kind: taken || body === null ? "transport" : "connect" };
-    } finally {
-      clearTimeout(timer);
-      unsubscribe();
-    }
-  }
-
-  /**
    * An endpoint route at the entry (docs/design/lane-provider-routes.md section 5): any route of the lane's view that is
-   * no lane relay's and has no adapter, attempted through egress's `/route/` kind when the entry has its keys and table.
+   * no lane relay's, attempted through egress's `/route/` kind when the entry has its keys and table.
    */
   private entryRoute(record: RouteRecord): boolean {
     const lane = this.lane;
-    return lane !== null && record.auth !== "lane_relay" && (record.adapter ?? null) === null && lane.endpointFetch !== undefined && lane.endpointCredentials !== undefined;
+    return record.auth !== "lane_relay" && lane.endpointFetch !== undefined && lane.endpointCredentials !== undefined;
   }
 
   /**
@@ -2514,7 +2108,7 @@ export class ModelApiRun {
    * the answer's deadline, its own bound and not what the pre phase left. Null when none came.
    */
   private async entryKey(record: RouteRecord, deadline: number): Promise<string | null> {
-    const keys = this.lane?.endpointCredentials;
+    const keys = this.lane.endpointCredentials;
     if (keys === undefined) return null;
     const budgetMs = Math.max(0, Math.min(LANE_BRIDGE_CALL_MS, deadline - this.deps.clock()));
     try {
@@ -2555,8 +2149,9 @@ export class ModelApiRun {
    * and the provider's key. The bytes' hash and events are the attempt's receipt draft; the request has a receipt
    * from the moment a fetch took the body.
    */
-  private async sendEntry(attempt: Attempt, entry: NonNullable<Attempt["entry"]>, deadline: number): Promise<SendResult> {
+  private async send(attempt: Attempt, deadline: number): Promise<SendResult> {
     const { clock } = this.deps;
+    const entry = attempt.entry;
     const record = attempt.candidate.record;
     const body = this.entryBody;
     if (body === null) return { kind: "refused", error: new ApiError(500, "internal_error") };
@@ -2615,20 +2210,6 @@ export class ModelApiRun {
     }
   }
 
-  /** `taken` (an `Outbound.hold`) counted in `bodyConnections` until it is given back, once, and given back at the record at the latest. */
-  private heldBody(taken: () => void): () => void {
-    this.bodyHeld++;
-    let given = false;
-    const release = (): void => {
-      if (given) return;
-      given = true;
-      this.bodyHeld--;
-      taken();
-    };
-    this.holds.push(release);
-    return release;
-  }
-
   /**
    * A failure before an answer: the hold released with `reason`, the request recorded, the error response,
    * which carries the upstream attempts sent and, for a request under a client's Idempotency-Key, says the
@@ -2653,15 +2234,13 @@ export class ModelApiRun {
     let handOver!: (response: Response) => void;
     const handed = new Promise<Response>((resolve) => (handOver = resolve));
     let reader: MediaAnswer | null = null;
-    if (this.lane !== null) {
-      // An answer committed: no other attempt follows, so the client's bytes are let go; what the client is sent is hashed
-      // from here.
-      this.dropEntryBody();
-      this.laneResponse = responseHash();
-    }
+    // An answer committed: no other attempt follows, so the client's bytes are let go; what the client is sent is hashed
+    // from here.
+    this.dropEntryBody();
+    this.laneResponse = responseHash();
     const run = (async () => {
       reader = answerReader({
-        ...(this.lane === null ? {} : { entry: true as const, tap: (bytes: Uint8Array) => this.laneResponse?.update(bytes) }),
+        tap: (bytes: Uint8Array) => this.laneResponse?.update(bytes),
         protocol: this.protocol,
         api,
         route: attempt.candidate.media,
@@ -2674,9 +2253,6 @@ export class ModelApiRun {
         deadline,
         silenceMs: cfg.upstreamSilenceMs,
         cfg,
-        // What the answer has fetched (a generated image's URL, a job's poll), with the server client's Accept.
-        fetch: acceptingFetch(this.outbound.fetch(this.deps.fetch)),
-        bucket: this.outbound.bucket(this.deps.env.CONTENT),
         retained: this.retained,
         isolate: this.answerShare,
         drainMs: Math.max(0, AFTER_CLIENT_LEFT_MS - cfg.accountAdmitBudgetMs),
@@ -2759,7 +2335,7 @@ export class ModelApiRun {
         this.abandon(error, "record_failed");
       }
     })();
-    this.relayed = run.catch((error: unknown) => {
+    const relayed = run.catch((error: unknown) => {
       const started = reader?.started === true;
       if (!started && this.billing === "charged") {
         // Charged at the shard before `handOver`: mark unsettled so gray-jobs refunds the undelivered answer.
@@ -2777,7 +2353,7 @@ export class ModelApiRun {
       }
       handOver(this.refuse(new ApiError(500, "internal_error"), this.admission));
     });
-    this.ctx.waitUntil(this.relayed);
+    this.ctx.waitUntil(relayed);
     return handed;
   }
 
@@ -2833,8 +2409,7 @@ export class ModelApiRun {
     const evidence = await mediaEvidence({
       model: api.model,
       protocol: this.protocol,
-      // A Gemini client's request served by an image API names the API it spoke (`client_protocol`).
-      clientProtocol: this.gemini === null ? null : "gemini",
+      clientProtocol: null,
       record,
       priced: candidate.priced,
       platformFeeBps: this.deps.cfg.platformFeeBps,
@@ -2849,7 +2424,7 @@ export class ModelApiRun {
     const verdict = judgeEvidence(evidence, cost);
     if (!verdict.ok) {
       const line = { level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: record.endpointId, why: verdict.why };
-      console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
+      console.error(JSON.stringify(laneSafeLog(line)));
       return invalid("usage_evidence_invalid", verdict.why);
     }
     const safe = (n: bigint) => (n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : Number.MAX_SAFE_INTEGER);
@@ -2925,7 +2500,7 @@ export class ModelApiRun {
           requestId: this.requestId,
           model: this.model ?? record.model,
           protocol: this.protocol,
-          stream: this.gemini?.stream ?? false,
+          stream: false,
           endpointId: record.endpointId,
           providerWorkspaceId: record.operator,
           attemptIndex: attempt.index,
@@ -2962,87 +2537,19 @@ export class ModelApiRun {
     logWithheld(end, this.requestId, shard);
   }
 
-  // ---------------------------------------------------------------- video creation
-
-  /**
-   * 9. A video create the upstream answered (apis/video.rs `respond`, `record`): the vendor's job and
-   * the seconds asked for (@gray/media `videoCreated`); a create the vendor refused with no work done
-   * releases the hold (502 `upstream_rejected`). The job's evidence is frozen now, priced for the
-   * requested seconds, and must be one the ledger takes; then the job is recorded and its Workflow
-   * started (media.ts `startVideoJob`), and the hold is the job's: this request ends without deciding
-   * it. A job that cannot be recorded, or whose id names another job, has its new hold released and
-   * the upstream asked to delete it (media.md 3.2 rule 8; section 6 item 10: released, not reviewed).
-   */
-  private async createVideo(api: ApiRequest, attempt: Attempt, response: Response, deadline: number): Promise<Response> {
-    const { cfg, clock } = this.deps;
-    const candidate = attempt.candidate;
-    const record = candidate.record;
-    let vendorJob: string;
-    let seconds: bigint;
-    try {
-      ({ vendorJob, seconds } = await videoCreated(api, candidate.media, response, deadline));
-    } catch (error) {
-      if (error instanceof CreateRejected) {
-        // The vendor refused the job: no work was done (`mark_not_consumed`).
-        this.endAttempt(attempt, { kind: "not_counted", reason: "request_refused" }, false, error.error.code);
-        return this.fail(error.error, error.error.code, attempt, 0);
-      }
-      if (!(error instanceof ApiError)) throw error;
-      this.endAttempt(attempt, { kind: "supplier_failure", reason: "invalid_response" }, false, error.code, { failure: countedFailure(null, error.code) });
-      return this.fail(error, error.code, attempt, 0);
-    }
-    // The evidence the job settles with, priced for the seconds asked for (video.rs `record`).
-    const units = { ...ZERO_COUNTERS, units: seconds };
-    const evidence = await mediaEvidence({ model: api.model, protocol: this.protocol, record, priced: candidate.priced, platformFeeBps: cfg.platformFeeBps, ceiling: this.ceiling, usage: units, unit: "seconds", rawUsage: { seconds } });
-    const cost = usageCost(evidence.usage, customerRates(evidence));
-    const verdict = cost === "amount" || cost > this.ceiling ? { ok: false as const, why: "the requested seconds cannot be priced within the request's ceiling" } : judgeEvidence(evidence, cost);
-    if (!verdict.ok) {
-      alert("video_evidence_invalid", { request_id: this.requestKey, endpoint: record.endpointId, why: verdict.why });
-      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "billing_usage_invalid");
-      this.ctx.waitUntil(deleteUpstream(mediaFetch(), candidate.media, this.jobOf(api, attempt, vendorJob, seconds, "", clock())).catch(() => {}));
-      return this.fail(new ApiError(502, "billing_usage_invalid"), "video_evidence_invalid", attempt, 0);
-    }
-    const job = this.jobOf(api, attempt, vendorJob, seconds, storedEvidence(evidence), clock());
-    // The vendor's answer is read: the job's record and Workflow wait what the post phase leaves.
-    this.budget.startPost();
-    let recorded: VideoJob;
-    try {
-      recorded = await startVideoJob(this.deps.videos, job, (work) => this.ctx.waitUntil(work), this.videoCall("post"));
-    } catch (error) {
-      const conflict = error instanceof VideoJobConflict ? error : null;
-      if (conflict === null) alert("video_job_unrecorded", { request_id: this.requestKey, job: job.id, message: error instanceof Error ? error.message : String(error) });
-      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "video_job_unrecorded");
-      // A hold the record owns stays the record's; any other is released, and the vendor's new job deleted (best effort).
-      if (conflict?.holdRecorded === true) this.holdDecided = true;
-      else this.ctx.waitUntil(deleteUpstream(mediaFetch(), candidate.media, job).catch(() => {}));
-      return this.fail(new ApiError(502, "video_job_unrecorded"), "video_job_unrecorded", attempt, 0);
-    }
-    // The hold is the job's from here (credit.rs `keep_for_job`): its Workflow settles or releases it.
-    this.holdDecided = true;
-    this.endAttempt(attempt, { kind: "success" }, false, null);
-    const body = encoder.encode(toJsonString(videoObject(recorded)));
-    this.responseBytes = body.length;
-    this.responseComplete = true;
-    this.ttfbMs = clock() - this.started;
-    this.record(200, "completed", null);
-    // As a repeat of this create answers (`replayVideoCreate`): the ledger request id the job settles under.
-    return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey!, "x-gray-attempt": String(attempt.index + 1) } });
-  }
-
   // ---------------------------------------------------------------- video creation at the confidential entry
 
   /** The job logic's dependencies for this request (lane/video-jobs.ts), its account calls through the request's outbound gate; null when the entry has no job store. */
   private videoIo(): VideoJobIo | null {
-    return this.lane === null ? null : videoJobIo(this.deps, this.lane, this.accounts());
+    return videoJobIo(this.deps, this.lane, this.accounts());
   }
 
   /**
    * A video create repeated under its `Idempotency-Key` (docs/design/standard-media-at-entry.md section 2.7, create
    * step 1): the job the key made, when the store holds it and the key may see it, answers as a retrieve does, with no
    * new hold and no second job at the provider. Its body is not read, so nothing of it is forwarded and no receipt
-   * is signed for it. Null when the store holds no such job: the request goes on as a new one (a job of a route with a
-   * vendor adapter is Gray's API's, which answers its own repeat). A store that cannot be read is
-   * `503 video_store_unavailable`: going on would ask a provider for a second video.
+   * is signed for it. Null when the store holds no such job: the request goes on as a new one. A store that cannot be
+   * read is `503 video_store_unavailable`: going on would ask a provider for a second video.
    */
   private async replayEntryVideo(snapshot: GatewaySnapshot, key: KeyRecord): Promise<Response | null> {
     const io = this.videoIo();
@@ -3065,7 +2572,7 @@ export class ModelApiRun {
       return this.refuse(unreadable ? new ApiError(502, "invalid_upstream_response") : new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
     }
     const body = observed.object.forClient(after.id, after.state);
-    // Answered before its body is read, as the API Worker answers its repeat: not counted against the key's minute.
+    // Answered before its body is read: not counted against the key's minute.
     this.rateOpen = false;
     this.responseBytes = body.length;
     this.responseComplete = true;
@@ -3197,65 +2704,6 @@ export class ModelApiRun {
     return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey!, "x-gray-attempt": String(attempt.index + 1) } });
   }
 
-  /** The record of the job the vendor accepted (video_jobs.rs `VideoJob`). */
-  private jobOf(api: ApiRequest, attempt: Attempt, vendorJob: string, seconds: bigint, evidence: string, nowMs: number): VideoJob {
-    const record = attempt.candidate.record;
-    const now = Math.floor(nowMs / 1000);
-    const size = api.body.kind === "json" ? get(api.body.value, "size") : undefined;
-    const workspace = this.key!.workspaceId;
-    return {
-      id: videoJobId(workspace, this.requestKey!),
-      tenant: workspace,
-      requestId: this.requestKey!,
-      model: api.model,
-      endpointId: record.endpointId,
-      providerWorkspace: record.operator,
-      adapter: record.adapter,
-      upstreamModel: record.upstreamModel,
-      vendorJob,
-      size: typeof size === "string" ? size : null,
-      secondsRequested: Number(seconds),
-      secondsConfirmed: null,
-      state: "queued",
-      progress: 0,
-      errorCode: null,
-      billing: "pending",
-      heldMicroUsd: this.heldMicrousd ?? 0,
-      chargedMicroUsd: null,
-      secondsBilled: null,
-      pricing: {
-        evidence,
-        requestKey: this.accountKey!,
-        meta: {
-          model: api.model,
-          protocol: this.protocol,
-          client: this.client.client,
-          client_version: this.client.clientVersion,
-          hold_mode: "worst_case",
-          workspace,
-          public_request_id: this.requestId,
-          endpoint: record.endpointId,
-          attempt: attempt.index,
-          offer_id: record.quote.offerId,
-          offer_version: record.quote.version,
-          platform_fee_bps: this.deps.cfg.platformFeeBps,
-          ...(this.clientKey ? { client_key: true } : {}),
-          ...(this.clientKey && this.admissionDegraded ? { admission_degraded: true } : {}),
-        },
-      },
-      hold: holdOf(this.token!),
-      // What its completion is traffic evidence about (media.ts `noteVideoCompleted`).
-      binding: { generation: attempt.evidence.binding.generation, fingerprint: attempt.evidence.binding.fingerprint, model: attempt.evidence.binding.model, protocol: attempt.evidence.binding.protocol },
-      createdAt: now,
-      updatedAt: now,
-      completedAt: null,
-      expiresAt: now + this.deps.cfg.videoJobTtlSeconds,
-      polledMs: 0,
-      pollFailures: 0,
-      missingSince: null,
-      deleted: false,
-    };
-  }
 }
 
 /** A receipt id of the confidential entry (inference.ts `newLaneReceiptId`). */

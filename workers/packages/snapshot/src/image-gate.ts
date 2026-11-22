@@ -22,7 +22,7 @@ export function pricesImageTokens(terms: { readonly media: { readonly image_outp
  * while its image check proved that the API's usage counts them apart (`CheckKind::ImageOutput`, which
  * requires an `IMAGE` entry in `candidatesTokensDetails`). Without that, an answer's image would be billed
  * as text: setup design item 5, gate G1. Its route view says `image_usage_unproved`. The image APIs bill
- * through their own adapters.
+ * by their own meters.
  */
 export function imageUsageKnown(protocol: Protocol, proved: boolean, pricesImageTokens: boolean): boolean {
   return !isGeneration(protocol) || proved || !pricesImageTokens;

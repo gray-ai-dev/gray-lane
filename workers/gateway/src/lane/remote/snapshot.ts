@@ -170,7 +170,7 @@ export function mapSnapshot(snapshot: Snapshot): ReturnType<typeof gatewaySnapsh
 /**
  * The lane snapshot's invariants (design v2 section B): a normal snapshot with every route removed but the lane relays'
  * and the endpoint routes the entry serves (`entryEndpointRoute`: `bearer` or `protocol_native` on the entry's
- * protocols, no adapter, a base URL egress's `/route/` kind carries), `translation` unset and `contentRecipients` empty.
+ * protocols, a base URL egress's `/route/` kind carries), `translation` unset and `contentRecipients` empty.
  * Kept as its own function so `state.ts` can assert the same rules on a snapshot it maps itself.
  */
 export function assertLaneSnapshot(version: number, routes: readonly EntryRouteFacts[], translation: string | undefined, recipientScopes: number): void {

@@ -1162,6 +1162,8 @@ export type BodyEnd =
       readonly supplierFailure: "timeout" | "upstream_error" | "invalid_response" | null;
       /** Gray's own request deadline ended the read (`read_whole`'s `cut_by_deadline`). */
       readonly cutByDeadline?: boolean;
+      /** The bytes read when the answer passed the read's limit (`upstream_body_limit`). */
+      readonly received?: number;
     }
   | { readonly kind: "client_left"; readonly received: number };
 
@@ -1209,7 +1211,7 @@ export async function readAnswer(
       if (length > limit) {
         upstream.cancel();
         letGo();
-        return { kind: "failed", code: "upstream_body_limit", why: `the answer passed its limit of ${limit} bytes`, supplierFailure: "invalid_response" };
+        return { kind: "failed", code: "upstream_body_limit", why: `the answer passed its limit of ${limit} bytes`, supplierFailure: "invalid_response", received: length };
       }
       if (!holds(length)) return capacity();
       chunks.push(next.bytes);

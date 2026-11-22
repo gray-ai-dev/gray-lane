@@ -1,15 +1,12 @@
 /**
  * What every model API shares (crates/gray-gateway/src/apis/mod.rs): request field readers, the
- * reservation of a bound, the checks a metered answer passes before it is charged, vendor calls on
- * a route, and the route filters run before pricing.
+ * reservation of a bound, the checks a metered answer passes before it is charged, and the route
+ * filters run before pricing.
  */
 import { ApiError } from "@gray/errors";
 import { type Protocol, type UsageCounters, ZERO_COUNTERS, billingUnit, countsTokens, isMultipart, nestedCounter, textInputTokens, textOutputTokens } from "@gray/protocol";
-import { type Json, type JsonObject, get, parseStrictBytes, toJsonString } from "@gray/json";
-import { authHeaders, parseSent, vendorForAdapter } from "../adapters.ts";
-import { AdapterError } from "../error.ts";
-import type { HttpCall, Operation, Parsed, Vendor } from "../types.ts";
-import { type ApiRequest, type Bound, type FormPart, type MediaRoute, type Metered, partText } from "./types.ts";
+import { type Json, type JsonObject, get } from "@gray/json";
+import { type Bound, type FormPart, type MediaRoute, type Metered, partText } from "./types.ts";
 
 /** A 400 with this code. */
 export function invalid(code: string): ApiError {
@@ -62,9 +59,9 @@ export type Billed =
   | { readonly kind: "metered"; readonly metered: Metered }
   | { readonly kind: "missing"; readonly reason: string; readonly raw: Json | null }
   /**
-   * The model's refusal of the request, answered with HTTP 200 and no content (a Gemini image model's
-   * blocked prompt, or a refusal reason and nothing else, @gray/protocol `GeminiRefusal`): delivered as
-   * it came, charged nothing, and neither for nor against the route (`refused_answer` on main).
+   * The model's refusal of the request, answered with HTTP 200 and no content (a refusal reason and
+   * nothing else, @gray/protocol `GeminiRefusal`): delivered as it came, charged nothing, and neither for
+   * nor against the route (`refused_answer` on main).
    */
   | { readonly kind: "refused"; readonly reason: string };
 
@@ -143,11 +140,6 @@ export function tokenUsage(usage: Json, input: string, output: string): UsageCou
   return counters;
 }
 
-/** `counted_units`: units Gray counts from the request itself, as usage evidence. */
-export function countedUnits(unit: "images" | "seconds" | "characters", units: bigint): Metered {
-  return { counters: { ...ZERO_COUNTERS, units }, raw: { [unit]: units }, unit };
-}
-
 /** The rates a bound is priced at (`RateBound`'s input, output and unit; micro-USD per million). */
 export interface BoundRates {
   readonly input: bigint;
@@ -206,122 +198,12 @@ export function checkMetered(protocol: Protocol, bound: Bound, metered: Metered,
   if (!asPriced) throw apiError(502, "billing_usage_invalid");
 }
 
-/** `vendor`: the vendor API serving `op` on a route whose mapping names an adapter. */
-export function vendorFor(route: MediaRoute, op: Operation): Vendor | undefined {
-  return route.adapter === undefined ? undefined : vendorForAdapter(route.adapter, op);
-}
-
-/**
- * A multipart form to send, field by field in order: text fields and held files with their bytes,
- * deferred files by their marker (@gray/media `FormPart`). The gateway writes it as
- * multipart/form-data, streaming each deferred file from where it holds it, with its exact length.
- */
-export interface Multipart {
-  readonly kind: "multipart";
-  readonly parts: readonly FormPart[];
-}
-
-/**
- * A request to send: what `fetch` takes, built by the API modules and sent by the gateway. A JSON
- * body may carry deferred files' markers (an edit's images, a video's reference image, in base64):
- * the gateway streams each file's encoding in where its marker is.
- */
+/** A request to send: what `fetch` takes (a video job's poll). */
 export interface Outgoing {
   readonly url: string;
   readonly method: "GET" | "POST" | "DELETE";
   readonly headers: readonly (readonly [string, string])[];
-  readonly body: Uint8Array | Multipart | undefined;
-}
-
-const utf8 = new TextEncoder();
-
-/**
- * `vendor_request_at`: a vendor call on a route, relative to the endpoint's base URL, with the
- * credential presented as the endpoint declares. The credential only goes to the endpoint's own
- * origin: a call whose URL leaves it is refused (502 `invalid_vendor_call`), and an unusable
- * credential is 502 `invalid_provider_credential`. The body is serialised as serde_json writes it.
- */
-export function vendorRequest(route: MediaRoute, vendor: Vendor, call: HttpCall, nowUnixSeconds: bigint): Outgoing & { readonly body: Uint8Array | undefined } {
-  let base: URL;
-  let url: URL;
-  try {
-    base = new URL(route.baseUrl);
-    url = new URL(`${route.baseUrl.replace(/\/+$/, "")}${call.path}`);
-  } catch {
-    throw apiError(502, "invalid_vendor_call");
-  }
-  if (!call.path.startsWith("/") || url.origin !== base.origin) throw apiError(502, "invalid_vendor_call");
-  for (const [name, value] of call.query) url.searchParams.append(name, value);
-  let auth: [string, string][];
-  try {
-    auth = authHeaders(vendor, route.auth, route.credential, nowUnixSeconds);
-  } catch {
-    throw apiError(502, "invalid_provider_credential");
-  }
-  return {
-    url: url.toString(),
-    method: call.method,
-    headers: [...call.headers, ...auth],
-    body: call.body === null ? undefined : utf8.encode(toJsonString(call.body)),
-  };
-}
-
-/**
- * The model refused the request for its content (an adapter's `AdapterError` refused: a Gemini image
- * model's blocked prompt, or a refusal reason and no image): the request's own outcome, as a provider's 4xx
- * refusal is (apis/mod.rs `read_vendor` on main). The gateway answers it 400 `provider_request_rejected`
- * naming `reason` (`modelRefused`, with `message` cleaned of the endpoint's names, URLs and identifiers),
- * charges nothing, and counts the attempt neither for nor against the route.
- */
-export class ModelRefused extends Error {
-  override readonly name = "ModelRefused";
-  readonly reason: string;
-  /** The vendor's message, as the adapter cleaned it of control characters. */
-  readonly said: string;
-
-  constructor(reason: string, said: string) {
-    super(`refused by the model: ${reason}`);
-    this.reason = reason;
-    this.said = said;
-  }
-}
-
-/**
- * `model_refused`: 400 `provider_request_rejected` for a request `model` refused for its content (`reason`,
- * as the vendor names it, and its cleaned `message`, when anything is left of it), with the reason in
- * `metadata.reason`. Not charged, and neither for nor against the route.
- */
-export function modelRefused(model: string, reason: string, message: string | undefined): ApiError {
-  const said = message === undefined ? "" : `: ${message.replace(/\.+$/, "")}`;
-  return new ApiError(400, "provider_request_rejected").withMessage(`\`${model}\` refused the request (${reason})${said}. Change the request; it is not charged.`).withMeta("reason", reason);
-}
-
-/**
- * `read_vendor`'s parse: a vendor's answer to `sent` mapped back. A vendor-reported error (some
- * answer 200 with an error body) is 502 `upstream_error`; the model's refusal of the request is
- * `ModelRefused`, the request's own outcome; an answer the adapter cannot map is 502
- * `invalid_upstream_response`.
- */
-export function vendorAnswer(vendor: Vendor, op: Operation, sent: HttpCall, status: number, body: Uint8Array): Parsed {
-  try {
-    return parseSent(vendor, op, sent, status, body);
-  } catch (error) {
-    if (error instanceof AdapterError && error.detail.kind === "refused") throw new ModelRefused(error.detail.reason, error.detail.message);
-    if (error instanceof AdapterError && error.detail.kind === "vendor") throw apiError(502, "upstream_error");
-    throw apiError(502, "invalid_upstream_response");
-  }
-}
-
-/**
- * A buffered JSON answer: one JSON value without duplicate keys (the bytes go back to the client as
- * received, so every parser must read them alike); else 502 `invalid_upstream_json`.
- */
-export function strictJson(bytes: Uint8Array): Json {
-  try {
-    return parseStrictBytes(bytes);
-  } catch {
-    throw apiError(502, "invalid_upstream_json");
-  }
+  readonly body: Uint8Array | undefined;
 }
 
 /**
@@ -388,8 +270,3 @@ export function takesForm(protocol: Protocol, contentType: string | null | undef
   );
 }
 
-/** The decoded API request's JSON body, or 502 `invalid_protocol_request` on a multipart one. */
-export function jsonBodyOf(api: ApiRequest): JsonObject {
-  if (api.body.kind !== "json") throw apiError(502, "invalid_protocol_request");
-  return api.body.value;
-}

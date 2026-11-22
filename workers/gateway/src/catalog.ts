@@ -3,7 +3,6 @@ import { rustTrim } from "@gray/errors";
 import { compareUtf8 } from "@gray/json";
 import type { CustomerRate } from "@gray/holds";
 import { billingUnit, endpointPath, geminiModelValue as geminiModel, isGeneration, modality, PROTOCOLS, type Protocol } from "@gray/protocol";
-import { servesGeminiImages, speaks } from "./gemini-images.ts";
 import { pricedQuoteOf } from "./money.ts";
 import { jaroWinkler } from "./similarity.ts";
 import { type GatewaySnapshot, takesTraffic } from "./snapshot.ts";
@@ -94,9 +93,8 @@ export function sortProtocols(protocols: Iterable<Protocol>): Protocol[] {
  * in byte order; every model when `scope` is null or empty. A model is listed under a protocol when one
  * of its live, priced routes speaks it (live: `takesTraffic`), or, when no live route of that protocol exists for it at all, when
  * the translation rules (the operator's policy; the confidential entry's own rule, translate.ts `entryRules`) serve it
- * to that protocol's clients from a route's protocol, or (Gemini) its
- * image routes speak Gemini's API (`gemini_images::speaks`). A native route always wins on generation, its
- * failures included, so such a model is never listed as served otherwise.
+ * to that protocol's clients from a route's protocol. A native route always wins on generation, its failures included,
+ * so such a model is never listed as served otherwise.
  */
 export function listedIn(snapshot: GatewaySnapshot, policy: TranslationRules, scope: readonly string[] | null, protocol: Protocol | null, nowMs: number, feeBps: number): Map<string, Listed> {
   // Live: the routes that may get traffic (snapshot.ts `takesTraffic`, the rule routing reads). One past its traffic
@@ -113,10 +111,7 @@ export function listedIn(snapshot: GatewaySnapshot, policy: TranslationRules, sc
     if (priced === undefined) continue;
     if (scope !== null && scope.length > 0 && !scope.includes(model)) continue;
     const native = protocol === null || r.protocol === protocol;
-    const translated =
-      protocol !== null &&
-      !routed.has(model) &&
-      ((policy.upstreams(model, protocol)?.includes(r.protocol) ?? false) || (protocol === "gemini" && r.protocol === "open_ai_image_generations" && speaks(r)));
+    const translated = protocol !== null && !routed.has(model) && (policy.upstreams(model, protocol)?.includes(r.protocol) ?? false);
     if (!native && !translated) continue;
     let entry = models.get(model);
     if (entry === undefined) {
@@ -152,16 +147,11 @@ const GENERATION: readonly Protocol[] = ["open_ai_chat", "open_ai_responses", "a
 
 /**
  * `reachable`: the APIs a client can call `model` through, given the protocols its routes speak: the
- * generation APIs among them, those the translation policy serves from one of them, and Gemini's for an
- * image model its image routes serve (`gemini_images::serves`); then its other APIs, in enum order.
+ * generation APIs among them and those the translation policy serves from one of them; then its other APIs, in enum
+ * order.
  */
-export function reachable(snapshot: GatewaySnapshot, policy: TranslationRules, model: string, served: ReadonlySet<Protocol>, nowMs: number): Protocol[] {
-  const apis = GENERATION.filter(
-    (p) =>
-      served.has(p) ||
-      (policy.upstreams(model, p)?.some((u) => served.has(u)) ?? false) ||
-      (p === "gemini" && served.has("open_ai_image_generations") && servesGeminiImages(snapshot, model, nowMs)),
-  );
+export function reachable(policy: TranslationRules, model: string, served: ReadonlySet<Protocol>): Protocol[] {
+  const apis = GENERATION.filter((p) => served.has(p) || (policy.upstreams(model, p)?.some((u) => served.has(u)) ?? false));
   return [...apis, ...sortProtocols(served).filter((p) => !isGeneration(p))];
 }
 

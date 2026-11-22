@@ -178,7 +178,7 @@ function listing(route: Extract<CatalogRoute, { kind: "models" | "model" }>, sna
   const models = listedIn(snapshot, policy, scope, null, nowMs, cfg.platformFeeBps);
   const facts = snapshot.facts ?? {};
   // A model id is client text (`constructor` is a valid one): only the record's own entries count.
-  const objectOf = (id: string) => openaiModelValue(id, models.get(id)!, Object.hasOwn(facts, id) ? facts[id]! : {}, reachable(snapshot, policy, id, models.get(id)!.protocols, nowMs));
+  const objectOf = (id: string) => openaiModelValue(id, models.get(id)!, Object.hasOwn(facts, id) ? facts[id]! : {}, reachable(policy, id, models.get(id)!.protocols));
   if (route.kind === "models") return value({ data: [...models.keys()].map(objectOf), object: "list" }, requestId, head);
   if (models.has(route.id)) return value(objectOf(route.id), requestId, head);
   throw notListed(route.id, suggest(route.id, models.keys()));

@@ -2,7 +2,7 @@ import { checkOfficialUpstream } from "@gray/lane";
 import { PROTOCOLS, type Protocol, geminiMethodPath } from "@gray/protocol";
 import { z } from "zod";
 import { capabilitiesFromClaims, UnsupportedClaim } from "./capabilities.ts";
-import { adapterServes } from "./media.ts";
+import { streamsMedia } from "./streaming.ts";
 import { rustTrim, utf8Length } from "./text.ts";
 
 /**
@@ -115,9 +115,22 @@ export interface ModelMapping {
   readonly upstream_model: string;
   readonly protocol: Protocol;
   readonly native_path: string;
-  /** The vendor-native media API (`gray-media-adapters`), or null for the OpenAI-compatible API at `native_path`. */
-  readonly adapter: string | null;
+  /**
+   * The model streams on its API: the provider declares it for a mapping of one of `STREAMED_MEDIA_PROTOCOLS`, and a
+   * check of its streamed form decides whether streamed requests are sent to the route (`mappingStreams`). Written
+   * only when true, as serde writes it, so a mapping that declares nothing keeps the bytes and fingerprint it had.
+   */
+  readonly streaming?: boolean;
 }
+
+/** Whether `m` declares that its model streams on its API (`ModelMapping::streaming`). */
+export function mappingStreams(m: Pick<ModelMapping, "streaming">): boolean {
+  return m.streaming === true;
+}
+
+/** Why registration refuses a mapping that declares streaming on an API without a streamed form (lib.rs `MAPPING_STREAMING_RULE`). */
+export const MAPPING_STREAMING_RULE =
+  "A mapping declares streaming only on image generations, image edits, speech or transcriptions; the text protocols are always checked streamed, and the other APIs have no streamed form.";
 
 export interface EndpointConfig {
   readonly name: string;
@@ -158,19 +171,17 @@ export class InvalidConfig extends Error {
 const u64 = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 
 /**
- * serde's reading of a `ModelMapping`: unknown fields ignored, `adapter` null or absent is None. A stored
- * mapping that still names `response_model_aliases` (any value) reads without them, and is written and
- * fingerprinted without them, as gray-control does since Gray stopped reading the model an answer names.
+ * serde's reading of a `ModelMapping`: unknown fields ignored. A stored mapping that still names
+ * `response_model_aliases` or the retired `adapter` (any value) reads without them, and is written and
+ * fingerprinted without them, as gray-control does. `streaming` (`#[serde(default)]`, a bool): absent or false is a
+ * mapping that declares nothing, written and fingerprinted without the field (`modelMappingValue`).
  */
 export const modelMappingSchema = z.object({
   requested_model: z.string(),
   upstream_model: z.string(),
   protocol: z.enum(PROTOCOLS as [Protocol, ...Protocol[]]),
   native_path: z.string(),
-  adapter: z
-    .string()
-    .nullish()
-    .transform((v) => v ?? null),
+  streaming: z.boolean().optional(),
 });
 
 /**
@@ -226,7 +237,7 @@ export function decodeEndpointConfig(value: unknown): EndpointConfig {
 /** The serde form of a mapping, field by field in declaration order, skipped fields left out. */
 export function modelMappingValue(m: ModelMapping): Record<string, unknown> {
   const out: Record<string, unknown> = { requested_model: m.requested_model, upstream_model: m.upstream_model, protocol: m.protocol, native_path: m.native_path };
-  if (m.adapter !== null) out.adapter = m.adapter;
+  if (mappingStreams(m)) out.streaming = true;
   return out;
 }
 
@@ -303,7 +314,6 @@ export function validateEndpointShape(c: EndpointConfig): void {
       !m.native_path.startsWith("/") ||
       m.native_path.startsWith("//") ||
       /[?#]/.test(m.native_path) ||
-      (m.adapter !== null && !adapterServes(m.adapter, m.protocol)) ||
       seen.has(key)
     ) {
       throw new InvalidConfig("exact model mapping");
@@ -420,6 +430,7 @@ export function validateEndpoint(c: EndpointConfig, credential?: string | null):
   // route on it could never be called (@gray/protocol `geminiMethodPath`).
   if (c.mappings.some((m) => m.protocol === "gemini" && geminiMethodPath(m.native_path, "generateContent") === undefined)) throw new InvalidConfig(GEMINI_PATH_RULE);
   if (c.mappings.some((m) => !validModelId(m.requested_model))) throw new InvalidConfig(MODEL_ID_RULE);
+  if (c.mappings.some((m) => mappingStreams(m) && !streamsMedia(m.protocol))) throw new InvalidConfig(MAPPING_STREAMING_RULE);
   if (c.prompt_overhead_tokens !== null && !(c.prompt_overhead_tokens >= RESERVED_PROMPT_OVERHEAD_TOKENS && c.prompt_overhead_tokens <= MAX_PROMPT_OVERHEAD_TOKENS)) {
     throw new InvalidConfig(PROMPT_OVERHEAD_RULE);
   }

@@ -9,8 +9,10 @@
     "test:workerd": "vitest run -c vitest.workerd.config.ts"
   },
   "dependencies": {
+    "@gray/attest": "0.0.0",
     "@gray/config": "0.0.0",
     "@gray/control": "0.0.0",
+    "@gray/lane-verify": "0.0.0",
     "@gray/protocol": "0.0.0",
     "@gray/snapshot": "0.0.0",
     "@gray/verifier": "0.0.0",
