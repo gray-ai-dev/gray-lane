@@ -19,7 +19,7 @@
  * byte for byte (json fixtures `client-body-*`).
  */
 import { Tokenizer, TokenType } from "@streamparser/json";
-import { type Json, type JsonObject, cloneJson, get, isObject, setMember, toJsonString } from "@gray/json";
+import { type Json, type JsonObject, JsonError, SERDE_MAX_DEPTH, cloneJson, get, isObject, setMember, toJsonString } from "@gray/json";
 import type { Protocol } from "./types.ts";
 import { type ClientBody, geminiKey, geminiObjectMut } from "./request.ts";
 import { exactStrings, refuseByteOrderMark } from "./answer-scan.ts";
@@ -121,6 +121,7 @@ export function locateMembers(bytes: Uint8Array, heldMax: number = Number.MAX_SA
           open = offset;
         }
         depth += 1;
+        if (depth > SERDE_MAX_DEPTH) throw new JsonError("recursion limit exceeded");
         return;
       case TokenType.RIGHT_BRACE:
       case TokenType.RIGHT_BRACKET:
@@ -354,7 +355,7 @@ export function attemptOverlay(
   if (protocol !== "gemini") overlay.set("model", upstreamModel);
   if (protocol === "open_ai_chat" && stream) {
     const current = overlay.field(body, "stream_options");
-    const options = current === undefined ? {} : cloneJson(current);
+    const options = current === undefined || current === null ? {} : cloneJson(current);
     if (!isObject(options)) return "invalid_stream_options";
     setMember(options, "include_usage", true);
     overlay.set("stream_options", options);

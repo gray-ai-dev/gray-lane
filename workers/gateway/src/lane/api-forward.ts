@@ -42,6 +42,14 @@ export function forwardedPath(method: string, path: string): boolean {
   return isSetupPath(path) || catalogRoute(method, path)?.kind === "key";
 }
 
+/** A forwarded path's kind, the closed word its log lines carry in place of the path. */
+export function forwardedKind(path: string): "setup" | "provider_setup" | "lane_stack" | "key" {
+  if (path.startsWith("/v1/provider-setup/")) return "provider_setup";
+  if (path.startsWith("/v1/lane-stack/")) return "lane_stack";
+  if (path.startsWith("/v1/setup/")) return "setup";
+  return "key";
+}
+
 /** The answer header naming the origin that served a forwarded path. */
 export const SERVED_BY_HEADER = "x-gray-served-by";
 
@@ -164,12 +172,15 @@ export async function forwardToApi(request: Request, url: URL, forward: ApiForwa
   try {
     answer = await forward.fetch(new Request(target, init));
   } catch (thrown) {
-    console.error(JSON.stringify({ level: "error", event: "lane_api_forward_failed", method: request.method, path: url.pathname, message: thrown instanceof Error ? thrown.message : String(thrown) }));
+    // The entry's container log is readable outside the VM (deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs"): the
+    // path's kind, never the client's path (which carries ids and whatever a client put after the prefix), and the
+    // error's class, never its message.
+    console.error(JSON.stringify({ level: "error", event: "lane_api_forward_failed", method: request.method, kind: forwardedKind(url.pathname), code: thrown instanceof Error ? thrown.name : "error" }));
     return unreachable(context);
   }
   if (answer.status < 200 || answer.status > 599) {
     await answer.body?.cancel().catch(() => undefined);
-    console.error(JSON.stringify({ level: "error", event: "lane_api_forward_failed", method: request.method, path: url.pathname, message: `status ${answer.status}` }));
+    console.error(JSON.stringify({ level: "error", event: "lane_api_forward_failed", method: request.method, kind: forwardedKind(url.pathname), status: answer.status }));
     return unreachable(context);
   }
   const out = forwardedAnswerHeaders(answer.headers);

@@ -20,6 +20,14 @@ import (
 
 const egressHeader = "x-gray-egress"
 
+// ownAnswerHeader marks every answer egress gives itself on the entry's paths to a provider: the vendor routes, /route/
+// and /peer/. Its value is "1" when a byte of the request may have reached the far side (the vendor, the provider or
+// the peer) and "0" when none did. It began as peer mode's x-gray-peer-sent (design §4.4) and keeps that name, so the
+// entry reads one header on all three paths. Egress removes it from every answer it forwards, so no upstream can put a
+// value on it (as x-gray-egress, D64); the entry reads an answer without it as the far side's. The relay listener's
+// answers and the control paths carry none.
+const ownAnswerHeader = "X-Gray-Peer-Sent"
+
 // proxyConnectCap is the sidecar's ceiling on the whole proxied connect phase: the TCP dial to the
 // proxy, the TLS handshake with an https proxy, the CONNECT exchange, and the TLS handshake with
 // the origin. It is derived from Go's own one-minute CONNECT ceiling: Go 1.27.2
@@ -87,8 +95,10 @@ type server struct {
 	routes *endpointRouteTable
 	// signIn is the sign-in proxy's and sessions' state (signin_session.go); used only with ops.
 	signIn *signInState
-	roots  *x509.CertPool
-	dial   dialFunc
+	// bodyBudget caps total request body bytes held in memory across all concurrent requests.
+	bodyBudget bodyBudget
+	roots      *x509.CertPool
+	dial       dialFunc
 }
 
 // newServer builds the transports the program uses. Production passes the pool
@@ -130,6 +140,7 @@ func newServer(cfg config, roots *x509.CertPool, dial dialFunc, logger *log.Logg
 	}
 	// Relay calls made in a vendor tunnel repeat the tunnel's ClientHello (mirror_dial.go).
 	srv.relayClient.Transport.(*modeRoundTripper).mirror = mirror
+	srv.bodyBudget.max.Store(cfg.inflightBodyBudget())
 	if cfg.peer {
 		srv.peers = newPeerTable(srv)
 	}
@@ -384,6 +395,7 @@ func (s *server) handled(w http.ResponseWriter, r *http.Request, serve func(*res
 
 // serveDirect is the entry's own vendor call: the plan, the body, then the vendor.
 func (s *server) serveDirect(rec *responseRecorder, r *http.Request, entry *requestLog) {
+	rec.own = true
 	plan, code := s.plan(r)
 	entry.Route = plan.route.name
 	if code != "" {
@@ -391,14 +403,19 @@ func (s *server) serveDirect(rec *responseRecorder, r *http.Request, entry *requ
 		writeRefusal(rec, code)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		entry.Error = code
 		writeRefusal(rec, code)
 		return
 	}
-	entry.Error = s.forward(r.Context(), s.client, rec, r.Method, plan, outboundHeader(r.Header), body, nil)
+	entry.Error = s.forward(r.Context(), s.client, rec, r.Method, plan, outboundHeader(r.Header), body, release, nil)
+	if entry.Error == errResponseRead {
+		// Headers are already on the wire: abort so the client sees a broken stream rather than a clean EOF.
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func bodyReadCode(err error) string {
@@ -407,6 +424,8 @@ func bodyReadCode(err error) string {
 		return ""
 	case errors.Is(err, errBodyTooLargeRequest):
 		return errBodyTooLarge
+	case errors.Is(err, errBodyBudgetExceeded):
+		return errEgressLimit
 	default:
 		return errBodyInvalid
 	}
@@ -448,8 +467,9 @@ func stoppedCode(obs upstreamObserver) string {
 }
 
 // forward sends the planned request to the vendor and streams the answer back unchanged; obs,
-// when not nil, observes it. It returns the log's error code ("" on success).
-func (s *server) forward(ctx context.Context, client *http.Client, rec *responseRecorder, method string, plan requestPlan, header http.Header, body []byte, obs upstreamObserver) string {
+// when not nil, observes it. letGo, when not nil, is the body's release (readRequestBody's): it runs as soon as the
+// call needs the body no more (sentBody), not when the answer ends. It returns the log's error code ("" on success).
+func (s *server) forward(ctx context.Context, client *http.Client, rec *responseRecorder, method string, plan requestPlan, header http.Header, body []byte, letGo func(), obs upstreamObserver) string {
 	finish := func(code string) string {
 		if obs != nil {
 			obs.finished(code)
@@ -499,12 +519,22 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 		outReq.Header["User-Agent"] = []string{""}
 	}
 	outReq.Host = plan.route.host
+	var sent *sentBody
 	if len(body) == 0 {
 		outReq.Body = http.NoBody
 		outReq.ContentLength = 0
+	} else if letGo != nil {
+		sent = newSentBody(body, letGo)
+		sent.attach(outReq)
 	}
 
+	// From here a byte of the request may reach the vendor: an answer egress gives itself after a fault in the call says
+	// so (ownAnswerHeader), unless the call's error shows it got no connection.
+	rec.sent = true
 	resp, err := client.Do(outReq)
+	if sent != nil {
+		sent.responded()
+	}
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -513,14 +543,18 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 		if obs != nil {
 			obs.failed(mapped.code)
 		}
+		// D72: only egress_upstream_failed comes after the vendor connection.
+		rec.sent = mapped.code == errUpstreamFailed
 		writeMappedError(rec, mapped)
 		return mapped.code
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// The reserved per-request header is removed in both directions (D64): an upstream answer
-	// must not be able to put a value on the header that only the lane's sidecar consumes.
+	// must not be able to put a value on the header that only the lane's sidecar consumes. Nor on the mark of egress's
+	// own answers, which the entry reads to tell them from the vendor's.
 	resp.Header.Del(egressHeader)
+	resp.Header.Del(ownAnswerHeader)
 	stripHopByHop(resp.Header)
 	// S35: a relay call's error answer is held until it is classified (stack_hold.go).
 	if holder, ok := obs.(errorHolder); ok && holder.holds(resp.StatusCode) {
@@ -529,6 +563,7 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 	if obs != nil && !obs.response(resp.StatusCode, resp.Header) {
 		return finish(stoppedCode(obs))
 	}
+	rec.relayed = true
 	copyHeader(rec.Header(), resp.Header)
 	rec.WriteHeader(resp.StatusCode)
 	controller := http.NewResponseController(rec)
@@ -578,23 +613,6 @@ func (s *server) forward(ctx context.Context, client *http.Client, rec *response
 // the read, HTTP/1.1 limits the body to it).
 func declaredLengthWritten(resp *http.Response, written int64) bool {
 	return resp.ContentLength >= 0 && written >= resp.ContentLength
-}
-
-func readRequestBody(r *http.Request, max int64) ([]byte, int64, error) {
-	if r.Body == nil {
-		return nil, 0, nil
-	}
-	if r.ContentLength > max {
-		return nil, 0, errBodyTooLargeRequest
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
-	if err != nil {
-		return body, int64(len(body)), err
-	}
-	if int64(len(body)) > max {
-		return body, int64(len(body)), errBodyTooLargeRequest
-	}
-	return body, int64(len(body)), nil
 }
 
 func mapUpstreamError(err error, spec *egressSpec, connected bool) mappedError {
@@ -716,11 +734,26 @@ type responseRecorder struct {
 	http.ResponseWriter
 	status int
 	bytes  int64
+	// own is set by the handlers of the entry's paths to a provider (serveDirect, serveEndpointRoute, servePeer): every
+	// answer egress writes itself there carries ownAnswerHeader, the panic guard's 500 included. relayed is set once an
+	// upstream answer's head is copied: that answer is the far side's and is never marked. sent is the mark's value:
+	// whether a byte of the request may have reached the far side. A handler that sets the header itself (peer mode's
+	// writePeerRefusal) keeps its value.
+	own     bool
+	relayed bool
+	sent    bool
 }
 
 func (w *responseRecorder) WriteHeader(status int) {
 	if w.status == 0 {
 		w.status = status
+		if w.own && !w.relayed && w.Header().Get(ownAnswerHeader) == "" {
+			value := "0"
+			if w.sent {
+				value = "1"
+			}
+			w.Header().Set(ownAnswerHeader, value)
+		}
 	}
 	w.ResponseWriter.WriteHeader(status)
 }

@@ -268,10 +268,15 @@ export function openaiModelValue(id: string, listed: Listed, facts: Facts, apis:
   const name = facts.name ?? id;
   const slash = id.indexOf("/");
   const contextLength = facts.context_length ?? null;
+  const created = facts.created ?? 0;
+  const createdDate = new Date(created * 1000);
+  const createdAt = Number.isNaN(createdDate.getTime()) ? "1970-01-01T00:00:00Z" : createdDate.toISOString().replace(".000Z", "Z");
   return sorted({
     id,
+    type: "model",
     object: "model",
-    created: facts.created ?? 0,
+    created,
+    created_at: createdAt,
     owned_by: slash >= 0 ? id.slice(0, slash) : "gray",
     name,
     // Claude Code's gateway model discovery reads `display_name`.

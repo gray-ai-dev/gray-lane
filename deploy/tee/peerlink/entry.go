@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -29,14 +30,27 @@ type entrySession struct {
 	streams           atomic.Int64
 }
 
+func (s *entrySession) tryAcquireStream(limit int64) bool {
+	for {
+		cur := s.streams.Load()
+		if cur >= limit {
+			return false
+		}
+		if s.streams.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
 type entry struct {
 	cfg config
 	now func() time.Time
 
-	mu       sync.Mutex
-	sessions map[string]*entrySession // by id
-	tunnels  map[string]int           // open tunnels by relay
-	next     uint64                   // round robin
+	mu           sync.Mutex
+	sessions     map[string]*entrySession // by id
+	tunnels      map[string]int           // open tunnels by relay
+	totalTunnels int                      // total open tunnels across all relays
+	next         uint64                   // round robin
 }
 
 func newEntry(cfg config) *entry {
@@ -65,7 +79,7 @@ func (e *entry) reserve(a attachHeader) (*entrySession, int, string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if old := e.sessions[a.session]; old != nil {
-		if old.relay != a.relay || old.keyset != a.keyset {
+		if old.relay != a.relay || old.keyset != a.keyset || (old.pinned && !a.pinned) {
 			return nil, http.StatusConflict, codeAttachConflict
 		}
 		// The VM redials a slot only after its session ended on its side; the old one here is a leftover.
@@ -143,13 +157,14 @@ func (e *entry) serveAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	startKeepalive(e.cfg, session)
 	if !pinned {
-		time.AfterFunc(e.cfg.unverifiedTTL, func() {
+		timer := time.AfterFunc(e.cfg.unverifiedTTL, func() {
 			e.mu.Lock()
 			defer e.mu.Unlock()
 			if !s.pinned {
 				e.dropLocked(s)
 			}
 		})
+		defer timer.Stop()
 	}
 	<-session.CloseChan()
 	e.drop(s)
@@ -183,39 +198,22 @@ func (e *entry) pick(relay, keyset string, attest bool) *entrySession {
 	return candidates[e.next%uint64(len(candidates))]
 }
 
-// pickTunnel is §5's choice: a pinned session of the relay (of keyset when given), else the newest unverified.
-func (e *entry) pickTunnel(relay, keyset string) *entrySession {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var pinned []*entrySession
-	var newest *entrySession
-	for _, s := range e.sessions {
-		if s.mux == nil || s.relay != relay || (keyset != "" && s.keyset != keyset) || s.mux.IsClosed() {
-			continue
-		}
-		if s.pinned {
-			pinned = append(pinned, s)
-		} else if newest == nil || s.opened.After(newest.opened) {
-			newest = s
-		}
-	}
-	if len(pinned) == 0 {
-		return newest
-	}
-	sort.Slice(pinned, func(i, j int) bool { return pinned[i].id < pinned[j].id })
-	e.next++
-	return pinned[e.next%uint64(len(pinned))]
-}
-
-// openStream opens a stream on s and waits for the VM's ready byte (README "Interface").
-func (e *entry) openStream(s *entrySession) (net.Conn, string) {
+// openStream opens a stream on s and waits for the VM's ready byte (README "Interface"),
+// aborting promptly if ctx is cancelled.
+func (e *entry) openStream(ctx context.Context, s *entrySession) (net.Conn, string) {
 	stream, err := s.mux.OpenStream()
 	if err != nil {
 		return nil, codeSessionMissing
 	}
+	stop := context.AfterFunc(ctx, func() { _ = stream.SetReadDeadline(time.Unix(1, 0)) })
+	defer stop()
 	_ = stream.SetReadDeadline(time.Now().Add(e.cfg.streamOpenTimeout))
 	var ready [1]byte
-	if _, err := stream.Read(ready[:]); err != nil || ready[0] != readyByte {
+	if _, err := io.ReadFull(stream, ready[:]); err != nil || ready[0] != readyByte {
+		_ = stream.Close()
+		return nil, codeSessionRefused
+	}
+	if !stop() || ctx.Err() != nil {
 		_ = stream.Close()
 		return nil, codeSessionRefused
 	}
@@ -239,13 +237,16 @@ func (e *entry) serveConnect(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusServiceUnavailable, codeSessionMissing)
 		return
 	}
-	stream, code := e.openStream(s)
+	if !s.tryAcquireStream(int64(e.cfg.maxStreamsPerSession)) {
+		refuse(w, http.StatusServiceUnavailable, codeSessionRefused)
+		return
+	}
+	defer s.streams.Add(-1)
+	stream, code := e.openStream(r.Context(), s)
 	if stream == nil {
 		refuse(w, http.StatusServiceUnavailable, code)
 		return
 	}
-	s.streams.Add(1)
-	defer s.streams.Add(-1)
 	conn, buffered, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		_ = stream.Close()
@@ -259,6 +260,42 @@ func (e *entry) serveConnect(w http.ResponseWriter, r *http.Request) {
 	pipe(&bufferedConn{Conn: conn, r: buffered.Reader}, stream)
 }
 
+// pickTunnelAndReserve selects a session for (relay, keyset) and atomically reserves a tunnel slot
+// under both per-relay and global caps, avoiding any map growth for relays with no live session.
+func (e *entry) pickTunnelAndReserve(relay, keyset string) (*entrySession, int, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.tunnels[relay] >= e.cfg.maxTunnelsPerRelay || e.totalTunnels >= e.cfg.maxTunnels {
+		return nil, http.StatusTooManyRequests, codeTunnelBusy
+	}
+	var pinned []*entrySession
+	var newest *entrySession
+	for _, s := range e.sessions {
+		if s.mux == nil || s.relay != relay || (keyset != "" && s.keyset != keyset) || s.mux.IsClosed() {
+			continue
+		}
+		if s.pinned {
+			pinned = append(pinned, s)
+		} else if newest == nil || s.opened.After(newest.opened) {
+			newest = s
+		}
+	}
+	var chosen *entrySession
+	if len(pinned) == 0 {
+		chosen = newest
+	} else {
+		sort.Slice(pinned, func(i, j int) bool { return pinned[i].id < pinned[j].id })
+		e.next++
+		chosen = pinned[e.next%uint64(len(pinned))]
+	}
+	if chosen == nil {
+		return nil, http.StatusServiceUnavailable, codeSessionMissing
+	}
+	e.tunnels[relay]++
+	e.totalTunnels++
+	return chosen, 0, ""
+}
+
 // serveTunnel is the lane's hand-over of /v1/peer/tunnel/<relay> (§5): a WebSocket piped into a stream.
 func (e *entry) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	relays, keysets := r.Header.Values(headerRelay), r.Header.Values(headerKeyset)
@@ -270,33 +307,29 @@ func (e *entry) serveTunnel(w http.ResponseWriter, r *http.Request) {
 	if len(keysets) == 1 {
 		keyset = keysets[0]
 	}
-	e.mu.Lock()
-	if e.tunnels[relay] >= e.cfg.maxTunnelsPerRelay {
-		e.mu.Unlock()
-		refuse(w, http.StatusTooManyRequests, codeTunnelBusy)
+	s, status, code := e.pickTunnelAndReserve(relay, keyset)
+	if s == nil {
+		refuse(w, status, code)
 		return
 	}
-	e.tunnels[relay]++
-	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
+		e.totalTunnels--
 		if e.tunnels[relay]--; e.tunnels[relay] == 0 {
 			delete(e.tunnels, relay)
 		}
 		e.mu.Unlock()
 	}()
-	s := e.pickTunnel(relay, keyset)
-	if s == nil {
-		refuse(w, http.StatusServiceUnavailable, codeSessionMissing)
+	if !s.tryAcquireStream(int64(e.cfg.maxStreamsPerSession)) {
+		refuse(w, http.StatusTooManyRequests, codeTunnelBusy)
 		return
 	}
-	stream, code := e.openStream(s)
+	defer s.streams.Add(-1)
+	stream, code := e.openStream(r.Context(), s)
 	if stream == nil {
 		refuse(w, http.StatusServiceUnavailable, code)
 		return
 	}
-	s.streams.Add(1)
-	defer s.streams.Add(-1)
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		_ = stream.Close()
@@ -337,8 +370,13 @@ func (e *entry) serveSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *entry) servePromote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validSessionID(id) {
+		refuse(w, http.StatusNotFound, codeSessionUnknown)
+		return
+	}
 	e.mu.Lock()
-	s := e.sessions[r.PathValue("id")]
+	s := e.sessions[id]
 	if s != nil {
 		s.pinned = true
 	}
@@ -352,8 +390,13 @@ func (e *entry) servePromote(w http.ResponseWriter, r *http.Request) {
 
 // serveDelete condemns a session (§3.5 "A pin mismatch condemns the session, not the pin"; a refused attestation).
 func (e *entry) serveDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validSessionID(id) {
+		refuse(w, http.StatusNotFound, codeSessionUnknown)
+		return
+	}
 	e.mu.Lock()
-	s := e.sessions[r.PathValue("id")]
+	s := e.sessions[id]
 	if s != nil {
 		e.dropLocked(s)
 	}

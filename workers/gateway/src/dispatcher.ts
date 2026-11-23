@@ -103,6 +103,14 @@ export interface DispatchPlan {
    * dispatcher is the server's.
    */
   readonly accountPool: (route: Route) => string | null;
+  /**
+   * Whether the request carries opaque provider-bound state (such as Responses `encrypted_content`
+   * or Anthropic `thinking.signature` / `redacted_thinking`). Pre-dial failures (`not_dialed`,
+   * `relay_declined`, `connect`, `unsent`) may still move to another operator; once an attempt
+   * actually dials an upstream vendor, the dispatcher locks to that operator (blocking
+   * cross-operator failover and stopping model fallback chains).
+   */
+  readonly lockOperatorOnDial?: boolean;
 }
 
 /**
@@ -712,6 +720,12 @@ export class Dispatcher {
   otherOperatorsOnly = false;
   /** The attempt in flight is a second opinion through its refusal's gate. */
   private gated = false;
+  /**
+   * When `plan.lockOperatorOnDial` is true (the request carries opaque provider-bound state), the
+   * operator of the first attempt that actually dialed an upstream vendor (not `unsent`, `declined`,
+   * or `connect`). Once set, cross-operator failover and model fallback chains are blocked.
+   */
+  private dialedOperator: string | null = null;
   /** The operator of the last failed attempt. */
   private lastOperator: string | null = null;
   /**
@@ -826,15 +840,26 @@ export class Dispatcher {
     this.stall = stop;
   }
 
+  /** The operator this dispatcher locked to after a post-dial attempt on opaque provider state, or null. */
+  get lockedOperator(): string | null {
+    return this.dialedOperator;
+  }
+
+  /** Whether cross-operator failover is currently allowed (`plan.otherOperators` and not locked to a dialed operator). */
+  private allowsOtherOperators(): boolean {
+    return this.plan.otherOperators && this.dialedOperator === null;
+  }
+
   /**
    * Whether the request may go on to the next model its customer listed now that the dispatcher gave
    * up (`leaves_to_next_model`): this model had no route left, or every attempt it was allowed failed
    * before an answer committed, whether or not the upstream received it, server-run tools included (owner
    * decision 2026-10-16). Not when the client left, nor when the request's time ran out (a later model
-   * would have none either), nor when an invariant failed.
+   * would have none either), nor when an invariant failed, nor after an opaque-state turn already dialed
+   * an upstream operator (`dialedOperator !== null`).
    */
   leavesToNextModel(): boolean {
-    return this.stopped !== null && this.stopped !== "client_left" && this.stopped !== "deadline" && this.stopped !== "invariant";
+    return this.stopped !== null && this.stopped !== "client_left" && this.stopped !== "deadline" && this.stopped !== "invariant" && this.dialedOperator === null;
   }
 
   /** The tier A candidates: for the first attempt every route of the plan not passed over; after a failure, the untried routes of operators not yet tried, when the request allows other operators. */
@@ -843,7 +868,7 @@ export class Dispatcher {
     return this.plan.eligible.filter(
       (r) =>
         this.tried.untried(r) &&
-        (first || (this.plan.otherOperators && !this.tried.operatorTried(r.record.operator))) &&
+        (first || (this.allowsOtherOperators() && !this.tried.operatorTried(r.record.operator))) &&
         this.view.quotable(r) &&
         !(this.held !== null && this.held.operator === r.record.operator),
     );
@@ -874,7 +899,8 @@ export class Dispatcher {
     const plan = this.plan;
     const timeout: Outcome = bareOutcome("timeout", 0);
     return (
-      plan.otherOperators &&
+      plan.lockOperatorOnDial !== true &&
+      this.allowsOtherOperators() &&
       this.tried.attempts + 1 < plan.retry.maxAttempts &&
       !this.tried.followedRefusal &&
       !this.tried.followedWork &&
@@ -1211,6 +1237,7 @@ export class Dispatcher {
     const operators: string[] = [];
     for (let i = tried.sent.length - 1; i >= 0; i--) {
       const operator = tried.sent[i]!.operator;
+      if (this.dialedOperator !== null && operator !== this.dialedOperator) continue;
       if (!operators.includes(operator)) operators.push(operator);
     }
     interface Option {
@@ -1548,6 +1575,10 @@ export class Dispatcher {
       sent.declined = o.declined === true;
     }
     this.last = { outcome, error };
+    const dialed = o.unsent !== true && o.declined !== true && cls !== "connect";
+    if (this.plan.lockOperatorOnDial === true && dialed && this.dialedOperator === null) {
+      this.dialedOperator = operator;
+    }
     const pool = this.plan.accountPool(route);
     if (cls === "credential" && pool !== null) this.credentialPools.add(pool);
     return disposition === undefined ? end : { ...end, disposition };
@@ -1581,7 +1612,7 @@ export class Dispatcher {
    * provider, and an upstream's `x-should-retry: false` is not passed on.
    */
   sendableElsewhere(own: BlockLease | null = null): boolean {
-    return this.plan.otherOperators && this.plan.eligible.some((r) => !this.tried.operatorTried(r.record.operator) && this.tried.untried(r) && this.view.quotable(r) && this.holdsOff(r, { own, at: null }) === undefined);
+    return this.allowsOtherOperators() && this.plan.eligible.some((r) => !this.tried.operatorTried(r.record.operator) && this.tried.untried(r) && this.view.quotable(r) && this.holdsOff(r, { own, at: null }) === undefined);
   }
 
   /**

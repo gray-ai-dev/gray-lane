@@ -1,4 +1,4 @@
-import { shardName as accountShardName, type ShardAddress } from "@gray/account";
+import { ID_PATTERN, shardName as accountShardName, type ShardAddress } from "@gray/account";
 import { rootName as endpointRootName, shardName as endpointShardName, type ShardIdentity } from "@gray/endpoint";
 import { BridgeWireError } from "./error.ts";
 
@@ -81,6 +81,7 @@ export const BRIDGE_OPS = [
   "account.count",
   "account.settle",
   "account.release",
+  "account.keyRevoked",
   "endpoint.acquire",
   "endpoint.release",
   "endpoint.release_retry",
@@ -129,6 +130,7 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "account.count": "POST",
   "account.settle": "POST",
   "account.release": "POST",
+  "account.keyRevoked": "POST",
   "endpoint.acquire": "POST",
   "endpoint.release": "POST",
   "endpoint.release_retry": "POST",
@@ -175,6 +177,7 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "account.count": "/v1/lane-bridge/account/count",
   "account.settle": "/v1/lane-bridge/account/settle",
   "account.release": "/v1/lane-bridge/account/release",
+  "account.keyRevoked": "/v1/lane-bridge/account/key-revoked",
   "endpoint.acquire": "/v1/lane-bridge/endpoint/acquire",
   "endpoint.release": "/v1/lane-bridge/endpoint/release",
   "endpoint.release_retry": "/v1/lane-bridge/endpoint/release-retry",
@@ -253,6 +256,14 @@ export function bridgeOpOf(value: unknown): BridgeOp {
 /** The account shard's Durable Object name (`@gray/account`'s `shardName`, the name the gateway uses). */
 export function accountTarget(shard: ShardAddress): string {
   return accountShardName(shard);
+}
+
+/** The account root's Durable Object name (the workspace id, as the gateway's `accountRoot` names it): `account.keyRevoked`'s target. */
+export function accountRootTarget(workspace: string): string {
+  if (!ID_PATTERN.test(workspace) || !BRIDGE_LINE_PATTERN.test(workspace)) {
+    throw new BridgeWireError("invalid_target", null, "a workspace id is 1-128 characters of [A-Za-z0-9_.:-]");
+  }
+  return workspace;
 }
 
 /** The endpoint shard's Durable Object name (`@gray/endpoint`'s `shardName`, the name the gateway uses). */

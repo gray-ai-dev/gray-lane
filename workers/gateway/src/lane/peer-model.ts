@@ -235,6 +235,8 @@ export interface PeerCallInput {
    * `relay_changes`. Absent otherwise.
    */
   readonly relayChanges?: "exclude";
+  /** True for an Anthropic token-counting request (`POST /v1/messages/count_tokens`); absent on generation calls. */
+  readonly countTokens?: boolean;
   /**
    * Gray's public request id, sent beside the envelope (`PEER_REQUEST_ID_HEADER`) so a violation the stack VM reports
    * names the request (docs/design/relay-ejection.md section 3). Absent, none is sent.
@@ -276,6 +278,8 @@ export interface LanePeerCall {
   readonly end: PeerEndDto | null;
   /** Why the hop gave no answer (`peer.failed`). */
   readonly failure: { readonly code: PeerFailedCode; readonly sent: boolean } | null;
+  /** Egress refused the request itself, nothing sent: its body budget full (`capacity`), or anything else (`refused`). */
+  readonly egressRefusal: "capacity" | "refused" | null;
   /** Whether a vendor was dialed, as `end`, `head` or the follow-up said; null when none did. */
   readonly dialed: boolean | null;
   /** The relay account of `end` (S27), or null. */

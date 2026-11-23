@@ -69,7 +69,7 @@ import { judgeEvidence, mediaEvidence } from "./evidence.ts";
 import { originsOf } from "./hosts.ts";
 import type { GatewayDeps } from "./inference.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
-import { type ResponseHash, bodyHashOf, egressBeforeVendor, egressSidecarFailure, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
+import { type ResponseHash, bodyHashOf, egressCapacity, egressOwnAnswer, egressRefused, egressSentNothing, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHash, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
@@ -190,6 +190,11 @@ interface Attempt {
   retest?: BlockLease | null;
   /** What the attempt has shown of its route's mapping (traffic-evidence.ts). */
   readonly evidence: AttemptEvidence;
+  /**
+   * Its evidence noted `provider_failure` for it: its record's `providerFailure`, the one yes/no about it that leaves
+   * the TEE (2026-11-23; inference.ts `Attempt.providerFailure`), the evidence itself staying inside.
+   */
+  providerFailure?: true;
   /** The failure rest in force on its route once its failure rested it (inference.ts `Attempt.rest`): the request log names it. */
   rest?: { readonly cause: string; readonly untilMs: number };
   /** Its routing group's dispatch (inference.ts `Attempt.dispatch`): committed as it goes out, dropped if it never did. */
@@ -254,6 +259,7 @@ function contract(model: string, protocol: Protocol): CanonicalRequest {
     model_alias: null,
     messages: [],
     tools: [],
+    hasHostedTools: false,
     tool_choice: null,
     response_format: null,
     reasoning: null,
@@ -741,6 +747,8 @@ export class ModelApiRun {
       ...(attempt.committed && this.retryStop === "served" ? { retryStop: "served" } : {}),
       ...(facts.rejected === true ? { rejected: true } : {}),
       ...(attempt.dispatch?.committed === true ? { dispatch: dispatchRecord(attempt.dispatch, this.rankedFor.get(attempt.dispatch), attempt.dispatchedAtMs) } : {}),
+      // Whether it failed on its provider's answer, as its evidence noted (inference.ts `endAttempt`, 2026-11-23).
+      providerFailure: attempt.providerFailure === true,
     });
     const { defer, rejected: _rejected, failure, ...rest } = facts;
     // An answer its client got free goes back as @gray/endpoint's FREE_DELIVERY says (the server's
@@ -845,6 +853,7 @@ export class ModelApiRun {
             waitMs: this.deps.cfg.accountAdmitAttemptMs,
             clock: this.deps.clock,
             ...(this.deps.admissionTimers === undefined ? {} : { timers: this.deps.admissionTimers }),
+            lane: true,
           });
     const pending = this.pendingRecord;
     this.pendingRecord = null;
@@ -1248,7 +1257,9 @@ export class ModelApiRun {
     this.rateAdmission = admitted.mayHaveCounted;
     if (admitted.home !== null && !admitted.degraded && (admitted.result.ok || admitted.result.code !== "unavailable")) {
       const resolved = this.deps.degraded.answered(shardName(admitted.home));
-      if (resolved !== null) console.log(JSON.stringify({ level: "info", event: "admission_degraded_resolved", alert_key: resolved, home_shard: shardName(admitted.home), workspace: key.workspaceId }));
+      // A model API runs only at the entry, whose log keeps the event (laneSafeLog): the alert key and the shard name carry
+      // the workspace id (deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs").
+      if (resolved !== null) console.log(JSON.stringify(laneSafeLog({ level: "info", event: "admission_degraded_resolved", alert_key: resolved, home_shard: shardName(admitted.home), workspace: key.workspaceId })));
     }
     // The admission counted the request against its key's minute, or refused it for the minute: its end makes no count.
     // No account shard answered the admission (`unavailable`): its end does not ask one again.
@@ -1267,7 +1278,9 @@ export class ModelApiRun {
       this.admissionDegraded = true;
       const home = admitted.home === null ? null : shardName(admitted.home);
       const said = home === null ? { level: "alert" as const, alertKey: null } : this.deps.degraded.degraded(home, clock(), cfg.alertGroupMs);
-      const line = JSON.stringify({ level: said.level, event: "admission_degraded", ...(said.alertKey === null ? {} : { alert_key: said.alertKey }), request_id: this.requestId, request_key: requestKey, workspace: key.workspaceId, key: key.keyId, attempt: admitted.attempt, home_shard: home, shard: shardName(admitted.shard) });
+      // The entry's line keeps the request id and the attempt (laneSafeLog): the workspace, the key id, the shards' names and
+      // the request key identify the customer.
+      const line = JSON.stringify(laneSafeLog({ level: said.level, event: "admission_degraded", ...(said.alertKey === null ? {} : { alert_key: said.alertKey }), request_id: this.requestId, request_key: requestKey, workspace: key.workspaceId, key: key.keyId, attempt: admitted.attempt, home_shard: home, shard: shardName(admitted.shard) }));
       if (said.level === "alert") console.error(line);
       else console.warn(line);
     }
@@ -1603,22 +1616,34 @@ export class ModelApiRun {
           continue;
         case "status": {
           const status = result.response.status;
-          attempt.status = status;
-          attempt.evidence.upstreamStatus = status;
           // Bounded by the deadline and a small byte budget; its end also ends the attempt's transport.
           const body = await errorBody(result.response, Math.min(deadline, clock() + ERROR_BODY_WAIT_MS), clock);
-          // An attempt goes through egress's `/route/` kind: its fixed 502s are egress's own, not the provider's. One
-          // from before egress connected the provider sent the provider nothing: no receipt names it (inference.ts
-          // `openAttempt`, D72).
-          if (egressSidecarFailure(status, body)) {
-            const unsent = egressBeforeVendor(status, body);
+          // An attempt goes through egress's `/route/` kind, which marks every answer it gives itself: read before any
+          // classification, such an answer is never the provider's (inference.ts `egressAnswered`). One from before
+          // egress reached the provider sent the provider nothing: no receipt names it (D72).
+          const own = egressOwnAnswer(result.response.headers, body);
+          if (own !== null) {
+            const unsent = egressSentNothing(own);
             if (unsent) {
               this.laneReceiptId = laneBefore.receiptId;
               this.laneForwardedDraft = laneBefore.forwardedDraft;
             }
-            this.failAttempt(d, attempt, bareOutcome(unsent ? "connect" : "transport", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
-            continue;
+            if (own.kind === "before_vendor" || own.kind === "after_vendor") {
+              // A connection that failed: the egress path's, and the next route may go.
+              attempt.status = status;
+              attempt.evidence.upstreamStatus = status;
+              this.failAttempt(d, attempt, bareOutcome(unsent ? "connect" : "transport", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
+              continue;
+            }
+            // Egress's body budget full is Gray's capacity (429), a request egress refused as handed to it Gray's error
+            // (500): the attempt is Gray's own, counted against nothing, and no other route is tried, every route
+            // leaving through the same egress.
+            const error = own.kind === "capacity" ? egressCapacity() : egressRefused();
+            this.endAttempt(attempt, { kind: "not_counted", reason: permit.probeId !== null ? "not_dispatched" : "gray_error" }, own.kind === "refused" && own.sent, error.code, { rejected: true });
+            return this.fail(error, error.code, attempt, 0);
           }
+          attempt.status = status;
+          attempt.evidence.upstreamStatus = status;
           const classified = classify(
             status,
             headerReader(result.response.headers),
@@ -1944,7 +1969,7 @@ export class ModelApiRun {
     if (previous !== null && d.held !== previous) this.dropHeld(previous);
     // What the failure shows of the route's mapping (traffic-evidence.ts `attemptFailed`); a refusal held counts once another operator served the request.
     if (d.refused) this.heldEvidence.set(ModelApiRun.permitKey(attempt.permit), attempt.evidence);
-    this.traffic.attemptFailed(attempt.evidence, { refused: d.refused, noImageAgain: end.noImageAgain === true, counted: end.outcome.kind !== "not_counted", blamesRoute: end.blamesRoute === true }, outcome.class, code, this.deps.clock());
+    if (this.traffic.attemptFailed(attempt.evidence, { refused: d.refused, noImageAgain: end.noImageAgain === true, counted: end.outcome.kind !== "not_counted", blamesRoute: end.blamesRoute === true }, outcome.class, code, this.deps.clock())) attempt.providerFailure = true;
     this.endAttempt(attempt, end.outcome, upstreamMayStillWork, code, {
       ...(outcome.accountBlock === undefined ? {} : { accountBlock: { kind: "refused" as const, block: outcome.accountBlock, model: attempt.route.record.model, pattern: this.pattern } }),
       ...(end.refusal === undefined ? {} : { refusal: end.refusal }),
@@ -2001,10 +2026,13 @@ export class ModelApiRun {
       this.dropHeld(held);
       return;
     }
-    if (later.evidence && evidence !== undefined) this.traffic.heldServedElsewhere(evidence, held.refusal.code, this.deps.clock());
     const failure: EndpointOutcome = { kind: "supplier_failure", reason: "upstream_error" };
     const key = ModelApiRun.permitKey(held.permit);
     const at = this.attemptAt.get(key);
+    // Its record says it failed on its provider's answer as its evidence does (`providerFailure`).
+    if (later.evidence && evidence !== undefined && this.traffic.heldServedElsewhere(evidence, held.refusal.code, this.deps.clock()) && at !== undefined) {
+      this.attempts[at] = { ...this.attempts[at]!, providerFailure: true };
+    }
     if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, failure: failure.reason };
     // Its sample's measures: the refusing attempt's latency, the failure it counts as (inference.ts `settleHeld`); its
     // record's route attempt takes them (r15, docs/live-speed.md).
@@ -2188,7 +2216,7 @@ export class ModelApiRun {
     let started = false;
     let stream: ReadableStream<Uint8Array> | null = null;
     try {
-      const headers = entryUpstreamHeaders(body, this.request.headers.get("content-type"), entry.credential);
+      const headers = entryUpstreamHeaders(this.protocol, body, this.request.headers, entry.credential);
       stream = sendable(forwarded.body(body.kind === "form" ? ENTRY_FORM_CHUNK_BYTES : UPSTREAM_BODY_CHUNK_BYTES), () => {
         taken = true;
         // The body is handed to the provider's fetch: the response names the id its receipt will use, and the last
@@ -2361,7 +2389,7 @@ export class ModelApiRun {
   private answerFailed(attempt: Attempt, reader: MediaAnswer, handOver: (response: Response) => void, error: ApiError, reason: string, why: string, supplier: "timeout" | "upstream_error" | "invalid_response" | null, upstreamMayStillWork: boolean): void {
     this.answerShare.hold(0, this.deps.cfg.answerHeldMaxBytes);
     if (upstreamMayStillWork) attempt.controller.abort(error.code);
-    if (supplier !== null) this.traffic.committedFailed(attempt.evidence, error.code, this.deps.clock());
+    if (supplier !== null && this.traffic.committedFailed(attempt.evidence, error.code, this.deps.clock())) attempt.providerFailure = true;
     this.endAttempt(attempt, supplier === null ? { kind: "not_counted", reason: "gray_error" } : { kind: "supplier_failure", reason: supplier }, upstreamMayStillWork, error.code, { failure: countedFailure(null, error.code) });
     this.releaseHold(reason, { code: error.code, why: why.slice(0, 200), endpoint: attempt.candidate.record.endpointId, provider: attempt.candidate.record.operator, attempt: attempt.index });
     this.heldBytes = Math.max(this.heldBytes, reader.heldMost);
@@ -2534,7 +2562,7 @@ export class ModelApiRun {
       this.billing = ended.billing;
       this.releaseReason = ended.releaseReason;
     }
-    logWithheld(end, this.requestId, shard);
+    logWithheld(end, this.requestId, shard, true);
   }
 
   // ---------------------------------------------------------------- video creation at the confidential entry
@@ -2565,7 +2593,7 @@ export class ModelApiRun {
     this.model = job.model;
     const route = videoJobRoute(snapshot, job);
     if (route === undefined) return this.refuse(new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
-    const observed = await pollVideoJob(io, route, job);
+    const observed = await pollVideoJob(io, route, job, undefined, this.request.headers);
     const after = await advanceVideoJob(io, job, observed, false);
     if (observed.kind !== "object") {
       const unreadable = observed.kind === "unknown" && (observed.why === "unreadable" || observed.why === "other_job");
@@ -2628,7 +2656,7 @@ export class ModelApiRun {
     const object = answered === null ? null : readVideoObject(answered);
     if (object === null || object.state === null || !isVideoProviderId(object.id)) {
       const error = new ApiError(502, object === null && answered !== null ? "invalid_upstream_json" : "invalid_upstream_response");
-      this.traffic.committedFailed(attempt.evidence, error.code, clock());
+      if (this.traffic.committedFailed(attempt.evidence, error.code, clock())) attempt.providerFailure = true;
       this.endAttempt(attempt, { kind: "supplier_failure", reason: "invalid_response" }, false, error.code, { failure: countedFailure(null, error.code) });
       return this.fail(error, error.code, attempt, 0);
     }

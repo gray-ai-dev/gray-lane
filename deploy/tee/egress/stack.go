@@ -58,8 +58,10 @@ func newStack(cfg config, check stackRequestCheck, newDigester func() stackEvent
 		accounts:       map[string]stackAccount{},
 		requests:       map[string]*stackRequest{},
 	}
-	// The health clock reads st.now at each call, so a test's clock replaces both.
+	// The health clock and lease bound read st.now / st.afterFunc at each call, so a test's clock replaces all of them.
 	st.health = newStackHealth(func() time.Time { return st.now() })
+	st.lease.now = func() time.Time { return st.now() }
+	st.lease.afterFunc = func(wait time.Duration, fire func()) *time.Timer { return st.afterFunc(wait, fire) }
 	st.budget.max.Store(cfg.stackMaxBytes)
 	return st
 }
@@ -71,6 +73,7 @@ type stackAccount struct {
 	id             string
 	vendor         string
 	credentialType string
+	credGen        uint64
 	proxyID        *string
 	spec           *egressSpec
 }
@@ -97,6 +100,8 @@ type stackRequest struct {
 	health      *stackHealth
 	// forwarded: the registration asked for each accepted call's forwarded body in the feed (recordForwarded).
 	forwarded bool
+	// countTokens: true for an Anthropic /v1/messages/count_tokens registration, isolating it from /v1/messages.
+	countTokens bool
 	// ctx ends when the rid does (DELETE or expiry); every vendor call for the rid is cancelled with it.
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -162,15 +167,25 @@ type feedItem struct {
 }
 
 // setAccounts replaces the whole table (S15: on every config version) unless (version, push) is below the
-// highest pair it accepted, which leaves the table as it is and returns false: a slow push of an older version
-// must not bring back an account a newer one removed or paused, and within one version an older push (a
-// rotation's table) must not replace a later one (the exact table the relay was then handed). The same pair
+// highest pair it accepted, which leaves the table (and lease) as they are and returns false: a slow push of an
+// older version must not bring back an account a newer one removed or paused, and within one version an older push
+// (a rotation's table) must not replace a later one (the exact table the relay was then handed). The same pair
 // replaces it again. Calls already accepted keep the account they were accepted with.
-func (st *stack) setAccounts(version, push uint64, accounts map[string]stackAccount) bool {
+//
+// When hasUntil is true, the KMS lease bound is updated atomically under st.mu (lock order st.mu -> lease.mu)
+// before st.mu is released, preventing a concurrent account lookup from wiping a newly renewed table. If the
+// effective lease is already ended at now, the table is left empty immediately.
+func (st *stack) setAccounts(version, push uint64, accounts map[string]stackAccount, until time.Time, hasUntil bool) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.accountsSet && (version < st.accountsVersion || (version == st.accountsVersion && push < st.accountsPush)) {
 		return false
+	}
+	if hasUntil {
+		st.lease.setUntil(until)
+	}
+	if st.lease.ended(st.now()) {
+		accounts = map[string]stackAccount{}
 	}
 	st.accounts = accounts
 	st.accountsVersion = version
@@ -178,8 +193,21 @@ func (st *stack) setAccounts(version, push uint64, accounts map[string]stackAcco
 	st.accountsSet = true
 	// S40: a new credential clears the entries that say so, in the same step as the table, so no answer of the old
 	// credential can set an entry between the two.
-	st.health.tableChanged(accountHashes(accounts))
+	st.health.tableChanged(accountHashes(accounts), accountCredGens(accounts))
 	return true
+}
+
+// leaseEnded reports whether the KMS lease has ended at now, emptying the account table under st.mu when it has.
+func (st *stack) leaseEnded() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.lease.ended(st.now()) {
+		if len(st.accounts) > 0 {
+			st.accounts = map[string]stackAccount{}
+		}
+		return true
+	}
+	return false
 }
 
 // account is the row a call's credential names; none once the KMS lease's end has passed (stack_lease.go), which also
@@ -273,6 +301,9 @@ func (st *stack) end(req *stackRequest, expired bool) bool {
 	if !req.feed.opened {
 		req.dropLinesLocked()
 	}
+	// Always wake a blocked feed reader even if the forced `done` line could not fit in the full budget.
+	close(req.feed.wake)
+	req.feed.wake = make(chan struct{})
 	req.active = map[int]*stackAttempt{}
 	req.mu.Unlock()
 	req.cancel()
@@ -370,7 +401,9 @@ func (req *stackRequest) recordForwarded(n int, body []byte) {
 	}
 	omitted = append(omitted, '\n')
 	size := int64(cap(omitted))
-	req.budget.force(size)
+	if !req.budget.force(size) {
+		return
+	}
 	req.queueLocked([]feedItem{{line: omitted, spare: req.budget.takeSpare(append(full, '\n'))}}, size)
 }
 
@@ -412,7 +445,9 @@ func (req *stackRequest) putLocked(forced bool, records ...any) bool {
 		size += int64(cap(line))
 	}
 	if forced {
-		req.budget.force(size)
+		if !req.budget.force(size) {
+			return false
+		}
 	} else if !req.budget.take(size) {
 		return false
 	}

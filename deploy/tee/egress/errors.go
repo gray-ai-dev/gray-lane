@@ -54,7 +54,9 @@ const (
 	errStackCoolingFull      = "stack_cooling_full"
 	// egress_limit (S17): the budget of -stack-max-bytes cannot hold the call. A refusal before the dial, and
 	// the reason of an `end` that cut an answer; on a cut answer nothing reaches the relay, its connection is
-	// closed.
+	// closed. Also the in-flight body budget's refusal (-max-inflight-body-bytes, body_budget.go) on every path,
+	// before the dial; on the entry's paths to a provider it carries ownAnswerHeader 0, which the entry answers as
+	// Gray's capacity.
 	errEgressLimit = "egress_limit"
 
 	// The peer mode's codes (design §4.4). Every answer egress itself gives on a /peer/ path carries

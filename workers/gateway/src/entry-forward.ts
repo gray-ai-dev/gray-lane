@@ -191,6 +191,19 @@ export function entryServes(snapshot: Pick<GatewaySnapshot, "routes" | "laneServ
 }
 
 /**
+ * Whether the confidential entry serves `model` natively on `protocol` (without translation): a lane relay's route of
+ * the pair (`laneServed`) or an endpoint route the entry serves (`entryEndpointRoute`) with exactly that protocol.
+ * Used by token counting, which is never translated.
+ */
+export function entryServesNative(snapshot: Pick<GatewaySnapshot, "routes" | "laneServed">, model: string, protocol: Protocol): boolean {
+  const served = snapshot.laneServed ?? {};
+  if (Object.hasOwn(served, laneServedKey(model, protocol))) return true;
+  return snapshot.routes.some(
+    (r) => r.auth !== "lane_relay" && r.model === model && r.protocol === protocol && entryEndpointRoute({ auth: r.auth, protocol: r.protocol, baseUrl: r.baseUrl, url: r.url }),
+  );
+}
+
+/**
  * Whether a request listing `models` on `protocol` goes to the entry (InferenceRun `forwardToEntry`): the entry serves one
  * of them (`entryServes`), and no model this gateway knows (a route or a mapping of it here) is one the entry does not
  * serve. A list naming such a model is answered here, as before: at the entry that model would be skipped for a later one

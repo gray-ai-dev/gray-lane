@@ -349,7 +349,10 @@ export class ApiError {
       "x-should-retry": this.shouldRetry() ? "true" : "false",
     };
     if (this.retryAfter !== undefined) headers["retry-after"] = this.retryAfter.toString();
-    if (requestId !== undefined && HEADER_VALUE.test(requestId)) headers["x-request-id"] = requestId;
+    if (requestId !== undefined && HEADER_VALUE.test(requestId)) {
+      headers["x-request-id"] = requestId;
+      if (shape === "anthropic") headers["request-id"] = requestId;
+    }
     return { status: this.status, headers, body: toJsonString(this.body(shape, origins, requestId)) };
   }
 }

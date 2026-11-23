@@ -295,9 +295,11 @@ function restoreEntrySchemaOf(int: IntOf) {
       gen: int(0, Number.MAX_SAFE_INTEGER),
       clears: z.array(z.enum(STACK_RULE_CLEARS)).max(STACK_RULE_CLEARS.length),
       observed: z.boolean(),
+      cred_gen: int(1, Number.MAX_SAFE_INTEGER).optional(),
     })
     .strict()
-    .refine((e) => (e.kind === "hold") === (e.until_ms === null), { message: "a hold has no end, a cool has one", path: ["until_ms"] });
+    .refine((e) => (e.kind === "hold") === (e.until_ms === null), { message: "a hold has no end, a cool has one", path: ["until_ms"] })
+    .refine((e) => e.cred_gen === undefined || e.clears.includes("credential"), { message: "cred_gen is only allowed when clears includes credential", path: ["cred_gen"] });
 }
 
 function rulesDocumentSchemaOf(int: IntOf) {
@@ -346,6 +348,8 @@ export interface StackRestoreEntry {
   readonly clears: readonly (typeof STACK_RULE_CLEARS)[number][];
   /** Made in observe mode: egress keeps it marked so, and refuses nothing for it. */
   readonly observed: boolean;
+  /** AF-06.3: TEE-owned credential generation when `clears` includes `"credential"`. */
+  readonly cred_gen?: number;
 }
 export interface StackRulesAnswer {
   readonly relay_id: string;

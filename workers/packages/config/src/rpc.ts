@@ -59,7 +59,7 @@ export const RPC_SURFACES = {
     callee: "credit-api",
     target: "AccountDO",
     kind: "object",
-    callers: ["gateway", "jobs", "console", "credit-signer", "credit-api"],
+    callers: ["gateway", "jobs", "console", "credit-signer", "credit-api", "lane-bridge"],
     calls: ["handle", "applyChainEvents", "exchange", "sealNow", "entries", "topUp", "heldTopUps", "putKey", "revokeKey", "keyRevoked", "balance", "liveBalance", "audit", "opsView"],
     // The tests' seams: the relayer stub of a lane, and the clock (an instance field, which RPC does not reach).
     hooks: ["relayer", "clock"],

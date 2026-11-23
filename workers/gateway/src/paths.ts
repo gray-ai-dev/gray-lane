@@ -1,5 +1,14 @@
-import { geminiPathModel, geminiWithoutModelsSegment } from "@gray/protocol";
+import { geminiCountModel, geminiPathModel, geminiWithoutModelsSegment } from "@gray/protocol";
 import type { Served } from "./inference.ts";
+
+/** Percent-decode a Gemini model path segment (falling back to the raw text on malformed escapes). */
+function decodeSegment(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
 
 /**
  * The paths of the generation APIs this gateway serves, with the server's unprefixed aliases
@@ -9,7 +18,7 @@ import type { Served } from "./inference.ts";
  * model. A Gemini path without the `models/` segment (`/v1beta/google/gemini-x:generateContent`,
  * the AI SDK's for a model id with a slash) is served as the path with it
  * (`gemini_without_models_segment`). Token counting (`/v1/messages/count_tokens`, Gemini's
- * `:countTokens`) is another endpoint and not served here yet.
+ * `:countTokens`) is matched separately by `countTokensProtocol`.
  */
 export function servedProtocol(method: string, path: string): Served | null {
   if (method !== "POST") return null;
@@ -20,6 +29,22 @@ export function servedProtocol(method: string, path: string): Served | null {
   if (gemini === undefined || !(gemini.endsWith(":generateContent") || gemini.endsWith(":streamGenerateContent"))) return null;
   const model = geminiPathModel(gemini);
   return model === undefined ? null : { protocol: "gemini", pathModel: model };
+}
+
+/**
+ * Native token-counting endpoints (crates/gray-gateway/src/count_tokens.rs):
+ * - `POST /v1/messages/count_tokens` (Anthropic; no unprefixed alias)
+ * - `POST /v1beta/models/{model}:countTokens` and `POST /v1beta/{vendor}/{model}:countTokens` (Gemini)
+ */
+export function countTokensProtocol(method: string, path: string): Served | null {
+  if (method !== "POST") return null;
+  if (path === "/v1/messages/count_tokens") return { protocol: "anthropic_messages", pathModel: null };
+  const gemini = path.startsWith("/v1beta/models/") ? path : geminiWithoutModelsSegment(path, undefined);
+  if (gemini === undefined) return null;
+  const rawModel = geminiCountModel(gemini);
+  if (rawModel === undefined || rawModel.length === 0) return null;
+  const model = decodeSegment(rawModel);
+  return model.length === 0 ? null : { protocol: "gemini", pathModel: model };
 }
 
 /**

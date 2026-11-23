@@ -15,6 +15,7 @@ export { PolicyError, TranslationPolicy, rustDebug } from "./policy.ts";
 export { type Fallback, RESPONSES_FALLBACK, type Rule, translationTargets } from "./targets.ts";
 export { CLIENT_RESPONSE_INVALID, CLIENT_STREAM_INVALID, StreamStage, TOOL_CALL_MISMATCH, TranslationFailure, answeredByUpstream, translateBody } from "./stage.ts";
 export {
+  TRANSLATED_BODY_MAX_BYTES,
   type SelectOptions,
   type Selection,
   Translation,

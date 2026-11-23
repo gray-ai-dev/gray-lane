@@ -1,8 +1,8 @@
+import type { Region } from "@gray/account";
 import type { GatewayConfig } from "@gray/config";
 import { ApiError } from "@gray/errors";
-import { accountRoot, workspaceHome } from "./account.ts";
+import { workspaceHome } from "./account.ts";
 import { keyHash, keyRefusal, presentedKey } from "./auth.ts";
-import type { GatewayEnv } from "./env.ts";
 import type { Outbound } from "./outbound.ts";
 import { type GatewaySnapshot, type KeyRecord, type SnapshotCache, type SnapshotSource, snapshotTiming } from "./snapshot.ts";
 
@@ -62,6 +62,9 @@ export async function lookUpKey(headers: Headers, d: KeyLookup, optional: boolea
   return { key, snapshot: read.snapshot, stale: read.stale };
 }
 
+/** Real-time revocation check against a workspace's account root (direct DO binding or over the lane bridge). */
+export type KeyRevocationCheck = (workspace: string, home: Region, keyId: string) => Promise<boolean>;
+
 /**
  * For a route that reaches no account shard (which is what refuses a revoked key on the request path
  * whatever the snapshot says): while the copy is past CONFIG_ALERT_AGE_MS (the database away, the copy
@@ -70,12 +73,13 @@ export async function lookUpKey(headers: Headers, d: KeyLookup, optional: boolea
  * revoked, and 503 `auth_snapshot_expired` when it does not answer (a key that cannot be checked).
  * `event`: the log line of a root that did not answer.
  */
-export async function checkStaleKey(looked: Looked, env: GatewayEnv, d: KeyLookup, event: string): Promise<void> {
+export async function checkStaleKey(looked: Looked, keyRevoked: KeyRevocationCheck, d: KeyLookup, event: string): Promise<void> {
   const key = looked.key;
   if (key === null || !looked.stale) return;
   let revoked: boolean;
   try {
-    revoked = await d.outbound.run(() => accountRoot(env, key.workspaceId, workspaceHome(looked.snapshot, key.workspaceId)).keyRevoked(key.keyId));
+    const home = workspaceHome(looked.snapshot, key.workspaceId);
+    revoked = await d.outbound.run(() => keyRevoked(key.workspaceId, home, key.keyId));
   } catch (error) {
     console.error(JSON.stringify({ level: "error", event, message: error instanceof Error ? error.message : String(error) }));
     throw new ApiError(503, "auth_snapshot_expired").withRetryAfter(2n);

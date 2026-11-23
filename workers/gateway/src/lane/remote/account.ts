@@ -1,16 +1,20 @@
 import {
+  accountRootTarget,
   accountTarget,
   admitInputDtoOf,
   admitResultOf,
   bridgeCall,
   countInputDtoOf,
   countResultOf,
+  keyRevokedInputDtoOf,
+  keyRevokedResultOf,
   releaseInputDtoOf,
   releaseResultOf,
   settleInputDtoOf,
   settleResultOf,
 } from "@gray/lane-wire";
-import type { AdmitInput, AdmitResult, CountInput, CountResult, ReleaseInput, ReleaseResult, SettleInput, SettleResult, ShardAddress, ShardLocator, ShardRpc } from "@gray/account";
+import type { AdmitInput, AdmitResult, CountInput, CountResult, Region, ReleaseInput, ReleaseResult, SettleInput, SettleResult, ShardAddress, ShardLocator, ShardRpc } from "@gray/account";
+import type { KeyRevocationCheck } from "../../key-lookup.ts";
 import { BridgeClient, type BridgeClientOptions } from "./client.ts";
 
 /**
@@ -77,4 +81,30 @@ export class AccountShardRpc extends BridgeClient implements ShardRpc {
  */
 export function remoteShardLocator(options: BridgeClientOptions, answerMarginMs = 0): ShardLocator {
   return (address: ShardAddress) => new AccountShardRpc(options, address, answerMarginMs);
+}
+
+/**
+ * A workspace's account root over the bridge (`account.keyRevoked`, GL-20): read-only revocation
+ * check while the snapshot is stale (`checkStaleKey`). Every failure throws (fail-closed, no
+ * `LegacyLatch`), so an un-upgraded or unreachable bridge produces 503 `auth_snapshot_expired`
+ * with `Retry-After: 2` only when the snapshot is stale and a key was presented.
+ */
+export class AccountRootClient extends BridgeClient {
+  constructor(options: BridgeClientOptions) {
+    super(options);
+  }
+
+  async keyRevoked(workspace: string, home: Region, keyId: string): Promise<boolean> {
+    const target = accountRootTarget(workspace);
+    const result = keyRevokedResultOf(
+      await this.call("account.keyRevoked", bridgeCall("account.keyRevoked", target), keyRevokedInputDtoOf({ workspace, home, keyId })),
+    );
+    return result.revoked;
+  }
+}
+
+/** Remote `KeyRevocationCheck` over the lane bridge, failing closed on any bridge or root error. */
+export function remoteKeyRevoked(options: BridgeClientOptions): KeyRevocationCheck {
+  const client = new AccountRootClient(options);
+  return (workspace, home, keyId) => client.keyRevoked(workspace, home, keyId);
 }

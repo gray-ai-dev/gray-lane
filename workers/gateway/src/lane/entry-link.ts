@@ -56,6 +56,10 @@ export const ENTRY_RENEW_MS = 5 * 60_000;
 
 /** The bound of one call to peerlink. */
 export const ENTRY_CALL_MS = 10_000;
+/** Strict byte cap for `/v1/aci/attestation` reads from an untrusted entry before verification. */
+export const ENTRY_ATTESTATION_MAX_BYTES = 1024 * 1024;
+/** Strict byte cap for peerlink control answers (`/v1/entries`). */
+export const ENTRY_CONTROL_MAX_BYTES = 64 * 1024;
 
 /**
  * How long a run is waited on past the start of its current step before the next fetch lets it go: a call to peerlink
@@ -276,7 +280,7 @@ export class EntryLink {
       const addr = this.#deps.entryAddrs?.().get(entry);
       const query = addr === undefined ? `nonce=${nonce}` : `nonce=${nonce}&addr=${encodeURIComponent(addr)}`;
       this.#step(run, ENTRY_CALL_HOLD_MS);
-      const answer = await this.#call(new Request(`${VM_PEERLINK_ORIGIN}/attest/${entry}/v1/aci/attestation?${query}`, { method: "GET" }));
+      const answer = await this.#call(new Request(`${VM_PEERLINK_ORIGIN}/attest/${entry}/v1/aci/attestation?${query}`, { method: "GET" }), ENTRY_ATTESTATION_MAX_BYTES);
       if (!this.#current(run)) return;
       spki = answer.headers.get("x-gray-peer-spki");
       if (answer.status !== 200 || spki === null || !isSpkiHex(spki)) {
@@ -388,15 +392,50 @@ export class EntryLink {
     this.#deps.log({ level: refused ? "error" : "warn", event: refused ? "lane_entry_refused" : "lane_entry_unavailable", entry, code, retry_ms: rest });
   }
 
-  async #call(request: Request): Promise<Response> {
+  async #call(request: Request, maxBytes: number = ENTRY_CONTROL_MAX_BYTES): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort("entry_call_timeout"), ENTRY_CALL_MS);
     try {
       const answer = await this.#deps.peerlink(new Request(request, { signal: controller.signal }));
-      const bytes = new Uint8Array(await answer.arrayBuffer());
+      const bytes = await readEntryBodyBounded(answer, maxBytes);
+      if (bytes === null) throw new Error(`entry response exceeded ${maxBytes} bytes`);
       return new Response(answer.status === 204 ? null : bytes, { status: answer.status, headers: answer.headers });
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+async function readEntryBodyBounded(response: Response, maxBytes: number): Promise<Uint8Array | null> {
+  const raw = response.headers.get("content-length");
+  if (raw !== null && /^[0-9]+$/.test(raw) && Number(raw) > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    return null;
+  }
+  const stream = response.body;
+  if (stream === null) return new Uint8Array(0);
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
 }

@@ -247,18 +247,87 @@ export function implicatesProvider(failure: AttemptFailure | undefined, code: st
   }
 }
 
+/** How a failed attempt before its commit ended, as the dispatcher ended it (`fail`, `close_attempt`). */
+export interface FailedEnd {
+  readonly refused: boolean;
+  readonly noImageAgain: boolean;
+  readonly counted: boolean;
+  readonly blamesRoute: boolean;
+}
+
+/**
+ * Which failed attempts of one request implicate their provider: the judgement `RequestEvidence` notes
+ * `provider_failure` by, once per endpoint and request (`evidenced`). The confidential entry's chat path keeps no
+ * evidence and asks it directly (inference.ts `laneFailures`): an attempt it answers true for carries
+ * `providerFailure` on its route attempt, the one yes/no about it the product owner let leave the TEE on 2026-11-23
+ * (docs/design/one-address.md, "Provider defects at the entry"). Each method answers whether `provider_failure` is due
+ * for the attempt.
+ */
+export class ProviderFailures {
+  /** Endpoints a failure of this request was counted against: a repeat failing again is no independent evidence (`evidenced`). */
+  private readonly evidenced = new Set<string>();
+
+  /**
+   * Whether a failed attempt counts (`failed`): it implicates the provider. An error body that names the provider's own
+   * failure is its fault whatever else; otherwise Gray's own deadline cutting an answer under way is not.
+   */
+  static failed(attempt: AttemptEvidence, failure: AttemptFailure | undefined, code: string | null): boolean {
+    return attempt.providerFault || (!attempt.deadlineCut && implicatesProvider(failure, code, attempt.upstreamStatus));
+  }
+
+  /** Whether a failure of this request at `attempt`'s endpoint is the first counted (`evidenced`). */
+  private first(attempt: AttemptEvidence): boolean {
+    const id = attempt.binding.endpointId;
+    if (this.evidenced.has(id)) return false;
+    this.evidenced.add(id);
+    return true;
+  }
+
+  /** `RequestEvidence.attemptFailed`. */
+  attemptFailed(attempt: AttemptEvidence, end: FailedEnd, cls: Class, code: string): boolean {
+    if (end.noImageAgain) return this.first(attempt);
+    if (end.refused || !end.counted) return false;
+    if (end.blamesRoute) attempt.providerFault = true;
+    return this.first(attempt) && ProviderFailures.failed(attempt, cls === "answer_defect" ? codeFailure(code) : classFailure(cls), code);
+  }
+
+  /** `RequestEvidence.committedFailed`. */
+  committedFailed(attempt: AttemptEvidence, code: string): boolean {
+    return this.first(attempt) && ProviderFailures.failed(attempt, codeFailure(code), code);
+  }
+
+  /** `RequestEvidence.pastOutputLimit`. */
+  pastOutputLimit(attempt: AttemptEvidence): boolean {
+    return this.first(attempt);
+  }
+
+  /** `RequestEvidence.heldServedElsewhere`. */
+  heldServedElsewhere(attempt: AttemptEvidence, code: string): boolean {
+    attempt.providerFault = true;
+    return ProviderFailures.failed(attempt, "rejected", code);
+  }
+}
+
 /**
  * One request's traffic evidence (the server's `TrafficEvidence` calls on it). `checksChat`: the gateway runs its
  * live checks on chat answers (trust mode not off); without them a chat answer proves nothing and is not counted.
+ * A failure is judged by `ProviderFailures`, and each method that notes one answers whether it noted
+ * `provider_failure`, which the confidential entry's model APIs carry on the attempt's route attempt (apis.ts), their
+ * evidence staying in the TEE.
  */
 export class RequestEvidence {
   readonly buffer = new TrafficEvidence();
   private readonly checksChat: boolean;
-  /** Endpoints a failure of this request was counted against: a repeat failing again is no independent evidence (`evidenced`). */
-  private readonly evidenced = new Set<string>();
+  private readonly failures = new ProviderFailures();
 
   constructor(checksChat: boolean) {
     this.checksChat = checksChat;
+  }
+
+  /** Notes `provider_failure` for `attempt`'s mapping when `due`, and answers `due`. */
+  private providerFailure(attempt: AttemptEvidence, due: boolean, at: number): boolean {
+    if (due) this.buffer.note(attempt.binding, ["provider_failure"], at);
+    return due;
   }
 
   /** A relay refused OpenCode's own agent turn of `attempt` in the words it refuses third-party coding agents with, saying `message`. */
@@ -302,17 +371,9 @@ export class RequestEvidence {
     if (attempt.flagged && this.checksChat && isGeneration(attempt.binding.protocol)) this.buffer.note(attempt.binding, ["provider_failure"], at);
   }
 
-  /**
-   * A failed attempt (`failed`): it counts only when it implicates the provider. An error body that names the
-   * provider's own failure is its fault whatever else; otherwise Gray's own deadline cutting an answer under way is not.
-   */
-  failed(attempt: AttemptEvidence, failure: AttemptFailure | undefined, code: string | null, at: number): void {
-    if (attempt.providerFault || (!attempt.deadlineCut && implicatesProvider(failure, code, attempt.upstreamStatus))) this.buffer.note(attempt.binding, ["provider_failure"], at);
-  }
-
-  /** An image route's upstream drew no image for the same request a second time, saying each time to send it again (`drew_no_image_again`). */
-  drewNoImageAgain(attempt: AttemptEvidence, at: number): void {
-    this.buffer.note(attempt.binding, ["provider_failure"], at);
+  /** A failed attempt (`failed`): it counts only when it implicates the provider (`ProviderFailures.failed`). */
+  failed(attempt: AttemptEvidence, failure: AttemptFailure | undefined, code: string | null, at: number): boolean {
+    return this.providerFailure(attempt, ProviderFailures.failed(attempt, failure, code), at);
   }
 
   /**
@@ -321,8 +382,8 @@ export class RequestEvidence {
    * (`upstream_usage_exceeds_limit`) did not. Its circuit
    * counts nothing (the cut is Gray's limit), so it comes here and not through `failed`. Once per endpoint and request.
    */
-  pastOutputLimit(attempt: AttemptEvidence, at: number): void {
-    if (this.first(attempt)) this.buffer.note(attempt.binding, ["provider_failure"], at);
+  pastOutputLimit(attempt: AttemptEvidence, at: number): boolean {
+    return this.providerFailure(attempt, this.failures.pastOutputLimit(attempt), at);
   }
 
   /** A billed answer of an API that is no text generation (`answered`): evidence of its base check alone. */
@@ -330,35 +391,22 @@ export class RequestEvidence {
     this.buffer.note(attempt.binding, ["answer"], at);
   }
 
-  /** Whether a failure of this request at `attempt`'s endpoint is the first counted (`evidenced`). */
-  private first(attempt: AttemptEvidence): boolean {
-    const id = attempt.binding.endpointId;
-    if (this.evidenced.has(id)) return false;
-    this.evidenced.add(id);
-    return true;
-  }
-
   /**
    * A failed attempt before its answer committed, as the dispatcher ended it (`fail`, `close_attempt`): a route that
-   * drew no image for the request a second time asks for its check (`drew_no_image`); a refusal is held, and counts
-   * only once another operator served the request (`heldServedElsewhere`); an attempt the route is excused for (ids
-   * it cannot know, the restored body's size, Gray's own wait, an answer its API allows: `counted` false) shows
-   * nothing; any other failure counts as it implicates the provider, a fault the provider stated in a code or by a
-   * status no request causes always (`blames_route`). Once per endpoint and request.
+   * drew no image for the same request a second time, saying each time to send it again, asks for its check
+   * (`drew_no_image_again`); a refusal is held, and counts only once another operator served the request
+   * (`heldServedElsewhere`); an attempt the route is excused for (ids it cannot know, the restored body's size, Gray's
+   * own wait, an answer its API allows: `counted` false) shows nothing; any other failure counts as it implicates the
+   * provider, a fault the provider stated in a code or by a status no request causes always (`blames_route`). Once per
+   * endpoint and request.
    */
-  attemptFailed(attempt: AttemptEvidence, end: { readonly refused: boolean; readonly noImageAgain: boolean; readonly counted: boolean; readonly blamesRoute: boolean }, cls: Class, code: string, at: number): void {
-    if (end.noImageAgain) {
-      if (this.first(attempt)) this.drewNoImageAgain(attempt, at);
-      return;
-    }
-    if (end.refused || !end.counted) return;
-    if (end.blamesRoute) attempt.providerFault = true;
-    if (this.first(attempt)) this.failed(attempt, cls === "answer_defect" ? codeFailure(code) : classFailure(cls), code, at);
+  attemptFailed(attempt: AttemptEvidence, end: FailedEnd, cls: Class, code: string, at: number): boolean {
+    return this.providerFailure(attempt, this.failures.attemptFailed(attempt, end, cls, code), at);
   }
 
   /** A failure after `attempt`'s answer committed, with `code` and no class of its own, counted against its route (`close_attempt`). */
-  committedFailed(attempt: AttemptEvidence, code: string, at: number): void {
-    if (this.first(attempt)) this.failed(attempt, codeFailure(code), code, at);
+  committedFailed(attempt: AttemptEvidence, code: string, at: number): boolean {
+    return this.providerFailure(attempt, this.failures.committedFailed(attempt, code), at);
   }
 
   /**
@@ -366,8 +414,7 @@ export class RequestEvidence {
    * (`refusal_served_later`). A block on the supplier's account counts only in its gate, and a refusal served at the
    * same operator in nothing.
    */
-  heldServedElsewhere(attempt: AttemptEvidence, code: string, at: number): void {
-    attempt.providerFault = true;
-    this.failed(attempt, "rejected", code, at);
+  heldServedElsewhere(attempt: AttemptEvidence, code: string, at: number): boolean {
+    return this.providerFailure(attempt, this.failures.heldServedElsewhere(attempt, code), at);
   }
 }

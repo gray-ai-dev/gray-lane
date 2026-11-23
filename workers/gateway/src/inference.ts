@@ -5,7 +5,24 @@ import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, ty
 import { endingWith, entryServesChain, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
 import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
-import { type ContinuationLocator, type PinResult, type StoreTiming, StreamBinding, bindReplyReferences, continuationTiming, pinContinuation, restrictToPinned, storesContinuation } from "@gray/continuation";
+import {
+  CONTINUATION_ERRORS,
+  CONTINUATION_STATE_TTL_MS,
+  MAX_REPLY_ITEM_REFERENCES,
+  StreamBinding,
+  bindContinuation,
+  bindReplyReferences,
+  continuationReferences,
+  continuationTiming,
+  hashedReference,
+  pinContinuation,
+  restrictToPinned,
+  storesContinuation,
+  type BindReference,
+  type ContinuationLocator,
+  type PinResult,
+  type StoreTiming,
+} from "@gray/continuation";
 import { answeredFailure, FREE_DELIVERY, type AccountBlockGates, type OutcomeMeasure, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type Pattern, type PermitToken } from "@gray/endpoint";
 import {
   ApiError,
@@ -130,11 +147,11 @@ import {
   priced,
   usageCounters as countersOfUsage,
 } from "./image-usage.ts";
-import { AttemptEvidence, RequestEvidence, agentThinking, opencodeAgent, wantsJson } from "./traffic-evidence.ts";
+import { AttemptEvidence, ProviderFailures, RequestEvidence, agentThinking, opencodeAgent, wantsJson, type FailedEnd } from "./traffic-evidence.ts";
 import { type FragmentUse, GateCapacity, PASS_THROUGH, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate, refusedAnswerChecks } from "./gate.ts";
 import { chargeSidesMismatch, customerTextRates, generationPriceOf, pricesModalities, quoteTextRates, recordedSides, safeAmount, usageCost, usageCostParts, type RecordedSides, type TokenSides } from "./money.ts";
 import { type ContentBucket, MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
-import { parseHeld, parseStored, type ParsedRequest } from "./parse.ts";
+import { continuationBody, parseHeld, parseStored, type ParsedRequest } from "./parse.ts";
 import { redactedHeaders, redactedQuery } from "./redact.ts";
 import { type ChunkTap, type LimitSource, type Primed as PrimedStream, type Uncommitted as StreamUncommitted, primeStream, readAnswer, relayStream, type SettleOutcome, type StreamEnd } from "./relay.ts";
 import { unrouted } from "./resolution.ts";
@@ -183,9 +200,12 @@ import {
   appendReserveTokens,
   bodyHashOf,
   continuesEarlierResponse,
+  egressCapacity,
   egressHeader,
-  egressBeforeVendor,
-  egressSidecarFailure,
+  egressOwnAnswer,
+  egressRefused,
+  egressSentNothing,
+  type EgressOwnAnswer,
   forwardedBody,
   forwardedStream,
   laneContinuationConversation,
@@ -216,11 +236,28 @@ import { addReceiptEvents } from "./lane/hooks.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
-import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, type RewriteDecisions } from "./lane/plan.ts";
+import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, storeOffBackend, type RewriteDecisions } from "./lane/plan.ts";
+import {
+  ResponsesStateTap,
+  expandZeroRetentionContinuation,
+  extractReplyMetadata,
+  isInvalidEncryptedContentError,
+  isUnsupportedIncludeEncryptedReasoningError,
+  newContinuationAffinityId,
+  normalizeResponsesInput,
+  openContinuationState,
+  routeEnforcesStoreFalse,
+  sealContinuationState,
+  shouldAddEncryptedReasoningInclude,
+  type CapturedResponsesReply,
+  type ExpandZeroRetentionResult,
+  type SealedItemState,
+  type SealedResponseState,
+} from "./lane/responses-continuation.ts";
 import { completedResponse, keptWeight } from "./lane/codex.ts";
 import type { LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
 import type { AppendedText, GrayRewriteOp, LaneProtocol } from "@gray/lane";
-import { applyDeclaredChanges, checkOfficialUpstream, GRAY_LANE_TRANSLATION_V1, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
+import { applyDeclaredChanges, checkOfficialUpstream, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_TRANSLATION_V1, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
 import {
   addStackReceipt,
@@ -252,7 +289,7 @@ import { STACK_BODY_MAX_BYTES, stackRequestBody, stackStreamOptionsUnusable, typ
 // The peer client as the request path sees it, types alone: its code and the peer check it runs are the lane entry's,
 // in no other bundle or program (`peer-model.ts`).
 import type { LanePeerCall, Peer } from "./lane/peer-model.ts";
-import type { PeerEndDto } from "@gray/lane-wire";
+import type { PeerEndDto, PeerHeadDto } from "@gray/lane-wire";
 
 /** One relay's policy decision, as `lanePolicy` caches it (design v2 §C.5). */
 type LanePolicyAnswer = { readonly allow: boolean; readonly appends: readonly AppendedText[]; readonly outcome: LanePolicyOutcome };
@@ -515,8 +552,16 @@ export interface Attempt {
    * does not count the image apart.
    */
   answeredImage?: boolean;
-  /** What the attempt has shown of its route's mapping so far (traffic-evidence.ts); none for the confidential lane. */
+  /**
+   * What the attempt has shown of its route's mapping so far (traffic-evidence.ts). The confidential lane keeps no
+   * evidence: its attempts have one only for what `ProviderFailures` reads (`laneFailures`), collecting no answer text.
+   */
   evidence?: AttemptEvidence;
+  /**
+   * A lane attempt that failed on its provider's answer (`laneFailures`): its record's `providerFailure`, the one yes/no
+   * about it that leaves the TEE (2026-11-23).
+   */
+  providerFailure?: true;
   /**
    * Its answer's two checks (docs/error-rates.md, r14) as the gate classified them once the answer ended: a stream's from
    * its inspector (relay.ts `StreamEnd.checks`, or its priming's when it failed before the commit), a non-streaming
@@ -603,6 +648,8 @@ export interface Attempt {
    * envelope, the hop's frames and its `end`, in place of a call to a container this VM does not have.
    */
   peer?: LanePeerCall;
+  /** Zero-retention continuation expansion applied to this attempt, if any. */
+  zdrExpansion?: ExpandZeroRetentionResult;
 }
 
 /**
@@ -618,9 +665,17 @@ type StackPlan =
       readonly peers?: undefined;
       /** What the relay's container is sent (relay standard v1.7, `stack-rewrite.ts`): set by `stackAttemptPlan`. */
       readonly body?: Extract<StackRequestBody, { ok: true }>;
+      readonly expansion?: ExpandZeroRetentionResult | null;
     }
   /** An entry's: the relay's usable peers, in its origins' order; the relay's config is its stack VM's, never read here. */
-  | { readonly ok: true; readonly config: null; readonly vendor: StackVendor; readonly route: null; readonly peers: readonly Peer[] }
+  | {
+      readonly ok: true;
+      readonly config: null;
+      readonly vendor: StackVendor;
+      readonly route: null;
+      readonly peers: readonly Peer[];
+      readonly expansion?: ExpandZeroRetentionResult | null;
+    }
   | { readonly ok: false; readonly code: string };
 
 /**
@@ -945,6 +1000,13 @@ export class InferenceRun {
    * index message (`emitRecord`); null for the confidential lane, whose routes have no checks for traffic to stand in for.
    */
   private readonly traffic: RequestEvidence | null;
+  /**
+   * The confidential lane's judgement of which failed attempts implicate their provider, the one `traffic` notes
+   * `provider_failure` by (traffic-evidence.ts `ProviderFailures`): the lane notes no evidence, and an attempt it answers
+   * true for carries `providerFailure` on its route attempt instead, which gray-jobs makes that evidence of
+   * (docs/design/one-address.md "Provider defects at the entry"). Null off the lane.
+   */
+  private readonly laneFailures: ProviderFailures | null;
   /** The request is OpenCode 2's own agent turn, untranslated (`opencode_agent`), and the thinking it carries. */
   private opencodeTurn = false;
   private turnThinking: OpencodeThinking | null = null;
@@ -1071,7 +1133,23 @@ export class InferenceRun {
    * the op's `request.modified` event, which the outer receipt's `peer.forwarded` declares. Made at the first peer
    * attempt; null until then, and for a request whose body states none (the hop then carries the client's bytes).
    */
-  private peerHop: { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null = null;
+  private peerHop: { readonly base: Uint8Array; readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null = null;
+  /** Decrypted zero-retention continuation response state for `previous_response_id`, keyed by plaintext id. */
+  private readonly laneSealedResponses = new Map<string, SealedResponseState>();
+  /** Decrypted zero-retention continuation item states for `item_reference`, keyed by plaintext item id. */
+  private readonly laneSealedItems = new Map<string, SealedItemState>();
+  /** Stable per-conversation affinity id used on zero-retention Responses routes when the client sent no session id. */
+  private laneZdrAffinityId: string | null = null;
+  /** Zero-retention continuation expansion recorded on the active peer hop receipt, if any. */
+  private lanePeerExpansion: ExpandZeroRetentionResult | null = null;
+  /** Zero-retention continuation expansion recorded on the active direct stack receipt, if any. */
+  private laneStackExpansion: ExpandZeroRetentionResult | null = null;
+  /** Parsed request body held for Turn 1 sealing on zero-retention Responses routes. */
+  private laneZdrRequestBody: Json | null = null;
+  /** At most one zero-retention fallback retry per request (unsupported `include` or `invalid_encrypted_content`). */
+  private zdrFallbackUsed = false;
+  private zdrSuppressInclude = false;
+  private zdrStripEncryptedReasoning = false;
   /**
    * A lane decision per `(relayId, protocol, model)` (design v2 §C.5, M12): the module runs once per
    * relay and model within a request, and a model the customer listed after another runs it again.
@@ -1109,8 +1187,9 @@ export class InferenceRun {
    * may still end at a pre-connect egress failure; if no headers went, the attempt's marks are rolled
    * back and the promise is not a promise that a receipt was named.
    */
-  private readonly laneSent: Promise<void>;
+  private laneSent!: Promise<void>;
   private markLaneSent!: () => void;
+  private laneSentOpen = false;
   /** The hash of the bytes handed to the client (design v2 §C.9, M7), finalisable on abort. */
   private laneResponse: ResponseHash | null = null;
   /**
@@ -1149,8 +1228,12 @@ export class InferenceRun {
   private readonly peerCalls: LanePeerCall[] = [];
   /** The entry's request id on the hop (the envelopes' `rid`): one per request, made with its first peer attempt. */
   private peerRid: string | null = null;
-  /** The request's last attempt went over the peer hop: its receipt is the outer one (`finishPeer`), not the attempt's own. */
-  private lastAttemptPeer = false;
+  /** Which receipt format the winning attempt uses (preserves per-attempt ownership across mixed endpoint <-> peer failovers). */
+  private winningReceipt: "lane" | "peer" | null = null;
+  /** Which receipt format the last attempt that actually forwarded bytes or an envelope used. */
+  private lastForwardedReceipt: "lane" | "peer" | null = null;
+  /** Per-attempt forwarded lane receipt drafts, keyed by attempt index, for held refusals that win after a later attempt fails. */
+  private readonly attemptLaneDrafts = new Map<number, LaneReceiptDraft>();
   /**
    * What the client was written, as a stack receipt's `response.returned` covers it (S26): the S19
    * digest chain of every event of a stream, Gray's own frames included, or a non-stream answer's
@@ -1214,12 +1297,13 @@ export class InferenceRun {
     this.lane = deps.lane ?? null;
     // The gateway's live checks run on chat answers unless the trust mode is off; without them a chat answer proves nothing.
     this.traffic = this.lane === null ? new RequestEvidence(deps.gate.mode !== "off") : null;
+    this.laneFailures = this.lane === null ? null : new ProviderFailures();
     // The lane's response hash lives for the whole request and is finalisable at any point, so a body
     // the client cut still has one (design v2 §C.9, M7). The main lane allocates none.
     this.laneResponse = this.lane === null ? null : responseHash();
     // F2 hooks-4: the header race waits for this before it starts (never resolves when no lane body is
-    // forwarded, and the dispatch's own end settles the race instead).
-    this.laneSent = new Promise<void>((resolve) => (this.markLaneSent = resolve));
+    // forwarded, and the dispatch's own end settles the race instead). Reset on pre-connect egress 502 rollback.
+    this.resetLaneSent();
     this.started = Math.floor(deps.clock());
     this.requestId = newRequestId(this.started);
     // The pre phase runs from the arrival: the snapshot's read is its first wait (snapshot.ts `SnapshotCache.read`).
@@ -1403,6 +1487,7 @@ export class InferenceRun {
       waitMs,
       clock: this.deps.clock,
       ...(this.deps.admissionTimers === undefined ? {} : { timers: this.deps.admissionTimers }),
+      ...(this.lane === null ? {} : { lane: true }),
     };
   }
 
@@ -1690,14 +1775,47 @@ export class InferenceRun {
    * behaviour of a receipt that was promised and not produced. Until then the id reads as pending
    * (`LaneReceiptStore.announce`), and it is withdrawn here when no receipt was stored under it.
    */
+  private resetLaneSent(): void {
+    this.laneSentOpen = false;
+    this.laneSent = new Promise<void>((resolve) => (this.markLaneSent = resolve));
+  }
+
+  private openLaneSent(): void {
+    if (this.laneSentOpen) return;
+    this.laneSentOpen = true;
+    this.markLaneSent();
+  }
+
+  private hasPeerEnvelope(): boolean {
+    return this.peerCalls.some((call) => call.envelopeSha256 !== null);
+  }
+
+  /**
+   * Which receipt kind this request will finalise (`X-Receipt-Id`, `laneReceipt`, `finishLane`), bound strictly
+   * to the winning attempt (or, when all attempts failed, the last attempt that actually forwarded bytes or a
+   * peer envelope) so mixed endpoint <-> stack peer failover never overwrites the winning attempt's receipt.
+   */
+  private receiptMode(): "stack" | "peer" | "lane" | null {
+    if (this.lane === null || this.laneReceiptId === null) return null;
+    if (this.stackCalls.length > 0) return "stack";
+    if (this.winningReceipt === "peer") return this.hasPeerEnvelope() ? "peer" : null;
+    if (this.winningReceipt === "lane") return this.laneReceiptToSign() !== null ? "lane" : null;
+    if (this.lastForwardedReceipt === "peer" && this.hasPeerEnvelope()) return "peer";
+    if (this.lastForwardedReceipt === "lane" && this.laneReceiptToSign() !== null) return "lane";
+    if (this.laneReceiptToSign() !== null) return "lane";
+    if (this.hasPeerEnvelope()) return "peer";
+    return null;
+  }
+
   private async laneReceipt(): Promise<void> {
     const lane = this.lane;
     if (lane === null) return;
     const receiptId = this.laneReceiptId;
+    const mode = this.receiptMode();
     try {
-      if (this.stackCalls.length > 0) await this.finishStack(lane, receiptId);
-      else if (this.lastAttemptPeer) await this.finishPeer(lane, receiptId);
-      else await this.signLaneReceipt(lane, receiptId);
+      if (mode === "stack") await this.finishStack(lane, receiptId);
+      else if (mode === "peer") await this.finishPeer(lane, receiptId);
+      else if (mode === "lane") await this.signLaneReceipt(lane, receiptId);
     } finally {
       // A stored receipt is no longer pending (`put`); an id the response named with no receipt under it reads as unknown.
       if (this.laneAnnounced !== null) lane.state.receipts.withdraw(this.laneAnnounced);
@@ -1710,7 +1828,8 @@ export class InferenceRun {
    */
   private finishLane(record: RequestRecord, finishedAt: number): void {
     const lane = this.lane;
-    if (lane === null || this.stackCalls.length > 0 || this.lastAttemptPeer) return;
+    const mode = this.receiptMode();
+    if (lane === null || mode === "stack" || mode === "peer") return;
     this.reportLaneOutcome(lane, record, finishedAt);
   }
 
@@ -1777,7 +1896,23 @@ export class InferenceRun {
         ...(relayImage === null ? {} : { relayImage }),
         ...laneArrival(lane),
       });
-      addStackReceipt(builder, { receivedHash: bodyHashOf(received), calls: this.stackCalls, returned: this.stackReturned() });
+      const stackExpansion = this.laneStackExpansion;
+      addStackReceipt(builder, {
+        receivedHash: bodyHashOf(received),
+        ...(stackExpansion !== null && stackExpansion.changed
+          ? {
+              continuationExpanded: {
+                mode: "zero_retention" as const,
+                previousResponseIdExpanded: stackExpansion.previousResponseIdExpanded,
+                itemReferencesExpanded: BigInt(stackExpansion.itemReferencesExpanded),
+                includeEncryptedReasoningAdded: stackExpansion.includeEncryptedReasoningAdded,
+                expandedBodySha256: stackExpansion.expandedBodySha256,
+              },
+            }
+          : {}),
+        calls: this.stackCalls,
+        returned: this.stackReturned(),
+      });
       const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
       if (this.laneOwner === null) throw new Error("a lane receipt without a key hash");
       lane.state.receipts.put(signed, this.laneOwner);
@@ -1818,6 +1953,16 @@ export class InferenceRun {
         ...laneArrival(lane),
       });
       builder.addRequestReceivedHash(bodyHashOf(received));
+      const peerExpansion = this.lanePeerExpansion;
+      if (peerExpansion !== null && peerExpansion.changed) {
+        builder.addRequestContinuationExpanded({
+          mode: "zero_retention",
+          previousResponseIdExpanded: peerExpansion.previousResponseIdExpanded,
+          itemReferencesExpanded: BigInt(peerExpansion.itemReferencesExpanded),
+          includeEncryptedReasoningAdded: peerExpansion.includeEncryptedReasoningAdded,
+          expandedBodySha256: peerExpansion.expandedBodySha256,
+        });
+      }
       let servedAttempt: bigint | null = null;
       for (const call of this.peerCalls) {
         if (call.envelopeSha256 === null) continue;
@@ -2096,6 +2241,9 @@ export class InferenceRun {
       ...(attempt.dispatch?.committed === true ? { dispatch: dispatchRecord(attempt.dispatch, attempt.ranked, attempt.dispatchedAtMs) } : {}),
       ...(checks.toolCallCheck === null ? {} : { toolCallCheck: checks.toolCallCheck }),
       ...(checks.outputCheck === null ? {} : { outputCheck: checks.outputCheck }),
+      // The lane's every attempt says whether it failed on its provider's answer (`laneFailures`): false where nothing
+      // said so, which tells gray-jobs this entry sends it (2026-11-23).
+      ...(this.lane === null ? {} : { providerFailure: attempt.providerFailure === true }),
     });
     // F2 D9/D111: every pick the TEE made is reported. A lane attempt whose fetch took the body is
     // reported as what the vendor did with it; one that ended before the body was taken (connect,
@@ -2208,6 +2356,7 @@ export class InferenceRun {
       upstreamModel: route.record.upstreamModel,
       upstream: laneUpstreamOf(route.record),
     });
+    this.winningReceipt = "lane";
     this.laneReceiptId ??= newLaneReceiptId();
   }
 
@@ -2264,7 +2413,7 @@ export class InferenceRun {
     // refusal, or a stream whose early headers already carried the id. A post-body failure that names
     // no receipt carries no id either. The body streams on untouched, and no other mode has an id. A
     // stack request names one once a call went to its relay's container (S26: every such call is receipted).
-    if (this.lane !== null && this.laneReceiptId !== null && (this.laneReceiptToSign() !== null || this.stackCalls.length > 0 || this.lastAttemptPeer) && !response.headers.has("x-receipt-id")) {
+    if (this.receiptMode() !== null && !response.headers.has("x-receipt-id")) {
       const headers = new Headers(response.headers);
       this.laneReceiptHeader(headers);
       response = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
@@ -2400,6 +2549,7 @@ export class InferenceRun {
         parseMax: cfg.bodyParseMaxBytes,
         rawMax: laneCap ?? cfg.bodyRawMaxBytes,
         waitMs: cfg.requestBodyMs,
+        ...(lane === null ? {} : { limitSource: "the most Gray's confidential VM holds of one request" }),
         ...(this.deps.waitTimers === undefined ? {} : { timers: this.deps.waitTimers }),
       },
       lane === null ? this.io.content : undefined,
@@ -2854,6 +3004,7 @@ export class InferenceRun {
     this.responseBytes = 0;
     this.dispatcher = null;
     this.recoveryRetryAfterS = null;
+    this.winningReceipt = null;
     // F2 hooks-1: that model's error body is not the answer either, and it was hashed when it was
     // rendered (`errorResponse`). A model is replaced only before its headers go, so nothing the
     // client got is dropped: the lane's `response.returned` starts again with this model's bytes.
@@ -2950,9 +3101,10 @@ export class InferenceRun {
     const resolving = laneMode || this.toolIds !== null ? null : this.resolveToolIds(snapshot, key, parsed, body, this.mayHoldHandles);
     // A binding found in another region's store is copied to this region's after the answer, so the conversation's next
     // turn from here asks one store (docs/request-path-availability.md M10).
+    const pinBody = continuationBody(protocol, parsed);
     const pin = laneMode
       ? await this.lanePin(key, parsed, records)
-      : await pinContinuation({ locate: this.io.continuation, workspace: key.workspaceId, region: this.deps.region, timing: this.continuationTiming("pre"), protocol, body: parsed.value, background: (work) => this.ctx.waitUntil(work) });
+      : await pinContinuation({ locate: this.io.continuation, workspace: key.workspaceId, region: this.deps.region, timing: this.continuationTiming("pre"), protocol, body: pinBody, background: (work) => this.ctx.waitUntil(work) });
     const unresolved = resolving === null ? null : await resolving;
     if (!pin.ok) {
       // The stores that did not answer, by region: a miss asks every region, so one slow region turns every unknown
@@ -2971,7 +3123,12 @@ export class InferenceRun {
       if (!kept.ok) return kept.error.code === "continuation_endpoint_unavailable" ? this.unserved(kept.error, "continuation") : { kind: "response", response: this.refuse(kept.error, "continuation") };
       records = kept.routes;
       this.pinned = true;
+      if (laneMode && protocol === "open_ai_responses" && storesContinuation(protocol, pinBody) && records.some((r) => this.laneZeroRetentionRoute(r))) {
+        const decrypted = await this.laneDecryptSealedContinuation(key.workspaceId, pinBody, pin.sealed, records);
+        if (!decrypted.ok) return { kind: "response", response: this.refuse(decrypted.error, "continuation") };
+      }
     }
+    if (laneMode && protocol === "open_ai_responses") this.laneZdrRequestBody = parsed.value;
 
     this.admission = "routes";
     const billed = () => {
@@ -3015,7 +3172,7 @@ export class InferenceRun {
       // could carry it and was left out for another reason (its traffic limit, its relay's VM, the customer's filter)
       // keeps its own answer. A body not read whole, which no translation takes, and a continuation of an earlier
       // response, which no translation carries, keep the native answer too.
-      if (laneMode && !this.preference.verifiable && parsed.whole && rules.upstreams(canonical.model, protocol) === undefined && !continuesEarlierResponse(protocol, parsed.value)) {
+      if (laneMode && !this.preference.verifiable && parsed.whole && rules.upstreams(canonical.model, protocol) === undefined && !continuesEarlierResponse(protocol, pinBody)) {
         const offered = (r: RouteRecord) => routeServes(r.expiresAt, now) && r.model === canonical.model && r.protocol === protocol && tierAdmitted(this.preference, r);
         if (snapshot.routes.some(offered) && !snapshot.routes.some((r) => offered(r) && capable(r, canonical, false))) rules = entryRulesWithout(snapshot, canonical.model, protocol);
       }
@@ -3025,7 +3182,7 @@ export class InferenceRun {
       }
       // A translated request has nothing but Gray's software between the client and the provider's other API, which has
       // no earlier response to continue: refused, whatever the model (`lanePin` left it to this point).
-      if (laneMode && continuesEarlierResponse(protocol, parsed.value)) return { kind: "response", response: this.refuse(laneContinuationTranslated(), "continuation") };
+      if (laneMode && continuesEarlierResponse(protocol, pinBody)) return { kind: "response", response: this.refuse(laneContinuationTranslated(), "continuation") };
       const upstreams = targets.upstreams;
       // The implied rule takes only a body read whole, as any translation does, and a body that is not keeps the
       // answer it gets without a translation (decisions of 2026-10-23, the critic's finding): the rule never turns
@@ -3194,22 +3351,47 @@ export class InferenceRun {
     let nextAdmitAttempt = baseKey ? this.baseKeyAttempt : 0;
     for (let refit = 0; ; refit++) {
       this.admission = "cost_ceiling";
-      const sized = this.size(snapshot, canonical, candidates, routes, bound, room, keySpend, units, billed);
+      let sized = this.size(snapshot, canonical, candidates, routes, bound, room, keySpend, units, billed);
       // A refusal on what the model costs (its ceiling, the output at its price) is the model's: a cheaper
       // model the customer listed may serve the request. One on memory, balance or the key's limit is final.
-      if ("error" in sized) return sized.nextModel ? this.unserved(sized.error, "cost_ceiling") : final(this.refuse(sized.error, "cost_ceiling"));
+      if ("error" in sized) {
+        if (canonical.max_output_tokens === null && routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok)) {
+          const direct = routes.filter((r) => !(this.stackRoute(r.record) && this.stackPlan(r).ok));
+          if (direct.length > 0) {
+            const repriced = priceRoutes(direct.map((r) => r.record), billed(), cfg.platformFeeBps, this.preference.maxPrice);
+            if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
+            sized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, room, keySpend, units, billed);
+          }
+        }
+        if ("error" in sized) return sized.nextModel ? this.unserved(sized.error, "cost_ceiling") : final(this.refuse(sized.error, "cost_ceiling"));
+      }
       ({ sizing, routes, bound } = sized);
-      const m = sizing.priced.bound(sizing.heldOutput);
-      if (previous !== null && m >= previous.held) return final(this.refuse(previous.refusal, "reservation"));
+      let m = sizing.priced.bound(sizing.heldOutput);
       // The rewrite decisions, made once (design v2 §C.7, M2): the main lane derives this refit's
       // request overlay from them, exactly as it built one inline before; the lane derives its declared
       // ops from them and the received body. The overlay below is unchanged in every field.
-      const written = sizing.defaultCap && sizing.writeCap;
+      let written = sizing.defaultCap && sizing.writeCap;
       // S23: Gray writes nothing into a stack relay's body, so an output the hold covers only with a cap
       // Gray would write (no cap from the request or the relay's route, and the balance, the key's limit or
-      // the ceiling lowered the model's own) cannot be held to: the request is refused rather than sent
-      // uncovered, and told to state its own limit.
-      if (written && routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok)) return final(this.refuse(stackCapRequired(), "cost_ceiling"));
+      // the ceiling lowered the model's own) cannot be held to. When non-Stack routes are also in the pool,
+      // drop the Stack routes and re-price/re-size so Direct/endpoint routes can serve with an injected cap;
+      // when only Stack routes remain, refuse and tell the client to state its own limit.
+      const hasStack = routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok);
+      const stackStuckOnTightRoom = previous !== null && m >= previous.held && canonical.max_output_tokens === null && hasStack;
+      if ((written && hasStack) || stackStuckOnTightRoom) {
+        const direct = routes.filter((r) => !(this.stackRoute(r.record) && this.stackPlan(r).ok));
+        if (direct.length === 0) {
+          return previous !== null && m >= previous.held ? final(this.refuse(previous.refusal, "reservation")) : final(this.refuse(stackCapRequired(), "cost_ceiling"));
+        }
+        const repriced = priceRoutes(direct.map((r) => r.record), billed(), cfg.platformFeeBps, this.preference.maxPrice);
+        if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
+        const resized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, room, keySpend, units, billed);
+        if ("error" in resized) return resized.nextModel ? this.unserved(resized.error, "cost_ceiling") : final(this.refuse(resized.error, "cost_ceiling"));
+        ({ sizing, routes, bound } = resized);
+        m = sizing.priced.bound(sizing.heldOutput);
+        written = sizing.defaultCap && sizing.writeCap;
+      }
+      if (previous !== null && m >= previous.held) return final(this.refuse(previous.refusal, "reservation"));
       // Nor into a Gemini body at the lane's entry (docs/design/lane-provider-routes.md section 5): the published rewrite
       // policy (`gray-lane-rewrites-v1`) declares no op on Gemini's `generationConfig`, and a receipt names only declared
       // changes, so a request whose hold needs a cap Gray would write is refused the same way. A translated body is
@@ -3262,7 +3444,7 @@ export class InferenceRun {
       // supplier whose gate holds it off goes after every supplier that does not. Read before the pin, which
       // skips a route the block would refuse anyway. Admission only orders: a supplier whose gate is
       // unproven with its re-test lease free keeps its ranked place, and an attempt sent there takes the lease.
-      this.pattern = { client: this.client.client ?? "", tools: canonical.tools.length > 0 };
+      this.pattern = { client: this.client.client ?? "", tools: canonical.tools.length > 0 || canonical.hasHostedTools };
       // OpenCode 2's own agent turn, sent as the client wrote it: what a route of its API does with it is a
       // result of the coding-agent check (`opencode_agent`). A User-Agent alone is no evidence of the prompt.
       this.opencodeTurn = this.traffic !== null && this.translation === null && opencodeAgent(this.client.client, this.client.clientVersion, canonical, parsed.value);
@@ -3299,8 +3481,10 @@ export class InferenceRun {
       this.rankingBaseAgeMs = rankingBaseAge(snapshot, rankedAt);
       this.ranked = rankedWith(snapshot, rankedAt);
       // The exploration budget's routing group, and whether a measured route is among the candidates, which is when the
-      // budget counts (inference.rs `admit`: `routing_group`, `mature_available`).
-      this.routingGroup = JSON.stringify([canonical.model, protocol, REST_EGRESS_REGION, this.stream === true, this.deps.region]);
+      // budget counts (inference.rs `admit`: `routing_group`, `mature_available`). Lane inference tags `lane-<env>`
+      // (matching `apis.ts`), so `route_refusal` and `ranking_dispatch` analytics distinguish lane traffic.
+      const routingRegion = this.lane !== null ? `lane-${cfg.deployEnv}` : REST_EGRESS_REGION;
+      this.routingGroup = JSON.stringify([canonical.model, protocol, routingRegion, this.stream === true, this.deps.region]);
       this.matureAvailable = ranking.result.evidence.some((e) => e.score !== undefined);
       // With only blocked routes ranked, a route ranking left out for want of samples goes first instead, in the
       // order a ranking without exploration gives them; the one permitted failover goes to an independent
@@ -3391,7 +3575,11 @@ export class InferenceRun {
       // The client's key's home shard answered (an admission or a refusal) after this isolate alerted it degraded.
       if (admitted.home !== null && !admitted.degraded && (admitted.result.ok || admitted.result.code !== "unavailable")) {
         const resolved = this.deps.degraded.answered(shardName(admitted.home));
-        if (resolved !== null) console.log(JSON.stringify({ level: "info", event: "admission_degraded_resolved", alert_key: resolved, home_shard: shardName(admitted.home), workspace: key.workspaceId }));
+        if (resolved !== null) {
+          // The alert key and the shard name carry the workspace id: the entry's log line keeps the event (laneSafeLog).
+          const line = { level: "info", event: "admission_degraded_resolved", alert_key: resolved, home_shard: shardName(admitted.home), workspace: key.workspaceId };
+          console.log(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
+        }
       }
       // The admission counted the request against its key's minute, or refused it for the minute: either way
       // the request was counted as the server's preflight counts it, and its end makes no count of its own. No
@@ -3414,7 +3602,7 @@ export class InferenceRun {
           this.admissionDegraded = true;
           const home = admitted.home === null ? null : shardName(admitted.home);
           const said = home === null ? { level: "alert" as const, alertKey: null } : this.deps.degraded.degraded(home, clock(), cfg.alertGroupMs);
-          const line = JSON.stringify({
+          const event = {
             level: said.level,
             event: "admission_degraded",
             ...(said.alertKey === null ? {} : { alert_key: said.alertKey }),
@@ -3425,7 +3613,11 @@ export class InferenceRun {
             attempt: admitted.attempt,
             home_shard: home,
             shard: shardName(admitted.shard),
-          });
+          };
+          // The workspace, the key id, the shards' names and the alert key (a shard name) identify the customer, and the
+          // request key is the same for every request under one Idempotency-Key: the entry's line keeps the request id
+          // and the attempt (laneSafeLog; deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs").
+          const line = JSON.stringify(this.lane === null ? event : laneSafeLog(event));
           if (said.level === "alert") console.error(line);
           else console.warn(line);
         }
@@ -3648,10 +3840,14 @@ export class InferenceRun {
       if (relayId === null) continue;
       if (this.stackRoute(route.record)) {
         // A stack relay's appends are its config's (S18): the largest selection egress lets it make.
-        const config = this.stackConfig();
+        // On an entry (`stackConfig() === null`, `entryPeers() !== null`), the relay's config lives on the stack VM,
+        // where egress bounds total appends at `DEFAULT_MAX_TOTAL_BYTES` (8 KiB). Reserve that ceiling on entry so
+        // admission holds cover the stack VM's appends rather than reserving 0.
         const protocol = route.record.protocol;
-        if (config === null || (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses")) continue;
-        largest = Math.max(largest, appendReserveTokens(stackAppendReserveBytes(protocol, config.appends)));
+        if (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses") continue;
+        const config = this.stackConfig();
+        const bytes = config !== null ? stackAppendReserveBytes(protocol, config.appends) : this.entryPeers() !== null ? DEFAULT_MAX_TOTAL_BYTES : 0;
+        largest = Math.max(largest, appendReserveTokens(bytes));
         continue;
       }
       const record = lane.policies.get(relayId);
@@ -3889,14 +4085,28 @@ export class InferenceRun {
     } else {
       // F2 hooks-4: a lane stream's headers never go before a vendor fetch takes the body (the receipt
       // id is allocated there), so a policy that blocks the first relay always answers the fixed 403
-      // before the headers can. The gate's wait is admission plus at most one padded policy step (F2
-      // D1's step budget, D32) plus the attempt's own send; the dispatch's end settles it too.
-      const decided = await Promise.race([dispatching, this.laneSent.then(() => "sent" as const)]);
-      early = decided === "sent" ? await Promise.race([dispatching, headers]) : decided;
+      // before the headers can. Re-check `laneSentOpen` after `headers` fires so a pre-connect egress
+      // 502 rollback re-gates early headers until a subsequent attempt genuinely forwards a body.
+      for (;;) {
+        const decided = await Promise.race([dispatching, this.laneSent.then(() => "sent" as const)]);
+        if (decided !== "sent") {
+          early = decided;
+          break;
+        }
+        const raced = await Promise.race([dispatching, headers]);
+        if (raced !== "headers") {
+          early = raced;
+          break;
+        }
+        if (!this.laneSentOpen) continue;
+        early = "headers";
+        break;
+      }
     }
     timers.clearTimeout(timer);
     if (early !== "headers" && early.kind === "stopped") return await this.stoppedResult(d, early);
-    return { kind: "response", response: await this.openStream(d, answering, early, dispatching, headersAt, deadline, stage, fragments) };
+    const hasStackPeerCandidate = this.entryPeers() !== null && o.routes.some((r) => this.stackRoute(r.record));
+    return { kind: "response", response: await this.openStream(d, answering, early, dispatching, headersAt, deadline, stage, fragments, hasStackPeerCandidate) };
   }
 
   /**
@@ -3905,7 +4115,7 @@ export class InferenceRun {
    * first admission), so that an attempt that fails before then still answers with that refusal, as a
    * call straight to the refusing route would have (`fail_request`; main 14ab29bd).
    */
-  private async openStream(d: Dispatcher, answering: Answering, early: Primed | "headers", dispatching: Promise<Primed | Stopped>, headersAt: number, deadline: number, stage: StreamStage | null, fragments: FragmentUse): Promise<Response> {
+  private async openStream(d: Dispatcher, answering: Answering, early: Primed | "headers", dispatching: Promise<Primed | Stopped>, headersAt: number, deadline: number, stage: StreamStage | null, fragments: FragmentUse, hasStackPeerCandidate: boolean): Promise<Response> {
     const { cfg, clock } = this.deps;
     const client = new ClientStream(this.presence, clock, cfg.streamClientStallMs, this.deps.meter?.clientQueued, this.laneTap(), this.deps.timers);
     const translation = this.translation;
@@ -3968,13 +4178,16 @@ export class InferenceRun {
       // The attempt failed before its first bytes: the client gets the refusal held for it.
       if (first !== null) return first;
     }
-    // S32: a stack relay's client gets SSE comments, never an API's own keep-alive event (Anthropic's
-    // `ping`), so the events it gets are the vendor's and its chain equals the served attempt's.
-    // A stack request's keep-alive is a comment (S32): outside the events chain, so an entry's outer `response.returned`
-    // is its stack VM's inner one (docs/confidential-lane-stack-routing.md L6) whichever route the request ends on.
-    client.startKeepAlive(cfg.streamKeepAliveMs, (this.lane?.stackConfig?.relayId ?? null) !== null || this.entryPeers() !== null ? STACK_KEEP_ALIVE : keepAliveFrame(this.protocol));
+    // S32 / L6: stack VM and stack-peer streams use SSE comment keep-alives (`STACK_KEEP_ALIVE`) so the events chain
+    // stays identical to the vendor's. Endpoint-only routes on an entry with `LANE_PEERS` (or streams already
+    // committed to an endpoint route) keep the client protocol's own keep-alive (e.g. Anthropic `event: ping`).
+    const stackKeepAlive =
+      (this.lane?.stackConfig?.relayId ?? null) !== null ||
+      (this.entryPeers() !== null && (early === "headers" ? hasStackPeerCandidate : early.attempt.peer !== undefined));
+    client.startKeepAlive(cfg.streamKeepAliveMs, stackKeepAlive ? STACK_KEEP_ALIVE : keepAliveFrame(this.protocol));
     this.headersSent = true;
     const headers = new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-request-id": this.requestId });
+    if (this.protocol === "anthropic_messages") headers.set("request-id", this.requestId);
     if (early !== "headers") {
       headers.set("x-gray-provider", await providerRef(early.attempt.route));
       headers.set("x-gray-attempt", String(early.attempt.index + 1));
@@ -4005,6 +4218,13 @@ export class InferenceRun {
     const held = this.dispatcher?.heldToTell() ?? null;
     if (pre === null || held === null || client.written > 0) return false;
     this.preHeaders = null;
+    if (this.lane !== null) {
+      const heldDraft = this.attemptLaneDrafts.get(held.attempt);
+      if (heldDraft !== undefined) {
+        this.laneDraft = heldDraft;
+        this.winningReceipt = "lane";
+      }
+    }
     const error = this.told(held.refusal);
     const response = this.errorResponse(error);
     this.record(error.status, error.status >= 500 ? "failed" : "rejected", error.code);
@@ -4141,9 +4361,10 @@ export class InferenceRun {
   }
 
   private heldLimitAlert(route: Route): void {
-    console.error(
-      JSON.stringify({ level: "alert", event: "answer_held_limit", request_id: this.requestId, workspace: this.key?.workspaceId ?? null, key: this.key?.keyId ?? null, held_bytes: this.heldBytes, limit_bytes: this.deps.cfg.answerHeldMaxBytes, endpoint: route.record.endpointId }),
-    );
+    // The entry's line has no key and no workspace (laneSafeLog; deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs"):
+    // the request id finds them in the request's record.
+    const line = { level: "alert", event: "answer_held_limit", request_id: this.requestId, workspace: this.key?.workspaceId ?? null, key: this.key?.keyId ?? null, held_bytes: this.heldBytes, limit_bytes: this.deps.cfg.answerHeldMaxBytes, endpoint: route.record.endpointId };
+    console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
   }
 
   /**
@@ -4207,6 +4428,7 @@ export class InferenceRun {
       blocks: this.blockGates(o.canonical.model),
       steered: this.steeredAway,
       accountPool: (route) => this.laneAccountPool(route),
+      lockOperatorOnDial: o.parsed.opaqueProviderState,
     };
   }
 
@@ -4552,6 +4774,11 @@ export class InferenceRun {
     return this.lane !== null && route.auth === "lane_relay" && codexBackend(route.url);
   }
 
+  /** Whether a sealed-credential lane relay route requires `store: false` on OpenAI/ChatGPT backends. */
+  private laneStoreOffRoute(route: RouteRecord): boolean {
+    return this.lane !== null && route.auth === "lane_relay" && !this.stackRoute(route) && storeOffBackend(route.url);
+  }
+
   /**
    * D129: a lane attempt whose upstream streams while its customer asked for a buffered answer: a
    * Responses request on a Codex route, sent with `stream: true` (`planOps`), whose answer is read to
@@ -4792,7 +5019,7 @@ export class InferenceRun {
 
   private laneTokenFor(cache: Map<string, string>, relayId: string, domain: string | undefined): string | undefined {
     const lane = this.lane;
-    const sessionId = this.client.sessionId;
+    const sessionId = this.client.sessionId ?? this.laneZdrAffinityId;
     const workspaceId = this.key?.workspaceId;
     if (lane === null || sessionId === null || workspaceId === undefined) return undefined;
     const cached = cache.get(relayId);
@@ -4861,6 +5088,7 @@ export class InferenceRun {
       // A refusal forwarded nothing, so no attempt commits and the receipt is this step's own
       // (design v2 §C.8, M6): `request.received`, the refusal and the error body the client gets.
       this.laneDraft = receiptDraft({ modifiedEvents: [], policy: answer.outcome, forwardedHash: null, accountId: null, upstreamModel: target.record.upstreamModel, upstream: laneUpstreamOf(target.record) });
+      this.winningReceipt = "lane";
       this.laneReceiptId ??= newLaneReceiptId();
       return { kind: "stop", stop: null, error: lanePolicyRefused() };
     }
@@ -4912,6 +5140,9 @@ export class InferenceRun {
   private async openAttempt(d: Dispatcher, o: Dispatch, prepared: Prepared, route: Route, acquired: Acquired, next: Next, selection: Selection, backoffMs: number | null, answerDeadline: number, retest: BlockLease | null): Promise<Answered | Stopped | { readonly kind: "continue" }> {
     const { clock } = this.deps;
     const { permit, dispatch, ranked } = acquired;
+    // Compute zero-retention continuation expansion up front so stable affinity IDs are ready
+    // before scheduler picks (`laneAttempt`) and peer/stack dispatch.
+    const directZdrExpansion = this.stackRoute(route.record) ? null : this.laneZdrExpansionFor(route.record, o.parsed.value);
     // S23: a stack relay's route has no scheduler pick and no sealed credential: the relay's container
     // picks its own account, and the attempt is one call to it. A route it cannot be made for (no config
     // version ready, the relay's config does not route it, no `RELAY`) is passed over unsent.
@@ -4995,6 +5226,7 @@ export class InferenceRun {
     if (permit.probeId !== null && permit.trial !== true) this.recoveryProbeEndpoint = route.record.endpointId;
     d.sent(route, next);
     if (next !== "none") this.noteFollowed(next, backoffMs);
+    const attemptZdrExpansion = stackPlan !== null && stackPlan.ok ? (stackPlan.expansion ?? undefined) : (directZdrExpansion ?? undefined);
     const attempt: Attempt = {
       route,
       index,
@@ -5013,48 +5245,78 @@ export class InferenceRun {
       ...(laneAttempt === null ? {} : { lane: laneAttempt }),
       ...(laneEndpoint === undefined ? {} : { endpoint: { fetch: laneEndpoint(route.record) } }),
       ...(dispatch === undefined ? {} : { dispatch, ...(ranked === undefined ? {} : { ranked }) }),
+      ...(attemptZdrExpansion === undefined ? {} : { zdrExpansion: attemptZdrExpansion }),
     };
+    // F2 D72: the receipt id, forwarded draft, receipt kind and `laneSent` state this attempt may replace, kept
+    // so a pre-connect egress failure (or an unsent peer attempt with no envelope) can restore them cleanly.
+    const laneBefore = { receiptId: this.laneReceiptId, forwardedDraft: this.laneForwardedDraft, forwardedReceipt: this.lastForwardedReceipt, laneSentOpen: this.laneSentOpen };
     if (stackPlan !== null && stackPlan.peers !== undefined) attempt.peer = this.peerCall(stackPlan, attempt, o);
     else if (stackPlan !== null) attempt.stack = this.stackCall(stackPlan, attempt, o);
-    this.lastAttemptPeer = attempt.peer !== undefined;
     attempt.evidence = this.startEvidence(route, o.canonical);
     this.current = attempt;
     this.toolIds?.startAttempt();
     attempt.issuer = await this.issuerOf(route.record, credential);
-    // F2 D72: the receipt id and forwarded draft this attempt's `sendable` callback may replace, kept
-    // so a pre-connect egress failure can put them back exactly as they were.
-    const laneBefore = { receiptId: this.laneReceiptId, forwardedDraft: this.laneForwardedDraft };
-    const result = await this.send(o, prepared, attempt, bound ?? answerDeadline);
+    const attemptUntil = bound ?? answerDeadline;
+    let result = await this.send(o, prepared, attempt, attemptUntil);
+    let prefetchedStatusBody: Uint8Array | null = null;
+    if (!this.zdrFallbackUsed && !this.headersSent && !this.presence.gone && attempt.zdrExpansion !== undefined) {
+      let fallbackStatus: number | null = null;
+      let fallbackBody: Uint8Array | null = null;
+      if (result.kind === "peer" && result.outcome.kind === "vendor_error") {
+        fallbackStatus = result.outcome.status;
+        fallbackBody = result.outcome.body;
+      } else if (result.kind === "stack" && result.outcome.kind === "vendor_error") {
+        fallbackStatus = result.outcome.status;
+        fallbackBody = result.outcome.body;
+      } else if (
+        result.kind === "status" &&
+        attempt.lane !== undefined &&
+        result.response.status === 400 &&
+        (attempt.zdrExpansion.includeEncryptedReasoningAdded || attempt.zdrExpansion.replayedEncryptedReasoning)
+      ) {
+        fallbackStatus = result.response.status;
+        prefetchedStatusBody = await errorBody(result.response, Math.min(answerDeadline, clock() + ERROR_BODY_WAIT_MS), clock);
+        fallbackBody = prefetchedStatusBody;
+      }
+      if (
+        fallbackStatus !== null &&
+        fallbackBody !== null &&
+        clock() < attemptUntil &&
+        this.activateZdrFallback(attempt, fallbackStatus, fallbackBody)
+      ) {
+        const retried = await this.retryZdrFallback(attempt, route, o, prepared, attemptUntil, laneBefore);
+        if (retried !== null) {
+          result = retried;
+          prefetchedStatusBody = null;
+        }
+      }
+    }
+    if (attempt.peer !== undefined && attempt.peer.envelopeSha256 === null && !this.headersSent) {
+      this.laneReceiptId = laneBefore.receiptId;
+      this.lastForwardedReceipt = laneBefore.forwardedReceipt;
+      if (!laneBefore.laneSentOpen) this.resetLaneSent();
+    }
     switch (result.kind) {
       case "answered":
         return { kind: "answered", attempt, response: result.response, firstBytesBy: bound };
       case "status": {
         const status = result.response.status;
-        attempt.status = status;
-        if (attempt.evidence !== undefined) attempt.evidence.upstreamStatus = status;
         // Bounded by the deadline and a small byte budget; its end also ends the attempt's transport.
-        const body = await errorBody(result.response, Math.min(answerDeadline, clock() + ERROR_BODY_WAIT_MS), clock);
-        // D18/E1: gray-egress's fixed 502s are a failure of the egress path, not of the account, so a
-        // dead proxy cannot look like a banned credential to the relay. D72: when the sidecar failed
-        // before it connected the vendor (direct dial, any proxy stage, the vendor TLS handshake), no
-        // byte of the request reached a vendor, and `sendable`'s marks are rolled back before any
-        // response headers can promise a receipt: the attempt is a `connect` failure, the account is
-        // reported as not reaching the vendor, and the response names no id. If early stream headers
-        // already went (the narrow race), the id they named stays and the receipt is finalised from
-        // this attempt's draft (`request.forwarded` then means handed to the attested egress).
-        // An entry's endpoint attempt goes through egress too (its `/route/` kind): its fixed 502s are egress's own.
-        if ((laneAttempt !== null || attempt.endpoint !== undefined) && egressSidecarFailure(status, body)) {
-          if (egressBeforeVendor(status, body) && !this.headersSent) {
+        const body = prefetchedStatusBody ?? (await errorBody(result.response, Math.min(answerDeadline, clock() + ERROR_BODY_WAIT_MS), clock));
+        // A lane attempt and an entry's endpoint attempt (egress's `/route/` kind) go through egress, which marks every
+        // answer it gives itself: read before any classification, such an answer is never the provider's.
+        const own = laneAttempt !== null || attempt.endpoint !== undefined ? egressOwnAnswer(result.response.headers, body) : null;
+        if (own !== null) {
+          return this.egressAnswered(d, attempt, own, status, () => {
             this.laneReceiptId = laneBefore.receiptId;
             this.laneForwardedDraft = laneBefore.forwardedDraft;
-            attempt.sentToVendor = false;
-            if (laneAttempt !== null) attempt.laneNotSentReport = true;
-            this.failAttempt(d, attempt, bareOutcome("connect", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
-            return { kind: "continue" };
-          }
-          this.failAttempt(d, attempt, bareOutcome("transport", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
-          return { kind: "continue" };
+            this.lastForwardedReceipt = laneBefore.forwardedReceipt;
+            this.attemptLaneDrafts.delete(attempt.index);
+            if (!laneBefore.laneSentOpen) this.resetLaneSent();
+          });
         }
+        attempt.status = status;
+        if (attempt.evidence !== undefined) attempt.evidence.upstreamStatus = status;
         const classified = classify(status, headerReader(result.response.headers), body, this.classifyContext(o.canonical.model, route), clock() - attempt.startedAt, clock());
         this.noteAgentRefusal(attempt, classified.outcome, { status, body });
         this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_attempt_failed", false, false, body);
@@ -5105,6 +5367,53 @@ export class InferenceRun {
         return this.stackFailed(d, attempt, o.canonical.model, result.outcome, result.timedOut ? "timeout" : null);
       case "peer":
         return this.peerFailed(d, attempt, o.canonical.model, result.outcome);
+    }
+  }
+
+  /**
+   * An answer egress gave itself on an attempt's call (`egressOwnAnswer`, by its mark), which says nothing of the provider.
+   *
+   * D72: when no byte of the request reached the vendor or provider, `sendable`'s marks are rolled back (`rollBack`)
+   * before any response headers can promise a receipt: the account is reported as not reaching the vendor, and the
+   * response names no id. If early stream headers already went (the narrow race), the id they named stays and the
+   * receipt is finalised from this attempt's draft (`request.forwarded` then means handed to the attested egress).
+   *
+   * - A connection that failed (D18/E1) is a failure of the egress path, not of the account, so a dead proxy cannot
+   *   look like a banned credential to the relay: a `connect` failure before the vendor, else `transport`, and the next
+   *   route may go. Its status stays the attempt's, as before.
+   * - Egress's body budget full (`capacity`) is Gray's capacity: 429 `gateway_capacity` with no `retry-after`, the
+   *   attempt Gray's own (not counted, no `providerFailure`, no rest). No other route is tried: every route of this
+   *   entry leaves through the same egress and its one budget, so the next would wait on the same bytes, and the
+   *   entry answers its own capacity (the forms it holds, the answers it keeps) the same way.
+   * - Egress refusing the request as handed to it, or failing itself (`refused`), is Gray's error: 500
+   *   `internal_error`, the attempt Gray's own. No other route is tried either: the next attempt is built by the same
+   *   code and handed to the same egress.
+   */
+  private egressAnswered(d: Dispatcher, attempt: Attempt, own: EgressOwnAnswer, status: number, rollBack: () => void): { readonly kind: "continue" } | Stopped {
+    const { clock } = this.deps;
+    const unsent = egressSentNothing(own) && !this.headersSent;
+    if (unsent) {
+      rollBack();
+      attempt.sentToVendor = false;
+      if (attempt.lane !== undefined) attempt.laneNotSentReport = true;
+    }
+    switch (own.kind) {
+      case "before_vendor":
+      case "after_vendor":
+        attempt.status = status;
+        if (attempt.evidence !== undefined) attempt.evidence.upstreamStatus = status;
+        this.failAttempt(d, attempt, bareOutcome(unsent ? "connect" : "transport", clock() - attempt.startedAt), upstreamUnavailable(), "upstream_unavailable", false);
+        return { kind: "continue" };
+      case "capacity": {
+        const error = egressCapacity();
+        this.endAttempt(attempt, unsentOutcome(attempt.permit), false, error.code, { rejected: true });
+        return { kind: "stopped", stop: null, error };
+      }
+      case "refused": {
+        const error = egressRefused();
+        this.endAttempt(attempt, unsentOutcome(attempt.permit), own.sent, error.code, { rejected: true });
+        return { kind: "stopped", stop: null, error };
+      }
     }
   }
 
@@ -5205,15 +5514,18 @@ export class InferenceRun {
   }
 
   /** What an attempt at a stack route is made of (S23), or why none can be made. */
-  private stackPlan(route: Route): StackPlan {
-    if (this.entryPeers() !== null) return this.peerPlan(route);
+  private stackPlan(route: Route, o?: Dispatch): StackPlan {
+    if (this.entryPeers() !== null) return this.peerPlan(route, o);
     const config = this.stackConfig();
     if (config === null) return { ok: false, code: "config_unready" };
     if (route.record.lane?.relayId !== config.relayId) return { ok: false, code: "foreign_relay" };
     if (this.lane?.stackTransport === undefined) return { ok: false, code: "no_relay_binding" };
     if (this.laneReceived === null) return { ok: false, code: "body_not_held" };
+    const parsedBody = o?.parsed.value ?? this.laneZdrRequestBody;
+    const expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody);
+    const baseBytes = expansion?.changed ? expansion.expandedBytes : this.laneReceived;
     // Relay standard v1.7 section 4: no body over the lane's 4 MiB reaches a stack route; another route may take it.
-    if (this.laneReceived.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
+    if (baseBytes.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
     const official = checkOfficialUpstream(route.record.url);
     if (!official.ok) return { ok: false, code: "upstream_not_official" };
     const protocol = route.record.protocol;
@@ -5221,44 +5533,47 @@ export class InferenceRun {
     const vendor = laneVendor(official.vendor);
     const configured = stackRouteOf(config, { model: route.record.model, upstreamModel: route.record.upstreamModel, protocol, vendor });
     if (configured === null) return { ok: false, code: "route_unconfigured" };
-    return { ok: true, config, vendor, route: configured };
+    return { ok: true, config, vendor, route: configured, expansion };
   }
 
   /**
    * What an entry's attempt at a stack route is made of (docs/confidential-lane-stack-routing.md section 4.5): the
-   * client's bytes held whole, a protocol the hop serves, an official upstream, and a usable peer of the route's relay.
-   * The relay's own configuration (its routes, caps and appends) is its stack VM's, which checks the route (check 6).
+   * client's bytes held whole (or their zero-retention expanded bytes), a protocol the hop serves, an official
+   * upstream, and a usable peer of the route's relay.
    */
-  private peerPlan(route: Route): StackPlan {
+  private peerPlan(route: Route, o?: Dispatch): StackPlan {
     const peers = this.entryPeers()!;
     const lane = route.record.lane;
     if (this.laneReceived === null) return { ok: false, code: "body_not_held" };
-    if (this.laneReceived.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
+    const parsedBody = o?.parsed.value ?? this.laneZdrRequestBody;
+    const expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody);
+    const baseBytes = expansion?.changed ? expansion.expandedBytes : this.laneReceived;
+    if (baseBytes.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
     const official = checkOfficialUpstream(route.record.url);
     if (!official.ok) return { ok: false, code: "upstream_not_official" };
     const protocol = route.record.protocol;
     if (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses") return { ok: false, code: "protocol" };
     const usable = lane === undefined || lane === null ? [] : peers.registry.usable(lane.relayId);
     if (usable.length === 0) return { ok: false, code: "peer_unpinned" };
-    if (this.peerHopBody(protocol) === null) return { ok: false, code: "stack_rewrite_refused" };
-    return { ok: true, config: null, route: null, vendor: laneVendor(official.vendor), peers: usable };
+    if (this.peerHopBody(protocol, baseBytes) === null) return { ok: false, code: "stack_rewrite_refused" };
+    return { ok: true, config: null, route: null, vendor: laneVendor(official.vendor), peers: usable, expansion };
   }
 
   /**
-   * The bytes the peer hop carries (docs/design/one-address.md): the client's, or, when the client stated its routing
-   * preference in the body, the client's with `/provider` removed under the published rewrite policy, so no stack VM
-   * and no vendor sees it, whatever stack release the VM runs. The op is declared on each `peer.forwarded` of the outer
-   * receipt, and the customer's verifier replays it before it compares the bytes with the stack VM's inner receipt.
-   * Null when the removal does not apply (the route is passed over).
+   * The bytes the peer hop carries (docs/design/one-address.md): `baseBytes` (either the client's bytes or the
+   * zero-retention expanded bytes), or, when the client stated its routing preference in the body, `baseBytes` with
+   * `/provider` removed under the published rewrite policy, so no stack VM and no vendor sees it. The op is declared
+   * on each `peer.forwarded` of the outer receipt, and the customer's verifier replays it before comparing with the
+   * stack VM's inner receipt. Null when the removal does not apply (the route is passed over).
    */
-  private peerHopBody(protocol: LaneProtocol): { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null {
-    const received = this.laneReceived;
-    if (received === null) return null;
-    if (!this.stripProvider) return { bytes: received, events: [] };
-    if (this.peerHop === null) {
-      const changed = applyDeclaredChanges(received, protocol, { grayOps: [{ op: "remove_member", path: "/provider" }], appends: [] });
+  private peerHopBody(protocol: LaneProtocol, baseBytes?: Uint8Array): { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null {
+    const base = baseBytes ?? this.laneReceived;
+    if (base === null) return null;
+    if (!this.stripProvider) return { bytes: base, events: [] };
+    if (this.peerHop === null || this.peerHop.base !== base) {
+      const changed = applyDeclaredChanges(base, protocol, { grayOps: [{ op: "remove_member", path: "/provider" }], appends: [] });
       if (!changed.ok) return null;
-      this.peerHop = { bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
+      this.peerHop = { base, bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
     }
     return this.peerHop;
   }
@@ -5269,12 +5584,14 @@ export class InferenceRun {
    * passed over; the container's body gets the required changes, and a body that cannot take them passes the route over.
    */
   private stackAttemptPlan(route: Route, o: Dispatch): StackPlan {
-    const plan = this.stackPlan(route);
+    const plan = this.stackPlan(route, o);
     if (!plan.ok) return plan;
     const protocol = route.record.protocol as LaneProtocol;
     if (stackStreamOptionsUnusable(protocol, o.canonical.stream, o.parsed.value)) return { ok: false, code: "stream_options_unusable" };
     if (plan.config === null) return plan;
-    const body = stackRequestBody({ config: plan.config, route: plan.route, protocol, stream: o.canonical.stream, received: this.laneReceived!, value: o.parsed.value });
+    const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
+    const baseValue = plan.expansion?.changed ? plan.expansion.expandedValue : o.parsed.value;
+    const body = stackRequestBody({ config: plan.config, route: plan.route, protocol, stream: o.canonical.stream, received: baseBytes, value: baseValue, stripModels: o.parsed.strip });
     return body.ok ? { ...plan, body } : { ok: false, code: body.code };
   }
 
@@ -5288,6 +5605,8 @@ export class InferenceRun {
     const protocol = attempt.route.record.protocol as LaneProtocol;
     this.peerRid ??= newStackRid();
     this.laneReceiptId ??= newLaneReceiptId();
+    this.lanePeerExpansion = plan.expansion ?? null;
+    const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     const conversation = attempt.route.record.lane === undefined || attempt.route.record.lane === null ? undefined : this.laneConversationFor(attempt.route.record.lane.relayId);
     const url = this.request.url;
     const query = stackRawQuery(url);
@@ -5300,7 +5619,7 @@ export class InferenceRun {
       route: { endpoint: attempt.route.record.endpointId, protocol, model: attempt.route.record.model },
       path: query === "" ? this.path : `${this.path}?${query}`,
       headers: stackPeerHeaders(this.request.headers, protocol),
-      body: this.peerHopBody(protocol)!.bytes,
+      body: this.peerHopBody(protocol, baseBytes)!.bytes,
       budgetMs: this.deadline(o.bodyRead) - this.deps.clock(),
       // Relay standard v1.7: the conversation id at the route's relay, derived with this entry's boot key, since the
       // envelope names no workspace.
@@ -5317,25 +5636,26 @@ export class InferenceRun {
   }
 
   /**
-   * The call an attempt at a stack route makes (S23): a fresh rid, the client's bytes, the route's
-   * `RewriteSpec`, the config's attempt limit and inbound token, the request's deadline as the rid's
-   * TTL, and the request's connections and timers. Both control calls and the container's go through
-   * the request's outbound gate.
+   * The call an attempt at a stack route makes (S23): a fresh rid, the client's bytes (or zero-retention expanded
+   * bytes), the route's `RewriteSpec`, the config's attempt limit and inbound token, the request's deadline as the
+   * rid's TTL, and the request's connections and timers.
    */
   private stackCall(plan: Extract<StackPlan, { ok: true; config: StackRelayConfig }>, attempt: Attempt, o: Dispatch): StackCall {
     const { cfg } = this.deps;
     const transport = this.lane!.stackTransport!;
     const protocol = attempt.route.record.protocol as LaneProtocol;
     const rid = newStackRid();
+    this.laneStackExpansion = plan.expansion ?? null;
+    const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     // Relay standard v1.7: the container is sent the required changes and the two headers; egress is registered the
-    // client's bytes. `openAttempt` made the plan with `stackAttemptPlan`, which sets the body.
+    // base bytes. `openAttempt` made the plan with `stackAttemptPlan`, which sets the body.
     const body = plan.body!;
     const conversationId = this.laneConversationFor(plan.config.relayId);
     return new StackCall({
       rid,
       endpointId: attempt.route.record.endpointId,
       protocol,
-      received: this.laneReceived!,
+      received: baseBytes,
       forwarded: body.forwarded,
       // S32: the client's raw query and own headers and the route's vendor are part of egress's check; the vendor's
       // header set starts from the client's own headers (owner, 2026-11-18).
@@ -5395,7 +5715,7 @@ export class InferenceRun {
         this.stackLeft ??= { answered: client.chain.count() > 0 || client.bodyBytes > 0, bodyHash: this.laneResponse?.bodyHash() ?? bodyHashOf(new Uint8Array(0)) };
       });
     }
-    this.markLaneSent();
+    this.openLaneSent();
     try {
       const sent = await call.send();
       if (sent.kind === "answered") return { kind: "answered", response: sent.response };
@@ -5437,20 +5757,24 @@ export class InferenceRun {
         this.stackLeft ??= { answered: client.chain.count() > 0 || client.bodyBytes > 0, bodyHash: this.laneResponse?.bodyHash() ?? bodyHashOf(new Uint8Array(0)) };
       });
     }
-    this.markLaneSent();
+    this.openLaneSent();
     try {
       const registry = this.entryPeers()!.registry;
       let sent = await call.send();
-      if (sent.kind === "unsent" && sent.code === "peer_unknown" && (await registry.rehello(call.peer, until))) sent = await call.send();
+      if (sent.kind === "unsent" && sent.code === "peer_unknown") {
+        if (await registry.rehello(call.peer, until)) sent = await call.send();
+        else call.close();
+      }
+      if (call.envelopeSha256 !== null) this.lastForwardedReceipt = "peer";
       // A peer this attempt found down or rebooted is attested again behind the request, never inside its wait (L5).
       if (sent.kind !== "answered" && sent.kind !== "ended") this.ctx.waitUntil(registry.maintain());
       switch (sent.kind) {
         case "answered":
           return { kind: "answered", response: sent.response };
         case "ended":
-          return { kind: "peer", outcome: peerEndedOutcome(sent.end, Number(sent.head.status), sent.body) };
+          return { kind: "peer", outcome: peerEndedOutcome(sent.end, sent.head, sent.body) };
         case "unsent":
-          return { kind: "peer", outcome: { kind: "not_dialed", code: sent.code } };
+          return { kind: "peer", outcome: { kind: "not_dialed", code: sent.code, ...(call.egressRefusal === null ? {} : { egress: call.egressRefusal }) } };
         case "aborted":
           if (this.presence.gone) return { kind: "left" };
           return { kind: "peer", outcome: await this.peerFollowUp(call, "peer_aborted") };
@@ -5491,6 +5815,14 @@ export class InferenceRun {
     const { clock } = this.deps;
     const elapsed = clock() - attempt.startedAt;
     attempt.peer?.close();
+    if (outcome.kind === "not_dialed" && outcome.egress !== undefined) {
+      // Egress refused the hop's request itself (its mark, nothing sent): never the relay's failure. Its body budget full
+      // is Gray's capacity (429), anything else Gray's error (500); the attempt counts against nothing, and no other
+      // route is tried, every route leaving through the same egress (`egressAnswered`).
+      const error = outcome.egress === "capacity" ? egressCapacity() : egressRefused();
+      this.endAttempt(attempt, unsentOutcome(attempt.permit), false, error.code, { rejected: true });
+      return { kind: "stopped", stop: null, error };
+    }
     if (outcome.kind === "not_dialed") {
       // The container's decline, which the stack VM names only with egress's record of no vendor call, counts against nothing.
       this.failAttempt(d, attempt, bareOutcome("connect", elapsed), upstreamUnavailable(), outcome.code, false, false, undefined, false, outcome.code === RELAY_DECLINED);
@@ -5498,16 +5830,18 @@ export class InferenceRun {
     }
     if (outcome.kind === "vendor_error") {
       attempt.status = outcome.status;
-      // The vendor's allowlisted headers (`retry-after`) do not cross the hop (PR 4): the classification reads the body.
-      const classified = classify(outcome.status, headerReader(new Headers()), outcome.body, this.classifyContext(model, attempt.route), elapsed, clock());
+      // The vendor's allowlisted error headers (`retry-after`, `retry-after-ms`, `x-should-retry`, `content-type`) cross
+      // the hop on `head.headers` (`error_headers` capability) so classification and client passthrough both receive them.
+      const classified = classify(outcome.status, headerReader(new Headers(outcome.headers)), outcome.body, this.classifyContext(model, attempt.route), elapsed, clock());
       this.noteAgentRefusal(attempt, classified.outcome, { status: outcome.status, body: outcome.body });
       this.failAttempt(d, attempt, classified.outcome, classified.error, "upstream_attempt_failed", false, false, outcome.body);
       if (refusedTheRelaysAccount(classified.outcome)) return this.relayAccountRefused(outcome.accountId);
-      const passthrough: StackPassthrough = { status: outcome.status, body: outcome.body, headers: {}, accountId: outcome.accountId };
+      const passthrough: StackPassthrough = { status: outcome.status, body: outcome.body, headers: outcome.headers, accountId: outcome.accountId };
       // The vendor's error is the served attempt's answer (S32), as the stack VM's receipt says it, once the client gets it.
       const peer = attempt.peer;
       const served = (): void => {
         if (peer !== undefined) peer.served = true;
+        this.winningReceipt = "peer";
       };
       if (passesToNextRoute(classified.outcome)) return this.stackVendorPassedOver(attempt, classified.error, outcome.accountId, passthrough, served);
       if (outcome.changedBody && this.relayChangeRefused(d, attempt, outcome.status, classified.outcome, classified.error, outcome.accountId, passthrough, served)) return { kind: "continue" };
@@ -5837,7 +6171,7 @@ export class InferenceRun {
     }
     const call = this.stackCalls.at(-1);
     // An entry's peer attempt served the client when the answer it released (or the vendor's error) is what it got.
-    const served = ((call !== undefined && call.served !== null) || this.peerCalls.at(-1)?.served === true) && !this.stackReplacedError;
+    const served = ((call !== undefined && call.served !== null) || this.peerCalls.some((peer) => peer.served)) && !this.stackReplacedError;
     if (this.stream && this.headersSent) {
       for (const digest of client.digester.close()) client.chain.push(digest);
       return {
@@ -5946,13 +6280,26 @@ export class InferenceRun {
     return this.deps.requestTimers ?? platformTimers;
   }
 
-  /** `AttemptEvidence::start` for an attempt at `route` (the request's own API sends OpenCode's agent turn as the client wrote it). */
-  private startEvidence(route: Route, contract: CanonicalRequest): AttemptEvidence | undefined {
-    if (this.traffic === null) return undefined;
+  /**
+   * `AttemptEvidence::start` for an attempt at `route` (the request's own API sends OpenCode's agent turn as the client
+   * wrote it). In the confidential lane, which keeps no evidence, only what `laneFailures` reads: no answer text, no
+   * thinking.
+   */
+  private startEvidence(route: Route, contract: CanonicalRequest): AttemptEvidence {
     const r = route.record;
-    const evidence = new AttemptEvidence({ endpointId: r.endpointId, credentialGeneration: r.credentialGeneration, configFingerprint: r.configFingerprint, model: r.model, protocol: r.protocol }, wantsJson(contract), this.turnThinking);
+    const kept = this.traffic !== null;
+    const evidence = new AttemptEvidence({ endpointId: r.endpointId, credentialGeneration: r.credentialGeneration, configFingerprint: r.configFingerprint, model: r.model, protocol: r.protocol }, kept && wantsJson(contract), kept ? this.turnThinking : null);
     if (this.opencodeTurn && r.protocol === contract.protocol) evidence.opencodeAgent();
     return evidence;
+  }
+
+  /**
+   * `attempt`'s failure implicated its provider (`due`, traffic-evidence.ts `ProviderFailures`): the lane's record of it
+   * says so (`providerFailure`) when `endAttempt` writes it, which comes after every caller. A held refusal's record is
+   * written before it is settled, and `settleHeld` marks it there.
+   */
+  private static laneProviderFailure(attempt: Attempt, due: boolean): void {
+    if (due) attempt.providerFailure = true;
   }
 
   /**
@@ -5970,19 +6317,25 @@ export class InferenceRun {
 
   /**
    * What a failed attempt shows of its route's mapping (traffic-evidence.ts `attemptFailed`); a refusal held keeps
-   * its evidence for `settleHeld`, which counts it once another operator served the request.
+   * its evidence for `settleHeld`, which counts it once another operator served the request. The lane's record says
+   * whether it implicated its provider (`laneProviderFailure`).
    */
   private failureEvidence(d: Dispatcher, attempt: Attempt, outcome: RetryOutcome, end: AttemptEnd, code: string): void {
     const evidence = attempt.evidence;
-    if (this.traffic === null || evidence === undefined) return;
+    if (evidence === undefined) return;
     if (d.refused) this.heldEvidence.set(InferenceRun.permitKey(attempt.permit), evidence);
     // Counted against its route: a supplier failure (an answered failure is its route's success, never evidence).
-    this.traffic.attemptFailed(evidence, { refused: d.refused, noImageAgain: end.noImageAgain === true, counted: end.outcome.kind === "supplier_failure", blamesRoute: end.blamesRoute === true }, outcome.class, code, this.deps.clock());
+    const failed: FailedEnd = { refused: d.refused, noImageAgain: end.noImageAgain === true, counted: end.outcome.kind === "supplier_failure", blamesRoute: end.blamesRoute === true };
+    if (this.traffic !== null) this.traffic.attemptFailed(evidence, failed, outcome.class, code, this.deps.clock());
+    else if (this.laneFailures !== null) InferenceRun.laneProviderFailure(attempt, this.laneFailures.attemptFailed(evidence, failed, outcome.class, code));
   }
 
   /** A failure after `attempt`'s answer committed, with `code`, counted against its route. */
   private committedFailureEvidence(attempt: Attempt, code: string): void {
-    if (this.traffic !== null && attempt.evidence !== undefined) this.traffic.committedFailed(attempt.evidence, code, this.deps.clock());
+    const evidence = attempt.evidence;
+    if (evidence === undefined) return;
+    if (this.traffic !== null) this.traffic.committedFailed(evidence, code, this.deps.clock());
+    else if (this.laneFailures !== null) InferenceRun.laneProviderFailure(attempt, this.laneFailures.committedFailed(evidence, code));
   }
 
   /**
@@ -5991,15 +6344,18 @@ export class InferenceRun {
    * provider writes around the tokens (docs/limits.md section 4), so its route did not honour the cap, the failure the
    * output-cap checks look for: `upstream_answer_exceeds_limit`, and evidence against the route's mapping that brings
    * its next check forward, as `upstream_usage_exceeds_limit` is (traffic-evidence.ts `pastOutputLimit`). Its circuit
-   * still counts nothing, the cut being Gray's limit. The code is what the confidential entry's record carries out of
-   * the TEE, where no evidence is kept: gray-jobs reads the defect from it (jobs/src/traffic-evidence.ts `rowDefect`).
+   * still counts nothing, the cut being Gray's limit. The confidential entry, where no evidence is kept, marks the
+   * attempt's route attempt (`laneProviderFailure`), and its record carries the code out of the TEE as well, which
+   * gray-jobs reads the defect from for an entry before the mark (jobs/src/traffic-evidence.ts `rowDefect`).
    * A request that declares a tool its upstream runs itself (`side_effect`) ends with `upstream_body_limit` and is no
    * evidence: its answer carries the tool's results (search results, fetched pages, a generated image), which no
    * output token pays for.
    */
   private bodyPastOutputLimit(attempt: Attempt): "upstream_answer_exceeds_limit" | "upstream_body_limit" {
     if (this.dispatcher?.plan.scope === "side_effect") return "upstream_body_limit";
-    if (this.traffic !== null && attempt.evidence !== undefined) this.traffic.pastOutputLimit(attempt.evidence, this.deps.clock());
+    const evidence = attempt.evidence;
+    if (evidence !== undefined && this.traffic !== null) this.traffic.pastOutputLimit(evidence, this.deps.clock());
+    else if (evidence !== undefined && this.laneFailures !== null) InferenceRun.laneProviderFailure(attempt, this.laneFailures.pastOutputLimit(evidence));
     return "upstream_answer_exceeds_limit";
   }
 
@@ -6099,8 +6455,11 @@ export class InferenceRun {
     // allocated when a fetch took a body (F2 hooks-4, D29); the `??=` stays as a safety net for a
     // commit that somehow never sent. Only a relay's attempt has a receipt to adopt: a non-lane route
     // served beside the lane (the harness's main-lane case, design v2 §C.2 m15) advertises none.
-    if (this.lane !== null && (attempt.lane !== undefined || attempt.endpoint !== undefined)) {
+    if (this.lane !== null && attempt.peer !== undefined) {
+      this.winningReceipt = "peer";
+    } else if (this.lane !== null && (attempt.lane !== undefined || attempt.endpoint !== undefined)) {
       this.laneDraft = attempt.laneDraft ?? null;
+      this.winningReceipt = "lane";
       // Only a relay's account has a scheduler to tell (`reportLaneOutcome`).
       if (attempt.lane !== undefined) this.laneServing = attempt.lane;
       this.laneReceiptId ??= newLaneReceiptId();
@@ -6226,13 +6585,17 @@ export class InferenceRun {
       this.dropHeld(held);
       return;
     }
-    // Served by another operator, the refusal was its route's own failure (`refusal_served_later`).
-    if (later.evidence && evidence !== undefined && this.traffic !== null) this.traffic.heldServedElsewhere(evidence, held.refusal.code, this.deps.clock());
     const failure: EndpointOutcome = { kind: "supplier_failure", reason: "upstream_error" };
     const key = InferenceRun.permitKey(held.permit);
     // Its attempt's record names the failure it counts as, served at its own operator too (capture.rs
     // `refusal_served_elsewhere`): the request log says what the refusal was held against.
     const at = this.attemptAt.get(key);
+    // Served by another operator, the refusal was its route's own failure (`refusal_served_later`): evidence, or in the
+    // lane its record's `providerFailure`.
+    if (later.evidence && evidence !== undefined && this.traffic !== null) this.traffic.heldServedElsewhere(evidence, held.refusal.code, this.deps.clock());
+    else if (later.evidence && evidence !== undefined && this.laneFailures !== null && this.laneFailures.heldServedElsewhere(evidence, held.refusal.code) && at !== undefined) {
+      this.attempts[at] = { ...this.attempts[at]!, providerFailure: true };
+    }
     // A vendor's 400 of the body a relay's software changed, served by another operator's route: the change was refused
     // (`relayChangeRefused`), and the record says so.
     const code = key === this.relayChangePermit ? { code: RELAY_CHANGE_REFUSED } : {};
@@ -6366,7 +6729,8 @@ export class InferenceRun {
    * caller ends the stream with `code`'s error event and the record.
    */
   private async stoppedResult(d: Dispatcher, s: Stopped): Promise<ModelResult & { readonly code: string; readonly outcome: RequestOutcome }> {
-    const held = d.heldToTell() !== null;
+    const heldRefusal = d.heldToTell();
+    const held = heldRefusal !== null;
     const { error, left, next, unrouted } = this.stopError(d, s);
     if (unrouted === true) return { ...(await this.unrouted(error)), code: error.code, outcome: "failed" };
     // The hold's release names why the last failure failed (a usage refusal's reason), else the client's code.
@@ -6379,6 +6743,13 @@ export class InferenceRun {
       s.served?.();
       const passed = this.stackPassthrough(s.passthrough, error, reason);
       return { kind: "response", response: passed.response!, code: passed.code, outcome: passed.outcome };
+    }
+    if (heldRefusal !== null && this.lane !== null && !(next && this.deferRecord)) {
+      const heldDraft = this.attemptLaneDrafts.get(heldRefusal.attempt);
+      if (heldDraft !== undefined) {
+        this.laneDraft = heldDraft;
+        this.winningReceipt = "lane";
+      }
     }
     const sent = this.fail(error, reason, null, 0, s.gray === true, next);
     return { kind: next ? "next" : "response", response: sent.response ?? new Response(null, { status: 499 }), code: sent.code, outcome: sent.outcome };
@@ -6426,7 +6797,13 @@ export class InferenceRun {
   private overlayFor(o: Dispatch, prepared: Prepared, route: RouteRecord): Overlay {
     const decisions = this.laneDecisions;
     if (decisions !== null && this.translation === null && prepared.protocol !== "gemini") {
-      return planOverlay(planRewrites(decisions, route.upstreamModel, this.laneCodexRoute(route)), prepared.protocol, o.canonical.stream, prepared.value, prepared.overlay);
+      return planOverlay(
+        planRewrites(decisions, route.upstreamModel, this.laneCodexRoute(route), this.laneStoreOffRoute(route)),
+        prepared.protocol,
+        o.canonical.stream,
+        prepared.value,
+        prepared.overlay,
+      );
     }
     const overlay = attemptOverlay(prepared.protocol, o.canonical.stream, prepared.value, prepared.overlay, route.upstreamModel);
     // Checked once before the first attempt (`nextAttempt`); the route's model does not change it.
@@ -6494,17 +6871,31 @@ export class InferenceRun {
     // when Gray would have to write its cap (`geminiCapRequired`). Its model is in the URL, never in the body.
     if (endpoint && prepared.protocol === "gemini") return { ok: true, bytes: received, events: [], applied: [] };
     const appends = relayId === null ? [] : await this.laneAppendsFor(relayId, prepared.protocol, o);
-    const plan = planRewrites(decisions, route.record.upstreamModel, this.laneCodexRoute(route.record));
+    const plan = planRewrites(decisions, route.record.upstreamModel, this.laneCodexRoute(route.record), this.laneStoreOffRoute(route.record));
+    const expansion = this.laneZdrExpansionFor(route.record, o.parsed.value);
+    const baseBytes = expansion?.changed ? expansion.expandedBytes : received;
     // F2 hooks-2: the key carries the route's upstream model too. Two models (a customer's fallback
     // list) or two endpoints of one relay (D13) with the same client cap and the same appends would
     // otherwise reuse the first route's composed bytes, so the vendor would be sent one model while
     // the scheduler and the receipt name another. The appends' full text, not its length, names them.
-    // D129: and whether the route is the Codex backend, whose body also carries `stream` and `store`:
-    // a relay's OpenAI and Codex routes of one model must not share bytes either.
-    const key = `${relayId ?? "\u0001endpoint"}\u0000${route.record.upstreamModel}\u0000${plan.codex ? "codex" : ""}\u0000${plan.cap === null ? "" : `${plan.cap.field}=${plan.cap.value}`}\u0000${appends.map((a) => `${a.templateId}:${a.position}:${a.text}`).join("\u0001")}`;
+    // D129: and whether the route is the Codex backend or enforces `store: false`, so routes with
+    // distinct zero-retention rewrites never share composed bytes.
+    const key = `${relayId ?? "\u0001endpoint"}\u0000${route.record.upstreamModel}\u0000${plan.codex ? "codex" : ""}\u0000${plan.storeOff ? "store_off" : ""}\u0000${plan.cap === null ? "" : `${plan.cap.field}=${plan.cap.value}`}\u0000${expansion?.changed ? expansion.expandedBodySha256 : ""}\u0000${appends.map((a) => `${a.templateId}:${a.position}:${a.text}`).join("\u0001")}`;
     let forwarded = this.laneForwarded.get(key);
     if (forwarded === undefined) {
-      forwarded = forwardedBody(received, prepared.protocol, plan, appends);
+      const composed = forwardedBody(baseBytes, prepared.protocol, plan, appends);
+      forwarded =
+        composed.ok && expansion?.changed
+          ? {
+              ...composed,
+              continuationExpanded: {
+                previousResponseIdExpanded: expansion.previousResponseIdExpanded,
+                itemReferencesExpanded: BigInt(expansion.itemReferencesExpanded),
+                includeEncryptedReasoningAdded: expansion.includeEncryptedReasoningAdded,
+                expandedBodySha256: expansion.expandedBodySha256,
+              },
+            }
+          : composed;
       this.laneForwarded.set(key, forwarded);
     }
     return forwarded;
@@ -6667,6 +7058,7 @@ export class InferenceRun {
         if (!composed.ok) return { kind: "lane_refused", error: composed.error };
         forwarded = composed.bytes;
         attempt.laneDraft = receiptDraft({
+          continuationExpanded: composed.continuationExpanded,
           modifiedEvents: composed.events,
           policy: lane === undefined ? null : (this.laneOutcomeFor(lane.relayId, protocol, o) ?? null),
           forwardedHash: bodyHashOf(composed.bytes),
@@ -6693,7 +7085,9 @@ export class InferenceRun {
           // really went is the receipt of a request nothing commits or refuses.
           this.laneReceiptId ??= newLaneReceiptId();
           this.laneForwardedDraft = attempt.laneDraft ?? null;
-          this.markLaneSent();
+          if (attempt.laneDraft !== undefined) this.attemptLaneDrafts.set(attempt.index, attempt.laneDraft);
+          this.lastForwardedReceipt = "lane";
+          this.openLaneSent();
         }
       });
       // An endpoint attempt's own fetch, through the request's outbound gate as every upstream fetch.
@@ -7104,7 +7498,8 @@ export class InferenceRun {
    */
   private answeredBy(a: Answering, attempt: Attempt, usage: Record<string, number>, rawUsage: Json | null): void {
     if (attempt.stack !== undefined) this.stackAnsweredAccount = attempt.stack.accountId;
-    if (attempt.peer !== undefined) this.stackAnsweredAccount = attempt.peer.accountId;
+    else if (attempt.peer !== undefined) this.stackAnsweredAccount = attempt.peer.accountId;
+    else this.stackAnsweredAccount = null;
     if (this.traffic !== null && attempt.evidence !== undefined) {
       if ((usage.cache_write_1h_input_tokens ?? 0) > 0 && !this.asksWrite1h && attempt.route.record.cacheTtlAsRequested) attempt.evidence.flagged = true;
       this.traffic.answered(attempt.evidence, a.contract.request, rawUsage, this.deps.clock());
@@ -7248,7 +7643,8 @@ export class InferenceRun {
     });
     const verdict = judgeEvidence(evidence, cost);
     if (!verdict.ok) {
-      console.error(JSON.stringify({ level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId, why: verdict.why }));
+      const line = { level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId, why: verdict.why };
+      console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
       return { ok: false, code: "billing_usage_invalid", reason: "usage_evidence_invalid", why: verdict.why };
     }
     // A generation route bills by tokens (`generationPriceOf` leaves a unit price out): its charge has the two sides.
@@ -7295,7 +7691,7 @@ export class InferenceRun {
       this.billing = ended.billing;
       this.releaseReason = ended.releaseReason;
     }
-    logWithheld(end, this.requestId, shard);
+    logWithheld(end, this.requestId, shard, this.lane !== null);
   }
 
   /**
@@ -7326,6 +7722,190 @@ export class InferenceRun {
   }
 
   /**
+   * Whether `route` is a confidential entry zero-retention OpenAI Responses route that enforces
+   * `store: false` upstream (P2 zero upstream retention).
+   */
+  private laneZeroRetentionRoute(route: RouteRecord): boolean {
+    if (this.lane === null || route.protocol !== "open_ai_responses") return false;
+    return routeEnforcesStoreFalse(route);
+  }
+
+  /**
+   * Decrypts sealed continuation state returned by `lane.continuation.pin` inside the entry TEE.
+   *
+   * On zero-retention routes, `item_reference` entries require decrypted item state (an unresolved
+   * `item_reference` cannot be forwarded to a `store: false` upstream and fails with 404
+   * `continuation_not_found`). For `previous_response_id` on a Relay Stack route without sealed
+   * state (for example past the 2-hour sealed-state TTL), preserves passthrough to the pinned VM.
+   */
+  private async laneDecryptSealedContinuation(
+    workspaceId: string,
+    body: Json,
+    sealedHits: readonly { readonly kind: "response" | "conversation" | "item"; readonly reference: string; readonly sealed: string }[] | undefined,
+    records: readonly RouteRecord[],
+  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly error: ApiError }> {
+    const lane = this.lane;
+    if (lane === null) return { ok: true };
+    this.laneSealedResponses.clear();
+    this.laneSealedItems.clear();
+    const refs = continuationReferences(body);
+    if (refs === undefined || refs.length === 0) return { ok: true };
+    const hits = new Map<string, string>();
+    for (const hit of sealedHits ?? []) hits.set(`${hit.kind}\u0000${hit.reference}`, hit.sealed);
+
+    let hasResponseRef = false;
+    let hasItemRef = false;
+    let missingResponseSealed = false;
+    let missingItemSealed = false;
+
+    for (const ref of refs) {
+      if (ref.kind === "conversation") continue;
+      if (ref.kind === "response") hasResponseRef = true;
+      if (ref.kind === "item") hasItemRef = true;
+      const hashed = await hashedReference(workspaceId, ref);
+      const token = hits.get(`${ref.kind}\u0000${hashed.reference}`);
+      if (token === undefined) {
+        if (ref.kind === "response") missingResponseSealed = true;
+        if (ref.kind === "item") missingItemSealed = true;
+        continue;
+      }
+      const opened = await openContinuationState(
+        lane.state.continuationKey,
+        { workspaceId, kind: ref.kind, referenceHash: hashed.reference },
+        token,
+      );
+      if (opened === null) {
+        if (ref.kind === "response") missingResponseSealed = true;
+        if (ref.kind === "item") missingItemSealed = true;
+        continue;
+      }
+      if (opened.kind === "response") {
+        this.laneSealedResponses.set(ref.reference, opened);
+        this.laneZdrAffinityId ??= opened.affinityId;
+      } else if (opened.kind === "item") {
+        this.laneSealedItems.set(ref.reference, opened);
+        this.laneZdrAffinityId ??= opened.affinityId;
+      }
+    }
+
+    if (hasItemRef && missingItemSealed) {
+      return {
+        ok: false,
+        error: CONTINUATION_ERRORS.notFound().withMessage(
+          "The referenced continuation item state is unavailable or expired on this zero-retention route. Send the full conversation or set `store: false`.",
+        ),
+      };
+    }
+    if (hasResponseRef && missingResponseSealed && !records.some((r) => this.stackRoute(r))) {
+      return {
+        ok: false,
+        error: CONTINUATION_ERRORS.notFound().withMessage(
+          "The referenced continuation response state is unavailable or expired on this zero-retention route. Send the full conversation or set `store: false`.",
+        ),
+      };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Computes zero-retention continuation expansion for `route`, or `null` when the request is not a
+   * zero-retention Responses request (including when the client explicitly opted out with `store: false`).
+   */
+  private laneZdrExpansionFor(route: RouteRecord, parsedBody: Json): ExpandZeroRetentionResult | null {
+    if (
+      this.lane === null ||
+      this.protocol !== "open_ai_responses" ||
+      this.translation !== null ||
+      this.laneReceived === null ||
+      !this.laneZeroRetentionRoute(route) ||
+      !storesContinuation(this.protocol, parsedBody)
+    ) {
+      return null;
+    }
+    const addInclude = !this.zdrSuppressInclude && shouldAddEncryptedReasoningInclude(parsedBody, route);
+    let expanded: ExpandZeroRetentionResult;
+    try {
+      expanded = expandZeroRetentionContinuation({
+        receivedBytes: this.laneReceived,
+        parsedBody,
+        sealedResponses: this.laneSealedResponses,
+        sealedItems: this.laneSealedItems,
+        addEncryptedReasoningInclude: addInclude,
+        stripReplayedEncryptedReasoning: this.zdrStripEncryptedReasoning,
+      });
+    } catch {
+      return null;
+    }
+    if (this.lane.continuation !== undefined) {
+      this.laneZdrAffinityId ??= expanded.inheritedAffinityId ?? newContinuationAffinityId();
+    }
+    return expanded;
+  }
+
+  /** Activates at most one zero-retention fallback mode when upstream rejects an entry-added transform with 400. */
+  private activateZdrFallback(attempt: Attempt, status: number, body: Uint8Array): boolean {
+    const expansion = attempt.zdrExpansion;
+    if (expansion === undefined || this.zdrFallbackUsed || this.headersSent) return false;
+    if (expansion.includeEncryptedReasoningAdded && isUnsupportedIncludeEncryptedReasoningError(status, body)) {
+      this.zdrFallbackUsed = true;
+      this.zdrSuppressInclude = true;
+      return true;
+    }
+    if (expansion.replayedEncryptedReasoning && isInvalidEncryptedContentError(status, body)) {
+      this.zdrFallbackUsed = true;
+      this.zdrStripEncryptedReasoning = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** Re-dispatches the same attempt once after a zero-retention fallback stripped an unsupported transform. */
+  private async retryZdrFallback(
+    attempt: Attempt,
+    route: Route,
+    o: Dispatch,
+    prepared: Prepared,
+    until: number,
+    laneBefore: { readonly receiptId: string | null; readonly forwardedDraft: LaneReceiptDraft | null },
+  ): Promise<SendResult | null> {
+    if (attempt.peer !== undefined) {
+      const previous = attempt.peer;
+      previous.close();
+      const idx = this.peerCalls.indexOf(previous);
+      if (idx >= 0) this.peerCalls.splice(idx, 1);
+      this.peerRid = null;
+      this.peerHop = null;
+      this.lanePeerExpansion = null;
+      const retryPlan = this.stackAttemptPlan(route, o);
+      if (!retryPlan.ok || retryPlan.peers === undefined) return null;
+      attempt.zdrExpansion = retryPlan.expansion ?? undefined;
+      attempt.peer = this.peerCall(retryPlan, attempt, o);
+      return await this.send(o, prepared, attempt, until);
+    }
+    if (attempt.stack !== undefined) {
+      const previous = attempt.stack;
+      this.ctx.waitUntil(previous.close());
+      const idx = this.stackCalls.indexOf(previous);
+      if (idx >= 0) this.stackCalls.splice(idx, 1);
+      this.laneStackExpansion = null;
+      const retryPlan = this.stackAttemptPlan(route, o);
+      if (!retryPlan.ok || retryPlan.config === null) return null;
+      attempt.zdrExpansion = retryPlan.expansion ?? undefined;
+      attempt.stack = this.stackCall(retryPlan, attempt, o);
+      return await this.send(o, prepared, attempt, until);
+    }
+    if (attempt.lane !== undefined) {
+      this.laneForwarded.clear();
+      attempt.laneDraft = undefined;
+      this.laneReceiptId = laneBefore.receiptId;
+      this.laneForwardedDraft = laneBefore.forwardedDraft;
+      attempt.zdrExpansion = this.laneZdrExpansionFor(route.record, o.parsed.value) ?? undefined;
+      return await this.send(o, prepared, attempt, until);
+    }
+    return null;
+  }
+
+  /**
    * An entry's endpoint route or a relay stack's route: the software that answers is the provider's API or the relay's
    * own, which may hold a conversation. A sealed-credential lane relay route is not one: Gray's lane calls the vendor
    * itself with `store: false`, so nothing holds the earlier turns.
@@ -7335,29 +7915,21 @@ export class InferenceRun {
   }
 
   /**
-   * The endpoint a lane request's `previous_response_id` or `conversation` is bound to (the owner's decision of
-   * 2026-11-21: Gray keeps no conversation, the request goes unchanged to the software that issued the response, and
-   * routing it there is Gray's one job). The answers are the API Worker's (`pinContinuation`): 404
-   * `continuation_not_found` for a reference never bound, expired or another workspace's; 409
-   * `continuation_endpoint_conflict`; 503 `continuation_lookup_unavailable`; 400 `invalid_continuation_reference`.
-   *
-   * Where no software but Gray's is in the path the request is still refused, 400 `lane_continuation_unsupported`: a
-   * reference with no binding for a model whose candidate routes here are all sealed-credential lane relay routes
-   * (`laneContinuationSealed`), and a request that would be translated (`laneContinuationTranslated`, where the
-   * translation is chosen: with no native route the answer for no route comes first). And `conversation` is refused
-   * on a relay stack route (`laneContinuationConversation`): egress keeps that member on the vendor call equal to the
-   * client's (P2), so no container is sent one. A request that names no earlier response makes no call.
+   * The endpoint a lane request's `previous_response_id`, `conversation`, or `item_reference` is bound to.
+   * The answers match the API Worker's (`pinContinuation`): 404 `continuation_not_found`, 409
+   * `continuation_endpoint_conflict`, 503 `continuation_lookup_unavailable`, 400 `invalid_continuation_reference`.
    */
   private async lanePin(key: KeyRecord, parsed: ParsedRequest, records: readonly RouteRecord[]): Promise<PinResult> {
-    if (!continuesEarlierResponse(this.protocol, parsed.value)) return { ok: true, pinned: null };
+    const pinBody = continuationBody(this.protocol, parsed);
+    if (!continuesEarlierResponse(this.protocol, pinBody)) return { ok: true, pinned: null };
     const record = this.lane?.continuation;
     if (record === undefined) return { ok: false, error: laneContinuationUnrecorded(), unanswered: [] };
     const { cfg } = this.deps;
-    const pin = await record.pin({ workspace: key.workspaceId, protocol: this.protocol, body: parsed.value, timeoutMs: this.budget.preWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs) });
+    const pin = await record.pin({ workspace: key.workspaceId, protocol: this.protocol, body: pinBody, timeoutMs: this.budget.preWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs) });
     if (pin.ok) {
-      const conversation = get(parsed.value, "conversation");
+      const conversation = get(pinBody, "conversation");
       const named = conversation !== undefined && conversation !== null;
-      return named && records.some((r) => r.endpointId === pin.pinned && this.stackRoute(r)) ? { ok: false, error: laneContinuationConversation(), unanswered: [] } : pin;
+      return named && records.some((r) => r.endpointId === pin.pinned && (this.stackRoute(r) || this.laneZeroRetentionRoute(r))) ? { ok: false, error: laneContinuationConversation(), unanswered: [] } : pin;
     }
     if (pin.error.code !== "continuation_not_found") return pin;
     // No native route: the translation branch answers (no route at all, or a translation, which is refused there).
@@ -7365,35 +7937,127 @@ export class InferenceRun {
     return records.some((r) => this.laneHoldsConversation(r)) ? pin : { ok: false, error: laneContinuationSealed(), unanswered: [] };
   }
 
-  /** Whether a lane reply's references are recorded: an untranslated Responses reply to a request that stores, on a route whose own software answers. */
+  /** Whether a lane reply's references are recorded: an untranslated Responses reply to a request that stores, on a route that supports continuation pinning or zero-retention continuation. */
   private laneBinds(a: Answering, attempt: Attempt): boolean {
-    return this.lane?.continuation !== undefined && a.protocol === "open_ai_responses" && a.stores && this.translation === null && this.laneHoldsConversation(attempt.route.record);
+    return (
+      this.lane?.continuation !== undefined &&
+      a.protocol === "open_ai_responses" &&
+      a.stores &&
+      this.translation === null &&
+      (this.laneHoldsConversation(attempt.route.record) || this.laneZeroRetentionRoute(attempt.route.record))
+    );
   }
 
   /**
-   * Records which endpoint issued `reply` (`LaneContinuation.bind`), within what the post phase has left. Best effort.
-   * A relay stack route's reply binds its response id alone: no container is sent `conversation` (`lanePin`).
+   * Records continuation references for a lane Responses reply (`LaneContinuation.bind`), within what
+   * the post phase has left. Best effort.
+   *
+   * - Plain Endpoint routes: hash-only endpoint pinning for `response`, `conversation`, and `item`
+   *   (`output[].id`), with no sealed state.
+   * - Zero-retention routes: seals `SealedResponseState` (`response`) and `SealedItemState` (`item`,
+   *   up to 64) under the per-app TEE key with `CONTINUATION_STATE_TTL_MS` (2h), never binding
+   *   `conversation`, and falls back to hash-only references if a payload exceeds 512 KiB.
    */
-  private async laneBind(a: Answering, attempt: Attempt, reply: Json): Promise<void> {
+  private async laneBindState(a: Answering, attempt: Attempt, captured: CapturedResponsesReply): Promise<void> {
+    const lane = this.lane;
+    const continuation = lane?.continuation;
+    if (lane === null || continuation === undefined) return;
     const { cfg } = this.deps;
-    const result = await this.lane!.continuation!.bind({
-      workspace: this.key!.workspaceId,
-      endpoint: attempt.route.record.endpointId,
+    const workspace = this.key!.workspaceId;
+    const route = attempt.route.record;
+    const zeroRetention = this.laneZeroRetentionRoute(route);
+    const references: BindReference[] = [];
+
+    if (!zeroRetention) {
+      if (captured.id !== null) references.push({ kind: "response", reference: captured.id });
+      if (!this.stackRoute(route) && captured.conversation !== null) references.push({ kind: "conversation", reference: captured.conversation });
+      for (const itemId of captured.outputIds.slice(0, MAX_REPLY_ITEM_REFERENCES)) {
+        references.push({ kind: "item", reference: itemId });
+      }
+      if (references.length === 0) return;
+      const result = await continuation.bind({
+        workspace,
+        endpoint: route.endpointId,
+        model: a.model,
+        reply: { id: captured.id },
+        references,
+        timeoutMs: this.budget.postWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs),
+      });
+      if (result.failed > 0) console.warn(JSON.stringify({ level: "warn", event: "lane_continuation_unbound", request_id: this.requestId, endpoint: route.endpointId, failed: result.failed }));
+      return;
+    }
+
+    const affinityId = this.laneZdrAffinityId ?? this.client.sessionId ?? newContinuationAffinityId();
+    const requestBody = this.laneZdrRequestBody;
+    const effectiveInputs = attempt.zdrExpansion?.effectiveInputItems ?? (requestBody === null ? [] : normalizeResponsesInput(requestBody));
+    const effectiveInstructions =
+      attempt.zdrExpansion?.effectiveInstructions ??
+      (requestBody !== null && isObject(requestBody) && typeof get(requestBody, "instructions") === "string"
+        ? (get(requestBody, "instructions") as string)
+        : undefined);
+    const key = lane.state.continuationKey;
+
+    if (captured.id !== null) {
+      let sealed: string | null = null;
+      if (!captured.overflow) {
+        const refHash = (await hashedReference(workspace, { kind: "response", reference: captured.id })).reference;
+        const payload: SealedResponseState = {
+          v: 1,
+          kind: "response",
+          items: [...effectiveInputs, ...captured.output],
+          ...(effectiveInstructions === undefined ? {} : { instructions: effectiveInstructions }),
+          affinityId,
+        };
+        sealed = await sealContinuationState(key, { workspaceId: workspace, kind: "response", referenceHash: refHash }, payload);
+      }
+      references.push(sealed === null ? { kind: "response", reference: captured.id } : { kind: "response", reference: captured.id, sealed });
+    }
+
+    if (!captured.overflow && captured.output.length > 0) {
+      const seen = new Set<string>();
+      for (const item of captured.output) {
+        if (seen.size >= MAX_REPLY_ITEM_REFERENCES) break;
+        const itemId = get(item, "id");
+        if (typeof itemId !== "string" || itemId.length === 0 || seen.has(itemId)) continue;
+        seen.add(itemId);
+        const refHash = (await hashedReference(workspace, { kind: "item", reference: itemId })).reference;
+        const sealed = await sealContinuationState(key, { workspaceId: workspace, kind: "item", referenceHash: refHash }, { v: 1, kind: "item", item, affinityId });
+        references.push(sealed === null ? { kind: "item", reference: itemId } : { kind: "item", reference: itemId, sealed });
+      }
+    } else {
+      for (const itemId of captured.outputIds.slice(0, MAX_REPLY_ITEM_REFERENCES)) {
+        references.push({ kind: "item", reference: itemId });
+      }
+    }
+
+    if (references.length === 0) return;
+    const result = await continuation.bind({
+      workspace,
+      endpoint: route.endpointId,
       model: a.model,
-      reply: this.stackRoute(attempt.route.record) ? { id: get(reply, "id") ?? null } : reply,
+      reply: { id: captured.id },
+      references,
+      stateTtlMs: CONTINUATION_STATE_TTL_MS,
       timeoutMs: this.budget.postWait(cfg.continuationCallTimeoutMs + cfg.laneBridgeAnswerMarginMs),
     });
-    if (result.failed > 0) console.warn(JSON.stringify({ level: "warn", event: "lane_continuation_unbound", request_id: this.requestId, endpoint: attempt.route.record.endpointId, failed: result.failed }));
+    if (result.failed > 0) console.warn(JSON.stringify({ level: "warn", event: "lane_continuation_unbound", request_id: this.requestId, endpoint: route.endpointId, failed: result.failed }));
   }
 
   /** The continuation binding of the reply (an untranslated Responses reply to a request that stores), or null. */
-  private binding(a: Answering, attempt: Attempt): StreamBinding | null {
+  private binding(a: Answering, attempt: Attempt): { readonly tap: ChunkTap | null; readonly stateTap: ResponsesStateTap | null } {
     if (this.lane !== null) {
-      // A stream names its response in its first event, long before it ends: the bind runs beside the stream and
-      // holds no event back for a bridge round trip.
-      return this.laneBinds(a, attempt) ? StreamBinding.through(async (reply) => this.ctx.waitUntil(this.laneBind(a, attempt, reply))) : null;
+      if (!this.laneBinds(a, attempt)) return { tap: null, stateTap: null };
+      const stateTap = new ResponsesStateTap();
+      return {
+        stateTap,
+        tap: {
+          observe: async (chunk: Uint8Array) => {
+            stateTap.pushSseChunk(chunk);
+          },
+        },
+      };
     }
-    return StreamBinding.forReply({
+    const streamBinding = StreamBinding.forReply({
       locate: this.io.continuation,
       workspace: this.key!.workspaceId,
       region: this.deps.region,
@@ -7404,6 +8068,17 @@ export class InferenceRun {
       stores: a.stores,
       translated: this.translation !== null,
     });
+    if (streamBinding === null) return { tap: null, stateTap: null };
+    const stateTap = new ResponsesStateTap();
+    return {
+      stateTap,
+      tap: {
+        observe: async (chunk: Uint8Array) => {
+          stateTap.pushSseChunk(chunk);
+          await streamBinding.observe(chunk);
+        },
+      },
+    };
   }
 
   /** Steps 8-10 for a stream: relay, settle or release, the permit back, the record. */
@@ -7415,7 +8090,7 @@ export class InferenceRun {
     this.toolNames = calls.names;
     // The upstream's stop reasons, read from its events for an end that is the chain's failure (`settle`).
     const answerEnd = new AnswerEnd(a.protocol);
-    const tap: ChunkTap | null = this.binding(a, attempt);
+    const { tap, stateTap } = this.binding(a, attempt);
     // The answer's tool-call ids that not every client keeps get handles (TOOL_CALL_ID_MINTING).
     const mapper = this.toolIds?.beginAnswer(attempt.issuer, a.protocol) ?? null;
     const streamIds = mapper === null ? null : new StreamIds(mapper, () => this.holdToolIds() === null);
@@ -7470,7 +8145,7 @@ export class InferenceRun {
             onVerdict: (verdict) => this.inspected(verdict, true),
             onDroppedNull: (member) => this.droppedNull(attempt, member),
             onEvents: (events) => {
-              attempt.evidence?.observeEvents(events);
+              if (this.traffic !== null) attempt.evidence?.observeEvents(events);
               for (const event of events) {
                 if (event.type === "native") answerEnd.observe(event.payload);
                 if (event.type === "tool_call_complete") calls.add(event.name);
@@ -7503,6 +8178,24 @@ export class InferenceRun {
     this.retained.set("stream_state", 0);
     this.responseBytes = client.written;
     if (end.kind === "settled") {
+      if (stateTap !== null) {
+        const captured = stateTap.finishSse();
+        if (this.lane !== null) {
+          this.ctx.waitUntil(this.laneBindState(a, attempt, captured));
+        } else if (captured.outputIds.length > 0) {
+          this.ctx.waitUntil(
+            bindContinuation({
+              locate: this.io.continuation,
+              workspace: this.key!.workspaceId,
+              region: this.deps.region,
+              timing: this.continuationTiming("post"),
+              endpoint: route.record.endpointId,
+              model: a.model,
+              reply: { output: captured.outputIds.map((id) => ({ id })) },
+            }),
+          );
+        }
+      }
       this.endAttempt(attempt, { kind: "success" }, false, null);
       // What passed: what the client was sent and the rest read on after it left, in the content too
       // (capture.rs `Captured::append` adds the tail to the response's total).
@@ -7676,6 +8369,7 @@ export class InferenceRun {
       const provider = await providerRef(route);
       const headers = (): Headers => {
         const h = new Headers({ "content-type": "application/json", "x-request-id": this.requestId, "x-gray-provider": provider, "x-gray-attempt": String(attempt.index + 1) });
+        if (this.protocol === "anthropic_messages") h.set("request-id", this.requestId);
         this.capHeaders(h);
         this.modelHeader(h);
         this.droppedHeader(h);
@@ -7685,6 +8379,7 @@ export class InferenceRun {
       const mapper = this.toolIds?.beginAnswer(attempt.issuer, a.protocol) ?? null;
       const answerIds = mapper === null ? null : new AnswerIds(mapper, a.protocol, () => this.holdToolIds() === null);
       const answerInspector = this.deps.gate.answer(a.contract, a.protocol, a.answerLimit);
+      const stateTap = this.lane !== null && this.laneBinds(a, attempt) ? new ResponsesStateTap() : null;
       relay = new AnswerRelay({
         protocol: a.protocol,
         body,
@@ -7708,6 +8403,7 @@ export class InferenceRun {
         sink: this.content,
         queued: this.deps.meter?.clientQueued,
         tap: this.laneTap(),
+        ...(stateTap === null ? {} : { onRawChunk: (chunk: Uint8Array) => stateTap.pushBufferedChunk(chunk) }),
         onDroppedNull: (member) => this.droppedNull(attempt, member),
         ids: answerIds,
         start: (stream, length) => {
@@ -7830,7 +8526,7 @@ export class InferenceRun {
         failed("upstream_trust_policy_rejected", "upstream_trust_policy_rejected", refused, "invalid_response");
         return;
       }
-      attempt.evidence?.observeResponse(parsedAnswer, payload);
+      if (this.traffic !== null) attempt.evidence?.observeResponse(parsedAnswer, payload);
       // Nothing of it goes out while it holds a replaced tool-call id at a site the rewriting does not know
       // (`check_release`, before the commit).
       if (!current.finish()) {
@@ -7878,9 +8574,11 @@ export class InferenceRun {
         this.endAttempt(attempt, { kind: "success" }, false, null);
       }
       // A Responses reply that stores is bound to its endpoint before the client has its last byte (`bind`); a lane's,
-      // through its own record (`laneBind`).
+      // through its own record (`laneBindState`).
       if (this.lane !== null) {
-        if (this.laneBinds(a, attempt) && response.status >= 200 && response.status <= 299) await this.laneBind(a, attempt, payload);
+        if (stateTap !== null && response.status >= 200 && response.status <= 299) {
+          await this.laneBindState(a, attempt, stateTap.finishBuffered(payload));
+        }
       } else {
         await bindReplyReferences({
           locate: this.io.continuation,
@@ -7911,6 +8609,12 @@ export class InferenceRun {
     // go, the record written; the client gets 500 before the answer started, a cut body after.
     this.relayed = run.catch((error: unknown) => {
       const started = relay?.started === true;
+      if (!started && this.billing === "charged") {
+        this.billing = "unsettled";
+        this.charged = null;
+        this.chargedSides = null;
+        this.chargeSeq = null;
+      }
       this.abandon(error, started ? "relay_failed" : "request_failed");
       if (started) {
         this.stackCut();
@@ -8054,7 +8758,7 @@ export class InferenceRun {
     attempt.checks = this.deps.gate.responseChecks(a.contract, { protocol: upstream, body: payload });
     const verdict = this.deps.gate.inspectResponse(a.contract, { protocol: upstream, body: payload }, a.answerLimit);
     if (!this.inspected(verdict, true)) return uncommitted(this.defect(attempt, "upstream_trust_policy_rejected", false));
-    attempt.evidence?.observeResponse(parsedAnswer, payload);
+    if (this.traffic !== null) attempt.evidence?.observeResponse(parsedAnswer, payload);
     // The model's refusal (a Gemini upstream's) is delivered translated and uncharged, so it needs no usage.
     const refusedFor = refusedOf(upstream, payload);
     if (upstream === "gemini") attempt.answeredImage = geminiImages(payload);
@@ -8106,6 +8810,7 @@ export class InferenceRun {
       this.endAttempt(attempt, { kind: "success" }, false, null);
     }
     const headers = new Headers({ "content-type": "application/json", "x-request-id": this.requestId, "x-gray-provider": await providerRef(route), "x-gray-attempt": String(attempt.index + 1) });
+    if (this.protocol === "anthropic_messages") headers.set("request-id", this.requestId);
     for (const [name, value] of Object.entries(translation.headers())) headers.set(name, value);
     this.capHeaders(headers);
     this.modelHeader(headers);
@@ -8270,8 +8975,12 @@ export class InferenceRun {
     this.commit(d, attempt);
     this.endAttempt(attempt, { kind: "success" }, false, null);
     // The terminal response is the reply: recorded before the client has it, as `nativeAnswer` records a buffered one.
-    if (this.laneBinds(a, attempt)) await this.laneBind(a, attempt, payload);
+    if (this.laneBinds(a, attempt)) {
+      const tap = new ResponsesStateTap();
+      await this.laneBindState(a, attempt, tap.setResponse(payload));
+    }
     const headers = new Headers({ "content-type": "application/json", "x-request-id": this.requestId, "x-gray-provider": await providerRef(route), "x-gray-attempt": String(attempt.index + 1) });
+    if (this.protocol === "anthropic_messages") headers.set("request-id", this.requestId);
     this.capHeaders(headers);
     this.modelHeader(headers);
     this.droppedHeader(headers);
@@ -8527,11 +9236,14 @@ type SendResult =
  * or a vendor was dialed, or may have been, and nothing can be released (`lane_relay_failed`, no other route).
  */
 type PeerOutcome =
-  | { readonly kind: "not_dialed"; readonly code: string }
+  /** `egress`: egress refused the hop's request itself, nothing sent (`LanePeerCall.egressRefusal`). */
+  | { readonly kind: "not_dialed"; readonly code: string; readonly egress?: "capacity" | "refused" }
   | {
       readonly kind: "vendor_error";
       readonly status: number;
       readonly body: Uint8Array;
+      /** Allowlisted vendor error headers carried on the hop's `head` frame (`retry-after`, `retry-after-ms`, `x-should-retry`, `content-type`). */
+      readonly headers: Readonly<Record<string, string>>;
       readonly accountId: string | null;
       /** The relay's software changed the body of the attempt whose error this is, as its inner receipt says (`receiptChangedBody`). */
       readonly changedBody: boolean;
@@ -8647,11 +9359,19 @@ function peerChecks(end: PeerEndDto | null): AnswerChecks {
  * `vendor_error` the vendor's own error body (`data`), `relay_failed` Gray's `lane_relay_failed`. A `served` or `cut`
  * end with a head that is not 200 is not one the backend writes (its head is 200 once bytes are released): Gray's 502.
  */
-function peerEndedOutcome(end: PeerEndDto, status: number, body: Uint8Array): PeerOutcome {
+function peerEndedOutcome(end: PeerEndDto, head: PeerHeadDto, body: Uint8Array): PeerOutcome {
   if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid" };
   // The stack VM's attempt whose error it released is `served_attempt`; its group in the inner receipt lists what the
   // relay's software changed (S26). A stack VM that sends no receipt, or one before `relay_stack.changed`, changed nothing.
-  if (end.outcome === "vendor_error") return { kind: "vendor_error", status, body, accountId: end.relay_account_id, changedBody: receiptChangedBody(end.receipt, end.served_attempt) };
+  if (end.outcome === "vendor_error") {
+    const headers: Record<string, string> = {};
+    if (head.headers !== undefined) {
+      for (const [name, value] of Object.entries(head.headers)) {
+        if (value !== undefined) headers[name] = value;
+      }
+    }
+    return { kind: "vendor_error", status: Number(head.status), body, headers, accountId: end.relay_account_id, changedBody: receiptChangedBody(end.receipt, end.served_attempt) };
+  }
   if (end.vendor_event !== undefined) return { kind: "vendor_event", event: end.vendor_event as Json, accountId: end.relay_account_id };
   return { kind: "relay_failed", code: end.code ?? "peer_invalid" };
 }

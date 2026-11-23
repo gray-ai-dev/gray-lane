@@ -169,9 +169,11 @@ const coolingSchema = z
     gen: uintSchema,
     observed: z.boolean(),
     clears: z.array(z.enum(STACK_RULE_CLEARS)).max(STACK_RULE_CLEARS.length),
+    cred_gen: uintSchema.min(1n).optional(),
   })
   .strict()
-  .refine((e) => (e.kind === "hold") === (e.until_minute_ms === null), { message: "a hold has no end, a cool has one", path: ["until_minute_ms"] });
+  .refine((e) => (e.kind === "hold") === (e.until_minute_ms === null), { message: "a hold has no end, a cool has one", path: ["until_minute_ms"] })
+  .refine((e) => e.cred_gen === undefined || e.clears.includes("credential"), { message: "cred_gen is only allowed when clears includes credential", path: ["cred_gen"] });
 
 const windowSchema = z
   .object({
@@ -340,6 +342,8 @@ export interface StackReportCooling {
   readonly gen: number;
   readonly observed: boolean;
   readonly clears: readonly (typeof STACK_RULE_CLEARS)[number][];
+  /** AF-06.3: TEE-owned credential generation when `clears` includes `"credential"`. */
+  readonly cred_gen?: number;
 }
 /** One vendor window of an account, with JS numbers. */
 export interface StackReportWindow {

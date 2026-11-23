@@ -40,19 +40,56 @@ type stackBudget struct {
 	spareBytes int64
 }
 
-// take holds n more bytes if they fit, taking back debug copies when only their bytes are in the way; false leaves
-// the budget as it was (and every copy held).
+const (
+	// stackBudgetReserveMinMax is the threshold at which the full 1/64 reserve floor applies
+	// (production default -max-body-bytes, 4 MiB). Smaller budgets (such as minimum 1 MiB configs
+	// or tight unit-test budgets) use a smaller 1/512 fraction so callers with modest headroom fit.
+	stackBudgetReserveMinMax       = int64(4 << 20)
+	stackBudgetReserveCap          = int64(4 << 20)
+	stackBudgetReserveDivisor      = 64
+	stackBudgetReserveSmallDivisor = 512
+)
+
+// stackBudgetReserve returns the headroom held back from normal take() calls inside maxBytes so
+// forced terminal records (`end`, `done`, `refused`, omitted `forwarded`) stay strictly within
+// -stack-max-bytes even when take() has saturated the rest of the budget.
+func stackBudgetReserve(maxBytes int64) int64 {
+	if maxBytes <= 0 {
+		return 0
+	}
+	if maxBytes < stackBudgetReserveMinMax {
+		return maxBytes / stackBudgetReserveSmallDivisor
+	}
+	return min(maxBytes/stackBudgetReserveDivisor, stackBudgetReserveCap)
+}
+
+// takeLimit is the maximum bytes normal take() and takeSpare() calls may occupy, leaving
+// stackBudgetReserve(max) for forced terminal records.
+func (b *stackBudget) takeLimit() int64 {
+	maxBytes := b.max.Load()
+	return maxBytes - stackBudgetReserve(maxBytes)
+}
+
+// take holds n more bytes if they fit within takeLimit(), taking back debug copies when only their
+// bytes are in the way; false leaves the budget as it was (and every copy held).
 func (b *stackBudget) take(n int64) bool {
-	if b.tryTake(n) {
+	return b.takeWithin(n, b.takeLimit)
+}
+
+func (b *stackBudget) takeWithin(n int64, limit func() int64) bool {
+	if b.tryTakeWithin(n, limit) {
 		return true
+	}
+	if n < 0 {
+		return false
 	}
 	b.spareMu.Lock()
 	defer b.spareMu.Unlock()
-	if b.used.Load()-b.spareBytes+n > b.max.Load() {
+	if b.used.Load()-b.spareBytes > limit()-n {
 		return false
 	}
 	for {
-		if b.tryTake(n) {
+		if b.tryTakeWithin(n, limit) {
 			return true
 		}
 		oldest := b.spares.Front()
@@ -63,11 +100,21 @@ func (b *stackBudget) take(n int64) bool {
 	}
 }
 
-// tryTake holds n more bytes if they fit as the budget stands.
+// tryTake holds n more bytes if they fit within takeLimit() as the budget stands.
 func (b *stackBudget) tryTake(n int64) bool {
+	return b.tryTakeWithin(n, b.takeLimit)
+}
+
+func (b *stackBudget) tryTakeWithin(n int64, limit func() int64) bool {
+	if n < 0 {
+		return false
+	}
+	if n == 0 {
+		return true
+	}
 	for {
 		used := b.used.Load()
-		if used+n > b.max.Load() {
+		if used > limit()-n {
 			return false
 		}
 		if b.used.CompareAndSwap(used, used+n) {
@@ -129,9 +176,13 @@ func (b *stackBudget) dropSpareLocked(spare *stackSpare) {
 	b.give(spare.size)
 }
 
-// force holds n bytes whether or not they fit: only for the few small records that must reach the entry
-// (`end`, `done`, a refusal without its path). A later take fails while the budget is over.
-func (b *stackBudget) force(n int64) { b.used.Add(n) }
+// force holds n bytes from the full budget (including the reserve held back from take(), and
+// taking back debug copies if needed), for the small terminal records that must reach the entry
+// (`end`, `done`, a refusal without its path, an omitted `forwarded`). Returns false if even the
+// full budget cannot hold n, keeping used strictly within -stack-max-bytes.
+func (b *stackBudget) force(n int64) bool {
+	return b.takeWithin(n, b.max.Load)
+}
 
 func (b *stackBudget) give(n int64) { b.used.Add(-n) }
 
@@ -163,11 +214,12 @@ func (h *stackHold) free() { h.shrink(h.bytes) }
 
 var errStackBudget = errors.New("egress stack budget exceeded")
 
-// readHeldBody reads a relay call's body under the budget: a declared length is taken whole before the
-// read, a chunked body as its buffer grows (doubling, or exactly what is needed when doubling does not
-// fit). The buffer's capacity is what the hold covers. The errors are readRequestBody's, plus
-// errStackBudget.
-func readHeldBody(r *http.Request, max int64, hold *stackHold) ([]byte, int64, error) {
+// readHeldBody reads a relay call's body under both the stack budget and the
+// global in-flight body budget: a declared length is taken whole before the
+// read, a chunked body as its buffer grows (doubling, or exactly what is needed
+// when doubling does not fit). The buffer's capacity is what both holds cover.
+// The errors are readRequestBody's, plus errStackBudget and errBodyBudgetExceeded.
+func readHeldBody(r *http.Request, max int64, hold *stackHold, global *bodyHold) ([]byte, int64, error) {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil, 0, nil
 	}
@@ -175,7 +227,11 @@ func readHeldBody(r *http.Request, max int64, hold *stackHold) ([]byte, int64, e
 		return nil, 0, errBodyTooLargeRequest
 	}
 	if r.ContentLength > 0 {
+		if !global.grow(r.ContentLength) {
+			return nil, 0, errBodyBudgetExceeded
+		}
 		if !hold.grow(r.ContentLength) {
+			global.free()
 			return nil, 0, errStackBudget
 		}
 		body := make([]byte, r.ContentLength)
@@ -190,9 +246,9 @@ func readHeldBody(r *http.Request, max int64, hold *stackHold) ([]byte, int64, e
 			return body, int64(len(body) + n), errBodyTooLargeRequest
 		}
 		if n > 0 {
-			var ok bool
-			if body, ok = growHeld(body, n, max, hold); !ok {
-				return body, int64(len(body)), errStackBudget
+			var budgetErr error
+			if body, budgetErr = growHeldBoth(body, n, max, hold, global); budgetErr != nil {
+				return body, int64(len(body)), budgetErr
 			}
 			body = append(body, chunk[:n]...)
 		}
@@ -203,6 +259,36 @@ func readHeldBody(r *http.Request, max int64, hold *stackHold) ([]byte, int64, e
 			return body, int64(len(body)), err
 		}
 	}
+}
+
+func growHeldBoth(held []byte, n int, limit int64, hold *stackHold, global *bodyHold) ([]byte, error) {
+	need := int64(len(held) + n)
+	if need <= int64(cap(held)) {
+		return held, nil
+	}
+	oldCap := int64(cap(held))
+	size := min(max(2*oldCap, need), max(limit, need))
+	delta := size - oldCap
+	tryGrow := func(d int64) error {
+		if !global.grow(d) {
+			return errBodyBudgetExceeded
+		}
+		if !hold.grow(d) {
+			global.shrink(d)
+			return errStackBudget
+		}
+		return nil
+	}
+	if err := tryGrow(delta); err != nil {
+		size = need
+		delta = size - oldCap
+		if err2 := tryGrow(delta); err2 != nil {
+			return held, err2
+		}
+	}
+	grown := make([]byte, len(held), size)
+	copy(grown, held)
+	return grown, nil
 }
 
 // growHeld makes room for n more bytes in held, taking the added capacity from hold first: double the

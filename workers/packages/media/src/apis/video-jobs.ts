@@ -172,7 +172,7 @@ export function videoObject(job: VideoJob): SerdeObject {
 
 /** `upstream_id`: a vendor job handle Gray stores and sends back: bounded, printable, nothing that could change a URL. */
 export function upstreamId(id: string): boolean {
-  return id.length > 0 && id.length <= 256 && /^[A-Za-z0-9_.:-]+$/.test(id);
+  return id.length > 0 && id.length <= 256 && id !== "." && id !== ".." && /^[A-Za-z0-9_.:-]+$/.test(id);
 }
 
 /** `openai_failure`: an OpenAI-compatible upstream's failure code when it is lowercase words, else the generic code. */
@@ -182,9 +182,9 @@ export function openAiFailure(code: string | undefined): string {
 
 /** `billed_seconds`: the vendor-confirmed seconds capped at the requested ones, else the requested ones. */
 export function billedSeconds(job: VideoJob): number {
-  const requested = Math.max(job.secondsRequested, 0);
+  const requested = Number.isSafeInteger(job.secondsRequested) && job.secondsRequested > 0 ? job.secondsRequested : 0;
   const confirmed = job.secondsConfirmed;
-  return confirmed !== null && confirmed > 0 ? Math.min(confirmed, requested) : requested;
+  return confirmed !== null && Number.isSafeInteger(confirmed) && confirmed > 0 ? Math.min(confirmed, requested) : requested;
 }
 
 /**
@@ -200,11 +200,9 @@ export type Observed =
   | { readonly kind: "unknown" };
 
 /**
- * `job_url`: `{route.url}/{segments...}` as the url crate's `path_segments_mut().pop_if_empty().extend()`
- * builds it: a trailing empty segment dropped, `.` and `..` skipped, `%` and `/` in a segment
- * percent-encoded, and every other character encoded by the URL parser's path rules (WHATWG URL,
- * which the url crate implements). A job handle passed `upstreamId` (`[A-Za-z0-9_.:-]`), so a `:`
- * stays as it is, as in Rust.
+ * `job_url`: `{route.url}/{segments...}` with a trailing empty segment dropped and `%`, `/` and `\`
+ * percent-encoded. Refuses empty or dot-only segments (`.`, `..`) so a malformed handle can never
+ * drop a segment or traverse the upstream path.
  */
 export function jobUrl(route: MediaRoute, segments: readonly string[]): string | undefined {
   let url: URL;
@@ -215,8 +213,8 @@ export function jobUrl(route: MediaRoute, segments: readonly string[]): string |
   }
   let path = url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname;
   for (const segment of segments) {
-    if (segment === "." || segment === "..") continue;
-    path += `/${segment.replaceAll("%", "%25").replaceAll("/", "%2F")}`;
+    if (segment === "" || segment === "." || segment === "..") return undefined;
+    path += `/${segment.replaceAll("%", "%25").replaceAll("/", "%2F").replaceAll("\\", "%5C")}`;
   }
   url.pathname = path;
   return url.toString();
@@ -251,8 +249,12 @@ export function observeOpenAi(job: VideoJob, status: number, body: Uint8Array): 
     case "completed": {
       const s = get(value, "seconds");
       let seconds: bigint | undefined;
-      if (typeof s === "string") seconds = /^\+?[0-9]+$/.test(s) && BigInt(s.replace(/^\+/, "")) <= 0xffff_ffff_ffff_ffffn ? BigInt(s.replace(/^\+/, "")) : undefined;
-      else if (typeof s === "bigint" && s >= 0n && s <= 0xffff_ffff_ffff_ffffn) seconds = s;
+      if (typeof s === "string" && /^\+?[0-9]+$/.test(s)) {
+        const n = BigInt(s.replace(/^\+/, ""));
+        if (n >= 1n && n <= 0xffff_ffff_ffff_ffffn) seconds = n;
+      } else if (typeof s === "bigint" && s >= 1n && s <= 0xffff_ffff_ffff_ffffn) {
+        seconds = s;
+      }
       return { kind: "completed", seconds };
     }
     case "failed": {
@@ -295,7 +297,7 @@ export function applyObserved(job: VideoJob, observed: Observed, now: number, ru
       };
     }
     case "completed": {
-      const seconds = observed.seconds !== undefined && observed.seconds <= 0x7fff_ffff_ffff_ffffn ? Number(observed.seconds) : null;
+      const seconds = observed.seconds !== undefined && observed.seconds >= 1n && observed.seconds <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(observed.seconds) : null;
       return finishJob(job, "completed", seconds, null, now);
     }
     case "failed":
@@ -340,7 +342,19 @@ export type Decision =
 export function decide(job: VideoJob): Decision | undefined {
   if (isOpen(job) || job.billing !== "pending") return undefined;
   if (job.state === "failed") return { kind: "release", reason: job.errorCode === "expired" ? "upstream_timeout" : "upstream_error" };
+  if (!Number.isSafeInteger(job.secondsRequested) || job.secondsRequested <= 0) {
+    return { kind: "invalid", seconds: 0, reason: "requested seconds must be a positive integer" };
+  }
+  if (job.secondsConfirmed !== null && !Number.isSafeInteger(job.secondsConfirmed)) {
+    return { kind: "invalid", seconds: 0, reason: "confirmed seconds must be an integer" };
+  }
   const seconds = billedSeconds(job);
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+    return { kind: "invalid", seconds: 0, reason: "billed seconds must be a positive integer" };
+  }
+  if (!Number.isSafeInteger(job.heldMicroUsd) || job.heldMicroUsd < 0) {
+    return { kind: "invalid", seconds, reason: "held amount must be a non-negative integer" };
+  }
   const frozen = parseEvidence(job.pricing.evidence);
   if (frozen === null) return { kind: "invalid", seconds, reason: "the frozen evidence does not read as FinalizationEvidence" };
   const units = BigInt(seconds);
@@ -405,19 +419,36 @@ async function headersWithin(fetcher: Fetcher, request: Request, ms: number): Pr
   }
 }
 
-/** `fetch_url`: a result URL fetched without credentials, redirects followed by hand under the same checks. */
-export async function fetchResultUrl(fetcher: Fetcher, raw: string, egress: EgressPolicy, limits: ContentLimits): Promise<Response> {
+/**
+ * `fetch_url`: a result URL fetched without credentials, redirects followed by hand under the same
+ * checks. When `method` is `"HEAD"`, sends `HEAD` to avoid transferring the media body, falling back
+ * to `GET` on 403/405/501 (e.g. presigned GET-only URLs; caller discards/cancels the body via
+ * `streamMedia(..., { head: true })`).
+ */
+export async function fetchResultUrl(
+  fetcher: Fetcher,
+  raw: string,
+  egress: EgressPolicy,
+  limits: ContentLimits,
+  method: "GET" | "HEAD" = "GET",
+): Promise<Response> {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     throw badGateway("upstream_content_unavailable");
   }
+  let currentMethod: "GET" | "HEAD" = method;
   for (let hop = 0; hop <= limits.hops; hop += 1) {
     if (url.username !== "" || url.password !== "") throw badGateway("upstream_content_forbidden");
     const vetted = vetUrl(url.toString(), egress);
     if (vetted === undefined) throw badGateway("upstream_content_forbidden");
-    const response = await headersWithin(fetcher, new Request(vetted.toString(), { method: "GET", redirect: "manual" }), limits.headersMs);
+    let response = await headersWithin(fetcher, new Request(vetted.toString(), { method: currentMethod, redirect: "manual" }), limits.headersMs);
+    if (currentMethod === "HEAD" && (response.status === 403 || response.status === 405 || response.status === 501)) {
+      await response.body?.cancel();
+      currentMethod = "GET";
+      response = await headersWithin(fetcher, new Request(vetted.toString(), { method: "GET", redirect: "manual" }), limits.headersMs);
+    }
     if (response.status >= 200 && response.status < 300) return response;
     await response.body?.cancel();
     if (response.status < 300 || response.status >= 400) throw badGateway("upstream_content_unavailable");
@@ -433,7 +464,14 @@ export async function fetchResultUrl(fetcher: Fetcher, raw: string, egress: Egre
 }
 
 /** `media_answer`: a credentialed media answer: its bytes, or the redirect it names fetched without the credential. */
-async function mediaAnswer(fetcher: Fetcher, response: Response, requestUrl: string, egress: EgressPolicy, limits: ContentLimits): Promise<Response> {
+async function mediaAnswer(
+  fetcher: Fetcher,
+  response: Response,
+  requestUrl: string,
+  egress: EgressPolicy,
+  limits: ContentLimits,
+  method: "GET" | "HEAD" = "GET",
+): Promise<Response> {
   if (response.status >= 200 && response.status < 300) return response;
   await response.body?.cancel();
   if (response.status >= 300 && response.status < 400) {
@@ -445,7 +483,7 @@ async function mediaAnswer(fetcher: Fetcher, response: Response, requestUrl: str
     } catch {
       throw badGateway("upstream_content_unavailable");
     }
-    return fetchResultUrl(fetcher, next.toString(), egress, limits);
+    return fetchResultUrl(fetcher, next.toString(), egress, limits, method);
   }
   throw badGateway("upstream_content_unavailable");
 }
@@ -495,17 +533,31 @@ export async function deleteUpstream(fetcher: Fetcher, route: MediaRoute, job: V
 
 /**
  * The upstream answer carrying a finished job's bytes (video/content.rs `openai_source`): the
- * provider's `{url}/{id}/content`, a redirect it names fetched without the credential. The variant is
- * `video`, `thumbnail` or `spritesheet`.
+ * provider's `{url}/{id}/content`, a redirect it names fetched without the credential. The variant
+ * is `video`, `thumbnail` or `spritesheet`. When `method` is `"HEAD"`, sends `HEAD` (falling back
+ * to `GET` on 405/501; combine with `streamMedia(..., { head: true })` to cancel any fallback body
+ * immediately).
  */
-export async function contentSource(fetcher: Fetcher, route: MediaRoute, job: VideoJob, variant: string, egress: EgressPolicy, limits: ContentLimits): Promise<Response> {
+export async function contentSource(
+  fetcher: Fetcher,
+  route: MediaRoute,
+  job: VideoJob,
+  variant: string,
+  egress: EgressPolicy,
+  limits: ContentLimits,
+  method: "GET" | "HEAD" = "GET",
+): Promise<Response> {
   const base = jobUrl(route, [job.vendorJob, "content"]);
   if (base === undefined) throw badGateway("upstream_content_unavailable");
   const url = new URL(base);
   if (variant !== "video") url.searchParams.append("variant", variant);
   const headers = upstreamAuthHeaders(route.auth, "open_ai_videos", route.credential, new Headers());
-  const response = await headersWithin(fetcher, new Request(url.toString(), { method: "GET", headers, redirect: "manual" }), limits.headersMs);
-  return mediaAnswer(fetcher, response, url.toString(), egress, limits);
+  let response = await headersWithin(fetcher, new Request(url.toString(), { method, headers, redirect: "manual" }), limits.headersMs);
+  if (method === "HEAD" && (response.status === 405 || response.status === 501)) {
+    await response.body?.cancel();
+    response = await headersWithin(fetcher, new Request(url.toString(), { method: "GET", headers, redirect: "manual" }), limits.headersMs);
+  }
+  return mediaAnswer(fetcher, response, url.toString(), egress, limits, method);
 }
 
 /** `media_type`: a video or image type without parameters, else `application/octet-stream`. */
@@ -525,6 +577,8 @@ export interface StreamMediaHooks {
   readonly tap?: (bytes: Uint8Array) => void;
   /** The transfer ended: `complete` (the upstream's end), `cut` (a bound crossed or the upstream broke) or `cancelled` (the customer left). */
   readonly ended?: (how: "complete" | "cut" | "cancelled") => void;
+  /** When true, any upstream body is cancelled immediately and a bodyless 200 response carrying sanitized headers is returned. */
+  readonly head?: boolean;
 }
 
 /**
@@ -532,12 +586,14 @@ export interface StreamMediaHooks {
  * `idleMs` between chunks and `totalMs` overall; the stream errors (a truncated transfer) when a bound
  * is crossed. A body announced larger than the limit is 502 `upstream_content_too_large`. One chunk is
  * read from the upstream each time the customer's stream asks for one, so nothing is held beyond the
- * chunk in hand and a customer that reads slowly holds the upstream back.
+ * chunk in hand and a customer that reads slowly holds the upstream back. When `hooks.head` is true,
+ * any upstream body is cancelled immediately and a bodyless 200 response carrying sanitized headers is
+ * returned.
  */
 export function streamMedia(upstream: Response, limits: ContentLimits, hooks: StreamMediaHooks = {}): Response {
   const length = upstream.headers.get("content-length");
   if (length !== null && /^[0-9]+$/.test(length) && Number(length) > limits.bytes) {
-    void upstream.body?.cancel();
+    void upstream.body?.cancel().catch(() => {});
     throw badGateway("upstream_content_too_large");
   }
   const headers = new Headers({ "content-type": mediaType(upstream.headers.get("content-type")) });
@@ -548,6 +604,11 @@ export function streamMedia(upstream: Response, limits: ContentLimits, hooks: St
     over = true;
     hooks.ended?.(how);
   };
+  if (hooks.head === true) {
+    void upstream.body?.cancel().catch(() => {});
+    ended("complete");
+    return new Response(null, { status: 200, headers });
+  }
   const source = upstream.body;
   if (source === null) {
     ended("complete");
@@ -558,7 +619,20 @@ export function streamMedia(upstream: Response, limits: ContentLimits, hooks: St
   let received = 0;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
-      const wait = Math.min(limits.idleMs, deadline - Date.now());
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        await reader.cancel().catch(() => {});
+        ended("cut");
+        controller.error(new Error("video content interrupted"));
+        return;
+      }
+      const wait = Math.min(limits.idleMs, remaining);
+      if (wait <= 0) {
+        await reader.cancel().catch(() => {});
+        ended("cut");
+        controller.error(new Error("video content interrupted"));
+        return;
+      }
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<"timeout">((resolve) => {
         timer = setTimeout(() => resolve("timeout"), Math.max(1, wait));

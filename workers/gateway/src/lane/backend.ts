@@ -1,7 +1,7 @@
 import { ReceiptBuilder, StackEventsChain, type SignedReceipt } from "@gray/attest";
 import type { GatewayConfig } from "@gray/config";
 import { ApiError, ERROR_BODY_WAIT_MS, isErrorBody } from "@gray/errors";
-import { isObject, toJsonString, type Json } from "@gray/json";
+import { isObject, parseStrictBytes, readSerdeBytes, toJsonString, type Json } from "@gray/json";
 import { stackBodyDigest, StackEventDigester, type LaneProtocol } from "@gray/lane";
 import {
   encodePeerFrame,
@@ -12,15 +12,17 @@ import {
   PEER_COMMENT,
   PEER_FRAME_MAX_BYTES,
   PEER_REFUSAL_STATUS,
+  peerErrorHeadersOf,
   peerReadsOf,
   stackTraceDtoOf,
   type PeerEndDto,
   type PeerEnvelopeDto,
+  type PeerErrorHeadersDto,
   type PeerRefusalCode,
   type StackTraceDto,
 } from "@gray/lane-wire";
 import { safeUsageCounters } from "@gray/ledger-keys";
-import { type AnswerChecks, bufferedUsage, parseResponse, UNCOUNTED_CHECKS } from "@gray/protocol";
+import { type AnswerChecks, bufferedUsage, COUNT_REPLY_LIMIT, countReply, countTarget, inspectedCountRequest, parseResponse, UNCOUNTED_CHECKS } from "@gray/protocol";
 import { AnswerRelay, keepsAnswerText } from "../answer.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, ClientStream, errorFrame, type StreamTimers } from "../client.ts";
 import type { FragmentUse, StreamInspector, ToolGate } from "../gate.ts";
@@ -111,6 +113,8 @@ export interface BackendInput {
   readonly envelope: PeerEnvelopeDto;
   /** The client's exact bytes (check 5 held them to `received_sha256`). */
   readonly body: Uint8Array;
+  /** True for Anthropic `/v1/messages/count_tokens`. */
+  readonly countTokens?: boolean;
   readonly cfg: GatewayConfig;
   readonly state: Pick<LaneState, "receiptKey" | "receiptKeyId" | "keysetDigest">;
   readonly relayImage: string | null;
@@ -282,6 +286,8 @@ class BackendRun {
   readonly #readsReceiptRefused: boolean;
   /** The entry named `vendor_event`: it reads the vendor's own error event that ended an answer before the commit. */
   readonly #readsVendorEvent: boolean;
+  /** The entry named `error_headers`: it reads allowlisted vendor error response headers on a non-200 `head`. */
+  readonly #readsErrorHeaders: boolean;
   /** The vendor's own error event that ended its stream before the commit (`primeStream`'s `event`), as it came. */
   #vendorEvent: Json | null = null;
   /** Why the receipt was not signed (a closed word, `receiptProblem`), once `#receipt` failed. */
@@ -301,6 +307,7 @@ class BackendRun {
     this.#readsChecks = reads.has("checks");
     this.#readsReceiptRefused = reads.has("receipt_refused");
     this.#readsVendorEvent = reads.has("vendor_event");
+    this.#readsErrorHeaders = reads.has("error_headers");
     this.#presence = new ClientPresence(null, input.clock, 0);
     hop.onLeave(() => this.#presence.leave("client_left"));
     this.#presence.onLeave(() => {
@@ -452,20 +459,48 @@ class BackendRun {
     if (input.transport === undefined) return { outcome: "not_dialed", code: "no_relay_binding" };
     const route = this.#route!;
     const protocol = input.protocol;
-    // The entry parsed these bytes before it forwarded them; a body that does not parse here is refused before egress.
-    const parsed = parseHeld(protocol, "A", input.body, null);
-    if (parsed instanceof ApiError) return { outcome: "not_dialed", code: "protocol" };
-    const stream = parsed.canonical.stream;
+    const isCount = input.countTokens === true;
+    let parsed: ParsedRequest | null = null;
+    let bodyValue: Json;
+    let stripModels = false;
+    let stream = false;
+    if (isCount) {
+      if (protocol !== "anthropic_messages") return { outcome: "not_dialed", code: "protocol" };
+      let read: ReturnType<typeof readSerdeBytes>;
+      try {
+        read = readSerdeBytes(input.body);
+      } catch {
+        return { outcome: "not_dialed", code: "protocol" };
+      }
+      if (read.duplicateKeys || !isObject(read.value)) return { outcome: "not_dialed", code: "protocol" };
+      const rawModel = countTarget(protocol, input.path, read.value);
+      if (rawModel === undefined) return { outcome: "not_dialed", code: "protocol" };
+      try {
+        inspectedCountRequest(protocol, rawModel, read.value);
+      } catch {
+        return { outcome: "not_dialed", code: "protocol" };
+      }
+      bodyValue = read.value;
+    } else {
+      // The entry parsed these bytes before it forwarded them; a body that does not parse here is refused before egress.
+      const held = parseHeld(protocol, "A", input.body, null);
+      if (held instanceof ApiError) return { outcome: "not_dialed", code: "protocol" };
+      parsed = held;
+      bodyValue = held.value;
+      stripModels = held.strip;
+      stream = held.canonical.stream;
+    }
     this.#stream = stream;
     // What the relay's container is sent (relay standard v1.7): the entry forwarded the client's bytes, and the required
     // changes are applied here, so the hop's `received_sha256` stays the client's.
-    const body = stackRequestBody({ config: input.config, route, protocol, stream, received: input.body, value: parsed.value });
+    const body = stackRequestBody({ config: input.config, route, protocol, stream, received: input.body, value: bodyValue, stripModels });
     if (!body.ok) return { outcome: "not_dialed", code: body.code };
     const rid = newStackRid();
     const conversation = envelope.conversation;
     const started = clock();
     // Bounded by its own limits and by what the entry left of the request (section 4.5: `budget_ms`).
-    const deadline = Math.min(started + (stream ? cfg.streamTotalSeconds * 1000 : cfg.nonStreamTotalMs), started + Number(envelope.budget_ms));
+    const totalMs = isCount ? Math.min(cfg.nonStreamTotalMs, 120_000) : stream ? cfg.streamTotalSeconds * 1000 : cfg.nonStreamTotalMs;
+    const deadline = Math.min(started + totalMs, started + Number(envelope.budget_ms));
     const controller = new AbortController();
     this.#presence.onLeave(() => controller.abort("client_left"));
     const timer = input.timers.setTimeout(() => controller.abort("attempt_deadline"), Math.max(0, deadline - clock()));
@@ -480,7 +515,15 @@ class BackendRun {
       clientHeaders: stackClientHeaders(input.request.headers, protocol),
       vendor: route.vendor,
       // The customer's opt-out comes over the hop in the envelope (docs/relay-request-changes.md).
-      rewrite: stackRewriteSpec({ protocol, upstreamModel: route.upstream_model, route, stream, appends: input.config.appends, relayChanges: envelope.relay_changes !== "exclude" }),
+      rewrite: stackRewriteSpec({
+        protocol,
+        upstreamModel: route.upstream_model,
+        route,
+        stream,
+        appends: input.config.appends,
+        relayChanges: envelope.relay_changes !== "exclude",
+        ...(isCount ? { countTokens: true } : {}),
+      }),
       attemptsMax: input.config.limits.attempts_max,
       expiresAt: Math.ceil(deadline / 1000),
       headers: stackRelayHeaders(input.request.headers, protocol, input.config.inboundToken, rid, body.routeModel, conversation),
@@ -488,13 +531,14 @@ class BackendRun {
       relay: input.transport.relay,
       // docs/design/relay-debug-sharing.md: egress writes each forwarded body into the feed for the debug capture.
       ...(input.debug === undefined ? {} : { captureForwarded: true }),
+      ...(isCount ? { countTokens: true } : {}),
       signal: controller.signal,
       timers: input.timers,
       clock,
       holdMs: cfg.upstreamSilenceMs,
       settleMs: ERROR_BODY_WAIT_MS,
       queueMs: cfg.upstreamHeaderMs,
-      answerMaxBytes: cfg.answerHeldMaxBytes,
+      answerMaxBytes: isCount ? COUNT_REPLY_LIMIT : cfg.answerHeldMaxBytes,
       deleteBackoffMs: cfg.retryBackoffMs,
       deleteBackoffMaxMs: cfg.retryBackoffMaxMs,
     });
@@ -508,12 +552,61 @@ class BackendRun {
       const sent = await call.send();
       if (sent.kind === "aborted") return this.#failed(call, await call.decided(), controller.signal.reason === "attempt_deadline");
       if (sent.kind === "failed") return this.#failed(call, sent.outcome, false);
-      if (stream) return await this.#relayStream(call, sent.response, deadline, parsed);
-      if (protocol === "open_ai_responses" && route.vendor === "chatgpt_codex") return await this.#codex(call, sent.response, deadline, parsed);
-      return await this.#buffered(call, sent.response, deadline, parsed);
+      if (isCount) return await this.#countTokens(call, sent.response, deadline);
+      if (stream) return await this.#relayStream(call, sent.response, deadline, parsed!);
+      if (protocol === "open_ai_responses" && route.vendor === "chatgpt_codex") return await this.#codex(call, sent.response, deadline, parsed!);
+      return await this.#buffered(call, sent.response, deadline, parsed!);
     } finally {
       input.timers.clearTimeout(timer);
     }
+  }
+
+  /** A token-counting answer: bounded by COUNT_REPLY_LIMIT, validated by countReply, and JCS-tied to egress's digest. */
+  async #countTokens(call: StackCall, response: Response, deadline: number): Promise<Ended> {
+    const { clock, protocol, timers } = this.#input;
+    const vendorBytes = await readBoundedWithin(response.body, COUNT_REPLY_LIMIT, deadline, clock, timers, this.#presence);
+    if (this.#presence.gone) {
+      this.#ownEnd = "client_left";
+      return { outcome: call.feed.dialed().length > 0 ? "relay_failed" : "not_dialed", code: "attempt_ended" };
+    }
+    if (vendorBytes === null) {
+      call.served = null;
+      this.#status = 502;
+      this.#replacedError = true;
+      this.#grayBody = true;
+      return { outcome: "relay_failed", code: "body_mismatch" };
+    }
+    let counts: Json | undefined;
+    try {
+      counts = countReply(protocol, parseStrictBytes(vendorBytes));
+    } catch {
+      counts = undefined;
+    }
+    if (counts === undefined) {
+      call.served = null;
+      this.#status = 502;
+      this.#replacedError = true;
+      this.#grayBody = true;
+      return { outcome: "relay_failed", code: "body_mismatch" };
+    }
+    const rebuilt = utf8Encoder.encode(toJsonString(counts));
+    let digestMatches = false;
+    try {
+      digestMatches = stackBodyDigest(vendorBytes) === stackBodyDigest(rebuilt);
+    } catch {
+      digestMatches = false;
+    }
+    if (!digestMatches) {
+      call.served = null;
+      this.#status = 502;
+      this.#replacedError = true;
+      this.#grayBody = true;
+      return { outcome: "relay_failed", code: "body_mismatch" };
+    }
+    this.#rawUsage = null;
+    await this.#head(200, false);
+    await this.#data(rebuilt);
+    return { outcome: "served", code: null };
   }
 
   /** A call whose answer was not released (S24, S25): the vendor's error is the answer; otherwise the entry's to render. */
@@ -526,7 +619,8 @@ class BackendRun {
       return { outcome: "not_dialed", code: fault?.why ?? "relay_transport" };
     }
     if (outcome.kind === "vendor_error") {
-      await this.#head(outcome.status, false);
+      const headers = this.#readsErrorHeaders ? peerErrorHeadersOf(outcome.headers) : undefined;
+      await this.#head(outcome.status, false, headers);
       // The vendor's error is the served attempt's answer, tied by its body digest (S32), not a replacement.
       await this.#data(outcome.body);
       return { outcome: "vendor_error", code: null };
@@ -783,8 +877,11 @@ class BackendRun {
     } catch {
       return this.#uncommitted(call);
     }
-    // The terminal response is the answer, as `InferenceRun.codexAnswer` reads its checks.
+    // The terminal response is the answer, as `InferenceRun.codexAnswer` reads its checks and enforces the gate verdict.
     this.#checks = this.#input.gate.responseChecks(contract, { protocol, body: read.response });
+    if (!this.#input.gate.inspectResponse(contract, { protocol, body: read.response }, Number.MAX_SAFE_INTEGER).ok) {
+      return this.#uncommitted(call);
+    }
     const raw = bufferedUsage(protocol, read.response) ?? null;
     this.#rawUsage = isObject(raw) ? raw : null;
     await this.#head(200, false);
@@ -808,12 +905,12 @@ class BackendRun {
     this.#body.push(bytes.slice());
   }
 
-  async #head(status: number, stream: boolean): Promise<void> {
+  async #head(status: number, stream: boolean, headers?: PeerErrorHeadersDto): Promise<void> {
     if (this.#headed) return;
     this.#headed = true;
     this.#status = status;
     this.#answerStream = stream;
-    await this.#hop.write(encodePeerFrame({ event: "head", head: { status: BigInt(status), stream } }));
+    await this.#hop.write(encodePeerFrame({ event: "head", head: { status: BigInt(status), stream, ...(headers === undefined ? {} : { headers }) } }));
   }
 
   /** Bytes the client is written outside a `ClientStream` (a vendor error, a Codex answer, Gray's last frame). */
@@ -915,6 +1012,54 @@ class BackendRun {
 
 /** The largest vendor error event `end.vendor_event` carries: a vendor's in-band error is a few hundred bytes. */
 const VENDOR_EVENT_MAX_BYTES = 16 * 1024;
+const utf8Encoder = new TextEncoder();
+
+/** Read a bounded non-stream reply within `deadline` and while `presence` stays open; null on overflow, error or timeout. */
+async function readBoundedWithin(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+  deadline: number,
+  clock: () => number,
+  timers: StreamTimers,
+  presence: ClientPresence,
+): Promise<Uint8Array | null> {
+  if (body === null) return new Uint8Array(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timedOut = false;
+  const timer = timers.setTimeout(() => {
+    timedOut = true;
+    void reader.cancel("deadline").catch(() => {});
+  }, Math.max(0, deadline - clock()));
+  const unsub = presence.onLeave(() => void reader.cancel("client_left").catch(() => {}));
+  try {
+    for (;;) {
+      const read = await reader.read();
+      if (read.done) break;
+      total += read.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("limit").catch(() => {});
+        return null;
+      }
+      chunks.push(read.value);
+    }
+  } catch {
+    return null;
+  } finally {
+    timers.clearTimeout(timer);
+    unsub();
+    reader.releaseLock();
+  }
+  if (timedOut || presence.gone) return null;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
 
 /**
  * The word `end.receipt_refused` gives for a receipt that was not signed: the receipt grammar's first problem (a

@@ -292,7 +292,9 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 		o.mu.Lock()
 		o.running--
 		account.busy = false
-		o.dropForLeaseLocked()
+		if o.leaseEnded(o.now()) {
+			o.dropForLeaseLocked()
+		}
 		o.mu.Unlock()
 		return
 	}
@@ -320,6 +322,10 @@ func (o *stackOps) run(ctx context.Context, account *opsAccount, op string) {
 	defer o.mu.Unlock()
 	o.running--
 	account.busy = false
+	if o.leaseEnded(now) {
+		o.dropForLeaseLocked()
+		return
+	}
 	// A push may have replaced the account while the call ran: the result goes to the account now held.
 	account = o.accounts[id]
 	if account == nil || account.vendor != vendor {
@@ -355,16 +361,23 @@ func (o *stackOps) call(ctx context.Context, vendor string, spec *egressSpec, en
 	for name, value := range values {
 		header[http.CanonicalHeaderKey(name)] = []string{value}
 	}
-	ctx, cancel := context.WithTimeout(ctx, stackOpsCallCap)
+	leaseCtx, cancelLease := o.withLeaseContext(ctx)
+	defer cancelLease()
+	ctx, cancel := context.WithTimeout(leaseCtx, stackOpsCallCap)
 	defer cancel()
 	isSignIn := signInRows[vendor].tunnelHost(target.Host, true)
 	if hello := o.srv.profiles.defaultHello(isSignIn); hello != nil && mirroredHelloOf(ctx) == nil {
 		ctx = context.WithValue(ctx, mirrorHelloKey{}, hello)
 	}
-	capture := &captureWriter{header: http.Header{}}
+	var capHold *bodyHold
+	if o.srv != nil {
+		capHold = &bodyHold{budget: &o.srv.bodyBudget}
+		defer capHold.free()
+	}
+	capture := &captureWriter{header: http.Header{}, hold: capHold}
 	rec := &responseRecorder{ResponseWriter: capture}
 	plan := requestPlan{route: route{name: stackVendors[vendor], host: target.Host}, target: target, spec: spec}
-	code := o.srv.forward(ctx, o.srv.relayClient, rec, template.method, plan, header, body, nil)
+	code := o.srv.forward(ctx, o.srv.relayClient, rec, template.method, plan, header, body, nil, nil)
 	switch {
 	case code == "":
 	case ctx.Err() != nil:
@@ -379,17 +392,20 @@ func (o *stackOps) call(ctx context.Context, vendor string, spec *egressSpec, en
 	if capture.status < 200 || capture.status > 299 {
 		return capture.status, nil, opsCodeVendorError
 	}
-	return capture.status, capture.body.Bytes(), ""
+	return capture.status, capture.body, ""
 }
 
 // captureWriter is an operation's end of forward: the vendor's answer, at most stackOpsAnswerMax bytes. A refusal
-// forward writes itself (no vendor answer) is not an answer.
+// forward writes itself (no vendor answer) is not an answer. When hold is non-nil, its backing buffer capacity is
+// charged against the server's global bodyBudget.
 type captureWriter struct {
 	header http.Header
 	status int
-	body   bytes.Buffer
+	body   []byte
 	// limit is the cap when set (a sign-in answer, stack_login.go); stackOpsAnswerMax otherwise.
-	limit int
+	limit          int
+	hold           *bodyHold
+	budgetExceeded bool
 }
 
 func (w *captureWriter) Header() http.Header { return w.header }
@@ -403,10 +419,18 @@ func (w *captureWriter) Write(p []byte) (int, error) {
 	if limit == 0 {
 		limit = stackOpsAnswerMax
 	}
-	if w.body.Len()+len(p) > limit {
+	if len(w.body)+len(p) > limit {
 		return 0, errors.New("answer over the cap")
 	}
-	return w.body.Write(p)
+	if w.hold != nil {
+		var ok bool
+		if w.body, ok = growBudgeted(w.body, len(p), int64(limit), w.hold); !ok {
+			w.budgetExceeded = true
+			return 0, errBodyBudgetExceeded
+		}
+	}
+	w.body = append(w.body, p...)
+	return len(p), nil
 }
 
 // answerValue parses the vendor's answer as JSON with numbers kept as text.
@@ -580,20 +604,17 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 			refuse(errMethodRefused)
 			return
 		}
-		body, readBytes, err := readRequestBody(r, stackOpsPushMax)
+		body, readBytes, release, err := s.readRequestBody(r, stackOpsPushMax)
+		defer release()
 		entry.RequestBytes = readBytes
 		if code := bodyReadCode(err); code != "" {
 			refuse(code)
 			return
 		}
 		until, hasUntil, untilOK := leaseUntilOf(r.Header)
-		if !untilOK || !s.ops.put(body) {
+		if !untilOK || !s.ops.put(body, until, hasUntil) {
 			refuse(errStackControlInvalid)
 			return
-		}
-		// The set's lease end (stack_lease.go): the same bound as the request table's.
-		if hasUntil {
-			s.stack.lease.setUntil(until)
 		}
 		rec.WriteHeader(http.StatusNoContent)
 	case stackOpsTokensPath:
@@ -607,7 +628,8 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 			refuse(errMethodRefused)
 			return
 		}
-		body, readBytes, err := readRequestBody(r, stackOpsAckMax)
+		body, readBytes, release, err := s.readRequestBody(r, stackOpsAckMax)
+		defer release()
 		entry.RequestBytes = readBytes
 		if code := bodyReadCode(err); code != "" {
 			refuse(code)
@@ -624,8 +646,10 @@ func (s *server) serveOpsControl(rec *responseRecorder, r *http.Request, entry *
 	}
 }
 
-// put replaces the account set; false for a body that is not one (nothing changes then).
-func (o *stackOps) put(body []byte) bool {
+// put replaces the account set; false for a body that is not one (nothing changes then). When hasUntil
+// is true, the KMS lease bound is updated atomically under o.mu (lock order o.mu -> lease.mu) before
+// releasing o.mu; if the effective lease is already ended at now, the set is left empty immediately.
+func (o *stackOps) put(body []byte, until time.Time, hasUntil bool) bool {
 	var wire wireOpsPush
 	if checkStrictJSON(body) != nil || !decodeControl(body, &wire) || wire.Accounts == nil || len(*wire.Accounts) > stackOpsAccountsMax {
 		return false
@@ -645,8 +669,17 @@ func (o *stackOps) put(body []byte) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	now := o.now()
+	if hasUntil && o.srv != nil && o.srv.stack != nil {
+		o.srv.stack.lease.setUntil(until)
+	}
 	// Set before the accounts are scheduled: a held VM's schedule has no refresh.
 	o.hold = hold
+	if o.leaseEnded(now) {
+		o.accounts = map[string]*opsAccount{}
+		o.persistFirst = wire.PersistFirst != nil && *wire.PersistFirst
+		o.wakeLocked()
+		return true
+	}
 	next := make(map[string]*opsAccount, len(pushed))
 	for id, account := range pushed {
 		held := o.accounts[id]
@@ -804,6 +837,9 @@ type opsTokenCredential struct {
 func (o *stackOps) tokens() map[string]any {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(o.now()) {
+		o.dropForLeaseLocked()
+	}
 	answers := []opsTokenAnswer{}
 	for _, account := range o.accounts {
 		if token := account.token; token != nil {
@@ -846,6 +882,10 @@ func (o *stackOps) recordTest(accountID, model string, answer *accountTestAnswer
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(o.now()) {
+		o.dropForLeaseLocked()
+		return
+	}
 	if account := o.accounts[accountID]; account != nil {
 		account.test = &opsTestResult{Outcome: answer.Outcome, Code: answer.Code, Model: model, AsOfMS: o.now().UnixMilli()}
 	}
@@ -871,13 +911,16 @@ func (o *stackOps) state() map[string]any {
 	now := o.now()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(now) {
+		o.dropForLeaseLocked()
+	}
 	accounts := []opsAccountState{}
 	for _, account := range o.accounts {
 		accounts = append(accounts, opsAccountState{ID: account.id, Vendor: account.vendor,
 			Limits: account.results[opLimits], Models: account.results[opModels], Test: account.test, Login: o.loginViewLocked(account, now)})
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
-	return map[string]any{"as_of_ms": o.now().UnixMilli(), "accounts": accounts}
+	return map[string]any{"as_of_ms": now.UnixMilli(), "accounts": accounts}
 }
 
 // serveAccountState is the relay listener's one own route: a GET without a body or a query. Everything else on the

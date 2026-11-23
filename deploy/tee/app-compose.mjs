@@ -39,7 +39,9 @@
 // `-peer-link /run/peerlink/peerlink.sock` (docs/design/relay-outbound-only.md §3.2) to match. The gate refuses a compose whose keys are missing, malformed or one key twice, whose LANE_PEERS and `-peer`
 // disagree, whose stack lane carries an entry's setting, or whose egress -max-body-bytes is below the lane's
 // BODY_PARSE_MAX_BYTES. In the default layout it also holds egress's `-route-max-body-bytes` to at least the lane's
-// largest form (LANE_FORM_MAX_BYTES, docs/design/standard-media-at-entry.md §2.3).
+// largest form (LANE_FORM_MAX_BYTES, docs/design/standard-media-at-entry.md §2.3), its `-max-inflight-body-bytes` to at
+// least the forms the lane holds together (LANE_FORM_HELD_MAX_BYTES) and 128 MiB beside them, and its `-memory-limit`
+// to at least that budget and 128 MiB.
 //
 // relay-outbound-only §3.2, §3.8 (PR 1.4): the default layout's third service is `peerlink`, gray-peerlink in the entry
 // role on its unix socket (PEERLINK_SOCKET), with no network (`network_mode: "none"`, the only service that may set
@@ -137,8 +139,11 @@
 //   that leak, which is the right trade for a confidential lane. D100/D101: `--target phala` omits it
 //   (Phala's schema refuses the member); the omission only reveals the encrypted disk's free-block
 //   layout, and the measured compose/TDX quote still bind everything that matters.
-// - `port_policy: { restrict_mode: true, ports: [{ port: 443 }] }`: the gateway forwards only 443 and
-//   rejects every other port at TCP accept.
+// - `port_policy` (`PORT_POLICY_PORTS`): `restrict_mode: true`, so the gateway forwards only the listed ports and
+//   rejects every other at TCP accept. The entry (default layout) lists 443, the lane, and 8090 (owner, 2026-11-23),
+//   the dstack guest agent's external listener, which serves the containers' logs that `public_logs` lets out
+//   (IMPLEMENTATION_NOTES.md §9.1: what the entry writes there, and the test that holds it). A relay stack VM lists
+//   none (relay-outbound-only O1).
 // - `gateway_enabled: true`: the dstack gateway routes to the app. **Only the TLS-passthrough forms
 //   are usable for this lane**: the `s` suffix (`<app-id>-443s.<base-domain>`) or a custom domain with
 //   a `_dstack-app-address` TXT record. The default `<app-id>-443.<base-domain>` host *terminates*
@@ -358,6 +363,21 @@ export const ROUTE_DENY_SUFFIX = "usefallback.com";
  */
 export const ROUTE_MAX_BODY_FLAG = "-route-max-body-bytes";
 export const ROUTE_MAX_BODY_BYTES_MAX = 64 * 1024 * 1024;
+/**
+ * docs/design/standard-media-at-entry.md §2.3, default layout only: what egress holds of request bodies at once
+ * (`-max-inflight-body-bytes`, past which it answers 503 egress_limit) and its Go runtime's soft memory limit
+ * (`-memory-limit`), each spelled so, once. The budget is at least the forms the lane holds together
+ * (LANE_FORM_HELD_MAX_BYTES, which no compose literal sets, so @gray/config's default is the lane's) and
+ * ENTRY_OTHER_BODY_BYTES beside them for the JSON bodies, peer hops and control pushes that share it: a form the lane
+ * admitted is never refused by its own egress. The limit is at least the budget and EGRESS_RUNTIME_BYTES. At most
+ * INFLIGHT_BODY_BYTES_MAX, above which egress refuses to start (deploy/tee/egress/config.go
+ * `maxMaxInflightBodyBytes`, 1 GiB).
+ */
+export const INFLIGHT_BODY_FLAG = "-max-inflight-body-bytes";
+export const INFLIGHT_BODY_BYTES_MAX = 1024 * 1024 * 1024;
+export const ENTRY_OTHER_BODY_BYTES = 128 * 1024 * 1024;
+export const MEMORY_LIMIT_FLAG = "-memory-limit";
+export const EGRESS_RUNTIME_BYTES = 128 * 1024 * 1024;
 const RELEASE_KEY = /^[0-9a-f]{64}$/;
 export const PEERS_ENV = "LANE_PEERS";
 export const PEER_FLAG = "-peer";
@@ -408,6 +428,13 @@ export const LAYOUTS = Object.freeze(["default", "stack"]);
  * to each other.
  */
 export const PUBLIC_LOGS = Object.freeze({ default: true, stack: false });
+/**
+ * The measured `port_policy.ports` per layout (the header's field list says why). The entry forwards 443 and, since the
+ * owner's decision of 2026-11-23, 8090: the dstack guest agent's external listener, which serves the containers' logs
+ * (`public_logs` above) to Phala Cloud's log reader. A relay stack VM takes no inbound connection
+ * (relay-outbound-only O1), and @gray/lane-compose's stack policy refuses any port.
+ */
+export const PORT_POLICY_PORTS = Object.freeze({ default: Object.freeze([443, 8090]), stack: Object.freeze([]) });
 
 export const STACK_COMPOSE_PATH = join(here, "compose.stack.yaml");
 export const STACK_APP_COMPOSE_PATH = join(here, "app-compose.stack.json");
@@ -1371,7 +1398,8 @@ export function phalaAppCompose(appCompose, kmsCaPubkey) {
   phala.features = gateway ? ["kms", "tproxy-net"] : ["kms"];
   phala.init_script = [];
   phala.key_provider_id = keyProviderId;
-  // D101: Phala adds its per-port proxy flag (false) to each port the app forwards (none in the stack layout).
+  // D101: Phala adds its per-port proxy flag (false) to each port the app forwards (443 and 8090 for the entry, none in
+  // the stack layout): no PROXY protocol header goes to the lane or to the guest agent, neither of which reads one.
   phala.port_policy = { restrict_mode: true, ports: appCompose.port_policy.ports.map((entry) => ({ ...entry, pp: false })) };
   phala.storage_fs = "zfs";
   phala.tproxy_enabled = gateway;
@@ -2042,6 +2070,46 @@ function checkEntryRoutes(services, label, problems) {
     problems.push(`${label}: egress.command must have ${ROUTE_DENY_SUFFIX_FLAG} ${ROUTE_DENY_SUFFIX} once, spelled so: no route row may point back at the deployment's own zone, and the lane's view denies exactly that one`);
   }
   checkEntryRouteBody(command, label, problems);
+  checkEntryBodyBudget(command, label, problems);
+}
+
+/** The whole-number value of `flag`, spelled so and once in `command`; a problem and null otherwise. */
+function onceBytes(command, flag, why, label, problems) {
+  const at = command.flatMap((arg, index) => (goFlag(flag.slice(1)).test(arg) ? [index] : []));
+  if (at.length !== 1 || command[at[0]] !== flag) {
+    problems.push(`${label}: egress.command must have ${flag} <bytes> once, spelled so (it has ${at.length === 0 ? "none" : at.map((index) => command[index]).join(", ")}): ${why}`);
+    return null;
+  }
+  const value = command[at[0] + 1];
+  if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+    problems.push(`${label}: egress's ${flag} is not a whole number of bytes`);
+    return null;
+  }
+  return Number(value);
+}
+
+/**
+ * docs/design/standard-media-at-entry.md §2.3, default layout: egress's in-flight body budget holds the lane's forms
+ * and the other bodies beside them, and its memory limit holds the budget and the runtime (INFLIGHT_BODY_FLAG's
+ * comment). Without the budget flag egress keeps 128 MiB, half the forms the lane admits, and answers the rest 503
+ * egress_limit after the lane admitted them.
+ */
+function checkEntryBodyBudget(command, label, problems) {
+  const held = SETTINGS.find((setting) => setting.name === "LANE_FORM_HELD_MAX_BYTES");
+  if (held === undefined || !/^[1-9][0-9]*$/.test(held.default ?? "")) throw new Error("@gray/config has no LANE_FORM_HELD_MAX_BYTES default");
+  const least = Number(held.default) + ENTRY_OTHER_BODY_BYTES;
+  const budget = onceBytes(command, INFLIGHT_BODY_FLAG, "egress holds the lane's forms and the other bodies beside them under it (docs/design/standard-media-at-entry.md §2.3)", label, problems);
+  if (budget !== null) {
+    if (budget < least) {
+      problems.push(`${label}: egress's ${INFLIGHT_BODY_FLAG} ${budget} is below ${least}, the forms the lane holds together (LANE_FORM_HELD_MAX_BYTES ${held.default}, @gray/config's default) and ${ENTRY_OTHER_BODY_BYTES} for the other bodies: egress would refuse a form the lane admitted`);
+    } else if (budget > INFLIGHT_BODY_BYTES_MAX) {
+      problems.push(`${label}: egress's ${INFLIGHT_BODY_FLAG} ${budget} is above ${INFLIGHT_BODY_BYTES_MAX}, the most egress takes (deploy/tee/egress/config.go): it would refuse to start`);
+    }
+  }
+  const limit = onceBytes(command, MEMORY_LIMIT_FLAG, "the Go runtime's soft memory limit, above the body budget", label, problems);
+  if (budget !== null && limit !== null && limit < budget + EGRESS_RUNTIME_BYTES) {
+    problems.push(`${label}: egress's ${MEMORY_LIMIT_FLAG} ${limit} is below ${budget + EGRESS_RUNTIME_BYTES}, its ${INFLIGHT_BODY_FLAG} and ${EGRESS_RUNTIME_BYTES} for the runtime: the collector would run without pause before the budget refused anything`);
+  }
 }
 
 /**
@@ -2359,8 +2427,8 @@ export function appComposeFor(composeText, options = {}) {
     no_instance_id: false,
     secure_time: true,
     storage_discard: false,
-    // relay-outbound-only O1: the stack forwards no port; the entry (default layout) its one 443.
-    port_policy: { restrict_mode: true, ports: spec.name === "stack" ? [] : [{ port: 443 }] },
+    // relay-outbound-only O1: the stack forwards no port; the entry (default layout) 443 and the guest agent's 8090.
+    port_policy: { restrict_mode: true, ports: PORT_POLICY_PORTS[spec.name].map((port) => ({ port })) },
     requirements: { platforms: ["dstack-tdx"] },
     pre_launch_script: preLaunchScript,
   };

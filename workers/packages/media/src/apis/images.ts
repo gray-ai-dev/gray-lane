@@ -16,7 +16,7 @@
 import { ApiError } from "@gray/errors";
 import { type Protocol, type UsageCounters, OPENAI_LINKING_FIELDS, ZERO_COUNTERS, rustTrim } from "@gray/protocol";
 import { type Json, type JsonObject, get, isObject } from "@gray/json";
-import { type Billed, apiError, billedBy, formText, invalid, jsonModel, metered, missing, optionalDetails, tokenUsage } from "./common.ts";
+import { type Billed, apiError, billedBy, formText, invalid, jsonModel, metered, missing, optionalCounter, optionalDetails, tokenUsage } from "./common.ts";
 import { isInlineImage } from "./egress.ts";
 import { type ApiRequest, type Bound, type FormPart, type Metered, type Received, partSize } from "./types.ts";
 
@@ -213,6 +213,18 @@ export function compatibleImagesBilled(api: ApiRequest, value: Json, billsUnits:
   return billedBy(() => ({ counters: imageTokenUsage(present), raw: present, unit: undefined }), present);
 }
 
+/** A non-empty `http:` or `https:` URL with an explicit host and no whitespace or control characters (within the 16 KiB vendor URL bound). */
+function isImageUrl(url: string): boolean {
+  if (url.length === 0 || url.length > 16 * 1024 || /[\s\x00-\x1f\x7f]/.test(url)) return false;
+  if (!/^https?:\/\/[^/?#]/i.test(url)) return false;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "https:" || parsed.protocol === "http:") && parsed.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether an image entry's `url` member is a link: a non-empty string. Some providers write the member with no value
  * (`null`, or an empty string) beside the inline image; that names no address, so it is no link.
@@ -272,19 +284,23 @@ export function entryImagesStreamBilled(api: ApiRequest, completed: readonly (Js
 
 /**
  * `delivered`: the number of images in an OpenAI images answer: a non-empty `data` list whose
- * every entry carries an inline image or, with no inline value, a non-empty `url`. An entry with a
- * non-empty `b64_json` is judged by it alone (the entry refuses a `url` beside it, `entryImagesBilled`).
+ * every entry is an object carrying an inline image or, with no inline value, a valid `http(s)`
+ * `url`. Non-string `b64_json` or `url` fields are rejected. An entry with a non-empty `b64_json`
+ * is judged by it alone (the entry refuses a `url` beside it, `entryImagesBilled`).
  */
 export function delivered(value: Json): bigint | undefined {
+  if (!isObject(value)) return undefined;
   const data = get(value, "data");
   if (!Array.isArray(data) || data.length === 0) return undefined;
   const image = (entry: Json) => {
-    const text = (key: string) => {
-      const v = get(entry, key);
-      return typeof v === "string" && v.length > 0 ? v : undefined;
-    };
-    const inline = text("b64_json");
-    return inline !== undefined ? isInlineImage(inline) : text("url") !== undefined;
+    if (!isObject(entry)) return false;
+    const rawB64 = get(entry, "b64_json");
+    const rawUrl = get(entry, "url");
+    if (rawB64 !== undefined && rawB64 !== null && typeof rawB64 !== "string") return false;
+    if (rawUrl !== undefined && rawUrl !== null && typeof rawUrl !== "string") return false;
+    const inline = typeof rawB64 === "string" && rawB64.length > 0 ? rawB64 : undefined;
+    if (inline !== undefined) return isInlineImage(inline);
+    return typeof rawUrl === "string" && isImageUrl(rawUrl);
   };
   return data.every(image) ? BigInt(data.length) : undefined;
 }
@@ -301,10 +317,17 @@ export function imageUnits(raw: Json | undefined, count: bigint): Metered {
   return { counters: { ...ZERO_COUNTERS, units: count }, raw: evidence, unit: "images" };
 }
 
-/** `image_token_usage`: gpt-image token usage; without `output_tokens_details` every output token is an image token. */
+/**
+ * `image_token_usage`: gpt-image token usage; without an `output_tokens_details` modality split
+ * (absent, null, empty `{}` or missing `image_tokens`/`audio_tokens`), every output token is an
+ * image token so it never falls back to the cheaper text output rate.
+ */
 export function imageTokenUsage(usage: Json): UsageCounters {
   const counters = tokenUsage(usage, "input_tokens", "output_tokens");
-  if (optionalDetails(usage, "output_tokens_details") === undefined) return { ...counters, image_output_tokens: counters.output_tokens };
+  const details = optionalDetails(usage, "output_tokens_details");
+  if (details === undefined || (optionalCounter(details, "image_tokens") === undefined && optionalCounter(details, "audio_tokens") === undefined)) {
+    return { ...counters, image_output_tokens: counters.output_tokens };
+  }
   return counters;
 }
 

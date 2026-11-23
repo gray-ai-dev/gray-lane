@@ -1,11 +1,34 @@
 /**
  * Tool calls as (name, arguments) for comparing the inspected upstream calls with what the client
  * decoder reads from the translated bytes (crates/gray-gateway/src/translation/mod.rs, `CallSet`).
- * Arguments text is compared as JSON when it parses (serde_json's `from_str`: of two equal keys
- * the last wins); empty arguments equal `{}`.
+ * Arguments text is compared strictly as JSON when it parses (`parseStrict`: duplicate keys are
+ * refused so ambiguous objects never collapse last-wins), and non-JSON raw strings carry a
+ * disjoint tag so they never collide with valid JSON string literals; empty arguments equal `{}`.
  */
-import { type Json, compareUtf8, parseSerde, toJsonString } from "@gray/json";
+import { type Json, compareUtf8, parseStrict, toJsonString } from "@gray/json";
 import { PROJECTION_NODE_BYTES, rustTrim, stringHeapBytes } from "@gray/protocol";
+
+/**
+ * Canonical comparison key for one tool call's arguments:
+ * - `null` and blank/whitespace-only strings equal the empty JSON object (`j:{}`);
+ * - strings that parse strictly as JSON (duplicate keys refused) use their canonical JSON form (`j:...`);
+ * - non-string JSON values use their canonical JSON form (`j:...`);
+ * - strings that are not strict JSON (malformed JSON, trailing tokens, or objects with duplicate keys)
+ *   keep their raw text under a disjoint prefix (`r:...`), so they neither collapse duplicate keys
+ *   nor collide with valid JSON string literals (e.g. `"\"x\""` vs `"x"`).
+ */
+export function canonicalArguments(args: Json): string {
+  if (args === null) return "j:{}";
+  if (typeof args === "string") {
+    if (rustTrim(args) === "") return "j:{}";
+    try {
+      return `j:${toJsonString(parseStrict(args))}`;
+    } catch {
+      return `r:${args}`;
+    }
+  }
+  return `j:${toJsonString(args)}`;
+}
 
 export class CallSet {
   private readonly calls: Array<readonly [string, string]> = [];
@@ -21,23 +44,7 @@ export class CallSet {
   }
 
   push(name: string, args: Json): void {
-    let value: Json;
-    if (args === null) {
-      value = {};
-    } else if (typeof args === "string") {
-      if (rustTrim(args) === "") {
-        value = {};
-      } else {
-        try {
-          value = parseSerde(args);
-        } catch {
-          value = args;
-        }
-      }
-    } else {
-      value = args;
-    }
-    const text = toJsonString(value);
+    const text = canonicalArguments(args);
     this.calls.push([name, text]);
     this.heap += PROJECTION_NODE_BYTES.item + PROJECTION_NODE_BYTES.array + 2 * PROJECTION_NODE_BYTES.item + PROJECTION_NODE_BYTES.string + stringHeapBytes(text);
   }

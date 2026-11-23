@@ -5,7 +5,7 @@
  */
 import { ApiError } from "@gray/errors";
 import { type Protocol, type UsageCounters, ZERO_COUNTERS, billingUnit, countsTokens, isMultipart, nestedCounter, textInputTokens, textOutputTokens } from "@gray/protocol";
-import { type Json, type JsonObject, get } from "@gray/json";
+import { type Json, type JsonObject, get, isObject } from "@gray/json";
 import { type Bound, type FormPart, type MediaRoute, type Metered, partText } from "./types.ts";
 
 /** A 400 with this code. */
@@ -75,9 +75,11 @@ export function missing(reason: string, raw: Json | null = null): Billed {
 
 /**
  * The counters of `read`, or the missing usage when a counter it is billed on was not reported
- * (`UsageUnreported`); any other usage error is a malformed usage, 502 `billing_usage_invalid`.
+ * (`UsageUnreported`); any other usage error (including a non-object `raw`) is a malformed usage,
+ * 502 `billing_usage_invalid`.
  */
 export function billedBy(read: () => Metered, raw: Json): Billed {
+  if (typeof raw !== "object" || raw === null) throw apiError(502, "billing_usage_invalid");
   try {
     return metered(read());
   } catch (error) {
@@ -119,6 +121,9 @@ function nested(raw: Json, details: string, key: string): bigint | undefined {
  * malformed or inconsistent.
  */
 export function tokenUsage(usage: Json, input: string, output: string): UsageCounters {
+  // A non-object `usage` (array, string, number, boolean) is malformed (`UsageError`, 502),
+  // never unreported (`UsageUnreported`, billed free).
+  if (!isObject(usage)) throw new UsageError(`usage.${input} missing`);
   const count = (key: string) => {
     const n = optionalCounter(usage, key);
     if (n === undefined) throw new UsageUnreported(`usage.${key} missing`);

@@ -821,22 +821,29 @@ export class AccountShard {
     const clean = written !== undefined && written.busy === 0 && written.counted !== 1;
     const ceiling = written?.countedUpTo !== undefined && written.countedUpTo.epoch === written.epoch ? written.countedUpTo.keys : undefined;
     const window = rpmWindowStart(now);
-    for (const [pool, l] of this.pools.live) {
+    const keys = new Set<string>();
+    for (const pool of this.pools.live.keys()) {
       const kind = parsePoolId(pool);
-      if (kind?.kind !== "rpm" || l.remaining <= 0) continue;
-      const stored = this.durable.minutes?.[kind.keyId];
-      const upTo = ceiling?.[kind.keyId];
-      const count = clean
-        ? stored !== undefined && stored.window === window
-          ? Math.min(stored.count, l.remaining)
-          : 0
-        : ceiling !== undefined
-          ? upTo !== undefined && upTo.window === window
-            ? Math.min(upTo.upTo, l.remaining)
-            : 0
-          : l.remaining;
-      if (count > 0) this.minuteCounts.set(kind.keyId, { window, count });
-      if (!clean && ceiling === undefined) this.restartBlind.set(kind.keyId, window);
+      if (kind?.kind === "rpm") keys.add(kind.keyId);
+    }
+    for (const keyId of Object.keys(this.durable.minutes ?? {})) keys.add(keyId);
+    for (const keyId of Object.keys(ceiling ?? {})) keys.add(keyId);
+    for (const keyId of keys) {
+      const rem = this.pools.live.get(rpmPoolId(keyId))?.remaining ?? 0;
+      const stored = this.durable.minutes?.[keyId];
+      const upTo = ceiling?.[keyId];
+      const storedCount = stored !== undefined && stored.window === window ? stored.count : 0;
+      const upToCount = upTo !== undefined && upTo.window === window ? upTo.upTo : 0;
+      let count: number;
+      if (clean) {
+        count = storedCount;
+      } else if (ceiling !== undefined) {
+        count = Math.max(storedCount, upToCount);
+      } else {
+        count = Math.max(storedCount, rem);
+        if (rem > 0) this.restartBlind.set(keyId, window);
+      }
+      if (count > 0) this.minuteCounts.set(keyId, { window, count });
     }
     // The new epoch is written before any token of it exists, so `epoch.seq` never repeats.
     this.writeLease();

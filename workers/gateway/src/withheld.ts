@@ -50,12 +50,22 @@ export function withheldBilling(end: WithheldEnd): { readonly billing: "released
 
 /**
  * Says how a resolution ended: `withheld_hold_resolved` (a late charge as a warning: gray-jobs refunds it), or the
- * `settle_in_doubt` alert when neither the release nor the settlement answered (the hold is left to the shard).
+ * `settle_in_doubt` alert when neither the release nor the settlement answered (the hold is left to the shard). `lane`:
+ * the line is the confidential entry's, whose container log is readable outside the VM
+ * (deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs"), so it names the shard's region and index, never its workspace.
  */
-export function logWithheld(end: WithheldEnd, requestId: string, shard: unknown): void {
+export function logWithheld(end: WithheldEnd, requestId: string, shard: unknown, lane = false): void {
   const fields = end.kind === "charged" ? { amount: end.amount } : end.kind === "closed" ? { code: end.code } : end.kind === "unresolved" ? { release: end.release } : {};
-  if (end.kind === "unresolved") console.error(JSON.stringify({ level: "alert", event: "settle_in_doubt", request_id: requestId, shard, ...fields }));
-  else console.log(JSON.stringify({ level: end.kind === "charged" ? "warn" : "info", event: "withheld_hold_resolved", request_id: requestId, shard, outcome: end.kind, ...fields }));
+  const where = lane ? shardPlace(shard) : { shard };
+  if (end.kind === "unresolved") console.error(JSON.stringify({ level: "alert", event: "settle_in_doubt", request_id: requestId, ...where, ...fields }));
+  else console.log(JSON.stringify({ level: end.kind === "charged" ? "warn" : "info", event: "withheld_hold_resolved", request_id: requestId, ...where, outcome: end.kind, ...fields }));
+}
+
+/** A shard address's region and index, without its workspace. */
+function shardPlace(shard: unknown): { readonly shard_region?: unknown; readonly shard_index?: unknown } {
+  if (shard === null || typeof shard !== "object") return {};
+  const { region, index } = shard as { readonly region?: unknown; readonly index?: unknown };
+  return { shard_region: typeof region === "string" ? region : null, shard_index: typeof index === "number" ? index : null };
 }
 
 /**

@@ -56,13 +56,15 @@ type stackHealth struct {
 	// modelEntries counts model-scope entries, modelPerAccount them by account (S38's bounds).
 	modelEntries    int
 	modelPerAccount map[string]int
-	// tableHashes are the account table's credentials by account (S15), for S40's credential-change clear.
-	tableHashes map[string][]string
+	// tableHashes and tableCredGens are the account table's credentials and generations by account (S15), for S40's credential-change clear.
+	tableHashes   map[string][]string
+	tableCredGens map[string][]uint64
 }
 
 func newStackHealth(now func() time.Time) *stackHealth {
 	return &stackHealth{now: now, startedMS: now().UnixMilli(), mode: coolingOff, accounts: map[string]*accountHealth{},
-		entries: map[coolingKey]*coolingEntry{}, modelPerAccount: map[string]int{}, tableHashes: map[string][]string{}}
+		entries: map[coolingKey]*coolingEntry{}, modelPerAccount: map[string]int{},
+		tableHashes: map[string][]string{}, tableCredGens: map[string][]uint64{}}
 }
 
 // accountHealth is one account's attempts in flight, their peak per minute, and its latest windows by key.
@@ -229,6 +231,8 @@ type stackHealthCooling struct {
 	// Clears is the entry's clears (S38), beyond S37's list: S40's restore entry carries it, so the entry passes
 	// it on in its report and the console can give it back exactly.
 	Clears []string `json:"clears"`
+	// CredGen is the TEE-owned credential generation (AF-06.3), emitted only when Clears includes "credential".
+	CredGen *uint64 `json:"cred_gen,omitempty"`
 }
 
 // snapshot is the S37 answer: the accounts of the table (tableIDs) and any others with an entry, a window or an
@@ -260,8 +264,13 @@ func (h *stackHealth) snapshot(tableIDs []string) stackHealthDocument {
 	byAccount := map[string][]stackHealthCooling{}
 	for _, key := range h.sortedKeysLocked() {
 		e := h.entries[key]
-		byAccount[key.account] = append(byAccount[key.account], stackHealthCooling{Model: modelOf(e.model), Kind: e.kind, UntilMS: e.until(),
-			RuleID: e.ruleID, Class: e.class, VendorCode: e.vendorCode, SetMS: e.setMS, Gen: e.gen, Observed: e.observed, Clears: e.clears.words()})
+		c := stackHealthCooling{Model: modelOf(e.model), Kind: e.kind, UntilMS: e.until(),
+			RuleID: e.ruleID, Class: e.class, VendorCode: e.vendorCode, SetMS: e.setMS, Gen: e.gen, Observed: e.observed, Clears: e.clears.words()}
+		if e.clears.credential && e.credGen > 0 {
+			cg := e.credGen
+			c.CredGen = &cg
+		}
+		byAccount[key.account] = append(byAccount[key.account], c)
 	}
 	minute := floorMinute(nowMS)
 	for _, id := range ids {
@@ -352,7 +361,8 @@ func (s *server) serveCooling(rec *responseRecorder, r *http.Request, entry *req
 		refuse(errMethodRefused)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)
@@ -382,10 +392,10 @@ func (s *server) serveCooling(rec *responseRecorder, r *http.Request, entry *req
 }
 
 // tableChanged takes a new account table (S40's credential-change clear); the stack's lock is held.
-func (h *stackHealth) tableChanged(hashes map[string][]string) {
+func (h *stackHealth) tableChanged(hashes map[string][]string, credGens map[string][]uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.tableChangedLocked(hashes)
+	h.tableChangedLocked(hashes, credGens)
 }
 
 // accountHashes groups an account table's credentials by account, each account's sorted.
@@ -395,4 +405,15 @@ func accountHashes(accounts map[string]stackAccount) map[string][]string {
 		hashes[account.id] = appendUnique(hashes[account.id], hash)
 	}
 	return hashes
+}
+
+// accountCredGens groups an account table's non-zero credential generations by account, each account's sorted.
+func accountCredGens(accounts map[string]stackAccount) map[string][]uint64 {
+	gens := map[string][]uint64{}
+	for _, account := range accounts {
+		if account.credGen > 0 {
+			gens[account.id] = appendUniqueUint64(gens[account.id], account.credGen)
+		}
+	}
+	return gens
 }

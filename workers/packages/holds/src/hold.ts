@@ -144,7 +144,7 @@ export function holdBounds(hold: Hold): HoldBounds | undefined {
   let inputCost: bigint | undefined;
   let inputKind: InputKind;
   if (hold.inputTokens !== undefined) {
-    const own = priceTokens(hold.inputTokens, bound.requestInput);
+    const own = priceTokens(mulU64(hold.inputTokens, passes), bound.requestInput);
     if (own === undefined) return undefined;
     const hidden = priceTokens(mulU64(hold.promptAllowance, passes), bound.input);
     if (hidden === undefined) return undefined;
@@ -175,8 +175,9 @@ export function holdBounds(hold: Hold): HoldBounds | undefined {
 export function expectedInputCost(hold: Hold, expectation: Expectation, boundInput: bigint): bigint {
   const tokens = expectation.inputTokens;
   if (tokens === undefined) return boundInput;
-  const warm = min(expectation.warmTokens, tokens);
-  const sum = warm * expectation.readRate + (tokens - warm) * hold.bound.requestInput;
+  const total = mulU64(tokens, hold.passes);
+  const warm = min(expectation.warmTokens, min(tokens, total));
+  const sum = warm * expectation.readRate + (total - warm) * hold.bound.requestInput;
   const ownCeil = sum > U128_MAX ? undefined : divCeil(sum, 1_000_000n);
   const own = ownCeil !== undefined && ownCeil <= I64_MAX ? ownCeil : undefined;
   const hidden = priceTokens(mulU64(hold.promptAllowance, hold.passes), hold.bound.input);

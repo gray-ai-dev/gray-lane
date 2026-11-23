@@ -62,17 +62,31 @@ export function protocolTitle(protocol: Protocol): string {
 }
 
 /**
- * 413 `request_body_limit` for a request whose translation for `upstream` is larger than that API
- * takes (`translated_body_refusal`): its client's API took the body, and the API that would serve it
- * would not.
+ * Default serialized size ceiling for a translated upstream request body (4 MiB, matching
+ * `@gray/config`'s `BODY_PARSE_MAX_BYTES` default): a client body under 4 MiB can expand past
+ * 4 MiB when translated into another protocol, which must still be refused with 413
+ * `request_body_limit` before serializing or forwarding inside a Worker isolate.
  */
-export function translatedBodyRefusal(upstream: Protocol, translatedBytes: bigint): ApiError {
-  const limit = requestLimit(upstream);
+export const TRANSLATED_BODY_MAX_BYTES = 4n * 1024n * 1024n;
+
+/**
+ * 413 `request_body_limit` for a request whose translation for `upstream` exceeds either Gray's
+ * translated body ceiling (`maxBodyBytes`) or that API's own request limit (`translated_body_refusal`).
+ */
+export function translatedBodyRefusal(upstream: Protocol, translatedBytes: bigint, maxBodyBytes?: bigint): ApiError {
+  const apiLimit = requestLimit(upstream);
+  if (maxBodyBytes !== undefined && maxBodyBytes < apiLimit) {
+    return new ApiError(413, "request_body_limit")
+      .withMessage(
+        `This model is served through ${protocolTitle(upstream)}: translated for it, the request is ${translatedBytes} bytes, larger than ${maxBodyBytes} bytes, Gray's translated request body limit. Send a smaller request.`,
+      )
+      .withMeta("limit_bytes", maxBodyBytes);
+  }
   return new ApiError(413, "request_body_limit")
     .withMessage(
-      `This model is served through ${protocolTitle(upstream)}: translated for it, the request is ${translatedBytes} bytes, larger than ${limit} bytes, ${requestLimitSource(upstream)}. Send a smaller request.`,
+      `This model is served through ${protocolTitle(upstream)}: translated for it, the request is ${translatedBytes} bytes, larger than ${apiLimit} bytes, ${requestLimitSource(upstream)}. Send a smaller request.`,
     )
-    .withMeta("limit_bytes", limit);
+    .withMeta("limit_bytes", apiLimit);
 }
 
 const utf8 = new TextEncoder();
@@ -207,6 +221,11 @@ export interface SelectOptions<R, T> {
   readonly upstreams: readonly Protocol[];
   /** The rule that listed `upstreams` (`translationTargets`); `operator` when left out. */
   readonly rule?: Rule;
+  /**
+   * Maximum serialized byte length of the translated upstream body (defaults to
+   * `TRANSLATED_BODY_MAX_BYTES`, 4 MiB). The upstream API's own smaller `requestLimit` still applies.
+   */
+  readonly maxBodyBytes?: bigint;
   /** The live routes of the model under an upstream protocol (unexpired, same requested model). */
   routes(upstream: Protocol): readonly R[];
   /**
@@ -265,11 +284,15 @@ export async function selectTranslation<R, T>(o: SelectOptions<R, T>): Promise<S
       failed ??= new ApiError(400, "translation_invalid_request");
       continue;
     }
-    // The upstream executes the translated request, so its API's body size applies. How many tools
-    // it declares is the provider's to decide: Gray forwards the request and passes a refusal on.
+    // Both the gateway's translated-body ceiling (4 MiB by default) and the upstream API's own
+    // request size limit apply. How many tools the request declares is the provider's to decide:
+    // Gray forwards the request and passes a refusal on.
     const bodyBytes = jsonLen(translated.body);
-    if (bodyBytes > requestLimit(upstream)) {
-      failed ??= translatedBodyRefusal(upstream, bodyBytes);
+    const apiLimit = requestLimit(upstream);
+    const ceiling = o.maxBodyBytes ?? TRANSLATED_BODY_MAX_BYTES;
+    const limit = apiLimit < ceiling ? apiLimit : ceiling;
+    if (bodyBytes > limit) {
+      failed ??= translatedBodyRefusal(upstream, bodyBytes, ceiling);
       continue;
     }
     const translation = new Translation(o.client, upstream, translated, bodyBytes, contract);

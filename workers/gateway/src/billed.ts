@@ -1,5 +1,5 @@
 import type { BilledInput } from "@gray/holds";
-import { type Json, asStr, get, isArray, pointer } from "@gray/json";
+import { type Json, asStr, get, isArray, isObject, pointer } from "@gray/json";
 import { type CanonicalRequest, anthropicBlockBreakpoint, anthropicCacheControls } from "@gray/protocol";
 
 /**
@@ -33,7 +33,10 @@ export function billedInputOf(request: CanonicalRequest, body: Json): BilledInpu
     const value = get(body, key);
     return value !== undefined && value !== null;
   };
-  const continuation = stated("previous_response_id") || stated("conversation");
+  const hasItemReference =
+    protocol === "open_ai_responses" &&
+    items(body, "input").some((entry) => isObject(entry) && asStr(get(entry, "type")) === "item_reference");
+  const continuation = stated("previous_response_id") || stated("conversation") || hasItemReference;
   const referenced =
     (protocol === "open_ai_chat" && items(body, "messages").some((m) => notNull(get(m, "audio")))) || (protocol === "open_ai_responses" && stated("prompt"));
   const geminiFunctionParts =

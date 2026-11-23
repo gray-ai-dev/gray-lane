@@ -48,9 +48,10 @@ export function nativeHeaders(protocol: Protocol, input: Headers): [string, stri
  */
 export const DEFAULT_ACCEPT = "*/*";
 
-/** `headers`, given the server client's Accept when they name none (`DEFAULT_ACCEPT`); the same object. */
+/** `headers`, given the server client's Accept when they name none or only whitespace (`DEFAULT_ACCEPT`); the same object. */
 export function withDefaultAccept(headers: Headers): Headers {
-  if (!headers.has("accept")) headers.set("accept", DEFAULT_ACCEPT);
+  const accept = headers.get("accept");
+  if (accept === null || accept.trim() === "") headers.set("accept", DEFAULT_ACCEPT);
   return headers;
 }
 

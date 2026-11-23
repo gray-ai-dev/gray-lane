@@ -794,15 +794,19 @@ export class AccountRoot {
   }
 
   /**
-   * What each shard had been granted in a pool when the root last recalled it (memory only): a shard
-   * is recalled again only after a new grant, so refusals at a spent limit do not recall the same
-   * emptied shards again and again. A share of requests per minute is also recalled again in a new
-   * minute: what a shard admitted in the last one is free again (shard.ts `dirty`).
+   * What each shard had been granted in a pool when the root last recalled it and until when another
+   * recall on that same mark is suppressed (memory only): a new grant or a new minute recalls at
+   * once, and once the cooldown passes the root recalls again so allowance freed when open holds
+   * release is not stranded while avoiding recall storms during long holds.
    */
-  private readonly recalledAt = new Map<string, string>();
+  private readonly recalledAt = new Map<string, { readonly mark: string; readonly until: number }>();
 
   private recallMark(pool: PoolId, granted: number): string {
     return isSharePool(pool) ? `${granted}@${rpmWindowStart(this.deps.clock())}` : `${granted}`;
+  }
+
+  private recallCooldownMs(): number {
+    return Math.min(this.settings.versionCheckMs, 2_000);
   }
 
   /**
@@ -814,19 +818,26 @@ export class AccountRoot {
    * of them did not answer for.
    */
   private async recall(needy: ShardAddress, pools: readonly PoolId[]): Promise<Recalled> {
+    const now = this.deps.clock();
     const skip = shardName(needy);
     const targets: { readonly shard: ShardAddress; readonly pools: PoolId[] }[] = [];
     for (const [n, r] of this.leases) {
       if (n === skip || r.suspect || r.handover) continue;
       const mine = pools.filter((pool) => {
         const p = r.pools[pool];
-        return p !== undefined && p.granted - p.returned - p.used > 0 && this.recallMark(pool, p.granted) !== this.recalledAt.get(`${n}\n${pool}`);
+        if (p === undefined || p.granted - p.returned - p.used <= 0) return false;
+        const prev = this.recalledAt.get(`${n}\n${pool}`);
+        return prev === undefined || prev.mark !== this.recallMark(pool, p.granted) || now >= prev.until;
       });
       if (mine.length > 0) targets.push({ shard: r.shard, pools: mine });
     }
     if (targets.length === 0) return { back: false, unanswered: new Set() };
+    const until = now + this.recallCooldownMs();
     for (const t of targets) {
-      for (const pool of t.pools) this.recalledAt.set(`${shardName(t.shard)}\n${pool}`, this.recallMark(pool, this.leases.get(shardName(t.shard))!.pools[pool]!.granted));
+      const name = shardName(t.shard);
+      for (const pool of t.pools) {
+        this.recalledAt.set(`${name}\n${pool}`, { mark: this.recallMark(pool, this.leases.get(name)!.pools[pool]!.granted), until });
+      }
     }
     const wait = Math.floor(this.settings.rootCallTimeoutMs / 2);
     const reports = await Promise.allSettled(targets.map((t) => withTimeout(Promise.resolve().then(() => this.deps.shard(t.shard).recall({ pools: t.pools })), wait, this.deps.recallTimers)));
@@ -834,21 +845,23 @@ export class AccountRoot {
     const unanswered = new Set<PoolId>();
     reports.forEach((r, i) => {
       const t = targets[i]!;
+      const name = shardName(t.shard);
       if (r.status === "rejected") {
         // Asked again by the next exchange that waits (a waiting shard asks at most once a version check).
         for (const pool of t.pools) {
-          this.recalledAt.delete(`${shardName(t.shard)}\n${pool}`);
+          this.recalledAt.delete(`${name}\n${pool}`);
           unanswered.add(pool);
         }
-        this.log({ level: "warn", event: "recall_failed", shard: shardName(t.shard), pools: t.pools, message: String(r.reason) });
+        this.log({ level: "warn", event: "recall_failed", shard: name, pools: t.pools, message: String(r.reason) });
         return;
       }
       try {
         const report = parseRecallReport(r.value);
-        this.refusedCheckpoints(shardName(t.shard), "recall", report.chargeCheckpointsRefused);
+        this.refusedCheckpoints(name, "recall", report.chargeCheckpointsRefused);
         if (this.recordRecall(t.shard, report)) back = true;
       } catch (err) {
-        this.log({ level: "alert", event: "recall_report_refused", shard: shardName(t.shard), message: String(err) });
+        for (const pool of t.pools) this.recalledAt.delete(`${name}\n${pool}`);
+        this.log({ level: "alert", event: "recall_report_refused", shard: name, message: String(err) });
       }
     });
     this.log({ level: "info", event: "allowance_recalled", for: skip, shards: targets.length, back });

@@ -134,6 +134,8 @@ export function laneFetch(binding: Partial<LaneEgressBinding> | undefined): (inp
   };
 }
 
+const DISABLED_BUCKET = Symbol("gray.lane.disabled_bucket");
+
 /** The content bucket stub: every method throws, and the lane is asserted never to reach it (B3). */
 export class LaneContentDisabled extends Error {
   override readonly name = "LaneContentDisabled";
@@ -144,11 +146,16 @@ export class LaneContentDisabled extends Error {
   }
 }
 
-function disabledBucket(): ContentBucket {
+/** Whether `bucket` is the lane's disabled content bucket stub (no spool storage is available). */
+export function isDisabledBucket(bucket: ContentBucket | undefined): boolean {
+  return bucket !== undefined && (bucket as unknown as Record<symbol, unknown>)[DISABLED_BUCKET] === true;
+}
+
+export function disabledBucket(): ContentBucket {
   const refuse = (): never => {
     throw new LaneContentDisabled();
   };
-  return { get: refuse, head: refuse, put: refuse, delete: refuse, createMultipartUpload: refuse } as unknown as ContentBucket;
+  return { [DISABLED_BUCKET]: true, get: refuse, head: refuse, put: refuse, delete: refuse, createMultipartUpload: refuse } as unknown as ContentBucket;
 }
 
 /** The members of a lane request that outlive no request: the lane process's singletons. */

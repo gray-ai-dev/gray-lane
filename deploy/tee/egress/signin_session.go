@@ -285,7 +285,8 @@ func (s *server) serveSignInControl(rec *responseRecorder, r *http.Request, entr
 	}
 	var body []byte
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
-		read, readBytes, err := readRequestBody(r, signInControlMax)
+		read, readBytes, release, err := s.readRequestBody(r, signInControlMax)
+		defer release()
 		entry.RequestBytes = readBytes
 		if code := bodyReadCode(err); code != "" {
 			refuse(code)
@@ -750,9 +751,14 @@ func (s *server) serveLoginPrompt(rec *responseRecorder, r *http.Request, entry 
 		refuse(errLoginRequestBound)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, signInPromptBodyMax)
+	body, readBytes, release, err := s.readRequestBody(r, signInPromptBodyMax)
+	defer release()
 	entry.RequestBytes = readBytes
 	if err != nil {
+		if errors.Is(err, errBodyBudgetExceeded) {
+			refuse(errEgressLimit)
+			return
+		}
 		refuse(errLoginBodyTooLarge)
 		return
 	}

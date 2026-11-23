@@ -38,6 +38,19 @@ var stackProtocolRoutes = map[string]map[string]string{
 	"open_ai_responses": {"openai": "/openai/v1/responses", "chatgpt_codex": "/chatgpt/backend-api/codex/responses"},
 }
 
+// stackExpectedRoute returns the one raw path a registered rid may call: /anthropic/v1/messages/count_tokens
+// only when countTokens is true for Anthropic Messages, and stackProtocolRoutes[protocol][vendor] when false.
+// This keeps Messages and count_tokens rids mutually isolated in both directions.
+func stackExpectedRoute(protocol, vendor string, countTokens bool) string {
+	if countTokens {
+		if protocol == protocolAnthropicMessages && vendor == "anthropic" {
+			return "/anthropic/v1/messages/count_tokens"
+		}
+		return ""
+	}
+	return stackProtocolRoutes[protocol][vendor]
+}
+
 // relayCall runs S16's checks, then the vendor call exactly as a direct one (pinned route, system roots, the
 // account's proxy). Every call that names a live rid is numbered; a numbered refusal is a `refused` record and
 // an accepted call an `attempt` record (S17). A refusal before the rid is known, or past attempts_max, writes
@@ -101,11 +114,17 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		}
 	}
 
+	// Strip hop-by-hop headers BEFORE extracting credentials or injecting Chatgpt-Account-Id, so a
+	// malicious relay cannot use Connection header smuggling to strip auth headers after validation.
+	// Protected auth headers are also immune to Connection stripping in stripHopByHop.
+	relayHeader := outboundHeader(r.Header)
+	relayHeader.Del(stackRequestHeader)
+
 	// S15, S38: the credential names the account, and its header form the credential type, which must be the
-	// row's when the row names one. A Codex account id egress takes from the token is in r.Header from here on.
-	credential, ok := stackCredential(plan.route, r.Header)
+	// row's when the row names one. A Codex account id egress takes from the token is in relayHeader from here on.
+	credential, ok := stackCredential(plan.route, relayHeader)
 	account, known := s.stack.account(credential)
-	callType := stackCallCredentialType(plan.route.name, r.Header)
+	callType := stackCallCredentialType(plan.route.name, relayHeader)
 	if !ok || !known || stackVendors[account.vendor] != plan.route.name || (account.credentialType != "" && account.credentialType != callType) {
 		refuse(errStackCredentialUnknown, "", "")
 		return
@@ -125,7 +144,8 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	}
 	// The request target is the registered one (S16, S32): the rid's vendor, POST on its protocol's path, and
 	// the client's query byte for byte.
-	if account.vendor != req.vendor || r.Method != http.MethodPost || rawPathOf(r) != stackProtocolRoutes[req.protocol][req.vendor] ||
+	expectedRoute := stackExpectedRoute(req.protocol, req.vendor, req.countTokens)
+	if account.vendor != req.vendor || r.Method != http.MethodPost || expectedRoute == "" || rawPathOf(r) != expectedRoute ||
 		r.URL.RawQuery != req.query {
 		refuse(errStackRouteRefused, "", "")
 		return
@@ -140,6 +160,8 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	// buffer and a direct call's HTTP/2 window (relayCallBytes), and its body.
 	hold := stackHold{budget: &s.stack.budget}
 	defer hold.free()
+	bHold := bodyHold{budget: &s.bodyBudget}
+	defer bHold.free()
 	// A call in a vendor tunnel whose hello offers HTTP/2 may get an HTTP/2 vendor connection through a proxy too.
 	// Its window is the one the vendor connection announces: relayStreamWindow on the direct transport, the
 	// learned preface's on a mirrored HTTP/2 connection (mirrorStreamWindow).
@@ -151,12 +173,10 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	if hello != nil && hello.h2 {
 		window = max(window, mirrorStreamWindow(s.cfg, hello))
 	}
-	if !hold.grow(headerBytes(r.Header) + relayCallBytes(window)) {
+	if !hold.grow(max(headerBytes(r.Header), headerBytes(relayHeader)) + relayCallBytes(window)) {
 		refuse(errEgressLimit, "", "")
 		return
 	}
-	relayHeader := outboundHeader(r.Header)
-	relayHeader.Del(stackRequestHeader)
 	oauth := plan.route.name == "/anthropic" && callType == "oauth_access_token"
 	// The relay's header values reach the vendor, recorded (stack_changes.go), for every customer; `relay_changes`
 	// decides the body's rule, and whether the customer's own behaviour headers may change (stack_headers.go).
@@ -165,14 +185,19 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		refuse(errStackHeaderRefused, "", refusedHeaderName(name))
 		return
 	}
-	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &hold)
+	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &hold, &bHold)
 	entry.RequestBytes = readBytes
-	if errors.Is(err, errStackBudget) {
+	if errors.Is(err, errStackBudget) || errors.Is(err, errBodyBudgetExceeded) {
 		refuse(errEgressLimit, "", "")
 		return
 	}
 	if code := bodyReadCode(err); code != "" {
 		refuse(code, "", "")
+		return
+	}
+	// Re-check the KMS lease after reading the relay body, before accepting an attempt or dialing the vendor.
+	if s.stack.leaseEnded() {
+		refuse(errStackCredentialUnknown, "", "")
 		return
 	}
 	answer, refusedPath, err := s.stack.check(req.protocol, req.received, body, req.rewrite)
@@ -235,14 +260,21 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 	// docs/design/relay-debug-sharing.md: the body as the vendor gets it, for a registration that asked for it.
 	req.recordForwarded(attempt.n, body)
 	s.stack.health.relayChanges(accepted.Changed, len(headerChanges) > 0)
-	// The vendor call ends with the relay's connection or with the rid, whichever ends first.
-	ctx, cancel := context.WithCancel(r.Context())
+	// The vendor call ends with the relay's connection, with the rid, or with the KMS lease, whichever ends first.
+	ctx, cancel := s.stack.lease.withContext(r.Context())
 	defer cancel()
 	stop := context.AfterFunc(req.ctx, cancel)
 	defer stop()
 	observer := &attemptObserver{stack: s.stack, req: req, attempt: attempt, account: account, credHash: credential, route: plan.route,
 		relay: r.Context(), hold: stackHold{budget: &s.stack.budget}}
-	entry.Error = s.forward(ctx, s.relayClient, rec, r.Method, plan, header, body, observer)
+	defer func() {
+		if observer.decoder != nil {
+			observer.decoder.close()
+			observer.decoder = nil
+		}
+		observer.hold.free()
+	}()
+	entry.Error = s.forward(ctx, s.relayClient, rec, r.Method, plan, header, body, nil, observer)
 	if entry.Error == errEgressLimit || entry.Error == errResponseRead {
 		// S17: an answer egress could not hold or read whole is cut, not ended: the connection closes (in an HTTP/2
 		// tunnel, the call's stream is reset) without the response's end, so the relay cannot take what it got for the
@@ -535,8 +567,9 @@ func (o *attemptObserver) response(status int, header http.Header) bool {
 		return false
 	}
 	stream := streamAnswer(o.route, status, header)
+	streamRefused := o.req.countTokens && stream
 	codings, known := stackResponseCodings(header)
-	if known {
+	if known && !streamRefused {
 		if stream {
 			o.digester = o.stack.newDigester()
 		} else {
@@ -550,9 +583,9 @@ func (o *attemptObserver) response(status int, header http.Header) bool {
 	if !o.req.record(feedResponse{T: "response", N: o.attempt.n, Status: status, Stream: stream, Headers: allowlistedHeaders(header)}) {
 		return false
 	}
-	if !known {
-		// Nothing of it could be digested: the vendor coded it in a way the relay did not offer egress to decode
-		// (stack_coding.go only forwards codings egress decodes). The `response` record names the coding.
+	if streamRefused || !known {
+		// Nothing of it could be digested: an SSE reply on count_tokens, or a coding the relay did not offer
+		// egress to decode (stack_coding.go only forwards codings egress decodes).
 		o.stopped = errResponseRead
 		return false
 	}

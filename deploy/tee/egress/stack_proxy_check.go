@@ -62,7 +62,8 @@ func (s *server) serveProxyCheck(rec *responseRecorder, r *http.Request, entry *
 		refuse(errMethodRefused)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, stackProxyCheckBodyMax)
+	body, readBytes, release, err := s.readRequestBody(r, stackProxyCheckBodyMax)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)

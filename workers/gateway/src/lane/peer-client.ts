@@ -91,6 +91,23 @@ export const PEER_PINS_URL = `${PEER_EGRESS_ORIGIN}/v1/peer/pins`;
 /** The longest a pin or a hello holds (section 4.3: `now + 1 h`); egress refuses a pin further away. */
 export const PEER_PIN_MAX_MS = 3_600_000;
 
+/** Strict byte cap for `/v1/aci/attestation` (and inner-receipt follow-up/debug) reads from an untrusted/remote peer. */
+export const PEER_ATTESTATION_MAX_BYTES = 1024 * 1024;
+/** Strict byte cap for small peer control/refusal responses (challenge, hello, healthz, pins, non-200 refusals). */
+export const PEER_CONTROL_MAX_BYTES = 64 * 1024;
+/** Strict byte cap for accumulated non-200 `data` error bodies over the peer hop (matches `@gray/errors` ERROR_BODY_LIMIT). */
+export const PEER_ERROR_BODY_MAX_BYTES = 64 * 1024;
+/** Strict byte cap for unread SSE bytes buffered inside `HopReader` before a frame boundary arrives. */
+export const PEER_HOP_BUFFER_MAX_BYTES = 1024 * 1024;
+/** Strict byte cap when peeking a refusal body (`{error}` / `{code}`). */
+const PEER_REFUSAL_MAX_BYTES = 8 * 1024;
+
+class PeerBodyTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(`peer response exceeded ${maxBytes} bytes`);
+  }
+}
+
 /**
  * How often a pinned boot not yet known to hold the relay's sealed credentials is probed (docs/design/relay-zero-
  * downtime.md): a new boot of an image rollout is sent requests once a probe finds it sealed, so it is looked at more
@@ -226,6 +243,10 @@ export interface PeerChannel {
   pinned(relay: string, keyset: string, pin: { readonly receiptKeys: readonly string[]; readonly notAfterMs: number }): Promise<unknown>;
   /** The registry refused (relay, keyset): close its sessions, refuse it `forMs` (5 min by default). */
   refused(relay: string, keyset: string, forMs?: number): Promise<unknown>;
+  /** Closes only unverified sessions of (relay, keyset) without placing a global ban. */
+  closeUnverified?(relay: string, keyset: string): Promise<unknown>;
+  /** Verifies session ownership under `receiptKeys` before placing a ban; closes forged sessions without banning. */
+  refuseVerified?(relay: string, keyset: string, receiptKeys: readonly string[], forMs?: number): Promise<{ readonly banned: boolean }>;
   /** A pin mismatch on `session`: close that session only. */
   mismatch(session: string): Promise<void>;
   /**
@@ -367,8 +388,11 @@ export class PeerRegistry implements LanePeerRegistry {
       if (!this.#peers.has(key)) this.#peers.set(key, new Peer({ relayId: relay, origin: channelOrigin(keyset), relayKey, keyset }));
     }
     let dropped = false;
+    const now = this.#deps.clock();
     for (const [key, peer] of this.#peers) {
       if (!peer.channel || channel.pinWanted(peer.target.relayId, peer.target.keyset!)) continue;
+      // Verified-owner refused peers keep their refusal entry until retryAt for /healthz and LIST_REREAD_MS tracking.
+      if (peer.status === "refused" && now <= peer.retryAt) continue;
       // A peer whose work is still out keeps its place until the work ends.
       if (peer.work !== null) continue;
       this.#peers.delete(key);
@@ -539,20 +563,69 @@ export class PeerRegistry implements LanePeerRegistry {
     this.#deps.log({ level: "warn", event: "lane_peer_down", relay: peer.target.relayId, origin: peer.target.origin, code, retry_ms: peer.backoffMs });
   }
 
-  /** Refuses the peer for `restMs` (the timing's recheck by default; LIST_REREAD_MS for a list miss alone). */
-  #refuse(peer: Peer, code: string, restMs?: number): void {
+  /**
+   * Refuses the peer for `restMs` (the timing's recheck by default; LIST_REREAD_MS for a list miss alone).
+   *
+   * On a channel peer (`PeerLink`), a global keyset ban (`PeerSessions.refuse()`) is ONLY recorded after
+   * cryptographic verification that the caller owns `keyset`'s private receipt key (either an already-pinned
+   * boot or verified attach signatures under `options.receiptKeys`). Otherwise only unverified/forged sessions
+   * are closed so an unauthenticated caller cannot trigger a 5-min DoS against a real boot.
+   */
+  async #refuse(
+    peer: Peer,
+    code: string,
+    options: { readonly restMs?: number; readonly receiptKeys?: readonly string[]; readonly verified?: boolean } = {},
+  ): Promise<void> {
     const hadPin = peer.pin !== null;
-    const rest = restMs ?? this.#deps.timing.recheckMs;
+    const rest = options.restMs ?? this.#deps.timing.recheckMs;
+    const channel = this.#channel;
+    const relay = peer.target.relayId;
+    const keyset = peer.target.keyset;
+    if (peer.channel && channel !== null && keyset !== undefined) {
+      const alreadyVerified = options.verified === true || hadPin || channel.hasPinnedSession(relay, keyset);
+      if (!alreadyVerified && channel.refuseVerified !== undefined && options.receiptKeys !== undefined && options.receiptKeys.length > 0) {
+        const outcome = await channel.refuseVerified(relay, keyset, options.receiptKeys, options.restMs);
+        if (!outcome.banned) {
+          peer.status = "unverified";
+          peer.code = code;
+          peer.pin = null;
+          peer.helloUntil = 0;
+          peer.retryAt = 0;
+          this.#deps.log({ level: "warn", event: "lane_peer_unverified_refused", relay, origin: peer.target.origin, code });
+          if (!channel.keysets().some((row) => row.relay === relay && row.keyset === keyset)) {
+            this.#peers.delete(peerKey(relay, peer.target.origin));
+          }
+          return;
+        }
+        peer.status = "refused";
+        peer.code = code;
+        peer.pin = null;
+        peer.helloUntil = 0;
+        peer.retryAt = this.#deps.clock() + rest;
+        this.#deps.log({ level: "error", event: "lane_peer_refused", relay, origin: peer.target.origin, code, retry_ms: rest });
+        return;
+      }
+      if (!alreadyVerified && channel.closeUnverified !== undefined) {
+        await channel.closeUnverified(relay, keyset);
+        peer.status = "unverified";
+        peer.code = code;
+        peer.pin = null;
+        peer.helloUntil = 0;
+        peer.retryAt = 0;
+        this.#deps.log({ level: "warn", event: "lane_peer_unverified_refused", relay, origin: peer.target.origin, code });
+        this.#peers.delete(peerKey(relay, peer.target.origin));
+        return;
+      }
+    }
     peer.status = "refused";
     peer.code = code;
     peer.pin = null;
     peer.helloUntil = 0;
     peer.retryAt = this.#deps.clock() + rest;
     // lane-watch alerts on the summary's refused count (section 5, row 16); the line names the relay for the operator.
-    this.#deps.log({ level: "error", event: "lane_peer_refused", relay: peer.target.relayId, origin: peer.target.origin, code, retry_ms: rest });
-    // A channel boot that failed its attestation: its sessions are closed and the keyset refused for 5 min (section 3.5),
-    // or for the peer's own rest when that is a list miss's LIST_REREAD_MS.
-    if (peer.channel && this.#channel !== null) void this.#channel.refused(peer.target.relayId, peer.target.keyset!, restMs);
+    this.#deps.log({ level: "error", event: "lane_peer_refused", relay, origin: peer.target.origin, code, retry_ms: rest });
+    // A channel boot that failed its attestation (verified owner or minimal test channel): close its sessions and refuse it.
+    if (peer.channel && channel !== null && keyset !== undefined) await channel.refused(relay, keyset, options.restMs);
     if (hadPin) void this.pushPins();
   }
 
@@ -565,15 +638,16 @@ export class PeerRegistry implements LanePeerRegistry {
     void this.pushPins();
   }
 
-  /** One call through egress, bounded by `untilMs` (the timing's `callMs` from now by default). */
-  async #call(url: string, init: RequestInit, untilMs?: number): Promise<Response> {
+  /** One call through egress, bounded by `untilMs` (the timing's `callMs` from now by default) and `maxBytes`. */
+  async #call(url: string, init: RequestInit, untilMs?: number, maxBytes: number = PEER_CONTROL_MAX_BYTES): Promise<Response> {
     const { timers, clock } = this.#deps;
     const controller = new AbortController();
     const timer = timers.setTimeout(() => controller.abort("peer_call_timeout"), Math.max(0, (untilMs ?? clock() + this.#deps.timing.callMs) - clock()));
     try {
       const response = await this.#deps.egress(url, { ...init, signal: controller.signal });
-      // The body is read within the same bound: a stalled answer ends with the call.
-      const bytes = new Uint8Array(await response.arrayBuffer());
+      // The body is read within the same bound and strict byte cap: a stalled or oversized answer ends with the call.
+      const bytes = await readBoundedBytes(response, maxBytes);
+      if (bytes === null) throw new PeerBodyTooLargeError(maxBytes);
       return new Response(response.status === 204 || response.status === 304 ? null : bytes, { status: response.status, headers: response.headers });
     } finally {
       timers.clearTimeout(timer);
@@ -597,16 +671,19 @@ export class PeerRegistry implements LanePeerRegistry {
     // relay and keyset).
     const attestPath = `${peer.target.relayId}/${peer.target.keyset!}`;
     try {
-      const answer = await this.#call(`${PEER_EGRESS_ORIGIN}/peer/attest/${attestPath}/v1/aci/attestation?nonce=${nonce}`, { method: "GET" });
+      const answer = await this.#call(`${PEER_EGRESS_ORIGIN}/peer/attest/${attestPath}/v1/aci/attestation?nonce=${nonce}`, { method: "GET" }, undefined, PEER_ATTESTATION_MAX_BYTES);
       spki = answer.headers.get("x-gray-peer-spki");
-      if (peer.channel && answer.headers.get("x-gray-peer-sent") !== null && SESSION_CODES.has(await refusalCode(answer))) {
-        // The sessions went before the attestation could ride one: nothing to judge; the next attach brings it back.
-        this.#down(peer, await refusalCode(answer), clock());
-        return;
+      if (peer.channel && answer.headers.get("x-gray-peer-sent") !== null) {
+        const code = await refusalCode(answer);
+        if (SESSION_CODES.has(code)) {
+          // The sessions went before the attestation could ride one: nothing to judge; the next attach brings it back.
+          this.#down(peer, code, clock());
+          return;
+        }
       }
       if (answer.status >= 400 && answer.status < 500 && answer.headers.get("x-gray-peer-sent") === null) {
-        // The VM answered, and not as a lane does (section 5, row 22: a peer that is no Gray TEE): refused.
-        this.#refuse(peer, `attestation_refused:status_${answer.status}`);
+        // The VM answered, and not as a lane does (section 5, row 22: a peer that is no Gray TEE): refused (unverified).
+        await this.#refuse(peer, `attestation_refused:status_${answer.status}`);
         return;
       }
       if (answer.status !== 200 || spki === null) {
@@ -617,10 +694,14 @@ export class PeerRegistry implements LanePeerRegistry {
       try {
         report = parseSerde(text);
       } catch {
-        this.#refuse(peer, "attestation_refused:not_a_report");
+        await this.#refuse(peer, "attestation_refused:not_a_report");
         return;
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof PeerBodyTooLargeError) {
+        await this.#refuse(peer, "attestation_refused:body_too_large");
+        return;
+      }
       this.#down(peer, "peer_attest_failed", clock());
       return;
     }
@@ -672,19 +753,28 @@ export class PeerRegistry implements LanePeerRegistry {
       // A boot refused only because the list it was checked against (read just now, or within LIST_REREAD_MS) does not
       // name its release rests LIST_REREAD_MS, not the recheck: the next attestation may read a list published since.
       // Of a channel peer, only when the report binds the keyset the sessions claimed; anything else is a real refusal.
-      const listOnly = onlyListMiss(verified.checks) && (!peer.channel || v?.keysetDigest === `sha256:${peer.target.keyset!}`);
-      this.#refuse(peer, `attestation_refused:${failed?.id ?? "unknown"}`, listOnly ? LIST_REREAD_MS : undefined);
+      const bindsClaimedKeyset = peer.channel && v !== null && v.keyset !== null && v.keysetDigest === `sha256:${peer.target.keyset!}`;
+      const listOnly = onlyListMiss(verified.checks) && (!peer.channel || bindsClaimedKeyset);
+      const receiptKeys = bindsClaimedKeyset ? v.keyset.receipt_signing_keys.filter((key) => key.algo === "ed25519").map((key) => key.public_key) : undefined;
+      await this.#refuse(peer, `attestation_refused:${failed?.id ?? "unknown"}`, {
+        ...(listOnly ? { restMs: LIST_REREAD_MS } : {}),
+        ...(receiptKeys !== undefined ? { receiptKeys } : {}),
+      });
       return;
     }
     // The empty slot's identity is held to the relay's key here: @gray/lane-verify checks only its relay id there (it has
     // no relay image whose signature would carry the key).
     if (facts.phase === "empty_slot" && facts.identity.publicKey !== peer.target.relayKey) {
-      this.#refuse(peer, "attestation_refused:relay_key_pin");
+      const receiptKeys =
+        peer.channel && v.keysetDigest === `sha256:${peer.target.keyset!}`
+          ? v.keyset.receipt_signing_keys.filter((key) => key.algo === "ed25519").map((key) => key.public_key)
+          : undefined;
+      await this.#refuse(peer, "attestation_refused:relay_key_pin", ...(receiptKeys !== undefined ? [{ receiptKeys }] : []));
       return;
     }
     if (peer.channel && v.keysetDigest !== `sha256:${peer.target.keyset!}`) {
       // The session claimed one boot and the report binds another: a liar, whatever the report is (section 3.5).
-      this.#refuse(peer, "attestation_refused:keyset_mismatch");
+      await this.#refuse(peer, "attestation_refused:keyset_mismatch");
       return;
     }
     const notAfterMs = Math.min(Number(v.keyset.not_after) * 1000, Number(verified.listCurrentUntil) * 1000, clock() + PEER_PIN_MAX_MS);
@@ -764,7 +854,7 @@ export class PeerRegistry implements LanePeerRegistry {
 
   async #helloFailed(peer: Peer, answer: Response | null): Promise<false> {
     const code = answer === null ? "peer_hello_invalid" : await refusalCode(answer);
-    if (code === "peer_hello_refused") this.#refuse(peer, code);
+    if (code === "peer_hello_refused") await this.#refuse(peer, code, { verified: true });
     else this.#down(peer, code, this.#deps.clock());
     return false;
   }
@@ -867,10 +957,49 @@ export class PeerRegistry implements LanePeerRegistry {
   }
 }
 
+/**
+ * Reads at most `maxBytes` from `response`; cancels and returns null if larger.
+ * When `cloned` is true (a branch of `Response.clone()`), `cancel()` is fired without awaiting so the
+ * WHATWG `tee()` cancel promise does not deadlock waiting for the unread sibling branch.
+ */
+async function readBoundedBytes(response: Response, maxBytes: number, cloned = false): Promise<Uint8Array | null> {
+  const raw = response.headers.get("content-length");
+  if (raw !== null && /^[0-9]+$/.test(raw) && Number(raw) > maxBytes) {
+    const cancelling = response.body?.cancel().catch(() => {});
+    if (!cloned) await cancelling;
+    return null;
+  }
+  const stream = response.body;
+  if (stream === null) return new Uint8Array(0);
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let cancelled = false;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        cancelled = true;
+        const cancelling = reader.cancel().catch(() => {});
+        if (!cloned) await cancelling;
+        return null;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    if (!cancelled || !cloned) reader.releaseLock();
+  }
+  return joined(chunks);
+}
+
 /** The closed code of an egress or stack VM refusal body (`{error}` or `{code}`), or the status's when it has none. */
 async function refusalCode(answer: Response): Promise<string> {
   try {
-    const body = parseSerde(await answer.clone().text()) as { readonly error?: unknown; readonly code?: unknown };
+    const raw = await readBoundedBytes(answer.clone(), PEER_REFUSAL_MAX_BYTES, true);
+    if (raw === null) return `status_${answer.status}`;
+    const body = parseSerde(new TextDecoder().decode(raw)) as { readonly error?: unknown; readonly code?: unknown };
     const code = typeof body.code === "string" ? body.code : typeof body.error === "string" ? body.error : null;
     if (code !== null && /^[a-z_]{1,64}$/.test(code)) return code;
   } catch {
@@ -923,6 +1052,12 @@ export class PeerCall implements LanePeerCall {
   end: PeerEndDto | null = null;
   /** Why the hop gave no answer (`peer.failed`), when it gave none. */
   failure: { readonly code: PeerFailedCode; readonly sent: boolean } | null = null;
+  /**
+   * Egress refused the entry's request itself, with nothing sent (its mark 0, a code that is not one of the hop's): its
+   * in-flight body budget full (`capacity`, Gray's capacity) or anything else (`refused`, Gray's own error). The receipt
+   * says `peer_invalid`, sent 0, as before; the attempt is Gray's own (inference.ts `peerFailed`).
+   */
+  egressRefusal: "capacity" | "refused" | null = null;
   /** The channel session egress named on its last own answer (`x-gray-peer-session`, a pin mismatch's). */
   #session: string | null = null;
   /** The follow-up's state, when one was asked. */
@@ -1100,10 +1235,14 @@ export class PeerCall implements LanePeerCall {
       const peer = input.peers[this.#at]!;
       this.peer = peer;
       last = await this.#sendTo(peer);
+      // An un-upgraded stack VM rejects `count_tokens: true` with `peer_malformed`; try the next peer without marking it down.
+      if (last.kind === "unsent" && input.countTokens === true && last.code === "peer_malformed") continue;
       if (last.kind !== "unsent" || !(UNSENT_CODES.has(last.code) || last.code === STALE_PIN_CODE)) break;
       input.registry.failed(peer, last.code, this.#session);
     }
-    if (last.kind !== "answered") this.#resolveEnded(this.end);
+    // Do not resolve `this.ended` on `peer_unknown`: the caller (`sendPeer`) retries `send()` after `rehello`,
+    // and resolving `ended` to `null` here would permanently drop the retry's `PeerEndDto`.
+    if (last.kind !== "answered" && !(last.kind === "unsent" && last.code === "peer_unknown")) this.#resolveEnded(this.end);
     return last;
   }
 
@@ -1116,16 +1255,18 @@ export class PeerCall implements LanePeerCall {
       ...this.#envelope(pin.keysetDigest, input.body),
       ...(input.conversation === undefined ? {} : { conversation: input.conversation }),
       ...(input.relayChanges === undefined ? {} : { relay_changes: input.relayChanges }),
+      ...(input.countTokens === true ? { count_tokens: true as const } : {}),
     };
     const header = await signPeerEnvelope("request", envelope, input.signer);
     this.envelopeSha256 = sha256BareHex(peerEnvelopeBytes(envelope));
     this.failure = null;
+    this.egressRefusal = null;
     this.#mayHold = false;
     let response: Response;
     try {
       response = await input.egress(`${PEER_EGRESS_ORIGIN}/peer/${pin.digest}${input.path}`, {
         method: "POST",
-        // `x-gray-peer-reads`: the `end` members this entry parses (r14 `checks`), so a stack VM sends them to it alone.
+        // `x-gray-peer-reads`: the optional `head`/`end` members this entry parses (`checks`, `error_headers`, ...), so a stack VM sends them to it alone.
         headers: {
           ...input.headers,
           "content-type": "application/json",
@@ -1144,17 +1285,23 @@ export class PeerCall implements LanePeerCall {
     const sent = response.headers.get("x-gray-peer-sent");
     this.#session = response.headers.get("x-gray-peer-session");
     if (sent !== null) {
-      // Egress's own answer (README "Peer mode"): the hop codes, or a refusal of the entry's request.
+      // Egress's own answer (README "Answers egress gives itself"): the hop codes, or a refusal of the entry's request.
       const code = await refusalCode(response);
       if (code === "peer_failed_after_send" || (code === "peer_timeout" && sent === "1")) return this.#unknown(code, true);
-      return UNSENT_CODES.has(code) ? this.#failed(code as PeerFailedCode, false) : this.#failed("peer_invalid", false);
+      if (UNSENT_CODES.has(code)) return this.#failed(code as PeerFailedCode, false);
+      // Any other answer of egress's after a byte may have gone (its own fault mid-call): what became of it is the
+      // follow-up's to say, as for a hop that failed after it sent.
+      if (sent !== "0") return this.#unknown("peer_failed_after_send", true);
+      this.egressRefusal = code === "egress_limit" ? "capacity" : "refused";
+      return this.#failed("peer_invalid", false);
     }
     if (response.status !== 200 || !(response.headers.get("content-type") ?? "").startsWith("text/event-stream")) {
       // The stack VM's lane answered before any frame: a refusal of checks 1 to 6, or any other answer of a lane that
       // registered nothing (its 404 without backend mode, its boot's 503). No vendor was dialed (S25).
       let code: PeerFailedCode = "peer_invalid";
       try {
-        code = parsePeerRefusal(new Uint8Array(await response.arrayBuffer())).code;
+        const raw = await readBoundedBytes(response, PEER_CONTROL_MAX_BYTES);
+        if (raw !== null) code = parsePeerRefusal(raw).code;
       } catch {
         // Not a refusal body: `peer_invalid`.
       }
@@ -1173,6 +1320,7 @@ export class PeerCall implements LanePeerCall {
     if (frame.head.status === 200n) return { kind: "answered", response: this.#answer(frame.head) };
     // Not committed: the vendor's error body in `data`, or nothing, then `end` (PR 4: `end` follows at once).
     const body: Uint8Array[] = [];
+    let bodyBytes = 0;
     for (;;) {
       let next: PeerFrame | "eof";
       try {
@@ -1181,8 +1329,14 @@ export class PeerCall implements LanePeerCall {
         return input.signal.aborted ? this.#aborted() : this.#unknown("peer_failed_after_send", true);
       }
       if (next === "eof") return this.#unknown("peer_failed_after_send", true);
-      if (next.event === "data") body.push(next.bytes);
-      else if (next.event === "end") {
+      if (next.event === "data") {
+        bodyBytes += next.bytes.length;
+        if (bodyBytes > PEER_ERROR_BODY_MAX_BYTES) {
+          this.#reader.cancel();
+          return this.#unknown("peer_invalid", true);
+        }
+        body.push(next.bytes);
+      } else if (next.event === "end") {
         this.#took(next.end);
         return { kind: "ended", head: frame.head, end: next.end, body: joined(body) };
       } else return this.#unknown("peer_invalid", true);
@@ -1332,8 +1486,13 @@ async function peerFollowUp(target: FollowUpTarget, deps: FollowUpDeps, untilMs:
     // `attempts_trace` among the reads: a stack VM that serves it adds the attempt's trace once it is done.
     const headers = { [PEER_HEADER]: header, [PEER_READS_HEADER]: PEER_END_READS.join(",") };
     const response = await deps.egress(`${PEER_EGRESS_ORIGIN}/peer/${target.pin.digest}/v1/peer/attempts/${target.rid}`, { method: "GET", headers, signal: controller.signal });
-    if (response.status !== 200 || response.headers.has("x-gray-peer-sent")) return null;
-    const answer = parsePeerAttemptsAnswer(new Uint8Array(await response.arrayBuffer()));
+    if (response.status !== 200 || response.headers.has("x-gray-peer-sent")) {
+      await response.body?.cancel().catch(() => {});
+      return null;
+    }
+    const raw = await readBoundedBytes(response, PEER_ATTESTATION_MAX_BYTES);
+    if (raw === null) return null;
+    const answer = parsePeerAttemptsAnswer(raw);
     return { state: answer.state, receipt: (answer.receipt ?? null) as Json | null, ...(answer.trace === undefined ? {} : { trace: answer.trace }) };
   } catch {
     return null;
@@ -1367,9 +1526,13 @@ async function peerDebug(target: FollowUpTarget, deps: FollowUpDeps, input: Peer
       deps.signer,
     );
     const response = await deps.egress(`${PEER_EGRESS_ORIGIN}/peer/${target.pin.digest}${PEER_DEBUG_PREFIX}${target.rid}`, { method: "POST", headers: { [PEER_HEADER]: header }, signal: controller.signal });
-    const body = new Uint8Array(await response.arrayBuffer());
     // Egress's own answer (the pin is gone, the dial failed) is not the stack VM's.
-    if (response.headers.has("x-gray-peer-sent")) return { outcome: "unavailable", code: "egress" };
+    if (response.headers.has("x-gray-peer-sent")) {
+      await response.body?.cancel().catch(() => {});
+      return { outcome: "unavailable", code: "egress" };
+    }
+    const body = await readBoundedBytes(response, response.status === 200 ? PEER_ATTESTATION_MAX_BYTES : PEER_CONTROL_MAX_BYTES);
+    if (body === null) return { outcome: "unavailable", code: "body_too_large" };
     if (response.status === 200) return { outcome: "shared", value: parsePeerDebugAnswer(body).value };
     const code = parsePeerDebugRefusal(body);
     if (code === "debug_rate_limited" || code === "debug_store_full") return { outcome: "refused", code };
@@ -1418,6 +1581,10 @@ class HopReader {
         this.#done = true;
         for (const event of [...this.#decoder.push(this.#frames.rest()), ...this.#decoder.finish()]) this.#queue.push(parsePeerFrame(event.event, event.data));
         continue;
+      }
+      if (this.#frames.length + read.value.byteLength > PEER_HOP_BUFFER_MAX_BYTES) {
+        this.cancel();
+        throw new Error(`peer hop frame exceeded ${PEER_HOP_BUFFER_MAX_BYTES} bytes`);
       }
       this.#frames.push(read.value);
     }

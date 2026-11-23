@@ -1,7 +1,8 @@
 import { ApiError } from "@gray/errors";
-import { requestLimitSource } from "@gray/limits";
+import { requestLimit, requestLimitSource } from "@gray/limits";
 import type { Protocol } from "@gray/protocol";
 import type { RequestBudget } from "./budget.ts";
+import { isDisabledBucket, LaneContentDisabled } from "./lane/deps.ts";
 import type { ContentBucket } from "./outbound.ts";
 import { SPOOL_PREFIX, Spool, spoolPartBytes } from "./spool.ts";
 
@@ -56,11 +57,14 @@ export interface BodyLimits {
    * byte, so no smaller one is copied into a larger one as the body arrives.
    */
   readonly whole?: boolean;
+  /** Whose limit applies when `limit` (or `rawMax` without a spool) is below the provider API's `requestLimit`. */
+  readonly limitSource?: string;
 }
 
-export function bodyTooLarge(protocol: Protocol, limit: number): ApiError {
+export function bodyTooLarge(protocol: Protocol, limit: number, limitSource?: string): ApiError {
+  const source = BigInt(limit) < requestLimit(protocol) ? (limitSource ?? "the gateway's configured limit") : requestLimitSource(protocol);
   return new ApiError(413, "request_body_limit")
-    .withMessage(`The request body is larger than ${limit} bytes, ${requestLimitSource(protocol)}.`)
+    .withMessage(`The request body is larger than ${limit} bytes, ${source}.`)
     .withMeta("limit_bytes", BigInt(limit));
 }
 
@@ -74,17 +78,27 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
   const header = request.headers.get("content-length");
   const declared = header !== null && /^[0-9]+$/.test(header) ? Number(header) : null;
   if (declared !== null && declared > limits.limit) {
-    return { ok: false, error: bodyTooLarge(limits.protocol, limits.limit) };
+    return { ok: false, error: bodyTooLarge(limits.protocol, limits.limit, limits.limitSource) };
   }
+  const activeSpool = isDisabledBucket(spool) ? undefined : spool;
   if (request.body === null) return { ok: true, body: { tier: "A", bytes: new Uint8Array(0), length: 0 } };
-  if (declared !== null && declared > limits.rawMax && spool === undefined) return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax) };
+  if (declared !== null && declared > limits.rawMax && activeSpool === undefined) return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource) };
   const reader = request.body.getReader();
-  const newSpool = (): Promise<Spool> => Spool.open(spool!, `${SPOOL_PREFIX}${crypto.randomUUID()}`, spoolPartBytes(declared));
+  const newSpool = (): Promise<Spool> => Spool.open(activeSpool!, `${SPOOL_PREFIX}${crypto.randomUUID()}`, spoolPartBytes(declared));
   // A stated length (tiers A and B): start with a modest buffer (at most 64 KiB) and grow as bytes arrive so an
   // unauthenticated request naming a 64 MiB Content-Length cannot pre-allocate 64 MiB before sending a byte.
   const INITIAL_DECLARED_BUFFER = 65_536;
   let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(limits.whole === true ? declared : Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
-  let spooled: Spool | null = declared !== null && declared > limits.rawMax ? await newSpool() : null;
+  let spooled: Spool | null = null;
+  if (declared !== null && declared > limits.rawMax) {
+    try {
+      spooled = await newSpool();
+    } catch (error) {
+      await reader.cancel().catch(() => {});
+      if (error instanceof LaneContentDisabled) return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource) };
+      return { ok: false, error: storeUnavailable() };
+    }
+  }
   const chunks: Uint8Array[] = [];
   let chunked = 0;
   let length = 0;
@@ -97,11 +111,12 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
     timer = timers === undefined ? setTimeout(fire, limits.waitMs) : timers.setTimeout(fire, limits.waitMs);
   });
   // A spool's write, its completion and its abort, within what REQUEST_BODY_MS leaves: "timeout" past it,
-  // "failed" when R2 failed the step.
-  const store = async <T>(step: () => Promise<T>): Promise<T | "timeout" | "failed"> => {
+  // "disabled" when the content bucket is disabled (413), "failed" when R2 failed the step.
+  const store = async <T>(step: () => Promise<T>): Promise<T | "timeout" | "failed" | "disabled"> => {
     try {
       return await Promise.race([step(), timeout]);
-    } catch {
+    } catch (error) {
+      if (error instanceof LaneContentDisabled) return "disabled";
       return "failed";
     }
   };
@@ -111,9 +126,15 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
     if (spooled !== null) await store(() => spooled!.abort());
     return { ok: false, error };
   };
-  // Every spool step: past REQUEST_BODY_MS the client's 408, a failed one Gray's store's 503.
+  // Every spool step: past REQUEST_BODY_MS the client's 408, disabled bucket 413, a failed one Gray's store's 503.
   const spoolFailure = (outcome: unknown): Promise<BodyRead> | null =>
-    outcome === "timeout" ? fail(new ApiError(408, "request_body_timeout")) : outcome === "failed" ? fail(storeUnavailable()) : null;
+    outcome === "timeout"
+      ? fail(new ApiError(408, "request_body_timeout"))
+      : outcome === "disabled"
+        ? fail(bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource))
+        : outcome === "failed"
+          ? fail(storeUnavailable())
+          : null;
   try {
     for (;;) {
       let next: ReadableStreamReadResult<Uint8Array> | "timeout" | "broken";
@@ -127,7 +148,7 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
       if (next.done) break;
       const chunk = next.value;
       length += chunk.length;
-      if (length > limits.limit) return await fail(bodyTooLarge(limits.protocol, limits.limit));
+      if (length > limits.limit) return await fail(bodyTooLarge(limits.protocol, limits.limit, limits.limitSource));
       watch?.(chunk);
       if (spooled !== null) {
         const wrote = spoolFailure(await store(() => spooled!.write(chunk)));
@@ -150,8 +171,13 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
       chunks.push(chunk);
       chunked += chunk.length;
       if (length > limits.rawMax) {
-        if (spool === undefined) return await fail(bodyTooLarge(limits.protocol, limits.rawMax));
-        spooled = await newSpool();
+        if (activeSpool === undefined) return await fail(bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource));
+        try {
+          spooled = await newSpool();
+        } catch (error) {
+          if (error instanceof LaneContentDisabled) return await fail(bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource));
+          return await fail(storeUnavailable());
+        }
         report();
         for (const piece of chunks) {
           const wrote = spoolFailure(await store(() => spooled!.write(piece)));

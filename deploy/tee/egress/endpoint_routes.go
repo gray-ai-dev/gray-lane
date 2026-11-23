@@ -149,7 +149,7 @@ func (t *endpointRouteTable) plan(r *http.Request) (endpointRoutePlan, string) {
 		return plan, errMethodRefused
 	}
 	remainder := "/" + tail
-	if !validRawPath(path) || strings.HasPrefix(remainder, "//") || hasDotSegment(remainder) {
+	if !validRawPath(path) || strings.HasPrefix(remainder, "//") || hasDotSegment(remainder) || hasEncodedSeparator(remainder) {
 		return plan, errPathRefused
 	}
 	row := t.lookup(id)
@@ -173,6 +173,7 @@ func (t *endpointRouteTable) plan(r *http.Request) (endpointRoutePlan, string) {
 
 // serveEndpointRoute is a request under /route/: the plan, the body, the plan again, then the row's host.
 func (s *server) serveEndpointRoute(rec *responseRecorder, r *http.Request, entry *requestLog) {
+	rec.own = true
 	entry.Route = endpointRouteLogName
 	refuse := func(code string) {
 		entry.Error = code
@@ -182,7 +183,8 @@ func (s *server) serveEndpointRoute(rec *responseRecorder, r *http.Request, entr
 		refuse(code)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, s.cfg.routeBodyBytes())
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.routeBodyBytes())
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)
@@ -195,7 +197,11 @@ func (s *server) serveEndpointRoute(rec *responseRecorder, r *http.Request, entr
 		refuse(code)
 		return
 	}
-	entry.Error = s.forward(r.Context(), plan.client, rec, r.Method, plan.request, outboundHeader(r.Header), body, nil)
+	entry.Error = s.forward(r.Context(), plan.client, rec, r.Method, plan.request, outboundHeader(r.Header), body, release, nil)
+	if entry.Error == errResponseRead {
+		// Headers are already on the wire: abort so the client sees a broken stream rather than a clean EOF.
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // serveRoutesControl is /v1/routes: the table, PUT only.
@@ -257,7 +263,8 @@ func exactRouteMembers(body []byte) bool {
 // putRoutes replaces the table. A row whose not_after has passed is accepted and never dialed: the table is the
 // entry's, and expiry is judged at each use.
 func (s *server) putRoutes(rec *responseRecorder, r *http.Request, entry *requestLog) {
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		entry.Error = code
@@ -438,12 +445,29 @@ func validRouteHost(host string, deny []string) bool {
 	return true
 }
 
+// hasEncodedSeparator reports whether path contains %2f or %5c in any hex case.
+// Upstream proxies that percent-decode before routing interpret them as path
+// separators, allowing payloads such as `..%2f..%2fadmin` to bypass hasDotSegment
+// and leave the row's path prefix.
+func hasEncodedSeparator(path string) bool {
+	for i := 0; i+2 < len(path); i++ {
+		if path[i] != '%' {
+			continue
+		}
+		a, b := path[i+1], path[i+2]
+		if (a == '2' && (b == 'f' || b == 'F')) || (a == '5' && (b == 'c' || b == 'C')) {
+			return true
+		}
+	}
+	return false
+}
+
 // validRoutePathPrefix is a row's path prefix: it starts and ends with '/', does not start with "//" (a remainder under
-// it would, which plan refuses), holds no '?' or '#' (a raw path never does: the query is cut off, a raw '#' refused),
-// and passes the vendor routes' path rule (validRawPath).
+// it would, which plan refuses), holds no '?', '#' or encoded path separator (%2f / %5c), and passes the vendor routes'
+// path rule (validRawPath).
 func validRoutePathPrefix(prefix string) bool {
 	return strings.HasPrefix(prefix, "/") && strings.HasSuffix(prefix, "/") && !strings.HasPrefix(prefix, "//") &&
-		!strings.ContainsAny(prefix, "?#") && validRawPath(prefix)
+		!strings.ContainsAny(prefix, "?#") && !hasEncodedSeparator(prefix) && validRawPath(prefix)
 }
 
 // suffixList is -route-deny-suffix: repeatable, each value one zone or a comma-separated list. validate checks each.

@@ -3,14 +3,15 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { ReceiptBuilder } from "@gray/attest";
 import { ApiError } from "@gray/errors";
 import { type JsonObject, isObject, readSerdeBytes } from "@gray/json";
-import { GRAY_LANE_REWRITES_V2, apiChangeSegments, apiRewriteRuleFor, formBodyBoundary, formBoundaryOf, isRewriteApi, type GrayApiOp, type RewriteApi } from "@gray/lane";
+import { GRAY_LANE_REWRITES_V2, apiChangeSegments, apiRewriteRuleFor, applyApiChanges, formBodyBoundary, formBoundaryOf, isRewriteApi, type GrayApiOp, type RewriteApi } from "@gray/lane";
+import { passedClientHeaders } from "@gray/lane-wire";
 import { type FormPart, formBoundary, partText } from "@gray/media";
-import { DEFAULT_ACCEPT, OPENAI_LINKING_FIELDS, type Protocol } from "@gray/protocol";
+import { OPENAI_LINKING_FIELDS, withDefaultAccept, type Protocol } from "@gray/protocol";
 import { ENTRY_MEDIA_PROTOCOLS } from "@gray/snapshot";
 import { readBody } from "../body.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
-import { addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
+import { EGRESS_HEADER, addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 
 /**
@@ -350,16 +351,19 @@ export async function entryForwarded(protocol: Protocol, body: EntryBody, upstre
 }
 
 /**
- * The headers of an attempt (the standard's clause 11.3): `content-type` as the client sent it (a JSON body sent
- * without one is named `application/json`), an `accept` of any type and the provider's key as a bearer token. Nothing else of
- * the client's request reaches the provider.
+ * The headers of an attempt: the client's allowlisted SDK headers (@gray/lane-wire `passedClientHeaders`),
+ * `content-type` as the client sent it (preserving multipart boundary or JSON charset, defaulting to
+ * `application/json` when absent/blank), the provider's key as a bearer token, `x-gray-egress` stripped,
+ * and absent/blank `accept` defaulted to `@gray/protocol` `DEFAULT_ACCEPT`.
  */
-export function entryUpstreamHeaders(body: EntryBody, clientContentType: string | null, credential: string): Headers {
+export function entryUpstreamHeaders(protocol: Protocol, body: EntryBody, client: Headers, credential: string): Headers {
   const headers = new Headers();
-  headers.set("content-type", body.kind === "form" ? body.contentType : (clientContentType ?? "application/json"));
-  headers.set("accept", DEFAULT_ACCEPT);
+  for (const [name, value] of Object.entries(passedClientHeaders(protocol, client))) headers.set(name, value);
+  const clientContentType = client.get("content-type");
+  headers.set("content-type", body.kind === "form" ? body.contentType : clientContentType !== null && clientContentType.trim() !== "" ? clientContentType : "application/json");
   headers.set("authorization", `Bearer ${credential}`);
-  return headers;
+  headers.delete(EGRESS_HEADER);
+  return withDefaultAccept(headers);
 }
 
 /** What a standard API's receipt is signed from. */
@@ -397,4 +401,16 @@ export async function signEntryReceipt(lane: LaneDeps, input: EntryReceiptInput)
   addReceiptEvents(builder, { receivedHash: input.receivedHash, draft: input.draft, responseHash: input.responseHash });
   const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
   lane.state.receipts.put(signed, input.owner);
+}
+
+/**
+ * Applies a declared `/generateContentRequest/model` rewrite (`set_member` or `insert_member`) to a
+ * Gemini `:countTokens` JSON body under the published v2 rewrite policy, keeping all v2 rewrite calls
+ * in this module.
+ */
+export function applyGeminiCountModelRewrite(
+  received: Uint8Array,
+  op: { readonly op: "set_member" | "insert_member"; readonly path: "/generateContentRequest/model"; readonly value: string },
+) {
+  return applyApiChanges(received, "gemini", { kind: "json" }, { ops: [op] });
 }

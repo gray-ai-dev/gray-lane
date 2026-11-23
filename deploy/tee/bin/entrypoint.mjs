@@ -852,9 +852,48 @@ function defaultSleep(ms) {
 }
 
 /**
+ * The entry's container log is readable outside the VM (owner, 2026-11-23: Phala Cloud's log reader;
+ * deploy/tee/IMPLEMENTATION_NOTES.md §9.1), so no client's address may reach it. Two programs this entrypoint runs
+ * print one that no setting of theirs turns off: workerd ends the line of a TLS handshake that failed with
+ * `clientId = <address>:<port>` (kj/compat/tls.c++), and gray-acme's TLS-ALPN-01 listener (lego's, with net/http's
+ * default error log) prints `http: TLS handshake error from <address>:<port>` for a client that reaches 443 while it
+ * listens. Their lines go on with every IPv4 address and every bracketed IPv6 address, with its port, as `[address]`.
+ */
+const ADDRESS = /\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?::\d{1,5})?|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g;
+
+/** One line of workerd's or gray-acme's output without the addresses in it (`ADDRESS`). */
+export function withoutAddresses(line) {
+  return line.replace(ADDRESS, "[address]");
+}
+
+/** How long the entrypoint waits, once workerd has exited for good, for its last output before it exits itself. */
+const WORKERD_CLOSE_WAIT_MS = 2_000;
+
+/** How the entrypoint starts workerd: stdin as its own, stdout and stderr through `passWorkerdOutput`. */
+export const WORKERD_STDIO = Object.freeze(["inherit", "pipe", "pipe"]);
+
+/**
+ * workerd's stdout and stderr, line by line, on to `stdout` and `stderr` without addresses (`withoutAddresses`). A
+ * child without the streams (a test's fake) passes nothing. A destination that cannot take more pauses the reading, so
+ * workerd waits as it waited on the inherited descriptors before.
+ */
+export function passWorkerdOutput(child, { stdout = process.stdout, stderr = process.stderr } = {}) {
+  for (const [input, output] of [[child.stdout, stdout], [child.stderr, stderr]]) {
+    if (input === undefined || input === null) continue;
+    const reader = createInterface({ input, crlfDelay: Infinity });
+    reader.on("line", (line) => {
+      if (!output.write(`${withoutAddresses(line)}\n`)) {
+        reader.pause();
+        output.once("drain", () => reader.resume());
+      }
+    });
+  }
+}
+
+/**
  * D133: run gray-acme and wait for its exit status and its stderr lines. Each line goes on to this process's stderr as
- * it arrives (the container log is unchanged); the lines are what a failed run reports (`acmeReport`). A child without
- * a stderr stream (a test's fake) has no lines.
+ * it arrives, without addresses (`withoutAddresses`); the lines are what a failed run reports (`acmeReport`). A child
+ * without a stderr stream (a test's fake) has no lines.
  */
 function runAcme(spawnProcess, command, env, error) {
   return new Promise((resolveRun, rejectRun) => {
@@ -867,7 +906,8 @@ function runAcme(spawnProcess, command, env, error) {
     };
     if (!closed) {
       const reader = createInterface({ input: child.stderr, crlfDelay: Infinity });
-      reader.on("line", (line) => {
+      reader.on("line", (raw) => {
+        const line = withoutAddresses(raw);
         error(line);
         lines.push(line);
         // gray-acme prints a few dozen lines; the report keeps far fewer, so a runaway child cannot grow this.
@@ -1406,8 +1446,8 @@ export async function superviseWorkerd({ first, restart, orderedAt, stopped, now
 /**
  * Render workerd's boot config and start workerd. Exported so the deploy-tee tests run the real
  * entrypoint in-process (D95): the CLI wrapper below supplies the process defaults and owns the
- * process lifetime, while `now`, `sleep`, `spawnAcme` and `spawnWorker` are injection seams for
- * deterministic tests. Resolves with the started workerd child, the function that starts it again,
+ * process lifetime, while `now`, `sleep`, `spawnAcme`, `spawnWorker` and `workerdOutput` (where workerd's output goes
+ * on to) are injection seams for deterministic tests. Resolves with the started workerd child, the function that starts it again,
  * and when this boot's certificate order began (D133: what `superviseWorkerd` needs).
  */
 export async function main({
@@ -1418,6 +1458,7 @@ export async function main({
   sleep = defaultSleep,
   spawnAcme = spawn,
   spawnWorker = spawn,
+  workerdOutput = { stdout: process.stdout, stderr: process.stderr },
   postBridge = postBridgeHttps,
   wallNow = Date.now,
   uptime = osUptime,
@@ -1738,7 +1779,8 @@ export async function main({
   // to each new workerd as soon as it listens.
   const restart = () => {
     if (lease !== null) rmSync(kmsLeaseSocket, { force: true });
-    const child = spawnWorker(workerd, ["serve", renderedPath], { stdio: "inherit" });
+    const child = spawnWorker(workerd, ["serve", renderedPath], { stdio: [...WORKERD_STDIO] });
+    passWorkerdOutput(child, workerdOutput);
     lease?.wake();
     return child;
   };
@@ -1776,7 +1818,7 @@ if (isMainModule()) {
   // PID 1, which the kernel delivers no unhandled SIGTERM to, and a boot may be inside gray-acme or a D133
   // hold. While workerd runs the signal goes to it and its exit ends the supervision with 0; otherwise
   // this process exits at once (gray-acme, if running, goes with the container).
-  const state = { stopping: false, child: null, running: false };
+  const state = { stopping: false, child: null, running: false, closed: Promise.resolve() };
   const stop = (signal) => {
     state.stopping = true;
     if (state.running && state.child !== null) state.child.kill(signal);
@@ -1787,6 +1829,12 @@ if (isMainModule()) {
   const track = (child) => {
     state.child = child;
     state.running = true;
+    // workerd's output passes through this process (passWorkerdOutput), and its pipes close after its exit: its last
+    // lines (a crash's, say) are read before this process exits, for at most WORKERD_CLOSE_WAIT_MS.
+    state.closed = new Promise((resolveClose) => {
+      child.on("close", () => resolveClose(undefined));
+      child.on("error", () => resolveClose(undefined));
+    });
     child.on("exit", () => {
       if (state.child === child) state.running = false;
     });
@@ -1816,6 +1864,7 @@ if (isMainModule()) {
       }
       return;
     }
+    await Promise.race([state.closed, new Promise((resolveWait) => setTimeout(resolveWait, WORKERD_CLOSE_WAIT_MS).unref())]);
     process.exit(code);
   }).catch((thrown) => {
     console.error(`lane: ${thrown instanceof Error ? thrown.message : String(thrown)}`);

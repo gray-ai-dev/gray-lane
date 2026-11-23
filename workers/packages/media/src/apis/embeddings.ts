@@ -35,11 +35,25 @@ const ENVELOPE_BYTES = 4096n;
 
 const FIELDS = ["model", "input", "encoding_format", "dimensions", "user"];
 
+/** Most model widths cached in one isolate (bounds global WIDTHS memory). */
+export const MAX_WIDTH_ENTRIES = 1024;
+
 /**
- * The width of the last valid answer without `dimensions`, by requested model: one entry per routed
- * embedding model this isolate has answered (the server keeps one per process).
+ * The width of the last valid answer without `dimensions`, by requested model: bounded to
+ * MAX_WIDTH_ENTRIES and strictly within 1..=MAX_DIMENSIONS so a rogue upstream cannot poison or
+ * exhaust the isolate's width cache.
  */
 const WIDTHS = new Map<string, bigint>();
+
+function rememberWidth(model: string, width: bigint): void {
+  if (width < 1n || width > MAX_DIMENSIONS) return;
+  if (WIDTHS.has(model)) WIDTHS.delete(model);
+  else if (WIDTHS.size >= MAX_WIDTH_ENTRIES) {
+    const oldest = WIDTHS.keys().next().value;
+    if (oldest !== undefined) WIDTHS.delete(oldest);
+  }
+  WIDTHS.set(model, width);
+}
 
 /** What a request asks for, and so what its answer must hold. */
 export interface Expected {
@@ -212,7 +226,7 @@ export function embeddingsAnswer(api: ApiRequest, shape: EmbeddingsShape, billsU
   if (inputTokens === 0n) throw apiError(502, "billing_usage_invalid");
   const m = { counters: { ...ZERO_COUNTERS, input_tokens: inputTokens }, raw: present, unit: undefined };
   checkMetered("open_ai_embeddings", api.bound, m, billsUnits);
-  if (expected.dimensions === undefined && WIDTHS.get(api.model) !== width) WIDTHS.set(api.model, width);
+  if (expected.dimensions === undefined) rememberWidth(api.model, width);
   return metered(m);
 }
 
@@ -272,7 +286,7 @@ export function widthOfShape(expected: Expected, shape: EmbeddingsShape): bigint
     } else {
       return undefined;
     }
-    if (len === 0n || (width !== undefined && width !== len)) return undefined;
+    if (len === 0n || len > MAX_DIMENSIONS || (width !== undefined && width !== len)) return undefined;
     width = len;
   }
   return width;
@@ -316,5 +330,5 @@ export function forgetWidths(): void {
 
 /** For tests: `learn_width`. */
 export function learnWidth(model: string, width: bigint): void {
-  WIDTHS.set(model, width);
+  rememberWidth(model, width);
 }

@@ -36,13 +36,14 @@ export const STACK_CONVERSATION_HEADER = "x-gray-conversation";
 export const STACK_BODY_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
- * A Chat stream whose `stream_options` is present and not an object (null included): no container may be sent it,
- * since neither the entry nor the relay can add `include_usage`, which Gray bills by.
+ * A Chat stream whose `stream_options` is present, non-null, and not an object: no container may be sent it,
+ * since neither the entry nor the relay can add `include_usage`, which Gray bills by. A `null` value is
+ * allowed by OpenAI's API and replaced with `{"include_usage":true}`.
  */
 export function stackStreamOptionsUnusable(protocol: LaneProtocol, stream: boolean, value: Json): boolean {
   if (protocol !== "open_ai_chat" || !stream || !isObject(value)) return false;
   const options = get(value, "stream_options");
-  return options !== undefined && !isObject(options);
+  return options !== undefined && options !== null && !isObject(options);
 }
 
 /** The op that makes the top-level `member` hold `to`: a set when the body has it, an insert when not. */
@@ -51,24 +52,49 @@ function memberOp(value: Json, member: string, to: Json): GrayRewriteOp {
 }
 
 /**
- * The required changes of one attempt, as `RewriteSpec`'s `model` and `set` state them (`stack.ts` `stackRewriteSpec`),
- * in the order egress reports ops (by path): the model, then `store: false` on every OpenAI Chat and Responses route, then
- * Codex's `stream` or Chat's `include_usage`.
+ * The required changes of one attempt, as `RewriteSpec`'s `model`, `set` and `remove` state them (`stack.ts`
+ * `stackRewriteSpec`), in the order egress reports ops (by top-level member name in UTF-16 order):
+ * `/metadata` (OpenAI) or `/metadata/user_id` (Anthropic, cascading an emptied `/metadata`), `/model`, `/models`,
+ * `/safety_identifier` (OpenAI), `store: false` on OpenAI routes, Codex's `stream: true`, Chat's `include_usage`,
+ * and `/user` (OpenAI; `prompt_cache_key` stays untouched).
  * So a customer who replays the receipt's ops on the client's bytes (`@gray/lane-verify`) makes exactly the bytes the
  * entry sent, when the container forwarded them as they are.
  */
-export function stackRequiredOps(input: { readonly protocol: LaneProtocol; readonly vendor: StackVendor; readonly upstreamModel: string; readonly stream: boolean; readonly value: Json }): GrayRewriteOp[] {
+export function stackRequiredOps(input: {
+  readonly protocol: LaneProtocol;
+  readonly vendor: StackVendor;
+  readonly upstreamModel: string;
+  readonly stream: boolean;
+  readonly value: Json;
+  /** The received body carried `models` (which `parseHeld`'s `takeModels` already deleted from `value`). */
+  readonly stripModels?: boolean;
+  /** The received body carried `provider` (which `Preference.take` already deleted from `value`). */
+  readonly stripProvider?: boolean;
+}): GrayRewriteOp[] {
   const { protocol, value } = input;
-  const ops: GrayRewriteOp[] = [memberOp(value, "model", input.upstreamModel)];
+  const openAi = protocol === "open_ai_chat" || protocol === "open_ai_responses";
+  const ops: GrayRewriteOp[] = [];
+  if (protocol === "anthropic_messages") {
+    const metadata = get(value, "metadata");
+    if (isObject(metadata) && Object.hasOwn(metadata, "user_id")) ops.push({ op: "remove_member", path: "/metadata/user_id" });
+  } else if (openAi && get(value, "metadata") !== undefined) {
+    ops.push({ op: "remove_member", path: "/metadata" });
+  }
+  ops.push(memberOp(value, "model", input.upstreamModel));
+  if (input.stripModels === true || get(value, "models") !== undefined) ops.push({ op: "remove_member", path: "/models" });
+  if (input.stripProvider === true) ops.push({ op: "remove_member", path: "/provider" });
+  if (openAi && get(value, "safety_identifier") !== undefined) ops.push({ op: "remove_member", path: "/safety_identifier" });
   // No OpenAI request is stored under a relay's account (docs/relay-request-changes.md P2), Codex's included (D129).
-  if ((protocol === "open_ai_chat" || protocol === "open_ai_responses") && stackStoreOff(input.vendor)) ops.push(memberOp(value, "store", false));
+  if (openAi && stackStoreOff(input.vendor)) ops.push(memberOp(value, "store", false));
   if (protocol === "open_ai_responses" && input.vendor === "chatgpt_codex") ops.push(memberOp(value, "stream", true));
   if (protocol === "open_ai_chat" && input.stream) {
     const options = get(value, "stream_options");
     if (options === undefined) ops.push({ op: "insert_member", path: "/stream_options", value: { include_usage: true } });
+    else if (options === null) ops.push({ op: "set_member", path: "/stream_options", value: { include_usage: true } });
     else if (isObject(options) && get(options, "include_usage") !== undefined) ops.push({ op: "set_member", path: "/stream_options/include_usage", value: true });
     else ops.push({ op: "insert_member", path: "/stream_options/include_usage", value: true });
   }
+  if (openAi && get(value, "user") !== undefined) ops.push({ op: "remove_member", path: "/user" });
   return ops;
 }
 
@@ -107,12 +133,24 @@ export function stackRequestBody(input: {
   readonly stream: boolean;
   readonly received: Uint8Array;
   readonly value: Json;
+  /** The received body carried `models` (which `parseHeld`'s `takeModels` already deleted from `value`). */
+  readonly stripModels?: boolean;
+  /** The received body carried `provider` (which `Preference.take` already deleted from `value`). */
+  readonly stripProvider?: boolean;
 }): StackRequestBody {
   const { config, route, protocol, received } = input;
   if (received.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
   if (stackStreamOptionsUnusable(protocol, input.stream, input.value)) return { ok: false, code: "stream_options_unusable" };
   const changed = applyDeclaredChanges(received, protocol, {
-    grayOps: stackRequiredOps({ protocol, vendor: route.vendor, upstreamModel: route.upstream_model, stream: input.stream, value: input.value }),
+    grayOps: stackRequiredOps({
+      protocol,
+      vendor: route.vendor,
+      upstreamModel: route.upstream_model,
+      stream: input.stream,
+      value: input.value,
+      ...(input.stripModels === true ? { stripModels: true } : {}),
+      ...(input.stripProvider === true ? { stripProvider: true } : {}),
+    }),
     appends: stackEntryAppends(config, protocol),
   });
   if (!changed.ok) return { ok: false, code: "stack_rewrite_refused" };

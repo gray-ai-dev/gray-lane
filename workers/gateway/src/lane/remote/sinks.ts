@@ -46,17 +46,24 @@ function unmeasured(a: RouteAttempt): RouteAttempt {
   return out as unknown as RouteAttempt;
 }
 
+/** A route attempt without its provider failure (2026-11-23): what a bridge before it knows. */
+const withoutProviderFailure = ({ providerFailure: _failure, ...a }: RouteAttempt): RouteAttempt => a;
+
 /**
  * `message` without what a bridge that answered `error` to it may have refused it for (`RemoteSinks.sendIndex`): its
  * rows' traces after a 404; after a 400 the newest member first, so a bridge that knows the older ones still gets them:
- * their route attempts' five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept;
- * then the route attempts (r14); then their charge sides and route API (0076). Null when the failure is another, or the
- * rows carry nothing of that kind to take out: the failure stands.
+ * their route attempts' provider failure (2026-11-23, docs/design/one-address.md "Provider defects at the entry"); then
+ * their five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept; then the route
+ * attempts (r14); then their charge sides and route API (0076). Null when the failure is another, or the rows carry
+ * nothing of that kind to take out: the failure stands.
  */
 function withoutRefused(error: unknown, message: RequestIndexMessage): RequestIndexMessage | null {
   if (!(error instanceof BridgeCallError)) return null;
   if (error.status === 404 && message.rows.some((row) => row.stackTrace !== undefined)) {
     return { ...message, rows: message.rows.map(({ stackTrace: _stackTrace, ...row }) => row) };
+  }
+  if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some((a) => a.providerFailure !== undefined) === true)) {
+    return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(withoutProviderFailure) })) };
   }
   if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some(measured) === true)) {
     return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(unmeasured) })) };
@@ -93,8 +100,10 @@ export class RemoteSinks extends BridgeClient implements Sinks {
    * 0076's three for a bridge older still; those rows count in no error rate. A bridge that predates the attempts'
    * measures (r15, docs/live-speed.md "Compatibility and rollout") refuses those the same way, so they go first: the
    * rows go again with r14's seven members of each attempt, which count in the error rates and in none of the three
-   * figures. Each is tried once, since rows sent again carry nothing left to take out: a document refused for another
-   * reason throws as before.
+   * figures. A bridge that predates the attempts' provider failure (2026-11-23) refuses it the same way, so it goes
+   * before the measures: the rows go again without it, and gray-jobs reads their defects as it reads those of an entry
+   * before it (jobs traffic-evidence.ts `rowDefects`). Each is tried once, since rows sent again carry nothing left to
+   * take out: a document refused for another reason throws as before.
    */
   async sendIndex(message: RequestIndexMessage): Promise<void> {
     try {

@@ -20,11 +20,11 @@ import { stackTraceSchema } from "./stack-trace.ts";
  *   envelope's JCS bytes (`@gray/attest` `jcsBytes`, RFC 8785), so one envelope has one spelling, and the signature is
  *   over a domain line and those bytes: `gray-lane-peer/v1\n` for an inference request, `gray-lane-peer-attempts/v1\n`
  *   for the late-facts follow-up (`GET /v1/peer/attempts/<rid>`), so neither can be presented as the other.
- * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream}`), `data` (standard base64 of
- *   the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts, relay_account_id,
- *   usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?}`). Between them the stack VM writes
- *   `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused` and `vendor_event` go only to an entry that named
- *   them in `PEER_READS_HEADER`.
+ * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream, headers?}`), `data` (standard
+ *   base64 of the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts,
+ *   relay_account_id, usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?}`). Between them the stack
+ *   VM writes `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused`, `vendor_event` and `head.headers`
+ *   (`error_headers`) go only to an entry that named them in `PEER_READS_HEADER`.
  * - **A refusal** of checks 1 to 6 (`peer_*`, `route_unconfigured`, `foreign_relay`): an HTTP 4xx whose body is
  *   `{code, dialed: false}`, before any frame; the status is `PEER_REFUSAL_STATUS`'s.
  * - **The attempts answer**: `{state, receipt, trace?}` from the stack VM's memory (`trace` once done, to an entry
@@ -76,8 +76,13 @@ export const PEER_READS_HEADER = "x-gray-peer-reads";
  * `attempts_trace`: named on the follow-up (`GET /v1/peer/attempts/<rid>`), the attempt's trace in the answer once it is
  * done, for an entry that let go of the hop before `end` came (its own limit, the client gone): the entry's row keeps the
  * relay's trace and its attempt.
+ *
+ * `error_headers`: allowlisted lower-case vendor error response headers (`PEER_ERROR_HEADERS`) carried on a non-200
+ * `vendor_error` `head` frame (`head.headers`), so the entry drives rest classification and passes `Retry-After` /
+ * `Content-Type` to the client. Sent only to an entry that named `error_headers` in `PEER_READS_HEADER`: an older
+ * entry's strict `peerHeadSchema` refuses a `head` that carries `headers`.
  */
-export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace"] as const;
+export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers"] as const;
 export type PeerEndRead = (typeof PEER_END_READS)[number];
 
 /**
@@ -165,6 +170,12 @@ export const peerEnvelopeSchema = z
      * change of the relay's own. Absent otherwise. It names a preference, not a customer.
      */
     relay_changes: z.literal("exclude").optional(),
+    /**
+     * True for an Anthropic token-counting request (`POST /v1/messages/count_tokens`); absent on generation calls so
+     * existing generation envelopes remain wire-compatible and older stack VMs reject unknown count_tokens hops with
+     * `peer_malformed`.
+     */
+    count_tokens: z.literal(true).optional(),
   })
   .strict();
 export type PeerEnvelopeDto = z.infer<typeof peerEnvelopeSchema>;
@@ -312,7 +323,66 @@ export const PEER_COMMENT: Uint8Array = ENCODER.encode(": keep-alive\n\n");
  */
 export const PEER_FRAME_MAX_BYTES = 64 * 1024;
 
-export const peerHeadSchema = z.object({ status: uintSchema.min(200n).max(599n), stream: z.boolean() }).strict();
+/** The lower-case vendor error response headers that may cross the peer hop on a non-200 `head` frame. */
+export const PEER_ERROR_HEADERS = ["retry-after", "retry-after-ms", "x-should-retry", "content-type"] as const;
+export type PeerErrorHeader = (typeof PEER_ERROR_HEADERS)[number];
+
+/** The longest value of one allowlisted vendor error header carried on a `head` frame. */
+export const PEER_ERROR_HEADER_MAX_LENGTH = 256;
+
+/** Header value characters: visible ASCII and HTAB, bounded length, never CR, LF, NUL, or other controls. */
+const PEER_ERROR_HEADER_VALUE = /^[\t\x20-\x7e]{1,256}$/;
+
+export const peerErrorHeadersSchema = z
+  .object({
+    "retry-after": z.string().regex(PEER_ERROR_HEADER_VALUE).optional(),
+    "retry-after-ms": z.string().regex(PEER_ERROR_HEADER_VALUE).optional(),
+    "x-should-retry": z.string().regex(PEER_ERROR_HEADER_VALUE).optional(),
+    "content-type": z.string().regex(PEER_ERROR_HEADER_VALUE).optional(),
+  })
+  .strict();
+export type PeerErrorHeadersDto = z.infer<typeof peerErrorHeadersSchema>;
+
+/**
+ * Picks the allowlisted lower-case vendor error headers from `headers`, strips CR/LF and outer whitespace,
+ * drops values outside `PEER_ERROR_HEADER_VALUE` (empty, controls, non-ASCII, or past 256 bytes), and returns
+ * them in `PEER_ERROR_HEADERS` order, or undefined when none remain.
+ */
+export function peerErrorHeadersOf(headers: Readonly<Record<string, string>>): PeerErrorHeadersDto | undefined {
+  const lowered = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) lowered.set(name.toLowerCase(), value);
+  const out: Partial<Record<PeerErrorHeader, string>> = {};
+  let count = 0;
+  for (const name of PEER_ERROR_HEADERS) {
+    const raw = lowered.get(name);
+    if (raw === undefined) continue;
+    const cleaned = raw.replace(/[\r\n]+/g, "").trim();
+    if (!PEER_ERROR_HEADER_VALUE.test(cleaned)) continue;
+    out[name] = cleaned;
+    count += 1;
+  }
+  return count === 0 ? undefined : out;
+}
+
+export const peerHeadSchema = z
+  .object({
+    status: uintSchema.min(200n).max(599n),
+    stream: z.boolean(),
+    /**
+     * Allowlisted vendor error headers (`PEER_ERROR_HEADERS`), carried only on a non-streaming error `head`
+     * (status >= 400, stream false) to an entry that named `error_headers` in `PEER_READS_HEADER`.
+     */
+    headers: peerErrorHeadersSchema.optional(),
+  })
+  .strict()
+  .superRefine((head, ctx) => {
+    if (head.headers === undefined) return;
+    if (head.status < 400n || head.stream) {
+      ctx.addIssue({ code: "custom", path: ["headers"], message: "headers are carried only on a non-streaming error head" });
+    } else if (Object.keys(head.headers).length === 0) {
+      ctx.addIssue({ code: "custom", path: ["headers"], message: "headers must not be empty" });
+    }
+  });
 export type PeerHeadDto = z.infer<typeof peerHeadSchema>;
 
 /**

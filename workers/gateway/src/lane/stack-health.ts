@@ -202,8 +202,10 @@ const egressCoolingSchema = z
     gen: uintSchema,
     observed: z.boolean(),
     clears: z.array(z.enum(STACK_RULE_CLEARS)).max(STACK_RULE_CLEARS.length),
+    cred_gen: uintSchema.min(1n).optional(),
   })
-  .strict();
+  .strict()
+  .refine((e) => e.cred_gen === undefined || e.clears.includes("credential"), { message: "cred_gen is only allowed when clears includes credential", path: ["cred_gen"] });
 
 /** A password account's sign-in (egress stack_login.go `loginHealth`): its times are already whole hours. */
 const egressLoginSchema = z
@@ -280,6 +282,7 @@ interface EgressHealth {
       readonly gen: number;
       readonly observed: boolean;
       readonly clears: readonly (typeof STACK_RULE_CLEARS)[number][];
+      readonly cred_gen?: number;
     }[];
     readonly windows: readonly EgressWindow[];
     readonly login?: StackReportLogin;
@@ -367,6 +370,7 @@ function reportCooling(entry: EgressHealth["accounts"][number]["cooling"][number
     gen: entry.gen,
     observed: entry.observed,
     clears: [...entry.clears],
+    ...(entry.cred_gen !== undefined && entry.clears.includes("credential") ? { cred_gen: entry.cred_gen } : {}),
   };
 }
 
@@ -383,7 +387,18 @@ function restoredCooling(entry: StackRestoreEntry): StackReportCooling {
     gen: entry.gen,
     observed: entry.observed,
     clears: [...entry.clears],
+    ...(entry.cred_gen !== undefined && entry.clears.includes("credential") ? { cred_gen: entry.cred_gen } : {}),
   };
+}
+
+/**
+ * AF-06.3 defense-in-depth: whether a cooling/restore entry still matches the account's current TEE `credGen`.
+ * Non-credential entries and legacy entries without `cred_gen` pass through; when the account is not currently sealed,
+ * the entry passes through so egress validates it atomically on the first table push.
+ */
+function matchesCurrentCredGen(entry: { readonly clears: readonly string[]; readonly cred_gen?: number }, held: StackSealedAccount | undefined): boolean {
+  if (entry.cred_gen === undefined || !entry.clears.includes("credential") || held === undefined) return true;
+  return BigInt(entry.cred_gen) === held.credGen;
 }
 
 /** A window as the report and a test result carry it: its times as minutes (ends ceiled, the observation floored). */
@@ -606,8 +621,15 @@ export class StackHealthService {
     const egress = options.egress;
     if (egress === undefined) return false;
     const restore = this.#restore;
+    const filteredRestore =
+      restore === null
+        ? null
+        : (() => {
+            const sealedById = new Map(options.credentials.stackAccounts(options.relayId, options.now()).map((account) => [account.account_id, account]));
+            return restore.filter((entry) => matchesCurrentCredGen(entry, sealedById.get(entry.account_id)));
+          })();
     const { mode, rules: list, windows, accounts } = rules.document;
-    const body = toJsonString(integersOfJson({ digest: rules.digest, mode, rules: list, windows, accounts, ...(restore === null ? {} : { restore }) }, "") as Json);
+    const body = toJsonString(integersOfJson({ digest: rules.digest, mode, rules: list, windows, accounts, ...(filteredRestore === null ? {} : { restore: filteredRestore }) }, "") as Json);
     this.#coolingPush += 1n;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.pollMs);
@@ -629,7 +651,7 @@ export class StackHealthService {
     }
     if (status === 204) {
       if (this.#restore === restore) this.#restore = null;
-      this.#log({ level: "info", event: "lane_stack_cooling_pushed", relay_id: options.relayId, digest: rules.digest, mode, restored: restore?.length ?? 0 });
+      this.#log({ level: "info", event: "lane_stack_cooling_pushed", relay_id: options.relayId, digest: rules.digest, mode, restored: filteredRestore?.length ?? 0 });
       return true;
     }
     // 409 `stack_cooling_stale`: egress holds a higher push number than this one; the next round reads it from egress's
@@ -691,10 +713,15 @@ export class StackHealthService {
     const own = health !== null && this.#holdsOwn(health);
     const restoring = new Map<string, StackReportCooling[]>();
     for (const entry of this.#restore ?? []) restoring.set(entry.account_id, [...(restoring.get(entry.account_id) ?? []), restoredCooling(entry)]);
-    // An entry a Clear since then dropped (its generation below the account's in the rules held) is not carried.
+    // An entry a Clear since then dropped (its generation below the account's in the rules held) or whose credential
+    // generation disagrees with the store's current credential is not carried.
     const generations = this.#rules?.document.accounts ?? {};
-    const carried = (accountId: string): readonly StackReportCooling[] =>
-      (this.#settled.get(accountId)?.cooling ?? restoring.get(accountId) ?? []).filter((entry) => (entry.until_minute_ms === null || entry.until_minute_ms > now) && entry.gen >= (generations[accountId] ?? 0));
+    const carried = (accountId: string): readonly StackReportCooling[] => {
+      const held = sealedById.get(accountId);
+      return (this.#settled.get(accountId)?.cooling ?? restoring.get(accountId) ?? []).filter(
+        (entry) => (entry.until_minute_ms === null || entry.until_minute_ms > now) && entry.gen >= (generations[accountId] ?? 0) && matchesCurrentCredGen(entry, held),
+      );
+    };
     const panel = [...(metadata?.accounts ?? [])].sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)).slice(0, STACK_ACCOUNTS_MAX);
     const named = new Set(panel.map((account) => account.id));
     const accounts = panel.map((account): StackReportAccount => {
@@ -863,6 +890,7 @@ export class StackHealthService {
       account_id: account.id,
       vendor: account.vendor,
       credential_type: sealed.credential.type,
+      credential_gen: sealed.credGen,
       protocol: test.protocol,
       model: test.model,
       credential,

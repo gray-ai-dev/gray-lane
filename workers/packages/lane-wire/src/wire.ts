@@ -1,10 +1,10 @@
 import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { z } from "zod";
 import { acmeChallengeAnswerSchema, acmeChallengeSchema } from "./acme-challenge.ts";
-import { continuationBindAnswerSchema, continuationBindRequestSchema, continuationPinAnswerSchema, continuationPinRequestSchema } from "./continuation.ts";
+import { CONTINUATION_BIND_MAX_BYTES, continuationBindAnswerSchema, continuationBindRequestSchema, continuationPinAnswerSchema, continuationPinRequestSchema } from "./continuation.ts";
 import { entryRoleAnswerSchema, entryRoleRequestSchema } from "./entry-role.ts";
 import { endpointCredentialAnswerSchema, endpointCredentialRequestSchema } from "./endpoint-credential.ts";
-import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
+import { admitInputSchema, admitResultSchema, countInputSchema, countResultSchema, keyRevokedInputSchema, keyRevokedResultSchema, releaseInputSchema, releaseResultSchema, settleInputSchema, settleResultSchema } from "./account.ts";
 import { attestCollateralAnswerSchema, attestCollateralRequestSchema, releaseListsAnswerSchema, releaseListsRequestSchema } from "./background.ts";
 import {
   ENDPOINT_FILE_REST_MAX_BYTES,
@@ -92,7 +92,8 @@ export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
  * record of up to 1 MiB (`STACK_VAULT_PUT_MAX_BYTES`); `stack.vault.share` a TDX quote and its event log
  * (`STACK_VAULT_SHARE_MAX_BYTES`); `endpoint.file_rest` a rest over as many keys and roots as a root's rests cover
  * (`ENDPOINT_FILE_REST_MAX_BYTES`); `video.put` a job's record, its hold token, evidence and projection columns
- * (`VIDEO_PUT_MAX_BYTES`); every other op's document is a few KB.
+ * (`VIDEO_PUT_MAX_BYTES`); `continuation.bind` references with optional sealed zero-retention state
+ * (`CONTINUATION_BIND_MAX_BYTES`); every other op's document is a few KB.
  */
 export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
@@ -101,6 +102,7 @@ export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "stack.vault.put") return STACK_VAULT_PUT_MAX_BYTES;
   if (op === "stack.vault.share") return STACK_VAULT_SHARE_MAX_BYTES;
   if (op === "video.put") return VIDEO_PUT_MAX_BYTES;
+  if (op === "continuation.bind") return CONTINUATION_BIND_MAX_BYTES;
   return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
 }
 
@@ -150,6 +152,7 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "account.count": countInputSchema,
   "account.settle": settleInputSchema,
   "account.release": releaseInputSchema,
+  "account.keyRevoked": keyRevokedInputSchema,
   "endpoint.acquire": acquireInputSchema,
   "endpoint.release": endpointReleaseInputSchema,
   "endpoint.release_retry": retryReleaseInputSchema,
@@ -195,6 +198,7 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "account.count": countResultSchema,
   "account.settle": settleResultSchema,
   "account.release": releaseResultSchema,
+  "account.keyRevoked": keyRevokedResultSchema,
   "endpoint.acquire": acquireResultSchema,
   "endpoint.release": endpointReleaseResultSchema,
   "endpoint.release_retry": emptyAnswerSchema,

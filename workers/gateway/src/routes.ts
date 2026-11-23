@@ -32,7 +32,7 @@ export function capable(route: Pick<RouteRecord, "capabilities">, request: Canon
   const media = mediaUnknown || request.messages.some((m) => m.content.some((c) => c.type === "image_url" || c.type === "input_image" || c.type === "file"));
   return (
     (request.stream ? caps.streaming : caps.streamedOnly !== true) &&
-    (request.tools.length === 0 || chat.tools) &&
+    ((request.tools.length === 0 && !request.hasHostedTools) || chat.tools) &&
     (request.response_format === null || !structured(request.response_format) || chat.structuredOutput) &&
     (request.reasoning === null || !reasoningRequested(request.reasoning) || chat.reasoning) &&
     (!media || chat.vision)

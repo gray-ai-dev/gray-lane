@@ -100,6 +100,21 @@ interface RelayState {
   readonly accountIds: Set<string>;
   /** H13: the last bundle's `vault.persist` (true when it named none). */
   persist: boolean;
+  /** AF-06.3: relay-wide monotonic credential-generation counter (S33: CSPRNG 48-bit seed + 1 per credential transition). */
+  credGenSeq: bigint;
+}
+
+/**
+ * CSPRNG 48-bit positive integer (`1n .. 2^48`) for a fresh relay's `credGenSeq` (AF-06.3, S33): contains zero bits
+ * derived from any credential, so cold vaultless reboots fail open on `clears: ["credential"]` holds with < 2^-48
+ * collision probability while leaving > 2^52 increments within JS safe integers.
+ */
+function randomInitialCredGenSeq(): bigint {
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+  return value + 1n;
 }
 
 /**
@@ -118,6 +133,8 @@ export interface RelayVaultSnapshot {
   readonly version: bigint;
   /** H13: the last bundle's `vault.persist`. */
   readonly persist: boolean;
+  /** AF-06.3: the relay's monotonic credential-generation sequence; absent in pre-AF-06.3 records. */
+  readonly cred_gen_seq?: bigint;
   readonly accounts: readonly RelayVaultAccount[];
   /** Tokens egress refreshed or a sign-in in the VM yielded, standing in for a sealed credential (`applyRefreshed`). */
   readonly refreshed: readonly RelayVaultRefreshed[];
@@ -164,6 +181,8 @@ export interface RelayVaultAccount {
    * `version`.
    */
   readonly login_since?: bigint;
+  /** AF-06.3: the account's credential generation; absent in pre-AF-06.3 records (defaults to 1n on restore). */
+  readonly cred_gen?: bigint;
 }
 
 export interface RelayVaultRefreshed {
@@ -172,6 +191,8 @@ export interface RelayVaultRefreshed {
   readonly credential: Credential;
   /** A `password` account's sign-in e-mail the token belongs to. */
   readonly username?: string;
+  /** AF-06.3: the refreshed token's credential generation; absent in pre-AF-06.3 records (defaults to 1n on restore). */
+  readonly cred_gen?: bigint;
 }
 
 interface StoredAccount {
@@ -191,6 +212,8 @@ interface StoredAccount {
    * (docs/design/relay-sign-in-in-vm.md D9). `version` for an API key.
    */
   loginSince: bigint;
+  /** AF-06.3: monotonic generation allocated when this account's effective credential changes. */
+  credGen: bigint;
 }
 
 /** A token egress refreshed or a sign-in in the VM yielded (`applyRefreshed`), standing in for a sealed credential. */
@@ -202,11 +225,28 @@ interface RefreshedToken {
   readonly credential: Credential;
   /** A `password` account's sign-in e-mail the token belongs to. */
   readonly username?: string;
+  /** AF-06.3: monotonic generation allocated when this standing-in token's effective credential changed. */
+  readonly credGen: bigint;
 }
 
 /** The sign-in e-mail of a `password` credential, or null. */
 function loginOf(credential: Credential): string | null {
   return credential.type === "password" && credential.username !== undefined ? credential.username : null;
+}
+
+/**
+ * Whether `prev` and `next` carry the same effective upstream credential (AF-06.3): same vendor and type, with exact
+ * `value` equality for `api_key`/`oauth_access_token` (matching `stackCredentialSha256`), same sign-in e-mail for
+ * `password`, and any `sign_in`. Used strictly inside the TEE to decide whether to keep or bump `credGen`.
+ */
+export function sameEffectiveCredential(
+  prev: { readonly vendor: Vendor; readonly credential: Credential },
+  next: { readonly vendor: Vendor; readonly credential: Credential },
+): boolean {
+  if (prev.vendor !== next.vendor || prev.credential.type !== next.credential.type) return false;
+  if (next.credential.type === "password") return loginOf(prev.credential) !== null && loginOf(prev.credential) === loginOf(next.credential);
+  if (next.credential.type === "sign_in") return true;
+  return prev.credential.value === next.credential.value;
 }
 
 /**
@@ -229,8 +269,8 @@ function loginSinceAfter(previous: StoredAccount | undefined, vendor: Vendor, ne
 
 /**
  * One account as `stackAccounts` returns it: the sealed credential and proxy as the relay sealed them,
- * and `version`, the sealed version that last set either (a relay stack's panel names the version the
- * entry waits for, §8 `credential_version`).
+ * `version`, the sealed version that last set either (a relay stack's panel names the version the
+ * entry waits for, §8 `credential_version`), and `credGen`, the TEE-owned generation of the effective credential.
  */
 export interface StackSealedAccount {
   readonly account_id: string;
@@ -242,6 +282,8 @@ export interface StackSealedAccount {
   readonly credential: Credential;
   readonly egress?: EgressSpec;
   readonly version: bigint;
+  /** AF-06.3: the effective credential's generation (`refreshed.credGen` when standing in, else `account.credGen`). */
+  readonly credGen: bigint;
   /**
    * The first sealed version the account is the same one from (D9), when it is older than `version`; absent: `version`.
    * The version egress is told: a token it made from this one on is still the account's.
@@ -277,6 +319,11 @@ export interface RelayCredentialStoreOptions {
    * holds outside the store, stops them. Off (the default) is phase 1, where the bundle's end is the bound.
    */
   readonly leaseGated?: boolean;
+  /**
+   * AF-06.3: initial `credGenSeq` for a brand-new (non-vault-restored) relay; defaults to a CSPRNG 48-bit positive
+   * integer (`1n .. 2^48`). Injectable for deterministic unit tests.
+   */
+  readonly initialCredGenSeq?: () => bigint;
 }
 
 export const DEFAULT_MAX_SKEW_SECONDS = 300n;
@@ -291,6 +338,7 @@ export class RelayCredentialStore implements AccountMembership {
   readonly #maxAccountsPerRelay: number;
   readonly #maxTotalAccounts: number;
   readonly #leaseGated: boolean;
+  readonly #initialCredGenSeq: () => bigint;
   readonly #relays = new Map<string, RelayState>();
   readonly #accounts = new Map<string, StoredAccount>();
   /**
@@ -308,6 +356,7 @@ export class RelayCredentialStore implements AccountMembership {
     this.#maxAccountsPerRelay = options.maxAccountsPerRelay ?? DEFAULT_MAX_ACCOUNTS_PER_RELAY;
     this.#maxTotalAccounts = options.maxTotalAccounts ?? DEFAULT_MAX_TOTAL_ACCOUNTS;
     this.#leaseGated = options.leaseGated === true;
+    this.#initialCredGenSeq = options.initialCredGenSeq ?? randomInitialCredGenSeq;
   }
 
   /** Whether the accounts are gated by the KMS lease rather than a bundle's `expires_at` (`leaseGated`). */
@@ -439,25 +488,44 @@ export class RelayCredentialStore implements AccountMembership {
       }
     }
     const previous = new Map<string, StoredAccount>();
+    const previousEffective = new Map<string, { readonly vendor: Vendor; readonly credential: Credential; readonly credGen: bigint }>();
     if (state !== undefined) {
       for (const accountId of state.accountIds) {
         const held = this.#accounts.get(accountId);
-        if (held !== undefined) previous.set(accountId, held);
+        if (held !== undefined) {
+          previous.set(accountId, held);
+          const effective = this.#currentEffective(relayId, held);
+          previousEffective.set(accountId, { vendor: held.vendor, credential: effective.credential, credGen: effective.credGen });
+        }
         this.#accounts.delete(accountId);
       }
       state.accountIds.clear();
     }
-    const next = state ?? { version: 0n, expiresAt: 0n, accountIds: new Set<string>(), persist: true };
+    const next = state ?? { version: 0n, expiresAt: 0n, accountIds: new Set<string>(), persist: true, credGenSeq: this.#initialCredGenSeq() };
     for (const account of bundle.accounts) {
-      this.#accounts.set(account.account_id, {
+      const prevAccount = previous.get(account.account_id);
+      const prevEff = previousEffective.get(account.account_id);
+      const stored: StoredAccount = {
         account_id: account.account_id,
         vendor: account.vendor,
         relay_id: relayId,
         credential: account.credential,
         ...(account.egress === undefined ? {} : { egress: account.egress }),
         version: bundle.version,
-        loginSince: loginSinceAfter(previous.get(account.account_id), account.vendor, account.credential, bundle.version),
-      });
+        loginSince: loginSinceAfter(prevAccount, account.vendor, account.credential, bundle.version),
+        credGen: 0n,
+      };
+      const refreshed = this.#refreshed.get(account.account_id);
+      if (prevAccount !== undefined && refreshed !== undefined && this.#standsIn(stored, refreshed)) {
+        // Standing-in refreshed token stays valid (no-op re-seal / lease renewal): keep stored & refreshed credGen.
+        stored.credGen = prevAccount.credGen;
+      } else if (prevEff !== undefined && sameEffectiveCredential(prevEff, account)) {
+        stored.credGen = prevEff.credGen;
+      } else {
+        next.credGenSeq += 1n;
+        stored.credGen = next.credGenSeq;
+      }
+      this.#accounts.set(account.account_id, stored);
       next.accountIds.add(account.account_id);
     }
     next.version = bundle.version;
@@ -489,6 +557,7 @@ export class RelayCredentialStore implements AccountMembership {
         throw error;
       }
     }
+    const prevEff = { vendor: existing.vendor, ...this.#currentEffective(relayId, existing) };
     if (update.credential !== undefined) {
       existing.loginSince = loginSinceAfter(existing, existing.vendor, update.credential, update.version);
       existing.credential = update.credential;
@@ -500,6 +569,14 @@ export class RelayCredentialStore implements AccountMembership {
     existing.version = update.version;
     state.version = update.version;
     this.#dropStaleToken(update.account_id);
+    if (update.credential !== undefined && !this.#refreshed.has(update.account_id)) {
+      if (sameEffectiveCredential(prevEff, { vendor: existing.vendor, credential: existing.credential })) {
+        existing.credGen = prevEff.credGen;
+      } else {
+        state.credGenSeq += 1n;
+        existing.credGen = state.credGenSeq;
+      }
+    }
   }
 
   /** A signed removal: one account, or every account of the relay. Revocations share the version. */
@@ -515,7 +592,7 @@ export class RelayCredentialStore implements AccountMembership {
       state.version = revocation.version;
       return;
     }
-    const next = state ?? { version: 0n, expiresAt: 0n, accountIds: new Set<string>(), persist: true };
+    const next = state ?? { version: 0n, expiresAt: 0n, accountIds: new Set<string>(), persist: true, credGenSeq: this.#initialCredGenSeq() };
     for (const accountId of next.accountIds) {
       this.#accounts.delete(accountId);
       this.#refreshed.delete(accountId);
@@ -612,13 +689,15 @@ export class RelayCredentialStore implements AccountMembership {
     if (state === undefined || this.#keys.publicKeyFor(relayId) === null) return [];
     if (BigInt(Math.floor(nowMs / 1000)) >= state.expiresAt) return [];
     return this.#accountsOf(relayId)
-      .map((account) =>
-        Object.freeze({
+      .map((account) => {
+        const effective = this.#currentEffective(relayId, account);
+        return Object.freeze({
           account_id: account.account_id,
           vendor: account.vendor,
-          credential: this.#currentCredential(relayId, account),
+          credential: effective.credential,
           ...(account.egress === undefined ? {} : { egress: account.egress }),
           version: account.version,
+          credGen: effective.credGen,
           ...(account.loginSince === account.version ? {} : { since: account.loginSince }),
           ...(account.credential.type !== "password" || account.credential.username === undefined
             ? {}
@@ -629,8 +708,8 @@ export class RelayCredentialStore implements AccountMembership {
                   ...(account.credential.totp_secret === undefined ? {} : { totp_secret: account.credential.totp_secret }),
                 }),
               }),
-        }),
-      )
+        });
+      })
       .sort((left, right) => (left.account_id < right.account_id ? -1 : left.account_id > right.account_id ? 1 : 0));
   }
 
@@ -648,17 +727,27 @@ export class RelayCredentialStore implements AccountMembership {
    */
   applyRefreshed(relayId: string, accountId: string, basedOn: bigint, credential: Credential): boolean {
     const account = this.#accounts.get(accountId);
-    if (account === undefined || account.relay_id !== relayId || credential.type !== "oauth_access_token") return false;
+    const state = this.#relays.get(relayId);
+    if (account === undefined || state === undefined || account.relay_id !== relayId || credential.type !== "oauth_access_token") return false;
     const username = loginOf(account.credential);
-    const token: RefreshedToken = Object.freeze({
+    const candidate: RefreshedToken = {
       relayId,
       vendor: account.vendor,
       basedOn,
       credential: Object.freeze({ ...credential }),
       ...(username === null ? {} : { username }),
-    });
-    if (!this.#standsIn(account, token)) return false;
-    this.#refreshed.set(accountId, token);
+      credGen: 0n,
+    };
+    if (!this.#standsIn(account, candidate)) return false;
+    const prevEff = { vendor: account.vendor, ...this.#currentEffective(relayId, account) };
+    let credGen: bigint;
+    if (sameEffectiveCredential(prevEff, { vendor: account.vendor, credential })) {
+      credGen = prevEff.credGen;
+    } else {
+      state.credGenSeq += 1n;
+      credGen = state.credGenSeq;
+    }
+    this.#refreshed.set(accountId, Object.freeze({ ...candidate, credGen }));
     return true;
   }
 
@@ -693,15 +782,15 @@ export class RelayCredentialStore implements AccountMembership {
     if (account === undefined || !this.#standsIn(account, token)) this.#refreshed.delete(accountId);
   }
 
-  /** The account's sealed credential, or the token egress refreshed from it (for a password account, signed in). */
-  #currentCredential(relayId: string, account: StoredAccount): Credential {
+  /** The account's effective credential and generation: standing-in refreshed token if valid, else sealed account. */
+  #currentEffective(relayId: string, account: StoredAccount): { readonly credential: Credential; readonly credGen: bigint } {
     const refreshed = this.#refreshed.get(account.account_id);
-    if (refreshed === undefined || refreshed.relayId !== relayId) return account.credential;
+    if (refreshed === undefined || refreshed.relayId !== relayId) return { credential: account.credential, credGen: account.credGen };
     if (!this.#standsIn(account, refreshed)) {
       this.#refreshed.delete(account.account_id);
-      return account.credential;
+      return { credential: account.credential, credGen: account.credGen };
     }
-    return refreshed.credential;
+    return { credential: refreshed.credential, credGen: refreshed.credGen };
   }
 
   /**
@@ -733,6 +822,7 @@ export class RelayCredentialStore implements AccountMembership {
         ...(account.egress === undefined ? {} : { egress: account.egress }),
         version: account.version,
         ...(account.loginSince === account.version ? {} : { login_since: account.loginSince }),
+        cred_gen: account.credGen,
       }),
     );
     const refreshed: RelayVaultRefreshed[] = [];
@@ -745,9 +835,10 @@ export class RelayCredentialStore implements AccountMembership {
         based_on: token.basedOn,
         credential: token.credential,
         ...(token.username === undefined ? {} : { username: token.username }),
+        cred_gen: token.credGen,
       });
     }
-    return { version: state.version, persist: state.persist, accounts, refreshed };
+    return { version: state.version, persist: state.persist, cred_gen_seq: state.credGenSeq, accounts, refreshed };
   }
 
   /**
@@ -783,7 +874,18 @@ export class RelayCredentialStore implements AccountMembership {
       }
     });
     this.removeRelay(relayId);
-    const state: RelayState = { version: snapshot.version, expiresAt: NO_EXPIRY, accountIds: new Set<string>(), persist: snapshot.persist };
+    let maxGen = 0n;
+    for (const account of snapshot.accounts) {
+      const credGen = account.cred_gen ?? 1n;
+      if (credGen > maxGen) maxGen = credGen;
+    }
+    for (const token of snapshot.refreshed) {
+      const credGen = token.cred_gen ?? 1n;
+      if (credGen > maxGen) maxGen = credGen;
+    }
+    const baseSeq = snapshot.cred_gen_seq !== undefined ? snapshot.cred_gen_seq : snapshot.accounts.length === 0 && snapshot.refreshed.length === 0 ? 0n : 1n;
+    const credGenSeq = baseSeq > maxGen ? baseSeq : maxGen;
+    const state: RelayState = { version: snapshot.version, expiresAt: NO_EXPIRY, accountIds: new Set<string>(), persist: snapshot.persist, credGenSeq };
     for (const account of snapshot.accounts) {
       const login = loginOf(account.credential);
       // A record from before `login_since`: the sign-in its own token names (a token of the same e-mail) is the start.
@@ -797,6 +899,7 @@ export class RelayCredentialStore implements AccountMembership {
         ...(account.egress === undefined ? {} : { egress: account.egress }),
         version: account.version,
         loginSince: since > account.version ? account.version : since,
+        credGen: account.cred_gen ?? 1n,
       });
       state.accountIds.add(account.account_id);
     }
@@ -812,6 +915,7 @@ export class RelayCredentialStore implements AccountMembership {
               basedOn: token.based_on,
               credential: Object.freeze({ ...token.credential }),
               ...(token.username === undefined ? {} : { username: token.username }),
+              credGen: token.cred_gen ?? 1n,
             });
       if (account === undefined || restored === null || !this.#standsIn(account, restored)) {
         dropped.add(token.account_id);

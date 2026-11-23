@@ -648,7 +648,11 @@ export class StackConfigService implements StackRelayConfigProvider {
       const since = this.#rotatedSince.get(row.account_id);
       if (since !== undefined && now - since >= this.#options.rotationGraceMs) return row;
       rotated.push(row.account_id);
-      return { ...row, credential_sha256: previous.credential_sha256 };
+      return {
+        ...row,
+        credential_sha256: previous.credential_sha256,
+        ...(previous.credential_gen === undefined ? {} : { credential_gen: previous.credential_gen }),
+      };
     });
     return { rows, rotated };
   }

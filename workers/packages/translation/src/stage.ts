@@ -10,6 +10,7 @@
 import {
   type CanonicalEvent,
   type CanonicalResponse,
+  PROJECTION_NODE_BYTES,
   type Protocol,
   ProtocolStreamDecoder,
   Refusal,
@@ -17,11 +18,12 @@ import {
   StreamTranslator,
   TRANSLATION_CODES,
   parseResponse,
+  stringHeapBytes,
   translateResponse,
   translationErrorFrame,
 } from "@gray/protocol";
-import { type Json, toJsonString } from "@gray/json";
-import { CallSet } from "./calls.ts";
+import { type Json, asStr, get, isObject, toJsonString } from "@gray/json";
+import { CallSet, canonicalArguments } from "./calls.ts";
 
 /** Failure codes of the translation stages (HTTP 502 before the first release). */
 export const CLIENT_STREAM_INVALID = "translation_client_stream_invalid";
@@ -55,14 +57,86 @@ export function answeredByUpstream(code: string): boolean {
   return code === TRANSLATION_CODES.UPSTREAM_ARGUMENTS;
 }
 
-function observe(events: readonly CanonicalEvent[], calls: CallSet, seen: { tool: boolean }): void {
-  for (const event of events) {
-    if (event.type === "tool_call_complete") {
-      seen.tool = true;
-      calls.push(event.name ?? "", event.arguments);
-    } else if (event.type === "tool_call_delta") {
-      seen.tool = true;
+/**
+ * Tracks completed tool calls per stream index and reconciles repeated Responses completions
+ * (`response.function_call_arguments.done` followed by `response.output_item.done`).
+ *
+ * - A repeated `tool_call_complete` for the same index whose canonical `(name, arguments)` matches
+ *   the first completion (for example `""` followed by `"{}"`) reconciles as one call rather than
+ *   double-counting it.
+ * - A repeated completion or `native` `response.output_item.done` for a `function_call` whose
+ *   canonical name or raw arguments disagree with the earlier completion (or that appears without
+ *   any completed call for that index) flags a conflict so `finish()` refuses with
+ *   `TOOL_CALL_MISMATCH`, because `StreamTranslator` already emitted the first completion to the
+ *   client and ignores subsequent completions for the same index.
+ */
+class CallLedger {
+  private readonly calls = new CallSet();
+  private readonly byIndex = new Map<bigint, readonly [string, string]>();
+  private readonly rawByIndex = new Map<bigint, string>();
+  private conflict = false;
+  private extraHeap = 0;
+
+  observe(events: readonly CanonicalEvent[], seen: { tool: boolean }): void {
+    for (const event of events) {
+      if (event.type === "tool_call_complete") {
+        seen.tool = true;
+        const name = event.name ?? "";
+        const key = canonicalArguments(event.arguments);
+        const existing = this.byIndex.get(event.index);
+        if (existing === undefined) {
+          this.byIndex.set(event.index, [name, key]);
+          this.extraHeap += PROJECTION_NODE_BYTES.item + PROJECTION_NODE_BYTES.array + 2 * PROJECTION_NODE_BYTES.item;
+          this.calls.push(name, event.arguments);
+        } else if (existing[0] !== name || existing[1] !== key) {
+          this.conflict = true;
+        }
+      } else if (event.type === "tool_call_delta") {
+        seen.tool = true;
+      }
     }
+    for (const event of events) {
+      if (event.type !== "native" || event.protocol !== "open_ai_responses" || !isObject(event.payload)) continue;
+      const kind = asStr(get(event.payload, "type"));
+      if (kind === "response.function_call_arguments.done") {
+        const index = get(event.payload, "output_index");
+        const raw = get(event.payload, "arguments");
+        if (typeof index === "bigint" && typeof raw === "string") this.recordRaw(index, canonicalArguments(raw));
+      } else if (kind === "response.output_item.done") {
+        const item = get(event.payload, "item");
+        if (!isObject(item) || asStr(get(item, "type")) !== "function_call") continue;
+        seen.tool = true;
+        const index = get(event.payload, "output_index");
+        if (typeof index !== "bigint") continue;
+        const recorded = this.byIndex.get(index);
+        if (recorded === undefined) {
+          this.conflict = true;
+          continue;
+        }
+        const itemName = asStr(get(item, "name"));
+        if (itemName !== undefined && recorded[0] !== itemName) this.conflict = true;
+        const raw = get(item, "arguments");
+        if (typeof raw === "string") this.recordRaw(index, canonicalArguments(raw));
+      }
+    }
+  }
+
+  private recordRaw(index: bigint, rawKey: string): void {
+    const previous = this.rawByIndex.get(index);
+    if (previous === undefined) {
+      this.rawByIndex.set(index, rawKey);
+      this.extraHeap += PROJECTION_NODE_BYTES.item + PROJECTION_NODE_BYTES.string + stringHeapBytes(rawKey);
+    } else if (previous !== rawKey) {
+      this.conflict = true;
+    }
+  }
+
+  same(other: CallLedger): boolean {
+    return !this.conflict && !other.conflict && this.calls.same(other.calls);
+  }
+
+  retainedBytes(): number {
+    return this.calls.retainedBytes() + this.extraHeap;
   }
 }
 
@@ -70,8 +144,8 @@ export class StreamStage {
   private readonly client: Protocol;
   private readonly translator: StreamTranslator;
   private readonly clientDecoder: ProtocolStreamDecoder;
-  private readonly upstreamCalls = new CallSet();
-  private readonly clientCalls = new CallSet();
+  private readonly upstreamCalls = new CallLedger();
+  private readonly clientCalls = new CallLedger();
   /** Sticky: a tool call was seen on either side, so nothing more may be released before the end-of-stream comparison. */
   private readonly seen = { tool: false };
 
@@ -83,7 +157,7 @@ export class StreamStage {
 
   /** Translates the inspected events of one upstream frame. Returns the client bytes, which the caller holds or releases like native bytes. */
   push(events: readonly CanonicalEvent[]): Uint8Array {
-    observe(events, this.upstreamCalls, this.seen);
+    this.upstreamCalls.observe(events, this.seen);
     let bytes: Uint8Array;
     try {
       bytes = this.translator.push(events);
@@ -98,7 +172,7 @@ export class StreamStage {
       } catch {
         throw new TranslationFailure(CLIENT_STREAM_INVALID);
       }
-      observe(decoded, this.clientCalls, this.seen);
+      this.clientCalls.observe(decoded, this.seen);
     }
     return bytes;
   }
@@ -129,7 +203,7 @@ export class StreamStage {
     } catch {
       throw new TranslationFailure(CLIENT_STREAM_INVALID);
     }
-    observe(decoded, this.clientCalls, this.seen);
+    this.clientCalls.observe(decoded, this.seen);
     if (!this.clientDecoder.isTerminal()) throw new TranslationFailure(CLIENT_STREAM_INVALID);
     if (!this.upstreamCalls.same(this.clientCalls)) throw new TranslationFailure(TOOL_CALL_MISMATCH);
   }

@@ -34,6 +34,17 @@ export interface KeyRateCount {
   readonly waitMs: number;
   readonly clock: () => number;
   readonly timers?: RetryTimers;
+  /**
+   * The count runs at the confidential entry, whose container log is readable outside the VM
+   * (deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs"): its failure line names neither the workspace nor the key.
+   */
+  readonly lane?: boolean;
+}
+
+/** `key_rate_count_failed`: with the workspace and the key on the Cloudflare gateway, without them at the entry. */
+function countFailed(o: KeyRateCount, code: string, extra: Readonly<Record<string, unknown>> = {}): void {
+  const who = o.lane === true ? {} : { workspace: o.workspace, key: o.keyId };
+  console.warn(JSON.stringify({ level: "warn", event: "key_rate_count_failed", request_id: o.requestId, ...who, code, ...extra }));
 }
 
 /** The one call (`@gray/account` `countOnce`); a call that threw is a shard that did not answer. */
@@ -52,7 +63,7 @@ export async function countKeyRate(o: KeyRateCount): Promise<ApiError | null> {
   if (result.code === "key_rate_limit") return keyRateRefusal(result.limit, result.retryAfterMs, o.clock());
   // The key's own refusal at the shard (revoked, unknown there) or no answer: the request's refusal stands.
   if (result.code === "unavailable" || result.code === "bad_request" || result.code === "moved") {
-    console.warn(JSON.stringify({ level: "warn", event: "key_rate_count_failed", request_id: o.requestId, workspace: o.workspace, key: o.keyId, code: result.code }));
+    countFailed(o, result.code);
   }
   return null;
 }
@@ -70,7 +81,7 @@ export async function countModelCheck(o: KeyRateCount): Promise<ApiError | null>
   if (result.ok) return null;
   if (result.code === "key_rate_limit") return keyRateRefusal(result.limit, result.retryAfterMs, o.clock());
   if (result.code === "revoked") return new ApiError(401, "api_key_revoked");
-  console.warn(JSON.stringify({ level: "warn", event: "key_rate_count_failed", request_id: o.requestId, workspace: o.workspace, key: o.keyId, code: result.code, model_check: true }));
+  countFailed(o, result.code, { model_check: true });
   return admissionUnavailable();
 }
 

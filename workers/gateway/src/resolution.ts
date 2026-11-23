@@ -91,7 +91,7 @@ export function missingCapability(model: string, protocol: Protocol, routes: rea
     // routes only when one of them serves streamed requests only: every other route proves it, and a refusal over
     // no route names what the request needs beyond a plain buffered answer, as before.
     { needed: !request.stream && routes.some((r) => r.capabilities.streamedOnly === true), name: BUFFERED_ANSWERS, param: "stream", proved: (r) => r.capabilities.streamedOnly !== true },
-    { needed: request.tools.length > 0, name: "tool calling", param: "tools", proved: (_, chat) => chat.tools },
+    { needed: request.tools.length > 0 || request.hasHostedTools, name: "tool calling", param: "tools", proved: (_, chat) => chat.tools },
     { needed: request.response_format !== null && structured(request.response_format), name: "structured output (JSON schema)", param: "response_format", proved: (_, chat) => chat.structuredOutput },
     { needed: request.reasoning !== null && reasoningRequested(request.reasoning), name: "reasoning", param: "reasoning", proved: (_, chat) => chat.reasoning },
     { needed: images, name: IMAGE_INPUT, param: contentParam(protocol), proved: (_, chat) => chat.vision },

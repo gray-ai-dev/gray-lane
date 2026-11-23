@@ -2,15 +2,16 @@ import { bytesToLowerHex, dstackGuestAgentQuoter, ed25519Sign, isReceiptRelayIma
 import { declaredPath } from "@gray/client-apps";
 import { LANE_RELAY_ID_PATTERN } from "@gray/control";
 import { gatewayConfig, type GatewayConfig } from "@gray/config";
-import { isPublicPath, noApi, shapeOf } from "@gray/errors";
+import { allowOf, ApiError, isPublicPath, noApi, shapeOf, wrongMethod } from "@gray/errors";
 import { newRequestId } from "@gray/ledger-keys";
 import { parseSerde, toJsonString, type Json } from "@gray/json";
 import { readBody } from "../body.ts";
 import { allowedOrigin, EXPOSED, preflight, withCors } from "../cors.ts";
 import type { GatewayEnv } from "../env.ts";
 import { originsOf } from "../hosts.ts";
-import { servedProtocol } from "../paths.ts";
+import { countTokensProtocol, servedProtocol } from "../paths.ts";
 import { ModelApiRun, modelApi } from "../apis.ts";
+import { CountTokensRun } from "../count-tokens.ts";
 import { entryStandardApi } from "./standard-api.ts";
 import { InferenceRun } from "../inference.ts";
 import { livez } from "../health.ts";
@@ -31,7 +32,7 @@ import { snapshots, snapshotTiming } from "../snapshot.ts";
 import { LaneRouteWarmer, laneRoutesOf } from "./warm.ts";
 import { EntryEndpointRoutes, endpointRowsOfSnapshot, endpointRowsOfView } from "./endpoint-routes.ts";
 import { remoteEndpointCredentials } from "./remote/endpoint-credential.ts";
-import { remoteShardLocator } from "./remote/account.ts";
+import { remoteKeyRevoked, remoteShardLocator } from "./remote/account.ts";
 import { remoteVideoStore } from "./remote/video.ts";
 import { VideoJobPolls, videoJobIo } from "./video-jobs.ts";
 import { entryVideoRoute, serveEntryVideo } from "./video-routes.ts";
@@ -617,7 +618,7 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
       }
     })();
     console.log(calibrationLogLine(calibration));
-    booted = createLaneState({
+    const next = createLaneState({
       bridgeUrl,
       laneKeyId,
       ...(receiptKeyId === undefined ? {} : { receiptKeyId }),
@@ -646,8 +647,15 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
       // P2e: the relay's accounts come from its vault and every change goes there.
       ...(vault === null ? {} : { vault }),
       // ER7: one bounded GetKey before the first answer; a failure serves on a random key and retries (`LaneAffinityKey`).
-      ...(affinity === null ? {} : { affinity }),
+      ...(affinity === null ? {} : { affinity, continuation: affinity }),
+    }).catch((thrown) => {
+      if (booted === next) {
+        booted = null;
+        bootKey = null;
+      }
+      throw thrown;
     });
+    booted = next;
   }
   return booted;
 }
@@ -1070,10 +1078,42 @@ function laneIsolateOnce(): LaneIsolate {
   return isolate;
 }
 
-/** The 404 for a path no API serves, built exactly as `index.ts` `unmatched` builds it. */
+/** The 404 for a path no API serves, built as `public-routes.ts` builds it (no body on HEAD). */
 function unmatched(request: Request, cfg: GatewayConfig, url: URL, path: string): Response {
   const rendered = noApi(request.method, path).render({ shape: shapeOf(path), origins: originsOf(cfg, url), requestId: newRequestId(Date.now()) });
-  return new Response(rendered.body, { status: rendered.status, headers: rendered.headers });
+  return new Response(request.method === "HEAD" ? null : rendered.body, { status: rendered.status, headers: rendered.headers });
+}
+
+/**
+ * The `Allow` header of a mounted entry route for `path`, or null when `path` is not mounted in the active layout:
+ * inference and token counting routes (`POST`), mounted standard media routes (`POST` when `endpointRoutes` is active,
+ * plus `videos` for `/v1/videos`), mounted video job routes (`GET` when `videos` is active), and model catalog routes
+ * (`GET,HEAD`, excluding `/v1/key` and Gemini RPC suffixes).
+ */
+function entryAllowed(path: string, mounted: { readonly endpointRoutes: boolean; readonly videos: boolean }): string | null {
+  if (servedProtocol("POST", path) !== null || countTokensProtocol("POST", path) !== null) return allowOf(["POST"]);
+  if (mounted.endpointRoutes) {
+    const api = modelApi("POST", path);
+    if (api !== null && entryStandardApi(api) && (api !== "open_ai_videos" || mounted.videos)) return allowOf(["POST"]);
+  }
+  if (mounted.videos && entryVideoRoute("GET", path) !== null) return "GET";
+  const cat = catalogRoute("GET", path);
+  if (cat !== null && cat.kind !== "key" && !(cat.kind === "gemini_model" && path.includes(":"))) return allowOf(["GET"]);
+  return null;
+}
+
+/** Layout-aware 405 + `Allow` for a mounted entry route asked with the wrong method, else 404. */
+function unmatchedEntry(
+  request: Request,
+  cfg: GatewayConfig,
+  url: URL,
+  path: string,
+  mounted: { readonly endpointRoutes: boolean; readonly videos: boolean },
+): Response {
+  const allow = entryAllowed(path, mounted);
+  if (allow === null) return unmatched(request, cfg, url, path);
+  const rendered = wrongMethod(request.method, path).render({ shape: shapeOf(path), origins: originsOf(cfg, url), requestId: newRequestId(Date.now()) });
+  return new Response(request.method === "HEAD" ? null : rendered.body, { status: rendered.status, headers: { ...rendered.headers, allow } });
 }
 
 /** The quoter of the attestation route: `@gray/attest`'s dstack client over the guest-agent binding. */
@@ -1083,99 +1123,128 @@ function quoter(env: LaneGatewayEnv, identity: LaneIdentity): Quoter {
   return dstackGuestAgentQuoter({ baseUrl: identity.guestAgentUrl, timeoutMs: identity.guestAgentTimeoutMs, fetch: (input, init) => fetcher.fetch(input, init) });
 }
 
+/**
+ * The answer to a request whose handling threw: a fixed 500 `internal_error` in the path's shape, and one log line with
+ * the error's class only. Without it the exception reaches workerd, whose own report of an uncaught exception prints
+ * the error's message to the container log, and a message can quote the request (V8's JSON.parse SyntaxError does:
+ * deploy/tee/workerd/uncaught-output-experiment.mjs). The entry's container log is readable outside the VM
+ * (deploy/tee/IMPLEMENTATION_NOTES.md §9, "public_logs").
+ */
+function requestFailed(request: Request, thrown: unknown): Response {
+  console.error(JSON.stringify({ level: "error", event: "lane_request_failed", code: thrown instanceof Error ? thrown.name : "error" }));
+  let path = "/";
+  try {
+    path = declaredPath(new URL(request.url).pathname)?.path ?? new URL(request.url).pathname;
+  } catch {
+    // An unparseable URL keeps the default shape.
+  }
+  const rendered = new ApiError(500, "internal_error").render({ shape: shapeOf(path), requestId: newRequestId(Date.now()) });
+  return new Response(request.method === "HEAD" ? null : rendered.body, { status: rendered.status, headers: { ...rendered.headers, [ACI_VERSION_HEADER]: ACI_API_VERSION } });
+}
+
 export default {
   async fetch(request: Request, env: LaneGatewayEnv, ctx: ExecutionContext): Promise<Response> {
-    let cfg: GatewayConfig;
     try {
-      // A bad var fails every request with the ConfigError, never a silent default (as `index.ts`).
-      cfg = gatewayConfig(env);
+      return await serveLane(request, env, ctx);
     } catch (thrown) {
-      return bootFailure(thrown);
+      return requestFailed(request, thrown);
     }
-    // The identity is read before the keyset exists: a refused identity serves no report at all, so
-    // every route answers the same 503 (M0's rule; `workers/lane-m0/src/config.ts` VG-06/VG-07).
-    // D5: a deployed lane's `KEYSET_NOT_AFTER` is required; its absence is the deployment's fixed
-    // `lane_misconfigured` state (`missing` below), not a boot failure.
-    const deployed = cfg.deployEnv !== "local";
-    let identityRead: LaneIdentityRead;
-    let identity: LaneIdentity;
-    let replicaIndex: number | null;
-    try {
-      identityRead = readLaneIdentity(env, deployed);
-      if (identityRead.identity === null) throw new LaneBootError(identityRead.problems);
-      identity = identityRead.identity;
-      const replica = laneReplicaIndex(env, identity.tls.replicaDomain);
-      if (replica.problem !== null) throw new LaneBootError([replica.problem]);
-      replicaIndex = replica.index;
-      setLaneNonceReplica(replicaIndex ?? identity.tls.replicaDomain);
-    } catch (thrown) {
-      return bootFailure(thrown);
-    }
-    // The boot's keyset digest is on every answer, errors included; before the boot exists, the entry
-    // answers the boot error itself (no keyset digest: there is none to name).
-    let state: LaneProcessState;
-    try {
-      state = await boot(env, cfg);
-    } catch (thrown) {
-      return bootFailure(thrown);
-    }
-    if (!bootTimes.has(state)) bootTimes.set(state, state.now());
-    const url = new URL(request.url);
-    const origin = allowedOrigin(request, cfg.consoleOrigin) ?? debugCorsOrigin(request, declaredPath(url.pathname)?.path ?? url.pathname);
-    // §D/M23: every Cloudflare-bound path of a deployed lane is a binding. `local` (a test) may use the
-    // platform's `fetch`; anywhere else a missing binding is a boot error the entry answers itself.
-    // docs/design/one-address.md: an API_ORIGIN the entry cannot forward to (not an https origin, the relay-stack layout,
-    // no API service) is the same fixed misconfiguration, in every environment: never a silent 404 for a forwarded path.
-    const api = apiForwardOf(env, typeof env.LANE_STACK_RELAY_ID === "string" && env.LANE_STACK_RELAY_ID !== "");
-    const missing = [...(deployed ? [...identityRead.missing, ...missingLaneBindings(env)] : []), ...(api.problem === null ? [] : [api.problem])];
-    const peers = missing.length === 0 ? peersOf(state, env, cfg, identity) : null;
-    const videos = missing.length === 0 ? entryVideosOf(state, env, cfg, replicaIndex) : null;
-    // M13: whatever this fetch is, the lane's routes are warmed behind it when due (the first one also primes the snapshot).
-    if (missing.length === 0) warmLane(state, env, cfg, ctx, undefined, peers, videos);
-    // ER7: an affinity key whose GetKey failed at boot is derived again behind requests when its retry is due.
-    if (state.affinity.source === "boot") ctx.waitUntil(state.affinity.tick());
-    // ER9 as revised: an entry replica reads its role behind requests when its poll is due.
-    const replica = missing.length === 0 ? entryRoleOf(state, env, cfg, replicaIndex) : null;
-    if (replica !== null) {
-      // The tick first, so a role it reads starts the stop's watch behind this same request.
-      ctx.waitUntil(replica.tick().then(() => replica.watch((work) => ctx.waitUntil(work))));
-    }
-    // The outbound-only channel (docs/design/relay-outbound-only.md). A stack VM attests its entries behind each fetch.
-    // An entry answers the attach, tunnel and health routes itself: an upgrade's 101 carries peerlink's WebSocket, which
-    // the ACI and CORS wrappers below would drop by rebuilding the Response, so the channel's answers are returned as
-    // they are (its error answers carry the ACI headers already).
-    if (missing.length === 0) {
-      const entryLink = entryLinkOf(state, env, cfg);
-      if (entryLink !== null) ctx.waitUntil(entryLink.maintain());
-      const link = peerLinkOf(state, env, peers, identity);
-      if (link !== null && PeerLink.handles(url.pathname)) return link.route(request, url);
-    }
-    // ER9 as revised: a replica counts every request but its health route's from here to its answer's end, and until the
-    // work it leaves behind settled: the handler's run and its `ctx.waitUntil` (its record, receipt and the relay's
-    // outcome report, which frees the pick's lease), which workerd's SIGTERM drain does not wait for (`entry-role.ts`).
-    const probe = declaredPath(url.pathname)?.path ?? url.pathname;
-    const end = replica === null || probe === HEALTH_PATH || probe === READY_PATH ? null : replica.begin(request.signal);
-    let answer: Response;
-    try {
-      if (missing.length > 0) {
-        answer = misconfigured(request, url, state, missing);
-      } else {
-        const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward, videos);
-        end?.hold(routed);
-        answer = await routed;
-      }
-    } catch (thrown) {
-      end?.();
-      throw thrown;
-    }
-    // docs/design/entry-replicas.md ER6: an entry replica names its own origin wherever it names its keyset digest.
-    const served = withCors(withAciHeaders(answer, state.keysetDigest, state.laneOrigin), origin, laneExposed(state.laneOrigin, api.forward !== null));
-    // ER9 as revised: `Connection: close` while draining, and the count ends with the body (a generation or a forwarded
-    // answer's) or now.
-    const live = liveAnswers.has(answer) && answer.status >= 200 && answer.status < 300;
-    return replica === null ? served : replica.answer(served, end, live);
   },
 } satisfies ExportedHandler<LaneGatewayEnv>;
+
+/** One request to the lane (the default export's `fetch`, which answers what this throws). */
+async function serveLane(request: Request, env: LaneGatewayEnv, ctx: ExecutionContext): Promise<Response> {
+  let cfg: GatewayConfig;
+  try {
+    // A bad var fails every request with the ConfigError, never a silent default (as `index.ts`).
+    cfg = gatewayConfig(env);
+  } catch (thrown) {
+    return bootFailure(thrown);
+  }
+  // The identity is read before the keyset exists: a refused identity serves no report at all, so
+  // every route answers the same 503 (M0's rule; `workers/lane-m0/src/config.ts` VG-06/VG-07).
+  // D5: a deployed lane's `KEYSET_NOT_AFTER` is required; its absence is the deployment's fixed
+  // `lane_misconfigured` state (`missing` below), not a boot failure.
+  const deployed = cfg.deployEnv !== "local";
+  let identityRead: LaneIdentityRead;
+  let identity: LaneIdentity;
+  let replicaIndex: number | null;
+  try {
+    identityRead = readLaneIdentity(env, deployed);
+    if (identityRead.identity === null) throw new LaneBootError(identityRead.problems);
+    identity = identityRead.identity;
+    const replica = laneReplicaIndex(env, identity.tls.replicaDomain);
+    if (replica.problem !== null) throw new LaneBootError([replica.problem]);
+    replicaIndex = replica.index;
+    setLaneNonceReplica(replicaIndex ?? identity.tls.replicaDomain);
+  } catch (thrown) {
+    return bootFailure(thrown);
+  }
+  // The boot's keyset digest is on every answer, errors included; before the boot exists, the entry
+  // answers the boot error itself (no keyset digest: there is none to name).
+  let state: LaneProcessState;
+  try {
+    state = await boot(env, cfg);
+  } catch (thrown) {
+    return bootFailure(thrown);
+  }
+  if (!bootTimes.has(state)) bootTimes.set(state, state.now());
+  const url = new URL(request.url);
+  const origin = allowedOrigin(request, cfg.consoleOrigin) ?? debugCorsOrigin(request, declaredPath(url.pathname)?.path ?? url.pathname);
+  // §D/M23: every Cloudflare-bound path of a deployed lane is a binding. `local` (a test) may use the
+  // platform's `fetch`; anywhere else a missing binding is a boot error the entry answers itself.
+  // docs/design/one-address.md: an API_ORIGIN the entry cannot forward to (not an https origin, the relay-stack layout,
+  // no API service) is the same fixed misconfiguration, in every environment: never a silent 404 for a forwarded path.
+  const api = apiForwardOf(env, typeof env.LANE_STACK_RELAY_ID === "string" && env.LANE_STACK_RELAY_ID !== "");
+  const missing = [...(deployed ? [...identityRead.missing, ...missingLaneBindings(env)] : []), ...(api.problem === null ? [] : [api.problem])];
+  const peers = missing.length === 0 ? peersOf(state, env, cfg, identity) : null;
+  const videos = missing.length === 0 ? entryVideosOf(state, env, cfg, replicaIndex) : null;
+  // M13: whatever this fetch is, the lane's routes are warmed behind it when due (the first one also primes the snapshot).
+  if (missing.length === 0) warmLane(state, env, cfg, ctx, undefined, peers, videos);
+  // ER7: an affinity key whose GetKey failed at boot is derived again behind requests when its retry is due.
+  if (state.affinity.source === "boot") ctx.waitUntil(state.affinity.tick());
+  if (state.continuation.source === "boot") ctx.waitUntil(state.continuation.tick());
+  // ER9 as revised: an entry replica reads its role behind requests when its poll is due.
+  const replica = missing.length === 0 ? entryRoleOf(state, env, cfg, replicaIndex) : null;
+  if (replica !== null) {
+    // The tick first, so a role it reads starts the stop's watch behind this same request.
+    ctx.waitUntil(replica.tick().then(() => replica.watch((work) => ctx.waitUntil(work))));
+  }
+  // The outbound-only channel (docs/design/relay-outbound-only.md). A stack VM attests its entries behind each fetch.
+  // An entry answers the attach, tunnel and health routes itself: an upgrade's 101 carries peerlink's WebSocket, which
+  // the ACI and CORS wrappers below would drop by rebuilding the Response, so the channel's answers are returned as
+  // they are (its error answers carry the ACI headers already).
+  if (missing.length === 0) {
+    const entryLink = entryLinkOf(state, env, cfg);
+    if (entryLink !== null) ctx.waitUntil(entryLink.maintain());
+    const link = peerLinkOf(state, env, peers, identity);
+    if (link !== null && PeerLink.handles(url.pathname)) return link.route(request, url);
+  }
+  // ER9 as revised: a replica counts every request but its health route's from here to its answer's end, and until the
+  // work it leaves behind settled: the handler's run and its `ctx.waitUntil` (its record, receipt and the relay's
+  // outcome report, which frees the pick's lease), which workerd's SIGTERM drain does not wait for (`entry-role.ts`).
+  const probe = declaredPath(url.pathname)?.path ?? url.pathname;
+  const end = replica === null || probe === HEALTH_PATH || probe === READY_PATH ? null : replica.begin(request.signal);
+  let answer: Response;
+  try {
+    if (missing.length > 0) {
+      answer = misconfigured(request, url, state, missing);
+    } else {
+      const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward, videos);
+      end?.hold(routed);
+      answer = await routed;
+    }
+  } catch (thrown) {
+    end?.();
+    throw thrown;
+  }
+  // docs/design/entry-replicas.md ER6: an entry replica names its own origin wherever it names its keyset digest.
+  const served = withCors(withAciHeaders(answer, state.keysetDigest, state.laneOrigin), origin, laneExposed(state.laneOrigin, api.forward !== null));
+  // ER9 as revised: `Connection: close` while draining, and the count ends with the body (a generation or a forwarded
+  // answer's) or now.
+  const live = liveAnswers.has(answer) && answer.status >= 200 && answer.status < 300;
+  return replica === null ? served : replica.answer(served, end, live);
+}
 
 /** The one answer a boot failure gets: 503, the status, and never a value from a binding. */
 function bootFailure(thrown: unknown): Response {
@@ -1267,27 +1336,31 @@ async function route(
   // nothing of another service's list. Every error's text points at this origin's `/v1/models` (hosts.ts `originsOf`):
   // without it that pointer led to a 404 (rehearsal of 2026-11-13). Gemini generation is served for the endpoint routes
   // the lane's view holds (docs/design/lane-provider-routes.md sections 2 and 7; a lane relay maps no Gemini route).
-  const listing = catalogRoute(request.method, path);
+  const geminiInference = servedProtocol("POST", path)?.protocol === "gemini" || countTokensProtocol("POST", path)?.protocol === "gemini";
+  const listing = geminiInference ? null : catalogRoute(request.method, path);
   const served = servedProtocol(request.method, path);
+  const counted = served === null ? countTokensProtocol(request.method, path) : null;
   // docs/design/standard-media-at-entry.md section 2.2: an entry with its endpoint routes (the default layout) serves the
   // standard APIs itself, on a provider's own API. A relay stack VM has no such route and serves none.
   const endpointRoutes = endpointRoutesOf(state, env, cfg);
-  const modelPath = served === null && listing === null && endpointRoutes !== null ? modelApi(request.method, path) : null;
+  const modelPath = served === null && counted === null && listing === null && endpointRoutes !== null ? modelApi(request.method, path) : null;
   // A video create needs the entry's job store; so do a job's retrieve and content (section 2.7), which the entry
   // answers for the jobs that store holds.
   const standard = modelPath !== null && entryStandardApi(modelPath) && (modelPath !== "open_ai_videos" || videos !== null) ? modelPath : null;
-  const videoJob = served === null && listing === null && modelPath === null && videos !== null ? entryVideoRoute(request.method, path) : null;
-  // Every other path is answered here. A path the entry has no route for is its 404, whatever the API Worker would
-  // answer there: token counting (`/v1/messages/count_tokens`, Gemini's `:countTokens`), which carries a prompt and
-  // which no Worker serves; a video job's list and delete; `/v1/key` without API_ORIGIN or with the API Worker's mark.
-  if (listing === null && served === null && standard === null && videoJob === null) return unmatched(request, cfg, url, path);
+  const videoJob = served === null && counted === null && listing === null && modelPath === null && videos !== null ? entryVideoRoute(request.method, path) : null;
+  // Every other path is answered here: a mounted route asked with the wrong method gets 405 + Allow; a path the entry
+  // does not mount (unmounted media/video routes, `/v1/key` without API_ORIGIN or with API_FORWARD_HEADER,
+  // unknown paths) stays 404.
+  if (listing === null && served === null && counted === null && standard === null && videoJob === null) {
+    return unmatchedEntry(request, cfg, url, path, { endpointRoutes: endpointRoutes !== null, videos: videos !== null });
+  }
   if (listing !== null && listing.kind === "key") return unmatched(request, cfg, url, path);
-  // docs/design/one-address.md: a chat request the API Worker forwarded is marked; the mark is checked and taken off
-  // (`api-arrival.ts`), an invalid one refused, and a request without one served as before.
-  const arrival = served === null && standard === null && videoJob === null ? null : await apiArrival(request, env["LANE_API_FORWARD_PUBLIC_KEY"], url, path, state.now(), originsOf(cfg, url));
+  // docs/design/one-address.md: a chat or count_tokens request the API Worker forwarded is marked; the mark is checked
+  // and taken off (`api-arrival.ts`), an invalid one refused, and a request without one served as before.
+  const arrival = served === null && counted === null && standard === null && videoJob === null ? null : await apiArrival(request, env["LANE_API_FORWARD_PUBLIC_KEY"], url, path, state.now(), originsOf(cfg, url));
   if (arrival?.kind === "refused") return arrival.response;
   if (arrival?.kind === "gray_api") request = arrival.request;
-  // The generation path: the same `InferenceRun` the main lane runs, with the lane's dependencies.
+  // The generation and token-counting paths: the same runs the main lane runs, with the lane's dependencies.
   const lane: LaneRequestState = {
     cfg,
     env,
@@ -1301,7 +1374,16 @@ async function route(
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
   if (listing !== null) {
     // The entry's own listing (OpenAI's or Gemini's): exactly the models it serves (@gray/snapshot `routeTakesTraffic`).
-    return serveCatalog(request, listing, path, { env: null, cfg, snapshots: deps.snapshots, source: deps.source, background: (p: Promise<unknown>) => ctx.waitUntil(p), lane: true });
+    return serveCatalog(request, listing, path, {
+      serveKeyStatus: false,
+      env: null,
+      keyRevoked: remoteKeyRevoked({ ...lane.bridge, now: state.now }),
+      cfg,
+      snapshots: deps.snapshots,
+      source: deps.source,
+      background: (p: Promise<unknown>) => ctx.waitUntil(p),
+      lane: true,
+    });
   }
   if (videoJob !== null) {
     // A job the entry's store holds is answered here, on any replica; one it does not hold is `404 video_not_found`.
@@ -1313,6 +1395,11 @@ async function route(
     // The model APIs' request path with the lane's dependencies. A video job it creates is recorded behind the bridge
     // (`lane.videos`).
     const answered = await new ModelApiRun(request, standard, deps, ctx, declared).serve();
+    liveAnswers.add(answered);
+    return answered;
+  }
+  if (counted !== null) {
+    const answered = await new CountTokensRun(request, counted, deps, ctx, declared).serve();
     liveAnswers.add(answered);
     return answered;
   }

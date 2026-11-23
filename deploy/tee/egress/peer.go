@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -48,9 +49,9 @@ const (
 	// decimal text, compared in that order as the account table's version and push are.
 	peerVersionHeader = "X-Gray-Peer-Version"
 	peerPushHeader    = "X-Gray-Peer-Push"
-	// The two headers only egress writes. Both are removed from the entry's request and from the peer's answer, so
+	// The headers only egress writes: x-gray-peer-sent (ownAnswerHeader, server.go) on every answer egress gives itself,
+	// and the SPKI of an attest-mode answer. Both are removed from the entry's request and from the peer's answer, so
 	// neither side can put a value on them (as x-gray-egress, D64).
-	peerSentHeader = "X-Gray-Peer-Sent"
 	peerSPKIHeader = "X-Gray-Peer-Spki"
 	// peerSessionHeader is peerlink's id of the session a channel peer's connection rode, on a peer_pin_mismatch
 	// answer (design §3.5). Egress removes it from the entry's request and the peer's answer, as the two above.
@@ -72,6 +73,11 @@ const (
 	peerPinMaxTTL = time.Hour
 	// peerMaxIdlePerPeer is the vendor transports' MaxIdleConnsPerHost; one peer is one host.
 	peerMaxIdlePerPeer = 8
+	// peerAttestMaxResponseBytes bounds an unverified peer's response body in attest mode, matching
+	// peerlink/vm.go's maxAttestBodyBytes (1 MiB) so an unattested peer cannot stream unbounded bytes.
+	peerAttestMaxResponseBytes = int64(1 << 20)
+	// peerMaxConcurrentAttests bounds simultaneous unverified attest dials (each allocates an unpooled transport).
+	peerMaxConcurrentAttests = int64(64)
 )
 
 var (
@@ -99,12 +105,30 @@ type peerTable struct {
 	// now is time.Now in production; a test replaces it to expire a pin without waiting.
 	now func() time.Time
 
+	attestInFlight atomic.Int64
+
 	mu   sync.Mutex
 	pins map[string]*peerPin // by keyset digest
 	// version and push are the highest pair a table was accepted under; set is false until the first table.
 	version uint64
 	push    uint64
 	set     bool
+}
+
+func (t *peerTable) tryAcquireAttest() bool {
+	for {
+		cur := t.attestInFlight.Load()
+		if cur >= peerMaxConcurrentAttests {
+			return false
+		}
+		if t.attestInFlight.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (t *peerTable) releaseAttest() {
+	t.attestInFlight.Add(-1)
 }
 
 func newPeerTable(srv *server) *peerTable {
@@ -361,7 +385,7 @@ func writePeerRefusal(w http.ResponseWriter, code string, sent bool) {
 	if sent {
 		value = "1"
 	}
-	w.Header().Set(peerSentHeader, value)
+	w.Header().Set(ownAnswerHeader, value)
 	writeRefusal(w, code)
 }
 
@@ -387,6 +411,8 @@ func peerTargetCode(r *http.Request) string {
 
 // servePeer is a request under /peer/: attest mode, or a request to a pinned peer.
 func (s *server) servePeer(rec *responseRecorder, r *http.Request, entry *requestLog) {
+	// writePeerRefusal marks its answers itself; this marks the panic guard's 500 too.
+	rec.own = true
 	path := rawPathOf(r)
 	if rest, ok := strings.CutPrefix(path, peerAttestPrefix); ok {
 		entry.Route = peerAttestRoute
@@ -422,7 +448,8 @@ func (s *server) servePeer(rec *responseRecorder, r *http.Request, entry *reques
 		refuse(errPeerUnpinned)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)
@@ -435,11 +462,11 @@ func (s *server) servePeer(rec *responseRecorder, r *http.Request, entry *reques
 		return
 	}
 	header := outboundHeader(r.Header)
-	header.Del(peerSentHeader)
+	header.Del(ownAnswerHeader)
 	header.Del(peerSPKIHeader)
 	header.Del(peerSessionHeader)
 	target := &url.URL{Scheme: "https", Host: pin.host, Opaque: "/" + tail, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
-	s.forwardPeer(rec, r, entry, pin.client, r.Method, target, header, body, false)
+	s.forwardPeer(rec, r, entry, pin.client, r.Method, target, header, body, release, false)
 }
 
 // serveAttest is attest mode (§4.3 step 1): /peer/attest/<relay>/<keyset>/<GET>, one of two content-free GETs over a
@@ -462,13 +489,19 @@ func (s *server) serveAttest(rec *responseRecorder, r *http.Request, rest string
 		writePeerRefusal(rec, errPeerAttestRefused, false)
 		return
 	}
+	if !s.peers.tryAcquireAttest() {
+		entry.Error = errEgressLimit
+		writePeerRefusal(rec, errEgressLimit, false)
+		return
+	}
+	defer s.peers.releaseAttest()
 	// One transport per attestation, without a pool, as the shared attest transport: each attestation is one new
 	// stream, and the SPKI egress reports is that stream's.
 	transport := s.newPeerTransport(peerTarget{digest: digest, relay: relay, attest: true})
 	transport.DisableKeepAlives = true
 	defer transport.CloseIdleConnections()
 	target := &url.URL{Scheme: "https", Host: digest + peerLinkHostSuffix, Opaque: path, RawQuery: query}
-	s.forwardPeer(rec, r, entry, peerClient(transport), http.MethodGet, target, http.Header{}, nil, true)
+	s.forwardPeer(rec, r, entry, peerClient(transport), http.MethodGet, target, http.Header{}, nil, nil, true)
 }
 
 // validAttestQuery is the attestation route's one query: `nonce=` and 32 bytes as 64 lower hex (@gray/attest
@@ -480,9 +513,10 @@ func validAttestQuery(query string) bool {
 
 // forwardPeer sends one request over a peer transport and streams the answer back unchanged: the status, the
 // headers but hop-by-hop ones and egress's own, and each body chunk flushed as it is read (§4.9). reportSPKI, for
-// attest mode, adds x-gray-peer-spki. The request's context is the entry's: when the entry leaves, net/http closes
-// the peer connection (HTTP/1.1 has no per-request reset), and the stack VM sees its client leave.
-func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requestLog, client *http.Client, method string, target *url.URL, header http.Header, body []byte, reportSPKI bool) {
+// attest mode, adds x-gray-peer-spki. letGo, when not nil, is the body's release, run once the peer has the body and
+// its head came back (sentBody). The request's context is the entry's: when the entry leaves, net/http closes the peer
+// connection (HTTP/1.1 has no per-request reset), and the stack VM sees its client leave.
+func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requestLog, client *http.Client, method string, target *url.URL, header http.Header, body []byte, letGo func(), reportSPKI bool) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	silence := &peerSilence{bound: s.cfg.peerSilenceTimeout, afterFunc: s.afterFunc, cancel: cancel}
@@ -503,12 +537,21 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 		outReq.Header["User-Agent"] = []string{""}
 	}
 	outReq.Host = target.Host
+	var sent *sentBody
 	if len(body) == 0 {
 		outReq.Body = http.NoBody
 		outReq.ContentLength = 0
+	} else if letGo != nil {
+		// As forward's: the body is let go once the peer has it and its head came back (sentBody).
+		sent = newSentBody(body, letGo)
+		sent.attach(outReq)
 	}
 
+	rec.sent = true
 	resp, err := client.Do(outReq)
+	if sent != nil {
+		sent.responded()
+	}
 	if err == nil && ctx.Err() != nil {
 		// A head read after egress canceled the call (the entry left, or the silence bound fired) is the cancel's,
 		// not the peer's answer: net/http's transport still returns a response its read loop got after the cancel, and
@@ -539,10 +582,16 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for _, name := range []string{egressHeader, peerSentHeader, peerSPKIHeader, peerSessionHeader} {
+	for _, name := range []string{egressHeader, ownAnswerHeader, peerSPKIHeader, peerSessionHeader} {
 		resp.Header.Del(name)
 	}
 	stripHopByHop(resp.Header)
+	if reportSPKI && resp.ContentLength > peerAttestMaxResponseBytes {
+		entry.Error = errPeerFailedAfterSend
+		writePeerRefusal(rec, errPeerFailedAfterSend, true)
+		return
+	}
+	rec.relayed = true
 	copyHeader(rec.Header(), resp.Header)
 	if session := trace.session(); reportSPKI && session != nil {
 		rec.Header().Set(peerSPKIHeader, hex.EncodeToString(session.spki[:]))
@@ -559,6 +608,10 @@ func (s *server) forwardPeer(rec *responseRecorder, r *http.Request, entry *requ
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
 			silence.touch()
+			if reportSPKI && written+int64(n) > peerAttestMaxResponseBytes {
+				entry.Error = errPeerFailedAfterSend
+				panic(http.ErrAbortHandler)
+			}
 			if _, writeErr := rec.Write(buffer[:n]); writeErr != nil {
 				entry.Error = errClientWrite
 				return
@@ -656,10 +709,34 @@ type wirePin struct {
 	NotAfter   *uint64 `json:"not_after"`
 }
 
+// pinRowMembers are a pin row's members, all required and nothing else.
+var pinRowMembers = []string{"peer", "relay", "spki_sha256", "not_after"}
+
+// exactPinMembers holds every row to pinRowMembers by their exact names: encoding/json matches a struct's field names
+// case-insensitively, so `{"Peer": ...}` would otherwise pass. checkStrictJSON has already refused repeated members.
+func exactPinMembers(body []byte) bool {
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return false
+	}
+	for _, row := range rows {
+		if len(row) != len(pinRowMembers) {
+			return false
+		}
+		for _, name := range pinRowMembers {
+			if _, ok := row[name]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // putPins replaces the pin table. A pin whose not_after has passed is accepted and never dialed: the table is the
 // entry's, and expiry is judged at each use.
 func (s *server) putPins(rec *responseRecorder, r *http.Request, entry *requestLog) {
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		entry.Error = code
@@ -673,7 +750,7 @@ func (s *server) putPins(rec *responseRecorder, r *http.Request, entry *requestL
 	version, versionOK := stackU64Header(r.Header, peerVersionHeader)
 	push, pushOK := stackU64Header(r.Header, peerPushHeader)
 	var rows []wirePin
-	if !versionOK || !pushOK || checkStrictJSON(body) != nil || !decodeControl(body, &rows) || rows == nil || len(rows) > peerMaxPins {
+	if !versionOK || !pushOK || checkStrictJSON(body) != nil || !exactPinMembers(body) || !decodeControl(body, &rows) || rows == nil || len(rows) > peerMaxPins {
 		refuse(errPeerControlInvalid)
 		return
 	}

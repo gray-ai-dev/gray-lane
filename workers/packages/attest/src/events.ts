@@ -56,6 +56,32 @@ export const EVENT_RELAY_POLICY_REFUSED = "relay_policy.refused";
 export const EVENT_REQUEST_MODIFIED = "request.modified";
 
 /**
+ * Gray's zero-retention continuation expansion extension event: the entry resolved client-side
+ * `previous_response_id` and/or `input[].type = "item_reference"` entries (and/or added
+ * `include: ["reasoning.encrypted_content"]`) inside the attested TEE while keeping upstream calls
+ * `store: false`. At most one per receipt, after `request.received` and before `request.modified`,
+ * `peer.forwarded`, or `request.forwarded`.
+ */
+export const EVENT_REQUEST_CONTINUATION_EXPANDED = "request.continuation_expanded";
+
+/** Closed mode vocabulary for `request.continuation_expanded`. */
+export const CONTINUATION_EXPANSION_MODES = Object.freeze(["zero_retention"] as const);
+export type ContinuationExpansionMode = (typeof CONTINUATION_EXPANSION_MODES)[number];
+
+/** Maximum `item_references_expanded` count in `request.continuation_expanded`. */
+export const CONTINUATION_EXPANDED_MAX_ITEMS = 256n;
+
+/** A `request.continuation_expanded` event: zero-retention continuation expansion applied inside the entry TEE. */
+export interface RequestContinuationExpandedEvent {
+  readonly type: typeof EVENT_REQUEST_CONTINUATION_EXPANDED;
+  readonly mode: ContinuationExpansionMode;
+  readonly previous_response_id_expanded: boolean;
+  readonly item_references_expanded: bigint;
+  readonly include_encrypted_reasoning_added: boolean;
+  readonly expanded_body_sha256: string;
+}
+
+/**
  * Gray's translation extension event (docs/design/lane-provider-routes.md section 10): the entry served the request on
  * another text API than the client's, translating the request with the published translation code and the answer back.
  * At most one, in a single-forward receipt only, after `request.received` and before `request.forwarded`. The
@@ -362,6 +388,49 @@ export function requestTranslatedEvent(input: {
   const checked = requestTranslatedSchema.safeParse(event);
   if (!checked.success) throw new Error(`not a request.translated event: ${checked.error.issues.map((issue) => issue.message).join("; ")}`);
   return event;
+}
+
+/**
+ * `request.continuation_expanded`: zero-retention continuation expansion applied inside the attested
+ * entry TEE. At least one of `previous_response_id_expanded`, `item_references_expanded > 0`, or
+ * `include_encrypted_reasoning_added` must be true.
+ */
+export const requestContinuationExpandedSchema = z
+  .object({
+    type: z.literal(EVENT_REQUEST_CONTINUATION_EXPANDED),
+    mode: z.enum(CONTINUATION_EXPANSION_MODES),
+    previous_response_id_expanded: z.boolean(),
+    item_references_expanded: u64Schema.max(CONTINUATION_EXPANDED_MAX_ITEMS, "item_references_expanded is 0 to 256"),
+    include_encrypted_reasoning_added: z.boolean(),
+    expanded_body_sha256: digestField,
+  })
+  .strict()
+  .superRefine((event, ctx) => {
+    if (!event.previous_response_id_expanded && event.item_references_expanded === 0n && !event.include_encrypted_reasoning_added) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["mode"],
+        message: "at least one of previous_response_id_expanded, item_references_expanded > 0, or include_encrypted_reasoning_added must be true",
+      });
+    }
+  });
+
+/** `request.continuation_expanded`: builds and validates a zero-retention continuation expansion event. */
+export function requestContinuationExpandedEvent(input: {
+  readonly mode?: ContinuationExpansionMode;
+  readonly previousResponseIdExpanded: boolean;
+  readonly itemReferencesExpanded: bigint;
+  readonly includeEncryptedReasoningAdded: boolean;
+  readonly expandedBodySha256: string;
+}): JsonObject {
+  return shaped(requestContinuationExpandedSchema, {
+    type: EVENT_REQUEST_CONTINUATION_EXPANDED,
+    mode: input.mode ?? "zero_retention",
+    previous_response_id_expanded: input.previousResponseIdExpanded,
+    item_references_expanded: input.itemReferencesExpanded,
+    include_encrypted_reasoning_added: input.includeEncryptedReasoningAdded,
+    expanded_body_sha256: input.expandedBodySha256,
+  });
 }
 
 /**
@@ -1404,6 +1473,9 @@ export type EventLogProblem =
   | "translated_repeated"
   | "translated_position"
   | "translated_with_relay_policy"
+  // Zero-retention continuation expansion (`request.continuation_expanded`):
+  | "continuation_expanded_repeated"
+  | "continuation_expanded_position"
   // A form op (`set_form_field`, `remove_form_field`, docs/design/standard-media-at-entry.md section 2.4):
   | "form_op_mixed"
   | "form_op_position"
@@ -1539,6 +1611,29 @@ export function checkEventLog(events: readonly Json[]): readonly EventLogIssue[]
       issues.push({ code: "modified_position", message: "request.modified follows response.returned" });
     }
   }
+  // Zero-retention continuation expansion (`request.continuation_expanded`): at most once, after request.received
+  // and before request.modified, request.translated, relay_policy.*, and request.forwarded.
+  const expandedIndexes = types.flatMap((type, index) => (type === EVENT_REQUEST_CONTINUATION_EXPANDED ? [index] : []));
+  if (expandedIndexes.length > 1) {
+    issues.push({ code: "continuation_expanded_repeated", message: "request.continuation_expanded appears more than once" });
+  }
+  for (const index of expandedIndexes) {
+    if (received >= 0 && index <= received) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded must follow request.received" });
+    }
+    if (forwarded < 0 || index > forwarded) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded must precede request.forwarded" });
+    }
+    if (returned >= 0 && index > returned) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded follows response.returned" });
+    }
+    if (modifiedIndexes.some((m) => m < index)) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded must precede request.modified" });
+    }
+    if (policyIndexes.some((p) => p < index)) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded must precede relay_policy.*" });
+    }
+  }
   // A translation (docs/design/lane-provider-routes.md section 10): once, between request.received and request.forwarded,
   // and never with a relay policy, which runs for a lane relay's route, never translated.
   const translatedIndexes = types.flatMap((type, index) => (type === EVENT_REQUEST_TRANSLATED ? [index] : []));
@@ -1546,6 +1641,9 @@ export function checkEventLog(events: readonly Json[]): readonly EventLogIssue[]
   for (const index of translatedIndexes) {
     if (forwarded < 0 || index > forwarded) issues.push({ code: "translated_position", message: "request.translated does not precede request.forwarded" });
     if (received >= 0 && index < received) issues.push({ code: "translated_position", message: "request.translated precedes request.received" });
+    if (expandedIndexes.some((e) => e > index)) {
+      issues.push({ code: "continuation_expanded_position", message: "request.continuation_expanded must precede request.translated" });
+    }
   }
   if (translatedIndexes.length > 0 && policyIndexes.length > 0) {
     issues.push({ code: "translated_with_relay_policy", message: "a translated request has no relay_policy.* event: Gray translates for endpoint routes alone" });
@@ -1559,6 +1657,7 @@ export function checkEventLog(events: readonly Json[]): readonly EventLogIssue[]
     }
     if (policyIndexes.length > 0) issues.push({ code: "form_op_position", message: "a form op with a relay_policy.* event: a relay's request is JSON" });
     if (translatedIndexes.length > 0) issues.push({ code: "form_op_position", message: "a form op with request.translated: Gray translates between the text APIs' JSON" });
+    if (expandedIndexes.length > 0) issues.push({ code: "form_op_position", message: "a form op with request.continuation_expanded: continuation expansion applies to JSON bodies" });
   }
   for (const index of policyIndexes) {
     const type = types[index];
@@ -1594,7 +1693,8 @@ export function isPeerEventLog(events: readonly Json[]): boolean {
  *   attempts is not in this receipt; a number repeats for the relay's next origin), and each `peer.forwarded` is
  *   answered by the next event, of the same `n` (`peer_order`);
  * - no event of another grammar is in it: the attempt's own record is the stack VM's inner receipt (`peer_foreign_event`);
- * - `response.returned` is once and last, and its `served_attempt` is an attempt the hop answered (`peer_served_attempt`).
+ * - `response.returned` is once, last, and in the relay-stack form (`stack_v1_event`), and its `served_attempt` is an
+ *   attempt the hop answered (`peer_served_attempt`).
  */
 function checkPeerOrder(events: readonly Json[], types: readonly (string | undefined)[], issues: EventLogIssue[]): void {
   const push = (code: EventLogProblem, message: string): void => {
@@ -1605,13 +1705,25 @@ function checkPeerOrder(events: readonly Json[], types: readonly (string | undef
   if (returned.length === 0) push("missing_required_event", `missing ${EVENT_RESPONSE_RETURNED}`);
   if (returned.length > 1) push("stack_event_repeated", "response.returned appears more than once");
   if (returned.length > 0 && returned.at(-1) !== events.length - 1) push("returned_not_last", "response.returned is not the last event");
+  for (const index of returned) {
+    if (!hasAnyMember(events[index] as Json, STACK_RETURNED_MEMBERS)) {
+      push("stack_v1_event", `event ${index} (${EVENT_RESPONSE_RETURNED}) has the single-forward form in an outer receipt`);
+    }
+  }
   const answered = new Set<bigint>();
   let last = 0n;
   let open: bigint | null = null;
+  let expandedCount = 0;
   for (let index = 1; index < events.length; index += 1) {
     const type = types[index];
     const event = events[index] as Json;
     if (type === EVENT_RESPONSE_RETURNED) continue;
+    if (type === EVENT_REQUEST_CONTINUATION_EXPANDED) {
+      expandedCount += 1;
+      if (expandedCount > 1) push("continuation_expanded_repeated", "request.continuation_expanded appears more than once");
+      else if (index !== 1 || last !== 0n || open !== null) push("continuation_expanded_position", "request.continuation_expanded must follow request.received and precede peer.forwarded");
+      continue;
+    }
     if (type !== EVENT_PEER_FORWARDED && type !== EVENT_PEER_ANSWERED && type !== EVENT_PEER_FAILED) {
       push("peer_foreign_event", `event ${index} (${String(type)}) is not in an outer receipt's grammar`);
       continue;
@@ -1733,6 +1845,7 @@ function checkStackOrder(events: readonly Json[], types: readonly (string | unde
   let open: { n: bigint | null; stage: AttemptStage } | null = null;
   let next = 1n;
   let vendorAnswered = false;
+  let expandedSeen = false;
   // Where the entry's record of the relay's calls stopped (relay_stack.feed_incomplete), and the
   // upstream.response events whose end it never recorded (`unrecorded`).
   let feedIncompleteAt: number | null = null;
@@ -1859,6 +1972,11 @@ function checkStackOrder(events: readonly Json[], types: readonly (string | unde
       // A relay stack's container is sent the client's own bytes (S23): Gray translates for endpoint routes alone.
       case EVENT_REQUEST_TRANSLATED:
         push("stack_v1_event", `event ${index} (request.translated) names a translation, which a relay-stack receipt never carries`);
+        break;
+      case EVENT_REQUEST_CONTINUATION_EXPANDED:
+        if (expandedSeen) push("continuation_expanded_repeated", "request.continuation_expanded appears more than once");
+        else if (open !== null || next > 1n || feedIncompleteAt !== null) push("continuation_expanded_position", "request.continuation_expanded must precede every attempt");
+        expandedSeen = true;
         break;
       default:
         break;
@@ -2005,6 +2123,8 @@ function checkEvent(event: Json, type: string): string | null {
     schemas = [requestModifiedSchema];
   } else if (type === EVENT_REQUEST_TRANSLATED) {
     schemas = [requestTranslatedSchema];
+  } else if (type === EVENT_REQUEST_CONTINUATION_EXPANDED) {
+    schemas = [requestContinuationExpandedSchema];
   } else {
     return null;
   }

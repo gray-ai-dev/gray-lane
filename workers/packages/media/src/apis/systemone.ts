@@ -35,7 +35,7 @@ export function decodeSystemOne(received: Received): ApiRequest {
 export function systemOneAnswer(value: Json, billsUnits: boolean): Billed {
   if (!isObject(get(value, "answers"))) throw apiError(502, "invalid_upstream_response");
   const usage = get(value, "usage");
-  if (usage === undefined) return missing("usage missing");
+  if (usage === undefined || usage === null) return missing("usage missing");
   const billed = billedBy(() => ({ counters: tokenUsage(usage, "input_tokens", "output_tokens"), raw: usage, unit: undefined }), usage);
   if (billed.kind === "metered") checkMetered("system_one", UNBOUNDED, billed.metered, billsUnits);
   return billed;

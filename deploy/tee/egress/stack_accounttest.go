@@ -37,6 +37,7 @@ type wireAccountTest struct {
 	AccountID      *string            `json:"account_id"`
 	Vendor         *string            `json:"vendor"`
 	CredentialType *string            `json:"credential_type"`
+	CredentialGen  *uint64            `json:"credential_gen"`
 	Protocol       *string            `json:"protocol"`
 	Model          *string            `json:"model"`
 	Credential     *map[string]string `json:"credential"`
@@ -90,7 +91,8 @@ func (s *server) serveAccountTest(rec *responseRecorder, r *http.Request, entry 
 		refuse(errMethodRefused)
 		return
 	}
-	body, readBytes, err := readRequestBody(r, stackAccountTestBody)
+	body, readBytes, release, err := s.readRequestBody(r, stackAccountTestBody)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)
@@ -108,7 +110,7 @@ func (s *server) serveAccountTest(rec *responseRecorder, r *http.Request, entry 
 	}
 	if answer == nil {
 		// Past the KMS lease's end no account test reaches a vendor (stack_lease.go).
-		if s.stack.lease.ended(s.stack.now()) {
+		if s.stack.leaseEnded() {
 			refuse(errStackCredentialUnknown)
 			return
 		}
@@ -117,8 +119,8 @@ func (s *server) serveAccountTest(rec *responseRecorder, r *http.Request, entry 
 			refuse(errStackTestsBusy)
 			return
 		}
+		defer s.stack.testsRunning.Add(-1)
 		answer = s.runAccountTest(r.Context(), test)
-		s.stack.testsRunning.Add(-1)
 	}
 	s.ops.recordTest(test.account.id, test.model, answer)
 	writeControlJSON(rec, answer)
@@ -162,6 +164,12 @@ func parseAccountTest(w wireAccountTest) (accountTest, *accountTestAnswer, bool)
 		return t, nil, false
 	}
 	t.account = stackAccount{id: *w.AccountID, vendor: vendor, credentialType: *w.CredentialType}
+	if w.CredentialGen != nil {
+		if *w.CredentialGen == 0 {
+			return t, nil, false
+		}
+		t.account.credGen = *w.CredentialGen
+	}
 	if w.Proxy != nil {
 		spec, err := parseEgressSpec([]string{string(*w.Proxy)})
 		if err != nil || !validStackID(*w.ProxyID) {
@@ -205,7 +213,9 @@ func (s *server) runAccountTest(ctx context.Context, t accountTest) *accountTest
 	// uncoded.
 	header.Set("Accept-Encoding", "identity")
 	credHash, _ := stackCredential(rt, t.credential)
-	ctx, cancel := context.WithCancel(ctx)
+	leaseCtx, cancelLease := st.lease.withContext(ctx)
+	defer cancelLease()
+	ctx, cancel := context.WithCancel(leaseCtx)
 	defer cancel()
 	if hello := s.profiles.defaultHello(false); hello != nil && mirroredHelloOf(ctx) == nil {
 		ctx = context.WithValue(ctx, mirrorHelloKey{}, hello)
@@ -217,11 +227,12 @@ func (s *server) runAccountTest(ctx context.Context, t accountTest) *accountTest
 		cancel()
 	})
 	defer timer.Stop()
-	o := &testObserver{stack: st, test: t, credHash: credHash, routeName: rt.name, start: start}
+	o := &testObserver{stack: st, test: t, credHash: credHash, routeName: rt.name, start: start, hold: bodyHold{budget: &s.bodyBudget}}
+	defer o.hold.free()
 	o.events = &stackSSEDigester{onEvent: o.event}
 	rec := &responseRecorder{ResponseWriter: discardWriter{header: http.Header{}}}
 	body, _ := stackTestBody(t.account.vendor, t.account.credentialType, t.protocol, t.model)
-	code := s.forward(ctx, s.relayClient, rec, http.MethodPost, plan, header, body, o)
+	code := s.forward(ctx, s.relayClient, rec, http.MethodPost, plan, header, body, nil, o)
 	return o.answer(code, timedOut.Load())
 }
 
@@ -250,17 +261,20 @@ type testObserver struct {
 	routeName string
 	start     time.Time
 
-	failedCode   string
-	answered     bool
-	status       int
-	observation  stackObservation
-	pending      []byte
-	events       *stackSSEDigester
-	firstByteMS  *int64
-	firstTokenMS *int64
-	terminal     bool
-	failedEvent  bool
-	lineTooLong  bool
+	failedCode     string
+	answered       bool
+	status         int
+	observation    stackObservation
+	pending        []byte
+	events         *stackSSEDigester
+	hold           bodyHold
+	eventsHeld     int64
+	budgetExceeded bool
+	firstByteMS    *int64
+	firstTokenMS   *int64
+	terminal       bool
+	failedEvent    bool
+	lineTooLong    bool
 }
 
 func (o *testObserver) sinceStart() *int64 {
@@ -293,14 +307,22 @@ func (o *testObserver) holds(status int) bool {
 }
 
 func (o *testObserver) holdChunk(p []byte) bool {
-	if len(o.pending)+len(p) <= stackErrorBodyMax+forwardBufferBytes {
-		o.pending = append(o.pending, p...)
+	limit := int64(stackErrorBodyMax + forwardBufferBytes)
+	if int64(len(o.pending)+len(p)) > limit {
+		return true
 	}
+	var ok bool
+	if o.pending, ok = growBudgeted(o.pending, len(p), limit, &o.hold); !ok {
+		o.budgetExceeded = true
+		return false
+	}
+	o.pending = append(o.pending, p...)
 	return true
 }
 
 func (o *testObserver) release(status int, header http.Header, complete bool) ([]byte, bool) {
 	o.observe(status, header, o.pending, complete)
+	o.hold.shrink(int64(cap(o.pending)))
 	o.pending = nil
 	return nil, true
 }
@@ -309,20 +331,33 @@ func (o *testObserver) afterHold(wait time.Duration, fire func()) *time.Timer {
 	return o.stack.afterFunc(wait, fire)
 }
 
-// chunk reads a 2xx answer's events; false (the answer is then left) for a line past stackTestLineMax.
+// chunk reads a 2xx answer's events; false (the answer is then left) for a line past stackTestLineMax or
+// when the global body budget cannot hold the SSE buffer.
 func (o *testObserver) chunk(p []byte) bool {
 	if o.status < 200 || o.status > 299 {
 		return true
 	}
 	o.events.Write(p)
-	if o.events.Held() > stackTestLineMax {
+	held := int64(o.events.Held())
+	if held > stackTestLineMax {
 		o.lineTooLong = true
 		return false
 	}
+	if held < o.eventsHeld {
+		o.hold.shrink(o.eventsHeld - held)
+	} else if !o.hold.grow(held - o.eventsHeld) {
+		o.budgetExceeded = true
+		return false
+	}
+	o.eventsHeld = held
 	return true
 }
 
-func (o *testObserver) finished(string) {}
+func (o *testObserver) finished(string) {
+	o.pending, o.events = nil, nil
+	o.eventsHeld = 0
+	o.hold.free()
+}
 
 // event is one dispatched SSE event: its type is the `event` field, or the data's own `type` (the Responses
 // events carry both); Chat chunks have neither and are read by their data.
@@ -420,6 +455,12 @@ func (o *testObserver) answer(code string, timedOut bool) *accountTestAnswer {
 	switch {
 	case timedOut:
 		set(testTimeout, classGrayEnded)
+	case o.budgetExceeded:
+		if o.answered && o.status >= 200 && o.status <= 299 {
+			set(testStreamIncomplete, classEgressLimit)
+		} else {
+			set(testUpstreamFailed, classEgressLimit)
+		}
 	case !o.answered:
 		failure := stackTestFailures[o.failedCode]
 		if failure[0] == "" {

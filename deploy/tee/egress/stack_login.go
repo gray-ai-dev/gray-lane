@@ -478,6 +478,8 @@ type loginFill struct {
 	// loginBodyMax. Each fill stops, login_body_too_large, as soon as its text would pass it, while the text is
 	// expanded and while it is encoded: a body that repeats a placeholder never makes egress build more than that.
 	left int
+	// hold, when non-nil, charges the filled output buffer against the server's global bodyBudget.
+	hold *bodyHold
 }
 
 // text fills s's placeholders; the result is at most limit bytes, or the code is login_body_too_large.
@@ -554,8 +556,8 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 		return body, ""
 	}
 	dec := jsontext.NewDecoder(bytes.NewReader(body))
-	var out bytes.Buffer
-	enc := jsontext.NewEncoder(&out, jsontext.EscapeForHTML(false), jsontext.EscapeForJS(false))
+	out := &budgetedBuffer{limit: int64(fill.left), hold: fill.hold}
+	enc := jsontext.NewEncoder(out, jsontext.EscapeForHTML(false), jsontext.EscapeForJS(false))
 	for {
 		tok, err := dec.ReadToken()
 		if errors.Is(err, io.EOF) {
@@ -566,6 +568,9 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 		}
 		if tok.Kind() != '"' {
 			if enc.WriteToken(tok) != nil {
+				if out.budgetExceeded {
+					return nil, errEgressLimit
+				}
 				return nil, errLoginBodyRefused
 			}
 		} else {
@@ -583,6 +588,9 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 				text = filled
 			}
 			if enc.WriteToken(jsontext.String(text)) != nil {
+				if out.budgetExceeded {
+					return nil, errEgressLimit
+				}
 				return nil, errLoginBodyRefused
 			}
 		}
@@ -591,7 +599,7 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 			return nil, errLoginBodyTooLarge
 		}
 	}
-	filled := bytes.TrimSuffix(out.Bytes(), []byte("\n"))
+	filled := bytes.TrimSuffix(out.buf, []byte("\n"))
 	fill.left -= len(filled)
 	return filled, ""
 }
@@ -601,7 +609,7 @@ func fillJSON(body []byte, fill *loginFill) ([]byte, string) {
 // none comes back as it came (changed false). refused is the code for a text that does not decode: egress could not
 // tell where a placeholder is.
 func fillForm(raw string, fill *loginFill, refused string) (string, bool, string) {
-	var out strings.Builder
+	out := &budgetedBuffer{limit: int64(fill.left), hold: fill.hold}
 	changed := false
 	copied, start := 0, 0 // raw[:copied] is in out; the pair being read starts at start
 	for part := range strings.SplitSeq(raw, "&") {
@@ -629,18 +637,28 @@ func fillForm(raw string, fill *loginFill, refused string) (string, bool, string
 		if rest+len(rawKey)+1+len(escaped) > fill.left {
 			return "", false, errLoginBodyTooLarge
 		}
-		out.WriteString(raw[copied:pairStart])
-		out.WriteString(rawKey)
-		out.WriteByte('=')
-		out.WriteString(escaped)
+		if _, err := out.WriteString(raw[copied:pairStart]); err != nil {
+			return "", false, errEgressLimit
+		}
+		if _, err := out.WriteString(rawKey); err != nil {
+			return "", false, errEgressLimit
+		}
+		if err := out.WriteByte('='); err != nil {
+			return "", false, errEgressLimit
+		}
+		if _, err := out.WriteString(escaped); err != nil {
+			return "", false, errEgressLimit
+		}
 		copied, changed = pairStart+len(part), true
 	}
 	if !changed {
 		return raw, false, ""
 	}
-	out.WriteString(raw[copied:])
+	if _, err := out.WriteString(raw[copied:]); err != nil {
+		return "", false, errEgressLimit
+	}
 	fill.left -= out.Len()
-	return out.String(), true, ""
+	return string(out.buf), true, ""
 }
 
 // loginGrayHeaders are egress's own (framing, hop-by-hop, the encoding it asks for): the container's value is left out.
@@ -727,8 +745,14 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	if tokenCall {
 		// One token call per account at a time, egress's own refresh included (tokenCalls). A call waits for its account's
 		// slot before it takes one of the sign-in calls' (loginSlots): one account's retries never hold the others' off.
-		release, taken := o.tokenCalls.take(r.Context(), accountID, o.persistWait)
+		waitCtx, cancelWait := o.withLeaseContext(r.Context())
+		release, taken := o.tokenCalls.take(waitCtx, accountID, o.persistWait)
+		cancelWait()
 		if !taken {
+			if o.dropIfLeaseEnded() {
+				refuse(errLoginAccountUnknown, "")
+				return
+			}
 			refuse(errLoginBusy, "")
 			return
 		}
@@ -742,9 +766,13 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 
 	var body []byte
 	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
-		read, readBytes, err := readRequestBody(r, loginBodyMax)
+		read, readBytes, release, err := o.srv.readRequestBody(r, loginBodyMax)
+		defer release()
 		entry.RequestBytes = readBytes
 		switch {
+		case errors.Is(err, errBodyBudgetExceeded):
+			refuse(errEgressLimit, "")
+			return
 		case errors.Is(err, errBodyTooLargeRequest):
 			refuse(errLoginBodyTooLarge, "")
 			return
@@ -753,6 +781,11 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 			return
 		}
 		body = read
+	}
+	// Re-check the KMS lease after waiting on slots and reading the request body, before filling secrets or dialing.
+	if o.dropIfLeaseEnded() {
+		refuse(errLoginAccountUnknown, "")
+		return
 	}
 	media := ""
 	if parsed, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil {
@@ -763,7 +796,9 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		refuse(code, "")
 		return
 	}
-	fill := &loginFill{username: login.username, password: login.password, totp: login.totp, at: o.now(), left: loginBodyMax}
+	filledHold := &bodyHold{budget: &o.srv.bodyBudget}
+	defer filledHold.free()
+	fill := &loginFill{username: login.username, password: login.password, totp: login.totp, at: o.now(), left: loginBodyMax, hold: filledHold}
 	query, _, code := fillForm(r.URL.RawQuery, fill, errLoginPathRefused)
 	if code == "" && len(body) > 0 {
 		// A placeholder is found in the body as its type decodes it.
@@ -789,7 +824,13 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	}
 	if code == "" {
 		// The session rules and the boundary rewriting of a proxied call (signin_session.go).
+		prev := body
 		query, body, code = call.outbound(r.Method, host, decodedPath, r.Header.Get("Content-Type"), query, body)
+		if code == "" && len(body) > 0 && (len(prev) == 0 || &body[0] != &prev[0]) {
+			if !filledHold.grow(int64(cap(body))) {
+				code = errEgressLimit
+			}
+		}
 	}
 	if code != "" {
 		refuse(code, "")
@@ -803,9 +844,14 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 	vendorCtx := context.WithValue(r.Context(), mirrorAccountKey{}, accountID)
 	if !tokenCall {
 		// Every other call: the vendor's answer streams back as it came, cookies and redirects included.
-		ctx, cancel := context.WithTimeout(vendorCtx, loginCallCap)
+		leaseCtx, cancelLease := o.withLeaseContext(vendorCtx)
+		defer cancelLease()
+		ctx, cancel := context.WithTimeout(leaseCtx, loginCallCap)
 		defer cancel()
-		entry.Error = o.srv.forward(ctx, o.srv.relayClient, rec, r.Method, plan, header, body, call.observer(r.Method, host, decodedPath))
+		entry.Error = o.srv.forward(ctx, o.srv.relayClient, rec, r.Method, plan, header, body, nil, call.observer(r.Method, host, decodedPath))
+		if entry.Error == errResponseRead {
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 	// The token exchange, holding the account's slot: a grant type a token family comes from, and only the account's
@@ -823,25 +869,33 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		return
 	}
 	// A caller that went away while it waited sends nothing; once sent, the call runs to its end whatever the caller
-	// does (the vendor rotates the family when it answers, and the family must reach the vault).
+	// does (the vendor rotates the family when it answers, and the family must reach the vault), except when the KMS
+	// lease itself ends.
 	if r.Context().Err() != nil {
 		entry.Error = errClientWrite
 		return
 	}
-	// The answer is read whole (at most loginTokenAnswerMax), a token in it becomes the account's, and the answer
-	// passes back as it came, once the family is in the vault (persist first; at once in phase 1).
-	capture := &captureWriter{header: http.Header{}, limit: loginTokenAnswerMax}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(vendorCtx), loginCallCap)
+	// The answer is read whole (at most loginTokenAnswerMax), charged against the global body budget, a token in it
+	// becomes the account's, and the answer passes back as it came, once the family is in the vault (persist first;
+	// at once in phase 1).
+	captureHold := &bodyHold{budget: &o.srv.bodyBudget}
+	defer captureHold.free()
+	capture := &captureWriter{header: http.Header{}, limit: loginTokenAnswerMax, hold: captureHold}
+	leaseCtx, cancelLease := o.withLeaseContext(context.WithoutCancel(vendorCtx))
+	defer cancelLease()
+	ctx, cancel := context.WithTimeout(leaseCtx, loginCallCap)
 	defer cancel()
-	forwardCode := o.srv.forward(ctx, o.srv.relayClient, &responseRecorder{ResponseWriter: capture}, r.Method, plan, header, body, nil)
+	forwardCode := o.srv.forward(ctx, o.srv.relayClient, &responseRecorder{ResponseWriter: capture}, r.Method, plan, header, body, nil, nil)
 	outcome := ""
 	var token *loginToken
 	// rejected: the vendor refused a refresh token (a 4xx answer to a refresh_token grant, such as invalid_grant): the
 	// account needs a sign-in now, not once its access token nears its end. A 5xx or a failed connection is not a refusal.
 	rejected := false
 	switch {
+	case capture.budgetExceeded:
+		outcome = loginCodeEgressError
 	case forwardCode == "" && capture.status >= 200 && capture.status <= 299:
-		token, outcome = readLoginToken(capture.body.Bytes(), tokenRule.accountIDClaim, o.now())
+		token, outcome = readLoginToken(capture.body, tokenRule.accountIDClaim, o.now())
 	case forwardCode == "":
 		outcome = loginCodeVendorRejected
 		rejected = capture.status >= 400 && capture.status <= 499 && inList(grants, "refresh_token")
@@ -857,6 +911,11 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 		outcome = loginCodeEgressError
 	}
 	seq := o.recordLogin(accountID, login.username, basis, token, outcome, rejected)
+	if capture.budgetExceeded {
+		call.exchanged(false, outcome)
+		refuse(errEgressLimit, "")
+		return
+	}
 	if forwardCode == "" && capture.status >= 200 && capture.status <= 299 && token == nil {
 		// A 2xx answer egress cannot read may still hold a token: never handed out unpersisted, never the vendor's words.
 		call.exchanged(false, outcome)
@@ -890,9 +949,9 @@ func (o *stackOps) loginCall(rec *responseRecorder, r *http.Request, accountID, 
 			rec.Header().Add(name, value)
 		}
 	}
-	rec.Header().Set("Content-Length", strconv.Itoa(capture.body.Len()))
+	rec.Header().Set("Content-Length", strconv.Itoa(len(capture.body)))
 	rec.WriteHeader(capture.status)
-	_, _ = rec.Write(capture.body.Bytes())
+	_, _ = rec.Write(capture.body)
 }
 
 // loginRate counts each account's sign-in calls in a fixed one-minute window (-login-calls-per-minute).
@@ -1016,6 +1075,10 @@ func (o *stackOps) recordLogin(accountID, username, basis string, token *loginTo
 	now := o.now()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(now) {
+		o.dropForLeaseLocked()
+		return 0
+	}
 	account := o.accounts[accountID]
 	// A proxied account without a sealed sign-in has username "" (signin_proxy.go).
 	if account == nil || (account.login == nil) != (username == "") || (account.login != nil && account.login.username != username) {
@@ -1161,6 +1224,9 @@ func (o *stackOps) loginHealth() map[string]*opsLoginHealth {
 	now := o.now()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(now) {
+		o.dropForLeaseLocked()
+	}
 	out := map[string]*opsLoginHealth{}
 	for id, account := range o.accounts {
 		l := account.login

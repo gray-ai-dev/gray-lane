@@ -204,6 +204,13 @@ export interface RouteAttempt {
   readonly ttftMs?: number;
   readonly durationMs?: number;
   readonly outputTokens?: number;
+  /**
+   * The confidential entry's (2026-11-23, docs/design/one-address.md "Provider defects at the entry"): whether the
+   * attempt failed on its provider's answer, true exactly where a gateway that keeps traffic evidence notes
+   * `provider_failure` for it, false on the entry's every other attempt. gray-jobs writes that evidence from it. Absent
+   * from a row of the API Worker, which sends the evidence itself, and from one of an entry, or through a bridge, before it.
+   */
+  readonly providerFailure?: boolean;
 }
 
 /**
@@ -602,6 +609,8 @@ export function parseRouteAttempts(v: unknown): RouteAttempt[] {
       outputCheck,
       // r15: the five measures, all or none; ones past their bounds are left out, never refusing the list.
       ...attemptMeasuresOf(o),
+      // The entry's provider failure (2026-11-23): a boolean, or left out, never refusing the list.
+      ...(typeof o.providerFailure === "boolean" ? { providerFailure: o.providerFailure } : {}),
     };
   });
 }
@@ -624,6 +633,7 @@ export const ROUTE_ATTEMPT_COLUMN_KEYS: { readonly [K in keyof RouteAttempt]-?: 
   ttftMs: "ttft_ms",
   durationMs: "duration_ms",
   outputTokens: "output_tokens",
+  providerFailure: "provider_failure",
 });
 
 /**

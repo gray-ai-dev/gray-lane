@@ -30,8 +30,10 @@ type config struct {
 	maxSessionsPerKeyset  int
 	maxUnverifiedPerRelay int
 	maxSessions           int
+	maxStreamsPerSession  int
 	unverifiedTTL         time.Duration
 	maxTunnelsPerRelay    int
+	maxTunnels            int
 
 	// VM role (§3.6).
 	lane             string
@@ -61,8 +63,10 @@ func defaultConfig() config {
 		maxSessionsPerKeyset:  4,
 		maxUnverifiedPerRelay: 2,
 		maxSessions:           4*256 + 64,
+		maxStreamsPerSession:  512,
 		unverifiedTTL:         60 * time.Second,
 		maxTunnelsPerRelay:    16,
+		maxTunnels:            256,
 		lane:                  "10.231.12.2:443",
 		sessionsPerEntry:      2, // R2
 		stagger:               5 * time.Second,
@@ -91,8 +95,10 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.IntVar(&cfg.maxSessionsPerKeyset, "max-sessions-per-keyset", cfg.maxSessionsPerKeyset, "entry: sessions per (relay, keyset)")
 	fs.IntVar(&cfg.maxUnverifiedPerRelay, "max-unverified-per-relay", cfg.maxUnverifiedPerRelay, "entry: unverified sessions per relay")
 	fs.IntVar(&cfg.maxSessions, "max-sessions", cfg.maxSessions, "entry: sessions in all")
+	fs.IntVar(&cfg.maxStreamsPerSession, "max-streams-per-session", cfg.maxStreamsPerSession, "entry: concurrent streams per session")
 	fs.DurationVar(&cfg.unverifiedTTL, "unverified-ttl", cfg.unverifiedTTL, "entry: an unverified session not promoted in this time is closed")
 	fs.IntVar(&cfg.maxTunnelsPerRelay, "max-tunnels-per-relay", cfg.maxTunnelsPerRelay, "entry: open tunnels per relay")
+	fs.IntVar(&cfg.maxTunnels, "max-tunnels", cfg.maxTunnels, "entry: open tunnels in all")
 	fs.StringVar(&cfg.lane, "lane", cfg.lane, "vm: the lane's address every stream is piped to")
 	fs.IntVar(&cfg.sessionsPerEntry, "sessions-per-entry", cfg.sessionsPerEntry, "vm: sessions kept to each entry")
 	fs.DurationVar(&cfg.stagger, "stagger", cfg.stagger, "vm: delay between an entry's session dials")
@@ -217,7 +223,9 @@ func (c config) validate() error {
 		{"max-sessions-per-keyset", c.maxSessionsPerKeyset, 1, 64},
 		{"max-unverified-per-relay", c.maxUnverifiedPerRelay, 1, 64},
 		{"max-sessions", c.maxSessions, 1, 1 << 16},
+		{"max-streams-per-session", c.maxStreamsPerSession, 1, 1 << 16},
 		{"max-tunnels-per-relay", c.maxTunnelsPerRelay, 1, 1024},
+		{"max-tunnels", c.maxTunnels, 1, 1 << 16},
 		{"sessions-per-entry", c.sessionsPerEntry, 1, 8},
 	} {
 		if n.value < n.min || n.value > n.max {

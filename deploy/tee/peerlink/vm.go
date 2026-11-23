@@ -32,8 +32,9 @@ import (
 var errEntryPinMismatch = errors.New("the entry's TLS key is not the pinned one")
 
 const (
-	maxEntries         = 16
-	maxAttestBodyBytes = 1 << 20
+	maxEntries          = 16
+	maxEntriesBodyBytes = 1 << 20
+	maxAttestBodyBytes  = 1 << 20
 	// directBench is how long a direct address that failed while <name>:443 answered with the pinned key is skipped:
 	// new sessions run through Cloudflare meanwhile, so a wrong address never takes a relay off the air.
 	directBench = 5 * time.Minute
@@ -143,11 +144,23 @@ func (v *vm) bench(name, direct string, err error) {
 }
 
 func (v *vm) servePut(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if r.ContentLength > maxEntriesBodyBytes {
+		refuse(w, http.StatusRequestEntityTooLarge, codeControlInvalid)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxEntriesBodyBytes+1))
+	if err != nil {
+		refuse(w, http.StatusBadRequest, codeControlInvalid)
+		return
+	}
+	if len(body) > maxEntriesBodyBytes {
+		refuse(w, http.StatusRequestEntityTooLarge, codeControlInvalid)
+		return
+	}
 	var table wireEntries
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if err != nil || decoder.Decode(&table) != nil || !v.validTable(table) {
+	if decoder.Decode(&table) != nil || decoder.Decode(&struct{}{}) != io.EOF || !v.validTable(table) {
 		refuse(w, http.StatusBadRequest, codeControlInvalid)
 		return
 	}

@@ -2,6 +2,7 @@ import { shardName, type Region, type ShardAddress, type ShardLocator, type Shar
 import { isLocationHint } from "@gray/config";
 import { ApiError } from "@gray/errors";
 import type { GatewayEnv } from "./env.ts";
+import type { KeyRevocationCheck } from "./key-lookup.ts";
 
 /**
  * The gateway's way to its account shards: a fresh stub per call (a stub breaks when its object
@@ -31,4 +32,9 @@ export function workspaceHome(snapshot: { readonly workspaces: Readonly<Record<s
  */
 export function accountRoot(env: Pick<GatewayEnv, "ACCOUNT_ROOT">, workspace: string, home: Region) {
   return env.ACCOUNT_ROOT.get(env.ACCOUNT_ROOT.idFromName(workspace), { locationHint: home });
+}
+
+/** Direct `AccountRootDO.keyRevoked` check for the main gateway's stale-snapshot revocation path (`checkStaleKey`). */
+export function accountRootKeyCheck(env: Pick<GatewayEnv, "ACCOUNT_ROOT">): KeyRevocationCheck {
+  return (workspace, home, keyId) => accountRoot(env, workspace, home).keyRevoked(keyId);
 }

@@ -5290,6 +5290,12 @@ export const CROSS_CHECKS: readonly CrossCheck[] = [
   },
   {
     workers: ["gateway"],
+    names: ["ACCOUNT_HOLD_MARGIN_MS", "REQUEST_POST_BUDGET_MS"],
+    check: (a, b) => (a >= b ? null : `${a} must be at least REQUEST_POST_BUDGET_MS (${b})`),
+    source: "The margin covers the gateway's post-stream budget, which settlement retries may run for up to (REQUEST_POST_BUDGET_MS source).",
+  },
+  {
+    workers: ["gateway"],
     names: ["PROJECTION_RETRY_MAX_MS", "PROJECTION_INTERVAL_MS"],
     check: (a, b) => (a >= b ? null : `${a} must be at least PROJECTION_INTERVAL_MS (${b})`),
     source: "The back-off starts at the projection interval and doubles; a cap below the interval would retry faster than a working shard sends.",

@@ -80,6 +80,7 @@ export type RewriteApi =
   | LaneProtocol
   | Extract<
       Protocol,
+      | "gemini"
       | "open_ai_embeddings"
       | "rerank"
       | "open_ai_image_generations"
@@ -94,6 +95,7 @@ export type RewriteApi =
 /** v2's APIs, in the order the document lists them. */
 export const REWRITE_APIS: readonly RewriteApi[] = Object.freeze([
   ...LANE_PROTOCOLS,
+  "gemini",
   "open_ai_embeddings",
   "rerank",
   "open_ai_image_generations",
@@ -159,6 +161,7 @@ const RAW_POLICY: unknown = {
       { op: "remove_member", path: "/user" },
       { op: "remove_member", path: "/safety_identifier" },
       { op: "remove_member", path: "/metadata" },
+      { op: "set_member", path: "/stream_options", value: STREAM_OPTIONS_ON },
       { op: "insert_member", path: "/stream_options", value: STREAM_OPTIONS_ON },
       { op: "set_member", path: "/stream_options/include_usage", value: INCLUDE_USAGE },
       { op: "insert_member", path: "/stream_options/include_usage", value: INCLUDE_USAGE },
@@ -208,6 +211,10 @@ const RAW_POLICY_V2: unknown = {
   version: 2,
   protocols: {
     ...(RAW_POLICY as { readonly protocols: Record<string, unknown> }).protocols,
+    gemini: [
+      { op: "set_member", path: "/generateContentRequest/model", value: MODEL_STRING },
+      { op: "insert_member", path: "/generateContentRequest/model", value: MODEL_STRING },
+    ],
     open_ai_embeddings: API_JSON_RULES,
     rerank: API_JSON_RULES,
     open_ai_image_generations: API_JSON_RULES,
@@ -329,12 +336,12 @@ export function validateRewritePolicyV2(value: unknown): LaneRewritePolicyV2 {
   for (const api of REWRITE_APIS) {
     const list = protocols[api];
     if (!Array.isArray(list)) throw new LaneError("lane/policy", `the ${api} rules are not an array`);
-    const text = (LANE_PROTOCOLS as readonly string[]).includes(api);
+    const jsonOnly = (LANE_PROTOCOLS as readonly string[]).includes(api) || api === "gemini";
     const seen = new Set<string>();
     const rules: ApiRewriteRule[] = [];
     for (const entry of list) {
       if (!isFormOp(record(entry, `a ${api} rule`).op)) rules.push(parseRule(entry, api, seen));
-      else if (text) throw new LaneError("lane/policy", `a form rule in ${api}, whose body is JSON`);
+      else if (jsonOnly) throw new LaneError("lane/policy", `a form rule in ${api}, whose body is JSON`);
       else rules.push(parseFormRule(entry, api, seen));
     }
     parsed[api] = rules;

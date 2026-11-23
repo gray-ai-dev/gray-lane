@@ -59,16 +59,29 @@ export function isImage(bytes: Uint8Array): boolean {
 }
 
 /**
- * `is_inline_image`: an image an answer carries inline. Its first 16 characters, decoded as standard
- * base64 with canonical padding (bits past the last byte left unchecked, as Rust's engine is
- * configured), carry a PNG, JPEG or WebP signature (`isImage`). A data URI,
- * URL-safe base64, a GIF or text is no image. The decode is the platform's `atob` (WHATWG
- * forgiving-base64, which ignores trailing bits) after the alphabet and padding checks Rust makes.
+ * `is_inline_image`: an image an answer carries inline. The entire string must be valid standard
+ * base64 (padded canonically or unpadded, no whitespace, no embedded `=`, no 4k+1 data length,
+ * `[A-Za-z0-9+/]` only), and its first 16 characters decoded carry a PNG, JPEG or WebP signature
+ * (`isImage`). A data URI, URL-safe base64, trailing non-base64 garbage, a GIF or text is no
+ * image.
  */
 export function isInlineImage(b64: string): boolean {
   if (b64.length < 16) return false;
+  let end = b64.length;
+  while (end > 0 && b64.charCodeAt(end - 1) === 0x3d) end -= 1;
+  const padding = b64.length - end;
+  if (padding > 2 || (padding > 0 && b64.length % 4 !== 0) || end % 4 === 1) return false;
+  for (let i = 0; i < end; i += 1) {
+    const c = b64.charCodeAt(i);
+    const ok =
+      (c >= 0x41 && c <= 0x5a) ||
+      (c >= 0x61 && c <= 0x7a) ||
+      (c >= 0x30 && c <= 0x39) ||
+      c === 0x2b ||
+      c === 0x2f;
+    if (!ok) return false;
+  }
   const head = b64.slice(0, 16);
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(head)) return false;
   let binary: string;
   try {
     binary = atob(head);
@@ -107,15 +120,24 @@ export async function readCapped(response: Response, limit: number, deadlineMs: 
     return undefined;
   }
   if (response.body === null) return new Uint8Array(0);
+  const initialRemaining = deadlineMs - Date.now();
+  if (initialRemaining <= 0) {
+    await response.body.cancel().catch(() => {});
+    throw unavailable();
+  }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<"expired">((resolve) => {
-    timer = setTimeout(() => resolve("expired"), left(deadlineMs));
+    timer = setTimeout(() => resolve("expired"), Math.max(1, initialRemaining));
   });
   try {
     for (;;) {
+      if (deadlineMs - Date.now() <= 0) {
+        await reader.cancel().catch(() => {});
+        throw unavailable();
+      }
       const next = await Promise.race([reader.read(), expired]);
       if (next === "expired") {
         await reader.cancel().catch(() => {});

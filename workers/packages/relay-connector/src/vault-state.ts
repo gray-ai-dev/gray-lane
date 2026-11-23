@@ -30,7 +30,7 @@ export const VAULT_STATE_FORMAT = "gray-relay-vault-state/v1";
 
 const u64 = z.bigint().min(0n).max(0xffff_ffff_ffff_ffffn);
 
-const vaultAccountSchema = accountSchema.extend({ version: u64.min(1n), login_since: u64.min(1n).optional() }).strict();
+const vaultAccountSchema = accountSchema.extend({ version: u64.min(1n), login_since: u64.min(1n).optional(), cred_gen: u64.min(1n).optional() }).strict();
 
 const refreshedSchema = z
   .object({
@@ -38,6 +38,7 @@ const refreshedSchema = z
     based_on: u64,
     credential: credentialSchema,
     username: z.string().min(1).optional(),
+    cred_gen: u64.min(1n).optional(),
   })
   .strict();
 
@@ -73,6 +74,7 @@ const vaultStateSchema = z
     relay_id: z.string().regex(RESOURCE_ID),
     version: u64,
     persist: z.boolean(),
+    cred_gen_seq: u64.optional(),
     accounts: z.array(vaultAccountSchema),
     refreshed: z.array(refreshedSchema),
     logins: z.array(loginSchema).optional(),
@@ -87,6 +89,8 @@ export function vaultStatePlaintext(relayId: string, snapshot: RelayVaultSnapsho
     relay_id: relayId,
     version: snapshot.version,
     persist: snapshot.persist,
+    // AF-06.3: serialize only when defined so legacy snapshots without cred_gen fields stay byte-identical.
+    ...(snapshot.cred_gen_seq === undefined ? {} : { cred_gen_seq: snapshot.cred_gen_seq }),
     accounts: snapshot.accounts.map((account) => ({
       account_id: account.account_id,
       vendor: account.vendor,
@@ -95,12 +99,14 @@ export function vaultStatePlaintext(relayId: string, snapshot: RelayVaultSnapsho
       version: account.version,
       // Only for an account sealed again as the same one, so other records are the same bytes as before.
       ...(account.login_since === undefined ? {} : { login_since: account.login_since }),
+      ...(account.cred_gen === undefined ? {} : { cred_gen: account.cred_gen }),
     })),
     refreshed: snapshot.refreshed.map((token) => ({
       account_id: token.account_id,
       based_on: token.based_on,
       credential: credentialValue(token.credential),
       ...(token.username === undefined ? {} : { username: token.username }),
+      ...(token.cred_gen === undefined ? {} : { cred_gen: token.cred_gen }),
     })),
     // P2e-2: only with pacing to keep, so a record without any is the same bytes as before.
     ...(snapshot.logins === undefined || snapshot.logins.length === 0
@@ -143,6 +149,7 @@ export function parseVaultState(relayId: string, plaintext: Uint8Array): RelayVa
   return {
     version: state.version,
     persist: state.persist,
+    ...(state.cred_gen_seq === undefined ? {} : { cred_gen_seq: state.cred_gen_seq }),
     accounts: state.accounts.map((account) => ({
       account_id: account.account_id,
       vendor: account.vendor,
@@ -150,12 +157,14 @@ export function parseVaultState(relayId: string, plaintext: Uint8Array): RelayVa
       ...(account.egress === undefined ? {} : { egress: account.egress }),
       version: account.version,
       ...(account.login_since === undefined ? {} : { login_since: account.login_since }),
+      ...(account.cred_gen === undefined ? {} : { cred_gen: account.cred_gen }),
     })),
     refreshed: state.refreshed.map((token) => ({
       account_id: token.account_id,
       based_on: token.based_on,
       credential: token.credential,
       ...(token.username === undefined ? {} : { username: token.username }),
+      ...(token.cred_gen === undefined ? {} : { cred_gen: token.cred_gen }),
     })),
     ...(state.logins === undefined ? {} : { logins: state.logins.map((login) => ({ ...login, last: login.last === null ? null : { ...login.last } })) }),
     ...(state.sign_in_pins === undefined ? {} : { sign_in_pins: state.sign_in_pins.map((pin) => ({ ...pin })) }),

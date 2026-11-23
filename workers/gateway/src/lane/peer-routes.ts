@@ -4,7 +4,7 @@ import { requestLimit } from "@gray/limits";
 import { encodePeerAttemptsAnswer, encodePeerDebugAnswer, encodePeerDebugRefusal, PEER_DEBUG_PREFIX, PEER_DEBUG_REFUSAL_STATUS, PEER_HEADER, peerReadsOf, peerRequestIdOf, type PeerDebugRefusalCode } from "@gray/lane-wire";
 import { readBody } from "../body.ts";
 import { platformTimers, type StreamTimers } from "../client.ts";
-import { servedProtocol } from "../paths.ts";
+import { countTokensProtocol, servedProtocol } from "../paths.ts";
 import { trustGate } from "../trust.ts";
 import { peerRefusal, serveBackend } from "./backend.ts";
 import { bridgeFetch, stackTransportOf, type LaneEnv, type LaneIsolate } from "./deps.ts";
@@ -115,10 +115,14 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
     });
   }
   const served = servedProtocol(request.method, path);
-  if (served === null || served.protocol === "gemini" || path.startsWith(PEER_PREFIX)) return peerRefusal("peer_malformed");
+  const counted = served === null ? countTokensProtocol(request.method, path) : null;
+  const target = served ?? counted;
+  const isCount = counted !== null;
+  if (target === null || target.protocol === "gemini" || path.startsWith(PEER_PREFIX)) return peerRefusal("peer_malformed");
   const checked = await peer.check(request.headers.get(PEER_HEADER), "request");
   if (!checked.ok) return peerRefusal(checked.code);
-  const protocol = served.protocol;
+  if ((checked.envelope.count_tokens === true) !== isCount) return peerRefusal("peer_malformed");
+  const protocol = target.protocol;
   // The lane's body cap (as `InferenceRun.receive` reads a lane body): no spool, the bytes held whole.
   const cap = Math.min(Number(requestLimit(protocol)), state.timing.bodyMaxBytes, cfg.bodyParseMaxBytes);
   const read = await readBody(request, { protocol, limit: cap, parseMax: cfg.bodyParseMaxBytes, rawMax: cap, waitMs: cfg.requestBodyMs }, undefined);
@@ -130,6 +134,7 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
     path,
     envelope: checked.envelope,
     body: read.body.bytes,
+    ...(isCount ? { countTokens: true } : {}),
     cfg,
     state,
     relayImage: state.stackConfig.relayImage ?? null,

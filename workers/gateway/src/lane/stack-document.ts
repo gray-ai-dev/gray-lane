@@ -132,6 +132,7 @@ export interface StackAccountRow {
   readonly vendor: StackVendor;
   readonly credential_sha256: string;
   readonly credential_type: CredentialType;
+  readonly credential_gen?: bigint;
   readonly proxy?: JsonObject;
   readonly proxy_id?: string;
 }
@@ -323,6 +324,7 @@ export function buildStackDocument(input: StackDocumentInput): StackDocument {
       vendor: account.vendor,
       credential_sha256: sha256,
       credential_type: sealed.credential.type,
+      credential_gen: sealed.credGen,
       ...(account.proxy_id === null || sealed.egress === undefined ? {} : { proxy: egressValue(sealed.egress), proxy_id: account.proxy_id }),
     });
   }

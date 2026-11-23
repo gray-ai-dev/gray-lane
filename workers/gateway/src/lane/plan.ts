@@ -1,6 +1,6 @@
 import { get, isObject, type Json, type JsonObject, cloneJson } from "@gray/json";
 import { Overlay, type Protocol, attemptOverlay, openAiFamily } from "@gray/protocol";
-import { checkOfficialUpstream, type GrayRewriteOp } from "@gray/lane";
+import { checkOfficialUpstream, stackStoreOff, type GrayRewriteOp } from "@gray/lane";
 import type { RewriteCap, RewritePlan, RewriteRemoval } from "./types.ts";
 
 /**
@@ -128,11 +128,22 @@ export function codexBackend(url: string): boolean {
 }
 
 /**
- * The whole plan: the request's decisions plus the route's upstream model and whether the route is
- * the Codex backend (design v2 §C.7, M2; D129).
+ * Whether a sealed-credential lane relay route's official upstream requires `store: false`
+ * (zero upstream retention on OpenAI / ChatGPT backends: `@gray/lane` `stackStoreOff`).
  */
-export function planRewrites(decisions: RewriteDecisions, upstreamModel: string, codex = false): RewritePlan {
-  return { upstreamModel, cap: decisions.cap, removals: decisions.removals, includeUsage: decisions.includeUsage, codex, collapsed: decisions.collapsed };
+export function storeOffBackend(url: string): boolean {
+  const official = checkOfficialUpstream(url);
+  if (!official.ok) return false;
+  const vendor = official.vendor === "chatgpt" ? "chatgpt_codex" : official.vendor;
+  return stackStoreOff(vendor);
+}
+
+/**
+ * The whole plan: the request's decisions plus the route's upstream model, whether the route is
+ * the Codex backend (design v2 §C.7, M2; D129), and whether the route enforces `store: false`.
+ */
+export function planRewrites(decisions: RewriteDecisions, upstreamModel: string, codex = false, storeOff = false): RewritePlan {
+  return { upstreamModel, cap: decisions.cap, removals: decisions.removals, includeUsage: decisions.includeUsage, codex, storeOff, collapsed: decisions.collapsed };
 }
 
 /**
@@ -147,6 +158,8 @@ export function planOverlay(plan: RewritePlan, protocol: Protocol, stream: boole
   if (codexMembers(plan, protocol)) {
     overlay.set("stream", true);
     overlay.set("store", false);
+  } else if (storeOffMember(plan, protocol)) {
+    overlay.set("store", false);
   }
   for (const removal of plan.removals) applyRemoval(overlay, removal.path, body);
   return overlay;
@@ -155,6 +168,11 @@ export function planOverlay(plan: RewritePlan, protocol: Protocol, stream: boole
 /** Whether the plan writes the Codex backend's `stream` and `store` (D129): a Codex route, a Responses request. */
 function codexMembers(plan: RewritePlan, protocol: Protocol): boolean {
   return plan.codex && protocol === "open_ai_responses";
+}
+
+/** Whether the plan writes `store: false` for zero upstream retention on OpenAI Chat or Responses. */
+function storeOffMember(plan: RewritePlan, protocol: Protocol): boolean {
+  return plan.storeOff && (protocol === "open_ai_chat" || protocol === "open_ai_responses");
 }
 
 /**
@@ -183,9 +201,10 @@ function applyRemoval(overlay: Overlay, path: string, body: Json): void {
  * - the upstream model: `set_member /model` when the body names a model, else `insert_member`;
  * - the cap: `set_member <field>` when the body has that field, else `insert_member`;
  * - Chat's stream option: `set_member /stream_options/include_usage` when the body has a
- *   `stream_options` object, `insert_member /stream_options` (the whole fixed object) when it has
- *   none. A `stream_options` that is not an object has no op form: the caller refuses it as the main
- *   lane refuses it (`invalid_stream_options`);
+ *   `stream_options` object, `set_member /stream_options` (the whole fixed object) when it is
+ *   `null`, and `insert_member /stream_options` when it has none. Any other non-object
+ *   `stream_options` has no op form: the caller refuses it as the main lane refuses it
+ *   (`invalid_stream_options`);
  * - a Codex route's Responses request (D129): `/stream` true and `/store` false, each `set_member`
  *   when the body has the member with another value, `insert_member` when it has none, and no op
  *   when it already says so. `store` is written whatever the customer sent: the backend refuses
@@ -215,6 +234,8 @@ export function planOps(plan: RewritePlan, protocol: Protocol, body: Json): Plan
     const options = get(body, "stream_options");
     if (options === undefined) {
       ops.push({ op: "insert_member", path: "/stream_options", value: { include_usage: true } });
+    } else if (options === null) {
+      ops.push({ op: "set_member", path: "/stream_options", value: { include_usage: true } });
     } else if (isObject(options)) {
       const path = "/stream_options/include_usage";
       ops.push(get(options, "include_usage") === undefined ? { op: "insert_member", path, value: true } : { op: "set_member", path, value: true });
@@ -228,6 +249,11 @@ export function planOps(plan: RewritePlan, protocol: Protocol, body: Json): Plan
       if (current === value) continue;
       const path = `/${member}`;
       ops.push(current === undefined ? { op: "insert_member", path, value } : { op: "set_member", path, value });
+    }
+  } else if (storeOffMember(plan, protocol)) {
+    const current = get(body, "store");
+    if (current !== false) {
+      ops.push(current === undefined ? { op: "insert_member", path: "/store", value: false } : { op: "set_member", path: "/store", value: false });
     }
   }
   for (const removal of plan.removals) {

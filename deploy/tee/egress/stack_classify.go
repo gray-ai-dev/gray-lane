@@ -563,22 +563,26 @@ func stackStatedEnd(vendorCode string, windows []stackWindow, fields stackErrorF
 // 8 days, bounds it anyway), which also keeps the conversion to a Duration in range.
 func retryAfterDelay(h http.Header, now time.Time) time.Duration {
 	positive := func(seconds float64) time.Duration {
-		if math.IsNaN(seconds) || seconds <= 0 {
+		if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
 			return 0
 		}
 		return time.Duration(min(seconds, stackResetFutureMax) * float64(time.Second))
 	}
 	if text := h.Get("retry-after-ms"); text != "" {
-		if ms, err := strconv.ParseFloat(text, 64); err == nil {
-			return positive(ms / 1000)
+		if len(text) <= stackNumberTextMax && stackDecimal.MatchString(text) {
+			if ms, err := strconv.ParseFloat(text, 64); err == nil {
+				return positive(ms / 1000)
+			}
 		}
 	}
 	text := h.Get("retry-after")
 	if text == "" {
 		return 0
 	}
-	if seconds, err := strconv.ParseFloat(text, 64); err == nil {
-		return positive(seconds)
+	if len(text) <= stackNumberTextMax && stackDecimal.MatchString(text) {
+		if seconds, err := strconv.ParseFloat(text, 64); err == nil {
+			return positive(seconds)
+		}
 	}
 	at, err := http.ParseTime(text)
 	if err != nil {

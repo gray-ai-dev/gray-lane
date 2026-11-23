@@ -158,6 +158,8 @@ export interface AnswerRelayInput {
   readonly queued?: (bytes: number) => void;
   /** Hears every byte the client is sent, keep-alives and the last frame included (the lane's receipt hash); none on the main lane. */
   readonly tap?: (bytes: Uint8Array) => void;
+  /** Optional bounded observer for raw upstream JSON chunks as they arrive (before `deliver`). */
+  readonly onRawChunk?: (bytes: Uint8Array) => void;
   /** A null member left out of what the client gets, as a JSON pointer (the record's `dropped_nulls`). */
   readonly onDroppedNull?: (member: string) => void;
   /** The response starts: the client's body, and its length when the answer goes whole (`deliver`). Called at most once. */
@@ -317,6 +319,7 @@ export class AnswerRelay {
       // The bytes its request's output limit allows (@gray/limits `answerLimit`): Gray's own bound, not the supplier's failure.
       return this.failed("upstream_body_limit", `the answer passed its limit of ${this.input.answerLimit} bytes`, null, true, { limitSource: "request_output_limit" });
     }
+    this.input.onRawChunk?.(bytes);
     try {
       this.scan.write(bytes);
     } catch (error) {

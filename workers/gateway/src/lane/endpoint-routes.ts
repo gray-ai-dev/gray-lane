@@ -15,6 +15,7 @@ import { parseSerde } from "@gray/json";
 import type { GatewaySnapshot, RouteRecord } from "../snapshot.ts";
 import { BridgeCallError } from "./remote/client.ts";
 import { LaneFetchRefusal } from "./fetch-refusal.ts";
+import { EGRESS_OWN_HEADER } from "./hooks.ts";
 
 /**
  * An entry's endpoint routes (docs/design/lane-provider-routes.md sections 3.2, 4.2 and 5): the routes a provider set up
@@ -55,6 +56,8 @@ const ROW_TTL_MS = ROUTE_ROW_MAX_TTL_SECONDS * 1000;
 const REFUSED_BACKOFF_MS = 60_000;
 /** After a key fetch that failed otherwise (a transport failure, a generation the snapshot has not caught up with). */
 const FAILED_BACKOFF_MS = 5_000;
+/** Strict cap on reading egress JSON refusal bodies so an upstream 502 error cannot exhaust isolate memory. */
+export const ROUTE_REFUSAL_MAX_BYTES = 8 * 1024;
 
 /** One endpoint the view admits, as the table and the key cache need it. */
 interface EndpointRow {
@@ -235,10 +238,13 @@ export class EntryEndpointRoutes {
       await this.#ensureTable();
       const answer = await this.#deps.egress(`${ROUTE_ORIGIN}/route/${row.key}${path}`, init);
       // An egress that does not hold the row (it restarted, and lost its table with it) answers `route_unknown` before
-      // any dial: the table is pushed again by the next attempt or fetch, not half an hour later.
-      if (answer.status === 502 && refusalCode(await answer.clone().text(), 502) === "route_unknown") {
-        this.#pushedUntil = 0;
-        this.#deps.log({ level: "warn", event: "lane_route_unknown" });
+      // any dial, marked as its own answer: the table is pushed again by the next attempt or fetch, not half an hour later.
+      if (answer.status === 502 && answer.headers.has(EGRESS_OWN_HEADER) && !exceedsContentLength(answer, ROUTE_REFUSAL_MAX_BYTES)) {
+        const peek = await readTextBounded(answer.clone(), ROUTE_REFUSAL_MAX_BYTES, true);
+        if (peek !== null && refusalCode(peek, 502) === "route_unknown") {
+          this.#pushedUntil = 0;
+          this.#deps.log({ level: "warn", event: "lane_route_unknown" });
+        }
       }
       return answer;
     };
@@ -331,7 +337,7 @@ export class EntryEndpointRoutes {
         body: JSON.stringify(rows),
         signal: controller.signal,
       });
-      const body = await answer.text();
+      const body = answer.status === 204 ? "" : ((await readTextBounded(answer, ROUTE_REFUSAL_MAX_BYTES)) ?? "");
       if (answer.status === 204) {
         this.#pushedChanges = Math.max(this.#pushedChanges, covers);
         this.#pushedUntil = Math.floor(now / 1000) * 1000 + ROW_TTL_MS;
@@ -409,6 +415,53 @@ export class EntryEndpointRoutes {
 
 function keyOf(endpointId: string, generation: number): string {
   return `${endpointId}\u0000${generation}`;
+}
+
+function exceedsContentLength(response: Response, maxBytes: number): boolean {
+  const raw = response.headers.get("content-length");
+  return raw !== null && /^[0-9]+$/.test(raw) && Number(raw) > maxBytes;
+}
+
+/**
+ * Reads at most `maxBytes` of `response` as UTF-8 text; cancels and returns null if larger.
+ * When `cloned` is true (a branch of `Response.clone()`), `cancel()` is fired without awaiting so the
+ * WHATWG `tee()` cancel promise does not deadlock waiting for the caller's unread sibling branch.
+ */
+async function readTextBounded(response: Response, maxBytes: number, cloned = false): Promise<string | null> {
+  if (exceedsContentLength(response, maxBytes)) {
+    const cancelling = response.body?.cancel().catch(() => {});
+    if (!cloned) await cancelling;
+    return null;
+  }
+  const stream = response.body;
+  if (stream === null) return "";
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let cancelled = false;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        cancelled = true;
+        const cancelling = reader.cancel().catch(() => {});
+        if (!cloned) await cancelling;
+        return null;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    if (!cancelled || !cloned) reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return new TextDecoder().decode(out);
 }
 
 /** The closed code of an egress refusal body (`{error}`), or the status's when it has none. */

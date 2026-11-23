@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
+import { continuationReferences } from "@gray/continuation";
 import { get, isObject, parsePlain, readSerdeBytes, toJsonString, type Json, type JsonObject } from "@gray/json";
 import { ApiError } from "@gray/errors";
 import {
@@ -19,8 +20,10 @@ import {
   requestModifiedEvent,
   type ReceiptBuilder,
 } from "@gray/attest";
-import type { Protocol } from "@gray/protocol";
-import type { LaneEgress, LanePolicyOutcome, LaneReceiptDraft, LaneTiming, RewritePlan } from "./types.ts";
+import { passedClientHeaders } from "@gray/lane-wire";
+import { openAiFamily, withDefaultAccept, type Protocol } from "@gray/protocol";
+import type { RequestRecord } from "../sinks.ts";
+import type { LaneContinuationExpanded, LaneEgress, LanePolicyOutcome, LaneReceiptDraft, LaneTiming, RewritePlan } from "./types.ts";
 import { planOps } from "./plan.ts";
 
 /**
@@ -39,19 +42,36 @@ import { planOps } from "./plan.ts";
 export const EGRESS_HEADER = "x-gray-egress";
 
 /**
- * The fixed error codes the egress sidecar answers a failed 502 with (deploy/tee/egress/README.md), `route_unknown`
- * among them: an endpoint route's id with no live row in egress's table (docs/design/lane-provider-routes.md 4.1).
+ * The header egress marks every answer it gives itself with on the entry's paths to a provider: the vendor routes, an
+ * endpoint route's `/route/` and `/peer/` (deploy/tee/egress/README.md "Answers egress gives itself"). `0` when no byte
+ * of the request can have reached the far side, `1` when one may have. Egress removes it from every answer it forwards,
+ * so an answer without it is the far side's, whatever its status or body says, and one with it is never the provider's.
  */
-const EGRESS_FAILURES = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed", "egress_upstream_failed", "route_unknown"] as const;
+export const EGRESS_OWN_HEADER = "x-gray-peer-sent";
 
 /**
- * The egress failures that happen before the vendor connection is made, so no byte of the request
- * reached the vendor (D72): the direct dial, any stage of a proxy (the proxy stands before the
- * vendor), the vendor TLS handshake, and an endpoint route with no row (refused before any dial).
- * `egress_upstream_failed` is deliberately not here: the sidecar answers it only after the vendor
- * connection exists.
+ * The connection failures egress answers 502 with before it reached the vendor or provider (D72): the direct dial (the
+ * dial rule's refusal of a private address among them), any stage of a proxy (the proxy stands before the vendor), the
+ * TLS handshake, and an endpoint route's id with no live row (docs/design/lane-provider-routes.md 4.1), refused before
+ * any dial.
  */
 const EGRESS_BEFORE_VENDOR = ["egress_connect_failed", "egress_proxy_failed", "egress_tls_failed", "route_unknown"] as const;
+
+/**
+ * An answer egress gave itself on an attempt's call, as the attempt reads it:
+ *
+ * - `capacity`: its in-flight body budget could not hold the body (`503 egress_limit`), before any dial. Gray's capacity:
+ *   the client gets 429 `gateway_capacity`, and no route is blamed.
+ * - `before_vendor`: a connection that failed before the vendor or provider was reached (`EGRESS_BEFORE_VENDOR`).
+ * - `after_vendor`: a connection that failed once it existed (`egress_upstream_failed`): the request may have reached it.
+ * - `refused`: egress refused the request the entry handed it (its target, method, path, proxy header, body) or failed
+ *   itself (`egress_internal`). Gray's own error, never the provider's answer; `sent` is the mark's.
+ */
+export type EgressOwnAnswer =
+  | { readonly kind: "capacity" }
+  | { readonly kind: "before_vendor"; readonly code: string }
+  | { readonly kind: "after_vendor" }
+  | { readonly kind: "refused"; readonly sent: boolean };
 
 /** The compact JSON the sidecar receives: the port is written as an integer, not a float. */
 export function egressHeader(egress: LaneEgress): string {
@@ -65,32 +85,43 @@ export function egressHeader(egress: LaneEgress): string {
 }
 
 /**
- * Whether a 502 body is one of gray-egress's fixed failures. Such an answer maps to the attempt's
- * `transport` or `connect` outcome: a dead proxy or a TLS failure is not the account's
- * `auth_failed`. The body is parsed as data only; nothing in it is ever logged or recorded.
+ * The answer egress gave itself, read from its mark ({@link EGRESS_OWN_HEADER}) and its fixed code; null for an answer
+ * without the mark, which is the far side's. Anything but `0` in the mark is read as a request that may have been sent.
+ * The body is parsed as data only; nothing in it is ever logged or recorded.
  */
-export function egressSidecarFailure(status: number, body: Uint8Array): boolean {
-  return egressFailure(status, body) !== null;
+export function egressOwnAnswer(headers: Headers, body: Uint8Array): EgressOwnAnswer | null {
+  const mark = headers.get(EGRESS_OWN_HEADER);
+  if (mark === null) return null;
+  const sent = mark.trim() !== "0";
+  const code = egressCode(body);
+  if (!sent && code === "egress_limit") return { kind: "capacity" };
+  if (!sent && code !== null && (EGRESS_BEFORE_VENDOR as readonly string[]).includes(code)) return { kind: "before_vendor", code };
+  if (code === "egress_upstream_failed") return { kind: "after_vendor" };
+  return { kind: "refused", sent };
 }
 
-/**
- * Whether the sidecar failed before it connected the vendor (D72): then the request never reached the
- * vendor and must not be reported or receipted as forwarded. The code is the sidecar's closed one;
- * the body is data only, and nothing in it is ever logged or recorded.
- */
-export function egressBeforeVendor(status: number, body: Uint8Array): boolean {
-  const code = egressFailure(status, body);
-  return code !== null && (EGRESS_BEFORE_VENDOR as readonly string[]).includes(code);
+/** Whether egress's own answer says no byte of the request reached the vendor or provider (D72): no receipt may say it was forwarded. */
+export function egressSentNothing(own: EgressOwnAnswer): boolean {
+  return own.kind === "capacity" || own.kind === "before_vendor" || (own.kind === "refused" && !own.sent);
 }
 
-/** The sidecar's fixed error code in a 502 body, or null when the answer is not one of its failures. */
-function egressFailure(status: number, body: Uint8Array): string | null {
-  if (status !== 502) return null;
+/** 429 for an attempt egress's in-flight body budget refused: Gray's capacity, with no `retry-after`, as the entry's own (standard-api.ts `formCapacity`). */
+export function egressCapacity(): ApiError {
+  return new ApiError(429, "gateway_capacity").withMeta("limit_source", "gateway_memory");
+}
+
+/** 500 for an attempt egress refused as handed to it, or failed on itself: Gray's error, not charged. */
+export function egressRefused(): ApiError {
+  return new ApiError(500, "internal_error");
+}
+
+/** The fixed code in an error body of egress's, or null. */
+function egressCode(body: Uint8Array): string | null {
   try {
     const value = parsePlain(new TextDecoder().decode(body)) as Json;
     if (!isObject(value)) return null;
     const code = get(value, "error");
-    return typeof code === "string" && (EGRESS_FAILURES as readonly string[]).includes(code) ? code : null;
+    return typeof code === "string" ? code : null;
   } catch {
     return null;
   }
@@ -181,21 +212,14 @@ export function lanePolicyRefused(): ApiError {
 }
 
 /**
- * Whether a Responses request continues an earlier one (`previous_response_id` or `conversation`
- * present, either with a value): the lane routes it to the endpoint that issued the response it names
- * (`InferenceRun.lanePin`). Read from the parsed body, because `@gray/protocol`'s canonical projection has
- * no member for either: only the Responses API defines them, and the lane must pin the request exactly
- * when the software that answers would honour them.
+ * Whether a Responses request continues an earlier one (`previous_response_id`, `conversation`,
+ * or `input[].type = "item_reference"` present, or an invalid reference shape that `lanePin` must
+ * reject with 400 `invalid_continuation_reference`).
  */
 export function continuesEarlierResponse(protocol: Protocol, body: Json): boolean {
   if (protocol !== "open_ai_responses" || !isObject(body)) return false;
-  // A member the client wrote as `null` is how several clients spell "absent": the vendor reads it as
-  // no continuation either, so the lane pins nothing for it (F2 hooks-9).
-  const present = (name: string): boolean => {
-    const value = get(body, name);
-    return value !== undefined && value !== null;
-  };
-  return present("previous_response_id") || present("conversation");
+  const refs = continuationReferences(body);
+  return refs === undefined || refs.length > 0;
 }
 
 /**
@@ -366,6 +390,7 @@ export type Forwarded =
       readonly bytes: Uint8Array;
       readonly events: readonly Readonly<Record<string, unknown>>[];
       readonly applied: readonly AppliedRecord[];
+      readonly continuationExpanded?: LaneContinuationExpanded;
     }
   | { readonly ok: false; readonly error: ApiError };
 
@@ -430,6 +455,15 @@ export function addReceiptEvents(builder: ReceiptBuilder, input: { readonly rece
   const forwarded = input.draft.forwardedHash;
   const policy = input.draft.policy;
   if (forwarded !== null) {
+    if (input.draft.continuationExpanded !== undefined) {
+      builder.addRequestContinuationExpanded({
+        mode: "zero_retention",
+        previousResponseIdExpanded: input.draft.continuationExpanded.previousResponseIdExpanded,
+        itemReferencesExpanded: input.draft.continuationExpanded.itemReferencesExpanded,
+        includeEncryptedReasoningAdded: input.draft.continuationExpanded.includeEncryptedReasoningAdded,
+        expandedBodySha256: input.draft.continuationExpanded.expandedBodySha256,
+      });
+    }
     // One `request.modified` per op the attempt applied, in application order: after
     // `request.received`, before `relay_policy.applied` and `request.forwarded` (§7.4, M2). A translated attempt's
     // `request.translated` stands among them, between the ops on the client's body and those on the translated one
@@ -584,37 +618,186 @@ export function laneUsage(usage: Readonly<Record<string, number>> | null): { rea
   };
 }
 
-/**
- * The fields a lane record must not carry (design v2 §D, M13, M20): who the client is and what its
- * tools are called. The lane's record goes to the bridge and on to Gray's own tables, and none of
- * these may leave the CVM — not because they are the prompt, but because they are the client's
- * fingerprint, and the lane's promise is that Gray learns nothing of the conversation beyond the
- * counts it bills. The list is the review's (§6), applied by name so a later field cannot slip in
- * silently: a new client-derived member of the record must be added here.
- */
-export const LANE_RECORD_NULLED = Object.freeze(["clientIp", "userAgent", "client", "clientVersion", "sessionId", "parentSessionId", "turnStart"] as const);
+/** How `laneSafeRecord` handles each field of `RequestRecord`. */
+export type LaneRecordFieldPolicy = "keep" | "null" | "empty_array";
 
-/** `value` with every lane-forbidden member nulled, and the answer's tool names kept as a count only. */
+/**
+ * Compile-time exhaustive policy for every field of `RequestRecord` (`sinks.ts`): adding a new
+ * field to `RequestRecord` fails typechecking until explicitly classified here.
+ *
+ * Client fingerprint fields (`"null"`) and answer tool names (`"empty_array"`) never leave the
+ * lane CVM; any runtime property not present in `LANE_RECORD_POLICY` is dropped fail-closed.
+ */
+export const LANE_RECORD_POLICY = Object.freeze({
+  requestId: "keep",
+  requestKey: "keep",
+  startedAt: "keep",
+  finishedAt: "keep",
+  method: "keep",
+  path: "keep",
+  protocol: "keep",
+  model: "keep",
+  stream: "keep",
+  region: "keep",
+  authResult: "keep",
+  authScheme: "keep",
+  workspaceId: "keep",
+  keyId: "keep",
+  userId: "keep",
+  admission: "keep",
+  heldMicrousd: "keep",
+  boundMicrousd: "keep",
+  outputCap: "keep",
+  outputCapSource: "keep",
+  outputCapReason: "keep",
+  attempts: "keep",
+  status: "keep",
+  outcome: "keep",
+  errorCode: "keep",
+  billing: "keep",
+  chargedMicrousd: "keep",
+  chargedInputMicrousd: "keep",
+  chargedOutputMicrousd: "keep",
+  chargeSeq: "keep",
+  releaseReason: "keep",
+  usage: "keep",
+  leftBeforeFinal: "keep",
+  ttftMs: "keep",
+  bodyTier: "keep",
+  requestBytes: "keep",
+  requestComplete: "keep",
+  responseBytes: "keep",
+  responseComplete: "keep",
+  gated: "keep",
+  ttfbMs: "keep",
+  bodyReadMs: "keep",
+  clientIp: "null",
+  userAgent: "null",
+  client: "null",
+  clientVersion: "null",
+  sessionId: "null",
+  parentSessionId: "null",
+  toolCount: "keep",
+  turnStart: "null",
+  toolCalls: "keep",
+  toolNames: "empty_array",
+  reasoningTokens: "keep",
+  isolateInFlight: "keep",
+  heldBytes: "keep",
+  trustMode: "keep",
+  trustRequestViolations: "keep",
+  trustResponseViolations: "keep",
+  trustRejected: "keep",
+  upstreamProtocol: "keep",
+  nativeRoutes: "keep",
+  translationDropped: "keep",
+  admissionDegraded: "keep",
+  connectionsPeak: "keep",
+  connectionsQueuedMs: "keep",
+  retainedPeakBytes: "keep",
+  admissions: "keep",
+  retry: "keep",
+  routingGroup: "keep",
+  rankingBaseAgeMs: "keep",
+  isolateGapMs: "keep",
+  routeRefusals: "keep",
+  freeReason: "keep",
+  routingCandidates: "keep",
+  preference: "keep",
+  relayAccountId: "keep",
+  stackTrace: "keep",
+} as const satisfies Record<keyof RequestRecord, LaneRecordFieldPolicy>);
+
+/** Fields of `RequestRecord` nulled before leaving the lane, derived from `LANE_RECORD_POLICY`. */
+export const LANE_RECORD_NULLED = Object.freeze(
+  (Object.entries(LANE_RECORD_POLICY) as [keyof RequestRecord, LaneRecordFieldPolicy][])
+    .filter(([, policy]) => policy === "null")
+    .map(([name]) => name),
+);
+
+/** Fields of `RequestRecord` cleared to an empty array before leaving the lane, derived from `LANE_RECORD_POLICY`. */
+export const LANE_RECORD_EMPTY_ARRAYS = Object.freeze(
+  (Object.entries(LANE_RECORD_POLICY) as [keyof RequestRecord, LaneRecordFieldPolicy][])
+    .filter(([, policy]) => policy === "empty_array")
+    .map(([name]) => name),
+);
+
+/**
+ * `value` sanitized by `LANE_RECORD_POLICY`: `"null"` fields become `null`, `"empty_array"` fields
+ * become `[]` when array-valued (`null` otherwise), `"keep"` fields are preserved, and any key not
+ * listed in `LANE_RECORD_POLICY` is dropped fail-closed.
+ */
 export function laneSafeRecord<T extends object>(value: T): T {
-  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
-  for (const name of LANE_RECORD_NULLED) if (name in out) out[name] = null;
-  if (Array.isArray(out.toolNames)) out.toolNames = [];
+  const out: Record<string, unknown> = {};
+  for (const [name, fieldValue] of Object.entries(value as Record<string, unknown>)) {
+    if (!Object.hasOwn(LANE_RECORD_POLICY, name)) continue;
+    const policy = LANE_RECORD_POLICY[name as keyof RequestRecord];
+    if (policy === "null") out[name] = null;
+    else if (policy === "empty_array") out[name] = Array.isArray(fieldValue) ? [] : null;
+    else out[name] = fieldValue;
+  }
   return out as T;
 }
 
 /**
- * A log line's fields as a lane may emit them (design v2 §D, M13): free text is dropped, because the
- * only free text the request path logs is an upstream's (or a parser's) message, which may quote the
- * customer's content. The event name, the ids and the codes stay.
+ * Structured content-free log fields a lane log line may emit (`laneSafeLog`): event names,
+ * identifiers, closed codes, and counters. Any field outside this allowlist is dropped fail-closed.
  */
-export const LANE_LOG_DROPPED = Object.freeze(["why", "message", "detail", "reason_text"] as const);
+export const LANE_LOG_ALLOWED = Object.freeze([
+  "level",
+  "event",
+  "request_id",
+  "stage",
+  "endpoint",
+  "code",
+  "error",
+  "reason",
+  "limit_bytes",
+  "bytes_received",
+  "silence_ms",
+  "charged_microusd",
+  "input_microusd",
+  "output_microusd",
+  "status",
+  "attempt",
+  "failed",
+  "stores",
+  "regions",
+] as const);
 
-/** `event` with every free-text member removed: the same line, without anything that may be content. */
+/**
+ * Free-text and sensitive log keys explicitly banned from lane logs (`laneSafeLog`), in addition to
+ * the fail-closed `LANE_LOG_ALLOWED` allowlist.
+ */
+export const LANE_LOG_DROPPED = Object.freeze([
+  "why",
+  "message",
+  "detail",
+  "reason_text",
+  "body",
+  "prompt",
+  "content",
+  "headers",
+  "stack",
+  "raw",
+  "error_body",
+  "text",
+  "user_agent",
+  "client_ip",
+] as const);
+
+const LANE_LOG_ALLOWED_SET: ReadonlySet<string> = new Set(LANE_LOG_ALLOWED);
+const LANE_LOG_DROPPED_SET: ReadonlySet<string> = new Set(LANE_LOG_DROPPED);
+
+/** `event` filtered to allowlisted content-free fields (`LANE_LOG_ALLOWED` minus `LANE_LOG_DROPPED`). */
 export function laneSafeLog<T extends object>(event: T): T {
-  const out: Record<string, unknown> = { ...(event as Record<string, unknown>) };
-  for (const name of LANE_LOG_DROPPED) delete out[name];
+  const out: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(event as Record<string, unknown>)) {
+    if (LANE_LOG_DROPPED_SET.has(name) || !LANE_LOG_ALLOWED_SET.has(name)) continue;
+    out[name] = value;
+  }
   return out as T;
-} 
+}
 
 /**
  * One attempt's receipt draft (design v2 §C.8, M6): the events the attempt would record, the policy
@@ -628,6 +811,7 @@ export function laneSafeLog<T extends object>(event: T): T {
  * refusal, an attempt that failed before it sent) carries no events.
  */
 export function receiptDraft(input: {
+  readonly continuationExpanded?: LaneContinuationExpanded | null;
   readonly modifiedEvents: readonly Readonly<Record<string, unknown>>[];
   readonly policy: LanePolicyOutcome | null;
   readonly forwardedHash: string | null;
@@ -637,6 +821,9 @@ export function receiptDraft(input: {
   readonly upstream?: { readonly name: string; readonly reason: string } | null;
 }): LaneReceiptDraft {
   return {
+    ...(input.forwardedHash !== null && input.continuationExpanded !== undefined && input.continuationExpanded !== null
+      ? { continuationExpanded: input.continuationExpanded }
+      : {}),
     modifiedEvents: input.forwardedHash === null ? [] : input.modifiedEvents,
     policy: input.policy,
     forwardedHash: input.forwardedHash,
@@ -667,30 +854,58 @@ export function laneUpstreamOf(route: { readonly auth: string; readonly url: str
 }
 
 /**
- * The lane's auth headers for one attempt (design v2 §C.6, M1): the account's headers from the
- * credential store, merged with the protocol's own client headers (never `route.auth`).
+ * The lane's auth headers for one attempt (design v2 §C.6, M1): the client's allowlisted SDK and
+ * protocol headers (@gray/lane-wire `passedClientHeaders`, bounded to 16 KiB) merged with the
+ * account's headers from the credential store (never `route.auth`).
  *
- * - Anthropic: one `anthropic-version` (the client's, else `2023-06-01`), and `anthropic-beta` as
- *   the comma-joined union of the client's and the account's, so an OAuth account's
- *   `oauth-2025-04-20` betas reach the vendor without dropping the client's;
- * - the OpenAI family: `openai-beta` as the union;
- * - `content-type: application/json`, the one header every upstream body needs.
- *
- * The account's own `anthropic-version`/`anthropic-beta`/`openai-beta` are unioned, every other
- * account header set as it is. A header the account sets twice in the record is impossible (a
- * record is a map), and the merge is a set, so no account header can produce a duplicate.
+ * - Client SDK headers pass first under the shared allowlist;
+ * - Account headers overwrite every credential and non-originator header (`authorization`,
+ *   `x-api-key`, `chatgpt-account-id`, etc.), while `originator` keeps a non-empty client value
+ *   (matching Stack `stack_vendor_headers.go`);
+ * - Beta headers (`anthropic-beta` on Anthropic, `openai-beta` on OpenAI family) are the
+ *   comma-joined union of the bounded client value and the account's value, so an OAuth account's
+ *   `oauth-2025-04-20` always survives even if the client's beta was budget-trimmed;
+ * - Anthropic always carries a non-empty `anthropic-version` (bounded client value, else account's,
+ *   else `2023-06-01`);
+ * - `content-type: application/json` is forced, `x-gray-egress` is stripped, and absent/blank
+ *   `accept` defaults to `@gray/protocol` `DEFAULT_ACCEPT`.
  */
 export function laneHeaders(protocol: Protocol, client: Headers, account: Readonly<Record<string, string>>): Headers {
-  const headers = new Headers({ "content-type": "application/json" });
-  for (const [name, value] of Object.entries(account)) headers.set(name.toLowerCase(), value);
-  const beta = protocol === "anthropic_messages" ? "anthropic-beta" : protocol === "open_ai_chat" || protocol === "open_ai_responses" ? "openai-beta" : null;
-  if (beta !== null) {
-    const union = unionHeader(client.get(beta), headers.get(beta));
-    if (union === null) headers.delete(beta);
-    else headers.set(beta, union);
+  const betaName = protocol === "anthropic_messages" ? "anthropic-beta" : openAiFamily(protocol) ? "openai-beta" : null;
+  const passed = passedClientHeaders(protocol, client);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(passed)) headers.set(name, value);
+  let accountBeta: string | null = null;
+  let accountVersion: string | null = null;
+  for (const [rawName, value] of Object.entries(account)) {
+    const name = rawName.toLowerCase();
+    if (name === betaName) {
+      accountBeta = unionHeader(accountBeta, value);
+      continue;
+    }
+    if (protocol === "anthropic_messages" && name === "anthropic-version") {
+      accountVersion = value;
+      continue;
+    }
+    if (name === "originator") {
+      if ((passed.originator ?? "").trim() === "") headers.set(name, value);
+      continue;
+    }
+    headers.set(name, value);
   }
-  if (protocol === "anthropic_messages") headers.set("anthropic-version", client.get("anthropic-version") ?? "2023-06-01");
-  return headers;
+  if (betaName !== null) {
+    const union = unionHeader(passed[betaName] ?? null, accountBeta);
+    if (union === null) headers.delete(betaName);
+    else headers.set(betaName, union);
+  }
+  if (protocol === "anthropic_messages") {
+    const clientVersion = passed["anthropic-version"]?.trim() ?? "";
+    const fallbackVersion = accountVersion?.trim() ?? "";
+    headers.set("anthropic-version", clientVersion !== "" ? passed["anthropic-version"]! : fallbackVersion !== "" ? accountVersion! : "2023-06-01");
+  }
+  headers.set("content-type", "application/json");
+  headers.delete(EGRESS_HEADER);
+  return withDefaultAccept(headers);
 }
 
 /** Two comma-separated header values as one union, each side's values in its own order, both empty: null. */

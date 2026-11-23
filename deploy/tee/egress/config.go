@@ -45,6 +45,12 @@ const (
 	// (-stack-max-answer-bytes' maximum), which leaves room above 25 MiB for D4's measurement.
 	maxRouteMaxBodyBytes = int64(64 << 20)
 
+	// -max-inflight-body-bytes bounds total request body bytes buffered concurrently across all paths (/route/,
+	// vendor, peer, control and relay-stack). Unset (0) it defaults to 128 MiB (capped to -memory-limit when set
+	// lower, and floored at max(-max-body-bytes, -route-max-body-bytes)).
+	defaultMaxInflightBodyBytes = int64(128 << 20)
+	maxMaxInflightBodyBytes     = int64(1 << 30)
+
 	defaultPhaseTimeout = 10 * time.Minute // UPSTREAM_HEADER_MS default
 	minPhaseTimeout     = 10 * time.Minute // never shorter than the gateway's header wait
 	maxPhaseTimeout     = time.Hour        // UPSTREAM_HEADER_MS / STREAM_TOTAL_SECONDS max
@@ -93,6 +99,11 @@ const (
 
 	defaultStackMaxBytes = int64(192 << 20)
 	maxStackMaxBytes     = int64(1 << 30)
+	// stackMemoryHeadroomCap caps the minimum Go runtime and non-stack headroom required above
+	// -stack-max-bytes when both -relay-listen and -memory-limit are set (headroom is
+	// min(stackMaxBytes/4, stackMemoryHeadroomCap), i.e. 32 MiB at the 192 MiB default, matching
+	// compose.stack.yaml's 288 MiB limit with comfortable margin).
+	stackMemoryHeadroomCap = int64(32 << 20)
 
 	defaultStackMaxRequests = 1024
 	maxStackMaxRequests     = 65536
@@ -215,6 +226,10 @@ type config struct {
 	// routeMaxBodyBytes is the largest /route/ request body (-route-max-body-bytes); 0 is -max-body-bytes. Read it
 	// through routeBodyBytes. It needs -routes.
 	routeMaxBodyBytes int64
+	// maxInflightBodyBytes bounds the sum of all request bodies held in memory at once (-max-inflight-body-bytes);
+	// 0 selects the default (128 MiB, capped to -memory-limit when lower, floored at largestBodyBytes). Read it
+	// through inflightBodyBudget.
+	maxInflightBodyBytes int64
 	// signInKeyDir and signInBundle (signin_ca.go, docs/design/relay-sign-in-in-vm.md D1): the egress-only memory volume
 	// the sign-in CA's key and certificate live on, and the file on the relay's read-only memory volume egress writes
 	// the trust bundle to (the system roots and the sign-in CA). Both or neither, both absolute, with -relay-listen.
@@ -266,6 +281,25 @@ func (c config) routeBodyBytes() int64 {
 	return c.routeMaxBodyBytes
 }
 
+// largestBodyBytes is the largest single request body any enabled path accepts.
+func (c config) largestBodyBytes() int64 {
+	return max(c.maxBodyBytes, c.routeBodyBytes())
+}
+
+// inflightBodyBudget is the global cap on concurrently buffered request bodies across all paths.
+// When -max-inflight-body-bytes is unset (0), it defaults to 128 MiB, capped to -memory-limit
+// when that is lower, and floored at largestBodyBytes so at least one legal request always fits.
+func (c config) inflightBodyBudget() int64 {
+	if c.maxInflightBodyBytes > 0 {
+		return c.maxInflightBodyBytes
+	}
+	budget := defaultMaxInflightBodyBytes
+	if c.memoryLimit > 0 && c.memoryLimit < budget {
+		budget = c.memoryLimit
+	}
+	return max(budget, c.largestBodyBytes())
+}
+
 // stackAppendLimits are the S18 check's append limits from the flags.
 func (c config) stackAppendLimits() stackAppendLimits {
 	return stackAppendLimits{maxItems: c.stackAppendMaxItems, maxBytes: c.stackAppendMaxBytes}
@@ -309,6 +343,7 @@ func parseConfig(args []string, out io.Writer) (config, error) {
 	fs.BoolVar(&cfg.routes, "routes", cfg.routes, "serve the endpoint routes on the unix socket: /route/<id>/<path> to the host the pushed table names (an entry only; not with -relay-listen)")
 	fs.Var((*suffixList)(&cfg.routeDenySuffixes), "route-deny-suffix", "a zone no route table row's host may be or be under; repeatable or comma-separated (needs -routes)")
 	fs.Int64Var(&cfg.routeMaxBodyBytes, "route-max-body-bytes", cfg.routeMaxBodyBytes, "largest /route/ request body accepted, in bytes (0: -max-body-bytes; needs -routes)")
+	fs.Int64Var(&cfg.maxInflightBodyBytes, "max-inflight-body-bytes", cfg.maxInflightBodyBytes, "most request body bytes held across all in-flight requests at once (0: 128 MiB, bounded by -memory-limit)")
 	addExtraRootCAFlag(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -428,6 +463,28 @@ func (c config) validate() error {
 		}
 		if c.routeMaxBodyBytes < c.maxBodyBytes || c.routeMaxBodyBytes > maxRouteMaxBodyBytes {
 			return fmt.Errorf("route-max-body-bytes must be 0 or between max-body-bytes and %d", maxRouteMaxBodyBytes)
+		}
+		if c.memoryLimit != 0 && c.memoryLimit < c.routeMaxBodyBytes {
+			return errors.New("memory-limit must be 0 or at least route-max-body-bytes")
+		}
+	}
+	if c.maxInflightBodyBytes < 0 {
+		return errors.New("max-inflight-body-bytes must be 0 or positive")
+	}
+	if c.maxInflightBodyBytes > 0 {
+		if c.maxInflightBodyBytes < c.largestBodyBytes() || c.maxInflightBodyBytes > maxMaxInflightBodyBytes {
+			return fmt.Errorf("max-inflight-body-bytes must be 0 or between %d and %d", c.largestBodyBytes(), maxMaxInflightBodyBytes)
+		}
+		if c.memoryLimit != 0 && c.memoryLimit < c.maxInflightBodyBytes {
+			return errors.New("memory-limit must be 0 or at least max-inflight-body-bytes")
+		}
+	}
+	// On the relay-stack path, -memory-limit must also leave headroom above -stack-max-bytes for the Go
+	// runtime and non-stack buffers (login calls, account tests, control pushes).
+	if c.relayListen != "" && c.memoryLimit != 0 {
+		headroom := min(c.stackMaxBytes/4, stackMemoryHeadroomCap)
+		if c.memoryLimit < c.stackMaxBytes+headroom {
+			return fmt.Errorf("memory-limit with -relay-listen must be 0 or at least stack-max-bytes plus %d bytes headroom", headroom)
 		}
 	}
 	for _, suffix := range c.routeDenySuffixes {

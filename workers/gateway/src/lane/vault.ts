@@ -7,6 +7,7 @@ type StackVaultCopy = { readonly version: number; readonly record: string | null
 import {
   parseVaultState,
   RelayConnectorError,
+  sameEffectiveCredential,
   vaultStatePlaintext,
   type ApplyResult,
   type RelayVaultLogin,
@@ -246,6 +247,36 @@ export function sameVaultState(relayId: string, left: RelayVaultSnapshot, right:
 
 const byAccount = <T extends { readonly account_id: string }>(l: T, r: T): number => (l.account_id < r.account_id ? -1 : l.account_id > r.account_id ? 1 : 0);
 
+/** Whether `token` stands in for `account` (mirrors `RelayCredentialStore.#standsIn`). */
+function tokenStandsIn(account: RelayVaultSnapshot["accounts"][number], token: RelayVaultSnapshot["refreshed"][number]): boolean {
+  if (token.credential.type !== "oauth_access_token") return false;
+  const since = account.login_since ?? account.version;
+  if (token.based_on > account.version || token.based_on < since) return false;
+  if (account.credential.type === "password") {
+    return account.credential.username !== undefined && token.username === account.credential.username;
+  }
+  return (account.credential.type === "sign_in" || account.credential.type === "oauth_access_token") && token.username === undefined;
+}
+
+/** One account's effective credential in `snapshot` (standing-in refreshed token, else sealed account). */
+function effectiveCredentialOf(
+  snapshot: RelayVaultSnapshot,
+  accountId: string,
+): { readonly vendor: RelayVaultSnapshot["accounts"][number]["vendor"]; readonly credential: RelayVaultSnapshot["accounts"][number]["credential"]; readonly refreshed: boolean } | null {
+  const account = snapshot.accounts.find((a) => a.account_id === accountId);
+  if (account === undefined) return null;
+  const token = snapshot.refreshed.find((t) => t.account_id === accountId);
+  if (token !== undefined && tokenStandsIn(account, token)) {
+    return { vendor: account.vendor, credential: token.credential, refreshed: true };
+  }
+  return { vendor: account.vendor, credential: account.credential, refreshed: false };
+}
+
+function sameEffectiveOption(left: ReturnType<typeof effectiveCredentialOf>, right: ReturnType<typeof effectiveCredentialOf>): boolean {
+  if (left === null || right === null) return left === right;
+  return sameEffectiveCredential(left, right);
+}
+
 /**
  * P7 (13.4): the state a serving instance writes after it lost a compare-and-swap, from the state this VM and Gray last
  * agreed on (`base`, null when unknown: everything this VM holds counts as its change), its own (`local`) and Gray's
@@ -269,11 +300,53 @@ export function mergeVaultStates(relayId: string, base: RelayVaultSnapshot | nul
     return out.sort(byAccount);
   };
   const persist = base !== null && local.persist !== base.persist ? local.persist : base === null && local.version >= gray.version ? local.persist : gray.persist;
+  const version = local.version > gray.version ? local.version : gray.version;
+  const accounts = pick("accounts", base?.accounts ?? [], local.accounts, gray.accounts);
+  const refreshed = pick("refreshed", base?.refreshed ?? [], local.refreshed, gray.refreshed);
+  const maxGen = (list: readonly { readonly cred_gen?: bigint }[]): bigint => {
+    let best = 0n;
+    for (const item of list) if (item.cred_gen !== undefined && item.cred_gen > best) best = item.cred_gen;
+    return best;
+  };
+  let mergedSeq = (local.cred_gen_seq ?? 0n) > (gray.cred_gen_seq ?? 0n) ? (local.cred_gen_seq ?? 0n) : (gray.cred_gen_seq ?? 0n);
+  for (const candidate of [maxGen(local.accounts), maxGen(local.refreshed), maxGen(gray.accounts), maxGen(gray.refreshed), maxGen(accounts), maxGen(refreshed)]) {
+    if (candidate > mergedSeq) mergedSeq = candidate;
+  }
+  let hasCredGen =
+    local.cred_gen_seq !== undefined ||
+    gray.cred_gen_seq !== undefined ||
+    accounts.some((a) => a.cred_gen !== undefined) ||
+    refreshed.some((r) => r.cred_gen !== undefined);
+  const mergedView: RelayVaultSnapshot = { version, persist, accounts, refreshed };
+  for (let index = 0; index < accounts.length; index += 1) {
+    const id = accounts[index]!.account_id;
+    const baseEff = base === null ? null : effectiveCredentialOf(base, id);
+    const localEff = effectiveCredentialOf(local, id);
+    const grayEff = effectiveCredentialOf(gray, id);
+    const localChanged = base === null ? localEff !== null : !sameEffectiveOption(baseEff, localEff);
+    const grayChanged = base === null ? grayEff !== null : !sameEffectiveOption(baseEff, grayEff);
+    if (!localChanged || !grayChanged || sameEffectiveOption(localEff, grayEff)) continue;
+    // Legacy entries without cred_gen default to 1n on restore, so a bumped generation stays strictly above them.
+    if (mergedSeq < 1n && (accounts.some((a) => a.cred_gen === undefined) || refreshed.some((r) => r.cred_gen === undefined))) mergedSeq = 1n;
+    mergedSeq += 1n;
+    hasCredGen = true;
+    const winning = effectiveCredentialOf(mergedView, id);
+    if (winning?.refreshed) {
+      const refIndex = refreshed.findIndex((r) => r.account_id === id);
+      if (refIndex >= 0) refreshed[refIndex] = { ...refreshed[refIndex]!, cred_gen: mergedSeq };
+    } else {
+      accounts[index] = { ...accounts[index]!, cred_gen: mergedSeq };
+    }
+  }
+  for (const candidate of [maxGen(accounts), maxGen(refreshed)]) {
+    if (candidate > mergedSeq) mergedSeq = candidate;
+  }
   return {
-    version: local.version > gray.version ? local.version : gray.version,
+    version,
     persist,
-    accounts: pick("accounts", base?.accounts ?? [], local.accounts, gray.accounts),
-    refreshed: pick("refreshed", base?.refreshed ?? [], local.refreshed, gray.refreshed),
+    ...(hasCredGen ? { cred_gen_seq: mergedSeq } : {}),
+    accounts,
+    refreshed,
     logins: pick("logins", base?.logins ?? [], local.logins ?? [], gray.logins ?? []),
     sign_in_pins: mergePins(local.sign_in_pins ?? [], gray.sign_in_pins ?? []),
   };
@@ -912,7 +985,7 @@ export class LaneVault implements LoginPins {
     if (!stored.persist) {
       // H13: RAM-only; the record without accounts that replaced a persisted one follows the image too.
       if (this.#version === null || this.#version === 0) return null;
-      state = { version: stored.version, persist: false, accounts: [], refreshed: [] };
+      state = { version: stored.version, persist: false, ...(stored.cred_gen_seq === undefined ? {} : { cred_gen_seq: stored.cred_gen_seq }), accounts: [], refreshed: [] };
     }
     const version = Math.max(this.#version ?? 0, this.#copyVersion ?? 0) + 1;
     const plaintext = vaultStatePlaintext(relayId, state);
@@ -1106,7 +1179,7 @@ export class LaneVault implements LoginPins {
     if (!snapshot.persist) {
       // H13: RAM-only. One record without accounts replaces a persisted one; after that nothing is written.
       if (this.#version === null || this.#version === 0 || this.#ramOnlyWritten) return;
-      state = { version: snapshot.version, persist: false, accounts: [], refreshed: [] };
+      state = { version: snapshot.version, persist: false, ...(snapshot.cred_gen_seq === undefined ? {} : { cred_gen_seq: snapshot.cred_gen_seq }), accounts: [], refreshed: [] };
     }
     let next = Math.max(this.#version ?? 0, this.#copyVersion ?? 0) + 1;
     // A version the disk took whose durability step did not return (see below): the same state goes down again.
@@ -1475,7 +1548,13 @@ export class LaneVault implements LoginPins {
     const previousPins = this.#pins;
     let dropped: readonly string[] | void;
     try {
-      dropped = store.restoreVaultSnapshot(relayId, { version: merged.version, persist: merged.persist, accounts: merged.accounts, refreshed: merged.refreshed });
+      dropped = store.restoreVaultSnapshot(relayId, {
+        version: merged.version,
+        persist: merged.persist,
+        ...(merged.cred_gen_seq === undefined ? {} : { cred_gen_seq: merged.cred_gen_seq }),
+        accounts: merged.accounts,
+        refreshed: merged.refreshed,
+      });
     } catch (error) {
       this.#syncWanted = false;
       this.#log({ level: "error", event: "lane_vault_merge_failed", relay_id: relayId, reason, copy_version: held.version, code: codeOf(error) });

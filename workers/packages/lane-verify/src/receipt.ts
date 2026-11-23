@@ -83,6 +83,7 @@ import {
   EVENT_RELAY_STACK_APPENDED,
   EVENT_RELAY_STACK_CHANGED,
   EVENT_RELAY_STACK_FEED_INCOMPLETE,
+  EVENT_REQUEST_CONTINUATION_EXPANDED,
   EVENT_REQUEST_FORWARDED,
   EVENT_REQUEST_MODIFIED,
   EVENT_REQUEST_RECEIVED,
@@ -106,6 +107,7 @@ import {
   relayPolicyAppliedSchema,
   relayStackAppendedSchema,
   relayStackChangedSchema,
+  requestContinuationExpandedSchema,
   requestModifiedSchema,
   requestTranslatedSchema,
   sealKeyset,
@@ -132,6 +134,8 @@ import {
   replayApiChanges,
   replayForwarded,
   replayTranslated,
+  rewriteRuleFor,
+  ruleAllowsValue,
   stackBodyDigest,
   stackVendorBodyDigest,
   stackVendorEventsSha256,
@@ -141,6 +145,7 @@ import {
   type AppliedAppend,
   type LaneProtocol,
   type LaneResponseRewrite,
+  type LaneRewritePolicy,
   type RewriteApi,
 } from "@gray/lane";
 import { applyRelayChanges } from "./relay-patch.ts";
@@ -170,6 +175,15 @@ export interface VerifyResponseReceiptOptions {
   readonly expectedKeysetDigest?: string;
   /** The raw response bytes the customer received, SSE framing included, when kept. */
   readonly responseBytes?: Uint8Array;
+  /**
+   * For a peer-routed SSE inner receipt: the entry may inject `: keep-alive\n\n` SSE comments
+   * into the customer's stream while the stack VM's inner `response.returned.body_hash` hashes
+   * the bytes without entry keep-alives (L6). When true and `response.returned` carries
+   * `events_sha256`, skip the raw `body_hash` check in `verifyReceipt` while still verifying
+   * `response_events_sha256` and `response_served_attempt` (including declared `rewrites`) against
+   * `responseBytes`. Non-stream inner receipts (`body_sha256`) still verify raw `body_hash`.
+   */
+  readonly allowKeepAliveComments?: boolean;
   /** Override the protocol the receipt's endpoint implies. */
   readonly protocol?: ReceiptProtocol;
   /**
@@ -178,6 +192,30 @@ export interface VerifyResponseReceiptOptions {
    * receipt names its boot's image, a default lane's names none); absent, the member is not checked.
    */
   readonly expectedRelayImage?: string | null;
+  /**
+   * Optional expanded request body plaintext when the entry applied zero-retention continuation expansion
+   * (`request.continuation_expanded`). When given, its SHA-256 must match `expanded_body_sha256` and
+   * post-expansion rewrites are replayed against it.
+   */
+  readonly expandedBody?: Uint8Array;
+  /**
+   * When an outer attested entry applied zero-retention continuation expansion before forwarding the body
+   * over a peer hop, the inner receipt's `request.received` commits to that expanded body (optionally after
+   * `peer.forwarded.modified` ops) instead of raw `receivedBody`.
+   */
+  readonly outerContinuationExpanded?: {
+    readonly expandedBodySha256: string;
+    readonly modified?: readonly RequestModifiedEvent[];
+  };
+}
+
+/** What a `request.continuation_expanded` event records for a zero-retention continuation turn. */
+export interface ReceiptContinuationExpanded {
+  readonly mode: "zero_retention";
+  readonly previous_response_id_expanded: boolean;
+  readonly item_references_expanded: bigint;
+  readonly include_encrypted_reasoning_added: boolean;
+  readonly expanded_body_sha256: string;
 }
 
 export interface AppendedTextRecord {
@@ -228,6 +266,11 @@ export interface ResponseReceiptVerification {
    * than the customer's. Null for a receipt that names none.
    */
   readonly translation: ReceiptTranslation | null;
+  /**
+   * Zero-retention continuation expansion (`request.continuation_expanded`) applied inside the attested entry TEE.
+   * Null when the receipt carries no such event.
+   */
+  readonly continuationExpanded: ReceiptContinuationExpanded | null;
 }
 
 /** What a translated receipt's `request.translated` says, as the receipt records it (the checks say whether it replays). */
@@ -298,7 +341,7 @@ export interface StackReceiptSummary {
 }
 
 /** A standard API the entry serves on a provider's own API (docs/design/standard-media-at-entry.md section 2.1). */
-export type StandardApi = Exclude<RewriteApi, LaneProtocol>;
+export type StandardApi = Exclude<RewriteApi, LaneProtocol | "gemini">;
 
 /**
  * A protocol a lane receipt may name: the lane relays' three; Gemini's generation API, which the entry serves on
@@ -324,18 +367,19 @@ const STANDARD_API_PATHS: readonly (readonly [string, StandardApi])[] = [
 const VIDEO_JOB_PATH = /\/v1\/videos\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9_.:-]{1,256}(?:\/content)?$/;
 
 /**
- * A Gemini generation path as the gateway serves it (`servedProtocol`): `/v1beta/models/<model>` or, without the `models`
- * segment, `/v1beta/<org>/<model>`, then `:generateContent` or `:streamGenerateContent`. A model id may hold a '/'.
+ * A Gemini path as the gateway serves it (`servedProtocol`, `countTokensProtocol`): `/v1beta/models/<model>` or,
+ * without the `models` segment, `/v1beta/<org>/<model>`, then `:generateContent`, `:streamGenerateContent` or
+ * `:countTokens`. A model id may hold a '/'.
  */
-const GEMINI_GENERATION_PATH = /\/v1beta\/(?:models\/[^:]+|[^:/]+\/[^:]+):(?:generateContent|streamGenerateContent)$/;
+const GEMINI_PATH = /\/v1beta\/(?:models\/[^:]+|[^:/]+\/[^:]+):(?:generateContent|streamGenerateContent|countTokens)$/;
 
 /** The protocol an ACI receipt's `endpoint` path implies, or null for an endpoint this lane does not serve. */
 export function protocolForEndpoint(endpoint: string): ReceiptProtocol | null {
   const path = endpoint.split(/[?#]/, 1)[0] ?? "";
-  if (path.endsWith("/v1/messages")) return "anthropic_messages";
+  if (path.endsWith("/v1/messages") || path.endsWith("/v1/messages/count_tokens")) return "anthropic_messages";
   if (path.endsWith("/v1/chat/completions")) return "open_ai_chat";
   if (path.endsWith("/v1/responses")) return "open_ai_responses";
-  if (GEMINI_GENERATION_PATH.test(path)) return "gemini";
+  if (GEMINI_PATH.test(path)) return "gemini";
   const standard = STANDARD_API_PATHS.find(([suffix]) => path.endsWith(suffix));
   if (standard !== undefined) return standard[1];
   if (VIDEO_JOB_PATH.test(path)) return "open_ai_videos";
@@ -368,6 +412,7 @@ export async function verifyResponseReceiptText(text: string, options: VerifyRes
       relayImage: null,
       arrival: null,
       translation: null,
+      continuationExpanded: null,
     };
   }
   return verifyResponseReceipt(parsed.value, options);
@@ -397,6 +442,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     relayImage: null as string | null,
     arrival: null as string | null,
     translation: null as ReceiptTranslation | null,
+    continuationExpanded: null as ReceiptContinuationExpanded | null,
   };
   const result = (): ResponseReceiptVerification => ({
     ok: checks.every((check) => check.status !== "fail"),
@@ -440,10 +486,16 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   }
   const keysetDigest = expectedDigest ?? sealed.digest;
 
+  const returnedEvent = isObject(receipt) && Array.isArray(get(receipt, "event_log"))
+    ? findEvent(get(receipt, "event_log") as readonly Json[], EVENT_RESPONSE_RETURNED)
+    : undefined;
+  const checkRawResponseBody =
+    options.responseBytes !== undefined &&
+    !(options.allowKeepAliveComments === true && typeof get(returnedEvent, "events_sha256") === "string");
   const verification = await verifyReceipt(receipt, sealed.keyset.receipt_signing_keys, {
     workloadKeysetDigest: keysetDigest,
-    requestBody: options.receivedBody,
-    ...(options.responseBytes === undefined ? {} : { responseBody: options.responseBytes }),
+    ...(options.outerContinuationExpanded === undefined ? { requestBody: options.receivedBody } : {}),
+    ...(checkRawResponseBody ? { responseBody: options.responseBytes } : {}),
   });
   const document = verification.document;
   if (document !== null) {
@@ -457,7 +509,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     const implied = protocolForEndpoint(document.endpoint);
     state.protocol = options.protocol ?? implied;
   }
-  checks.push(...receiptChecks(verification, document, options));
+  checks.push(...receiptChecks(verification, document, options, checkRawResponseBody));
 
   if (document === null) return result();
 
@@ -470,19 +522,28 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     checks.push(fail("protocol", `the receipt endpoint ${JSON.stringify(document.endpoint)} is not a lane protocol`));
     return result();
   }
+  const expandedRaw = findEvent(document.event_log, EVENT_REQUEST_CONTINUATION_EXPANDED);
+  let continuationExpanded: ReceiptContinuationExpanded | null = null;
+  if (expandedRaw !== undefined) {
+    const checkedExpanded = checkContinuationExpandedEvent(expandedRaw, state.protocol, options.receivedBody, options.expandedBody);
+    checks.push(checkedExpanded.check);
+    if (!checkedExpanded.ok) return result();
+    continuationExpanded = checkedExpanded.event;
+    state.continuationExpanded = checkedExpanded.event;
+  }
   // A request the entry translated onto another text API, Gemini included on either side. The event-log check held the
   // event to once, in a single-forward log, between request.received and request.forwarded, with no relay policy.
   const translatedAt = document.event_log.findIndex((event) => eventType(event) === EVENT_REQUEST_TRANSLATED);
   if (translatedAt >= 0) {
     checks.push(pass("protocol", state.protocol));
     if (options.expectedRelayImage !== undefined) checks.push(relayImageCheck(document.relay_image, options.expectedRelayImage));
-    translationChecks({ document, at: translatedAt, protocol: state.protocol, forwardedHash: state.forwardedBodyHash, options, checks, state });
+    translationChecks({ document, at: translatedAt, protocol: state.protocol, forwardedHash: state.forwardedBodyHash, options, checks, state, continuationExpanded });
     return result();
   }
   if (state.protocol === "gemini") {
     checks.push(pass("protocol", "gemini"));
     if (options.expectedRelayImage !== undefined) checks.push(relayImageCheck(document.relay_image, options.expectedRelayImage));
-    geminiChecks(document.event_log, state.forwardedBodyHash, state.receivedBodyHash, checks);
+    state.modified = geminiChecks(document.endpoint, document.event_log, state.forwardedBodyHash, state.receivedBodyHash, options, checks);
     return result();
   }
   if (!isLaneProtocol(state.protocol)) {
@@ -502,7 +563,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   if (isStackEventLog(document.event_log)) {
     // A stack receipt forwards once per attempt; the single-forward hash fields mean nothing here.
     state.forwardedBodyHash = null;
-    state.stack = stackChecks(document.event_log, protocol, options, checks);
+    state.stack = stackChecks(document.event_log, protocol, options, checks, continuationExpanded);
     return result();
   }
 
@@ -586,6 +647,49 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     return result();
   }
   const forwardedBare = forwardedHash.startsWith("sha256:") ? forwardedHash.slice("sha256:".length) : forwardedHash;
+  if (continuationExpanded !== null) {
+    const baseBody = options.expandedBody;
+    if (baseBody !== undefined) {
+      if (modified.length > 0) {
+        const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+        if (verifyForwardedWithChanges(baseBody, protocol, modified, forwardedBare, applied, policy)) {
+          checks.push(pass("forwarded_body_hash", `${forwardedHash} = SHA-256(${modified.length} declared op(s) then F(expanded, declared appends)); zero-retention continuation expansion applied inside the attested entry TEE`));
+        } else {
+          checks.push(fail("forwarded_body_hash", `${forwardedHash} is not SHA-256(expanded + declared request.modified ops + declared appends)`));
+        }
+      } else if (relayApplied) {
+        if (verifyForwarded(baseBody, protocol, applied, forwardedBare)) {
+          checks.push(pass("forwarded_body_hash", `${forwardedHash} = SHA-256(F(expanded, declared appends)); zero-retention continuation expansion applied inside the attested entry TEE`));
+        } else {
+          checks.push(fail("forwarded_body_hash", `${forwardedHash} is not SHA-256(F(expanded, declared appends))`));
+        }
+      } else if (forwardedHash !== continuationExpanded.expanded_body_sha256) {
+        checks.push(fail("forwarded_body_hash", `no relay_policy.applied and no request.modified, but forwarded ${forwardedHash} != expanded_body_sha256 ${continuationExpanded.expanded_body_sha256}`));
+      } else {
+        checks.push(pass("forwarded_body_hash", `${forwardedHash} equals request.continuation_expanded.expanded_body_sha256 (zero-retention continuation expansion applied inside the attested entry TEE)`));
+      }
+    } else if (modified.length === 0 && !relayApplied) {
+      if (forwardedHash !== continuationExpanded.expanded_body_sha256) {
+        checks.push(fail("forwarded_body_hash", `no relay_policy.applied and no request.modified, but forwarded ${forwardedHash} != expanded_body_sha256 ${continuationExpanded.expanded_body_sha256}`));
+      } else {
+        checks.push(pass("forwarded_body_hash", `${forwardedHash} equals request.continuation_expanded.expanded_body_sha256 (zero-retention continuation expansion applied inside the attested entry TEE)`));
+      }
+    } else {
+      const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const bad = disallowedOps(policy, protocol, modified);
+      if (bad.length > 0) {
+        checks.push(fail("forwarded_body_hash", `declared request.modified op(s) disallowed by ${policy.id}: ${bad.join("; ")}`));
+      } else {
+        checks.push(
+          pass(
+            "forwarded_body_hash",
+            `pre-rewrite commitment ${continuationExpanded.expanded_body_sha256} accepted for zero-retention continuation expansion inside the attested entry TEE before ${modified.length} declared op(s)${relayApplied ? ` and ${applied.length} declared append(s)` : ""}; forwarded ${forwardedHash}`,
+          ),
+        );
+      }
+    }
+    return result();
+  }
   if (modified.length > 0) {
     // The ops replay under the policy they name: v1, or v2 when every one names it (v2 keeps v1's rules for the text APIs).
     const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
@@ -610,18 +714,73 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
 }
 
 /**
- * A Gemini receipt's content check (an entry's endpoint route): no relay and no declared op, so the forwarded bytes are
- * the received bytes (step 1). A stack log, a `request.modified` or a `relay_policy` event has no meaning for one.
+ * A Gemini receipt's content check (an entry's endpoint route): no relay stack and no relay policy. On generation
+ * (`:generateContent`, `:streamGenerateContent`) no declared op is allowed and forwarded bytes must equal received
+ * bytes. On `:countTokens`, Gray may declare `gray-lane-rewrites-v2` member ops on `/generateContentRequest/model`
+ * when rewriting the nested model field; those replay via `replayApiChanges`.
  */
-function geminiChecks(events: readonly Json[], forwardedHash: string | null, receivedHash: string | null, checks: ReceiptCheck[]): void {
+function geminiChecks(
+  endpoint: string,
+  events: readonly Json[],
+  forwardedHash: string | null,
+  receivedHash: string | null,
+  options: VerifyResponseReceiptOptions,
+  checks: ReceiptCheck[],
+): RequestModifiedEvent[] {
   if (isStackEventLog(events)) {
     checks.push(fail("gemini", "a Gemini receipt is never a relay stack's"));
-    return;
+    return [];
   }
-  const declared = [EVENT_REQUEST_MODIFIED, EVENT_RELAY_POLICY_APPLIED, EVENT_RELAY_POLICY_REFUSED].filter((type) => findEvent(events, type) !== undefined);
+  const countTokens = (endpoint.split(/[?#]/, 1)[0] ?? "").endsWith(":countTokens");
+  const forbidden = countTokens
+    ? [EVENT_RELAY_POLICY_APPLIED, EVENT_RELAY_POLICY_REFUSED]
+    : [EVENT_REQUEST_MODIFIED, EVENT_RELAY_POLICY_APPLIED, EVENT_RELAY_POLICY_REFUSED];
+  const declared = forbidden.filter((type) => findEvent(events, type) !== undefined);
   if (declared.length > 0) {
-    checks.push(fail("gemini", `the lane declares no rewrite and no relay policy on a Gemini body, but the receipt carries ${declared.join(", ")}`));
-    return;
+    checks.push(
+      fail(
+        "gemini",
+        countTokens
+          ? `no relay policy runs on a Gemini body, but the receipt carries ${declared.join(", ")}`
+          : `the lane declares no rewrite and no relay policy on a Gemini body, but the receipt carries ${declared.join(", ")}`,
+      ),
+    );
+    return [];
+  }
+  const modified: RequestModifiedEvent[] = [];
+  if (countTokens) {
+    for (const raw of findEvents(events, EVENT_REQUEST_MODIFIED)) {
+      const parsed = requestModifiedSchema.safeParse(raw);
+      if (!parsed.success) {
+        checks.push(fail("request_modified", parsed.error.issues.map((issue) => issue.message).join("; ")));
+        return modified;
+      }
+      modified.push(parsed.data as RequestModifiedEvent);
+    }
+    const misdeclared = modified
+      .filter((op) => op.declared_in !== GRAY_LANE_REWRITES_V2.id || isFormOp(op.op))
+      .map((op) => (isFormOp(op.op) ? `${op.op} ${op.path} is a form op on a JSON body` : `${op.op} ${op.path} is declared in ${op.declared_in}, not ${GRAY_LANE_REWRITES_V2.id}`));
+    if (misdeclared.length > 0) checks.push(fail("request_modified", misdeclared.join("; ")));
+    else if (modified.length > 0) checks.push(pass("request_modified", `${modified.length} declared op(s) on your JSON body (${GRAY_LANE_REWRITES_V2.id})`));
+    if (forwardedHash === null) {
+      checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
+      return modified;
+    }
+    if (modified.length === 0) {
+      if (forwardedHash !== receivedHash) checks.push(fail("forwarded_body_hash", `no request.modified, but forwarded ${forwardedHash} != received ${String(receivedHash)}`));
+      else checks.push(pass("forwarded_body_hash", "no rewrites; forwarded hash equals received hash"));
+      return modified;
+    }
+    if (misdeclared.length > 0) {
+      checks.push(fail("forwarded_body_hash", `${forwardedHash} is not checked: the declared ops do not replay under ${GRAY_LANE_REWRITES_V2.id}`));
+      return modified;
+    }
+    const replayed = replayApiChanges(options.receivedBody, "gemini", modified);
+    const what = `${modified.length} declared op(s) on your JSON body`;
+    if (replayed === null) checks.push(fail("forwarded_body_hash", `${forwardedHash} is not SHA-256(${what}): they do not replay on the received body`));
+    else if (bodyHash(replayed) === forwardedHash) checks.push(pass("forwarded_body_hash", `${forwardedHash} = SHA-256(${what})`));
+    else checks.push(fail("forwarded_body_hash", `${forwardedHash} is not SHA-256(${what}), which is ${bodyHash(replayed)}`));
+    return modified;
   }
   if (forwardedHash === null) {
     checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
@@ -630,6 +789,7 @@ function geminiChecks(events: readonly Json[], forwardedHash: string | null, rec
   } else {
     checks.push(pass("forwarded_body_hash", "no rewrites; forwarded hash equals received hash"));
   }
+  return [];
 }
 
 /**
@@ -726,8 +886,9 @@ function translationChecks(input: {
   readonly options: VerifyResponseReceiptOptions;
   readonly checks: ReceiptCheck[];
   readonly state: { translation: ReceiptTranslation | null; modified: RequestModifiedEvent[] };
+  readonly continuationExpanded: ReceiptContinuationExpanded | null;
 }): void {
-  const { document, at, protocol, options, checks } = input;
+  const { document, at, protocol, options, checks, continuationExpanded } = input;
   const events = document.event_log;
   const parsed = requestTranslatedSchema.safeParse(events[at]);
   if (!parsed.success) {
@@ -789,7 +950,18 @@ function translationChecks(input: {
     checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
     return;
   }
-  const replay = replayTranslated(options.receivedBody, { endpoint: document.endpoint, from, to, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
+  const sourceBody = continuationExpanded !== null ? options.expandedBody : options.receivedBody;
+  if (continuationExpanded !== null && sourceBody === undefined) {
+    checks.push(
+      pass(
+        "forwarded_body_hash",
+        `pre-rewrite commitment ${continuationExpanded.expanded_body_sha256} accepted for zero-retention continuation expansion inside the attested entry TEE before translation from ${from} to ${to}; forwarded ${forwardedHash}`,
+      ),
+    );
+    checks.push(skip("translation_dropped", "not replayed: zero-retention continuation expansion was applied inside the attested entry TEE"));
+    return;
+  }
+  const replay = replayTranslated(sourceBody!, { endpoint: document.endpoint, from, to, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
   const what = `${before.length} declared op(s), the translation from ${from} to ${to}${cap === null ? "" : ` with output cap ${cap.toString()}`}, ${after.length} declared op(s)`;
   if (!replay.ok) {
     checks.push(fail("forwarded_body_hash", `${forwardedHash} is not checked: the received body does not replay (${replay.reason})`));
@@ -821,7 +993,13 @@ function translationChecks(input: {
  * per attempt that has a `request.forwarded`, then the response digest when the customer kept the
  * bytes. Returns what the receipt records, for the transcript and the machine output.
  */
-function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: VerifyResponseReceiptOptions, checks: ReceiptCheck[]): StackReceiptSummary {
+function stackChecks(
+  events: readonly Json[],
+  protocol: LaneProtocol,
+  options: VerifyResponseReceiptOptions,
+  checks: ReceiptCheck[],
+  continuationExpanded: ReceiptContinuationExpanded | null,
+): StackReceiptSummary {
   const attempts: MutableAttempt[] = [];
   let feedIncomplete: string | null = null;
   for (const event of events) {
@@ -918,6 +1096,17 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     }
     const expected = attempt.forwarded_body_jcs_sha256;
     const changed = attempt.changed;
+    const expandedDigest = continuationExpanded?.expanded_body_sha256 ?? options.outerContinuationExpanded?.expandedBodySha256 ?? null;
+    if (expandedDigest !== null && options.expandedBody === undefined) {
+      const policy = attempt.modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const bad = disallowedOps(policy, protocol, attempt.modified);
+      if (bad.length > 0) {
+        checks.push(fail(`${id}:forwarded_body_jcs_sha256`, `declared request.modified op(s) disallowed by ${policy.id}: ${bad.join("; ")}`));
+      } else {
+        checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not replayed: zero-retention continuation expansion was applied inside the attested entry TEE (pre-rewrite commitment ${expandedDigest})`));
+      }
+      continue;
+    }
     // Only the body entries change the body: changed headers alone leave the declared replay as it is.
     if (changed !== null && (changed.omitted > 0n || (changed.values === "omitted" && changed.body.length > 0))) {
       const why = changed.omitted > 0n ? `leaves ${changed.omitted} change(s) out` : "names the changed paths but not their values";
@@ -926,7 +1115,8 @@ function stackChecks(events: readonly Json[], protocol: LaneProtocol, options: V
     }
     const relayEntries = changed === null ? 0 : changed.body.length;
     const what = `${attempt.modified.length} op(s) then ${applied.length} append(s)${changed === null ? "" : ` then the deployment's ${relayEntries} change(s)`}`;
-    const declared = replayForwarded(options.receivedBody, protocol, attempt.modified, applied);
+    const replayBase = continuationExpanded !== null && options.expandedBody !== undefined ? options.expandedBody : options.receivedBody;
+    const declared = replayForwarded(replayBase, protocol, attempt.modified, applied);
     const replay = declared === null || changed === null || relayEntries === 0 ? declared : applyRelayChanges(declared, changed.body);
     const actual = replay === null ? null : stackBodyDigest(replay);
     if (actual === null) {
@@ -1141,6 +1331,7 @@ function receiptChecks(
   verification: Awaited<ReturnType<typeof verifyReceipt>>,
   document: ReceiptDocument | null,
   options: VerifyResponseReceiptOptions,
+  checkRawResponseBody: boolean,
 ): ReceiptCheck[] {
   const checks: ReceiptCheck[] = [];
   if (document === null) {
@@ -1184,14 +1375,141 @@ function receiptChecks(
   if (has("invalid_event_log")) checks.push(fail("event_log", problemOf("invalid_event_log")));
   else checks.push(pass("event_log", `${document.event_log.length} events`));
 
-  if (has("request_body_mismatch")) checks.push(fail("request_received_hash", problemOf("request_body_mismatch")));
+  if (options.outerContinuationExpanded !== undefined) {
+    const receivedHash = bodyHashOf(document, EVENT_REQUEST_RECEIVED);
+    const outer = options.outerContinuationExpanded;
+    if (outer.modified === undefined || outer.modified.length === 0) {
+      if (receivedHash === outer.expandedBodySha256) {
+        checks.push(pass("request_received_hash", `${receivedHash} (matches outer request.continuation_expanded.expanded_body_sha256)`));
+      } else {
+        checks.push(fail("request_received_hash", `request.received.body_hash is ${String(receivedHash)}, outer request.continuation_expanded.expanded_body_sha256 is ${outer.expandedBodySha256}`));
+      }
+    } else if (options.expandedBody !== undefined) {
+      const protocol = options.protocol ?? protocolForEndpoint(document.endpoint);
+      const policy = outer.modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.expandedBody, protocol, outer.modified, [], policy) : null;
+      const expected = replayed === null ? null : bodyHash(replayed);
+      if (expected !== null && receivedHash === expected) {
+        checks.push(pass("request_received_hash", `${receivedHash} (replayed from outer expanded body with ${outer.modified.length} declared entry op(s))`));
+      } else {
+        checks.push(fail("request_received_hash", `request.received.body_hash is ${String(receivedHash)}, expected ${String(expected)} after outer declared op(s)`));
+      }
+    } else if (receivedHash !== null && isDigestField(receivedHash)) {
+      checks.push(pass("request_received_hash", `${receivedHash} (derived from outer expanded_body_sha256 ${outer.expandedBodySha256} with ${outer.modified.length} declared entry op(s))`));
+    } else {
+      checks.push(fail("request_received_hash", `request.received.body_hash is missing or malformed: ${String(receivedHash)}`));
+    }
+  } else if (has("request_body_mismatch")) checks.push(fail("request_received_hash", problemOf("request_body_mismatch")));
   else if (options.receivedBody !== undefined) checks.push(pass("request_received_hash", bodyHashOf(document, EVENT_REQUEST_RECEIVED) ?? "missing"));
 
-  if (options.responseBytes !== undefined) {
+  if (checkRawResponseBody) {
     if (has("response_body_mismatch")) checks.push(fail("response_returned_hash", problemOf("response_body_mismatch")));
     else checks.push(pass("response_returned_hash", bodyHashOf(document, EVENT_RESPONSE_RETURNED) ?? "missing"));
   }
   return checks;
+}
+
+/**
+ * Validates one `request.continuation_expanded` event against its schema and cross-checks its
+ * claimed expansions against the customer's raw `receivedBody` JSON (and optional `expandedBody`).
+ */
+export function checkContinuationExpandedEvent(
+  rawEvent: Json,
+  protocol: ReceiptProtocol | null,
+  receivedBody: Uint8Array,
+  expandedBody?: Uint8Array,
+): { readonly ok: true; readonly event: ReceiptContinuationExpanded; readonly check: ReceiptCheck } | { readonly ok: false; readonly check: ReceiptCheck } {
+  const parsed = requestContinuationExpandedSchema.safeParse(rawEvent);
+  if (!parsed.success) {
+    return { ok: false, check: fail("continuation_expanded", parsed.error.issues.map((issue) => issue.message).join("; ")) };
+  }
+  const data = parsed.data;
+  if (protocol !== "open_ai_responses") {
+    return { ok: false, check: fail("continuation_expanded", `request.continuation_expanded applies only to open_ai_responses, not ${String(protocol)}`) };
+  }
+  let body: Json;
+  try {
+    body = parseSerdeBytes(receivedBody);
+  } catch {
+    return { ok: false, check: fail("continuation_expanded", "the received request body is not valid JSON") };
+  }
+  if (!isObject(body)) {
+    return { ok: false, check: fail("continuation_expanded", "the received request body is not a JSON object") };
+  }
+  if (data.previous_response_id_expanded) {
+    const prev = get(body, "previous_response_id");
+    if (typeof prev !== "string" || prev.length === 0) {
+      return {
+        ok: false,
+        check: fail("continuation_expanded", "receipt claims previous_response_id_expanded, but the received request has no non-empty string previous_response_id"),
+      };
+    }
+  }
+  if (data.item_references_expanded > 0n) {
+    const input = get(body, "input");
+    let count = 0n;
+    if (Array.isArray(input)) {
+      for (const entry of input) {
+        if (isObject(entry) && get(entry, "type") === "item_reference") count += 1n;
+      }
+    }
+    if (count < data.item_references_expanded) {
+      return {
+        ok: false,
+        check: fail(
+          "continuation_expanded",
+          `receipt claims ${data.item_references_expanded} item_references_expanded, but the received request has ${count} item_reference input entries`,
+        ),
+      };
+    }
+  }
+  if (expandedBody !== undefined) {
+    const actual = bodyHash(expandedBody);
+    if (actual !== data.expanded_body_sha256) {
+      return {
+        ok: false,
+        check: fail("continuation_expanded", `expanded_body_sha256 is ${data.expanded_body_sha256}, supplied expandedBody hashes to ${actual}`),
+      };
+    }
+  }
+  const parts: string[] = [];
+  if (data.previous_response_id_expanded) parts.push("previous_response_id");
+  if (data.item_references_expanded > 0n) parts.push(`${data.item_references_expanded} item_reference(s)`);
+  if (data.include_encrypted_reasoning_added) parts.push("include encrypted reasoning");
+  const event: ReceiptContinuationExpanded = {
+    mode: data.mode,
+    previous_response_id_expanded: data.previous_response_id_expanded,
+    item_references_expanded: data.item_references_expanded,
+    include_encrypted_reasoning_added: data.include_encrypted_reasoning_added,
+    expanded_body_sha256: data.expanded_body_sha256,
+  };
+  return {
+    ok: true,
+    event,
+    check: pass(
+      "continuation_expanded",
+      `zero-retention continuation expansion applied inside the attested entry TEE (${parts.join(", ")}); pre-rewrite expanded body ${data.expanded_body_sha256}`,
+    ),
+  };
+}
+
+function disallowedOps(policy: LaneRewritePolicy, protocol: LaneProtocol, ops: readonly RequestModifiedEvent[]): string[] {
+  const bad: string[] = [];
+  for (const op of ops) {
+    if (op.declared_in !== policy.id) {
+      bad.push(`${op.op} ${op.path} declared_in ${op.declared_in} != ${policy.id}`);
+      continue;
+    }
+    const rule = rewriteRuleFor(policy, protocol, { op: op.op, path: op.path });
+    if (rule === undefined) {
+      bad.push(`${op.op} ${op.path} is not allowed for ${protocol}`);
+      continue;
+    }
+    if (op.value_sha256 !== undefined || !ruleAllowsValue(rule, op.value)) {
+      bad.push(`${op.op} ${op.path} carries a value disallowed by ${policy.id}`);
+    }
+  }
+  return bad;
 }
 
 type SealedKeysetResult =

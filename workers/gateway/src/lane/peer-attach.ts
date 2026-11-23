@@ -65,6 +65,10 @@ export const PEER_ATTACH_LIMITS = Object.freeze({
   tunnelsPerRelay: 16,
   /** A pin with no session for this long ends (section 3.5, O6). */
   pinIdleMs: 60_000,
+  /** Maximum refused (relay, keyset) entries held in memory at once. */
+  maxRefused: 1024,
+  /** Maximum (relay, keyset) recency/birth entries held in memory at once. */
+  maxSeen: 1024,
 });
 
 /** The signed facts of one attach. */
@@ -225,6 +229,7 @@ export class PeerSessions {
    */
   sync(live: readonly LiveSession[]): readonly string[] {
     const now = this.#deps.clock();
+    this.#prune(now);
     const open = new Map(live.map((row) => [row.session, row]));
     const strangers: string[] = [];
     for (const row of live) {
@@ -243,7 +248,7 @@ export class PeerSessions {
       }
       session.seen = true;
       session.tunnels = row.tunnels;
-      this.#lastSeen.set(pairKey(session.relay, session.keyset), now);
+      if (session.state === "pinned") this.#touchSeen(pairKey(session.relay, session.keyset), now);
     }
     return strangers;
   }
@@ -252,6 +257,7 @@ export class PeerSessions {
   async admit(claims: AttachClaims, signature: string): Promise<AttachVerdict> {
     const { clock, isStackRelay, stackRelays, pinOf } = this.#deps;
     const now = clock();
+    this.#prune(now);
     if (!isStackRelay(claims.relay)) return { ok: false, status: 404, code: "peer_relay_unknown" };
     const refusedUntil = this.#refused.get(pairKey(claims.relay, claims.keyset));
     if (refusedUntil !== undefined) {
@@ -280,8 +286,25 @@ export class PeerSessions {
       state = "unverified";
     }
     this.#sessions.set(claims.session, { session: claims.session, relay: claims.relay, keyset: claims.keyset, state, attachedMs: now, claims, signature, tunnels: 0, seen: false });
-    if (this.firstSeenOf(claims.relay, claims.keyset) === null) this.#firstSeen.set(pairKey(claims.relay, claims.keyset), now);
-    this.#lastSeen.set(pairKey(claims.relay, claims.keyset), now);
+    // Only record boot-age and pin-retention timestamps once ownership of the keyset is verified, so an
+    // unauthenticated caller cannot spoof boot ordering or grow `#lastSeen`/`#firstSeen` with arbitrary keysets.
+    if (state === "pinned") {
+      const key = pairKey(claims.relay, claims.keyset);
+      if (this.firstSeenOf(claims.relay, claims.keyset) === null) {
+        let earliest = now;
+        if (pin !== null) {
+          for (const existing of this.#sessions.values()) {
+            if (existing.session === claims.session || existing.relay !== claims.relay || existing.keyset !== claims.keyset) continue;
+            if (existing.attachedMs >= earliest) continue;
+            if (existing.state === "pinned" || (await verifyAttach(pin.receiptKeys, existing.claims, existing.signature))) {
+              earliest = existing.attachedMs;
+            }
+          }
+        }
+        this.#setFirstSeen(key, earliest);
+      }
+      this.#touchSeen(key, now);
+    }
     this.#deps.log({ level: "info", event: "lane_peer_attached", relay: claims.relay, keyset_digest: claims.keyset, session: claims.session, state });
     return { ok: true, state };
   }
@@ -292,16 +315,24 @@ export class PeerSessions {
    */
   async promote(relay: string, keyset: string, pin: KeysetPin): Promise<SessionChanges> {
     const now = this.#deps.clock();
+    this.#prune(now);
     const promoted: string[] = [];
     const closed: string[] = [];
+    let earliestPromoted = Number.POSITIVE_INFINITY;
     for (const session of this.#sessions.values()) {
       if (session.relay !== relay || session.keyset !== keyset || session.state !== "unverified") continue;
       if (await this.#signed(session.claims, session.signature, pin, now)) {
         session.state = "pinned";
         promoted.push(session.session);
+        if (session.attachedMs < earliestPromoted) earliestPromoted = session.attachedMs;
       } else closed.push(session.session);
     }
     for (const id of closed) this.#sessions.delete(id);
+    if (promoted.length > 0) {
+      const key = pairKey(relay, keyset);
+      if (this.firstSeenOf(relay, keyset) === null) this.#setFirstSeen(key, earliestPromoted);
+      this.#touchSeen(key, now);
+    }
     if (closed.length > 0) this.#deps.log({ level: "warn", event: "lane_peer_attach_refused", relay, keyset_digest: keyset, code: "peer_attach_forged", sessions: closed.length });
     return { promoted, closed };
   }
@@ -313,12 +344,58 @@ export class PeerSessions {
    */
   refuse(relay: string, keyset: string, forMs: number = PEER_ATTACH_LIMITS.refusedMs): SessionChanges {
     const now = this.#deps.clock();
-    this.#refused.set(pairKey(relay, keyset), now + forMs);
+    this.#prune(now);
+    this.#setRefused(pairKey(relay, keyset), now + forMs);
     const closed: string[] = [];
     for (const session of this.#sessions.values()) if (session.relay === relay && session.keyset === keyset) closed.push(session.session);
     for (const id of closed) this.#sessions.delete(id);
     this.#deps.log({ level: "error", event: "lane_peer_refused", relay, keyset_digest: keyset, code: "peer_keyset_refused", sessions: closed.length, refused_ms: forMs });
     return { promoted: [], closed };
+  }
+
+  /**
+   * Closes only unverified sessions of (relay, keyset) without placing the keyset in `#refused`. Used when
+   * attestation fails without cryptographic proof that the caller owns `keyset`'s private receipt key, so an
+   * unauthenticated attacker cannot trigger a 5-min global ban against a real boot.
+   */
+  closeUnverified(relay: string, keyset: string): SessionChanges {
+    const closed: string[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.relay === relay && session.keyset === keyset && session.state === "unverified") closed.push(session.session);
+    }
+    for (const id of closed) this.#sessions.delete(id);
+    if (closed.length > 0) this.#deps.log({ level: "warn", event: "lane_peer_unverified_closed", relay, keyset_digest: keyset, sessions: closed.length });
+    return { promoted: [], closed };
+  }
+
+  /**
+   * Refuses (relay, keyset) for `forMs` ONLY after cryptographically verifying that the attached session(s) own
+   * `keyset`'s receipt signing key (or the boot already holds a pinned session). If any unverified session fails
+   * signature verification under `receiptKeys`, only the forged session(s) are closed and no ban is recorded.
+   */
+  async refuseVerified(relay: string, keyset: string, receiptKeys: readonly string[], forMs: number = PEER_ATTACH_LIMITS.refusedMs): Promise<SessionChanges & { readonly banned: boolean }> {
+    const now = this.#deps.clock();
+    this.#prune(now);
+    if (this.hasPinnedSession(relay, keyset)) return { ...this.refuse(relay, keyset, forMs), banned: true };
+    const unverified: PeerSession[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.relay === relay && session.keyset === keyset && session.state === "unverified") unverified.push(session);
+    }
+    if (unverified.length === 0 || receiptKeys.length === 0) return { promoted: [], closed: [], banned: false };
+    const forged: string[] = [];
+    let verified = 0;
+    const pin: KeysetPin = { receiptKeys, notAfterMs: Number.POSITIVE_INFINITY };
+    for (const session of unverified) {
+      if (await this.#signed(session.claims, session.signature, pin, now)) verified += 1;
+      else forged.push(session.session);
+    }
+    if (forged.length > 0) {
+      for (const id of forged) this.#sessions.delete(id);
+      this.#deps.log({ level: "warn", event: "lane_peer_attach_refused", relay, keyset_digest: keyset, code: "peer_attach_forged", sessions: forged.length });
+      return { promoted: [], closed: forged, banned: false };
+    }
+    if (verified === 0) return { promoted: [], closed: [], banned: false };
+    return { ...this.refuse(relay, keyset, forMs), banned: true };
   }
 
   /** A pin mismatch on a stream of `session` (section 3.5): that session is condemned, the pin stays. */
@@ -374,13 +451,24 @@ export class PeerSessions {
 
   /** Whether the pin of (relay, keyset) may stay: a session now, or one within `pinIdleMs` (O6). */
   pinWanted(relay: string, keyset: string): boolean {
-    const seen = this.#lastSeen.get(pairKey(relay, keyset));
-    return seen !== undefined && this.#deps.clock() - seen < PEER_ATTACH_LIMITS.pinIdleMs;
+    for (const s of this.#sessions.values()) if (s.relay === relay && s.keyset === keyset) return true;
+    const key = pairKey(relay, keyset);
+    const seen = this.#lastSeen.get(key);
+    if (seen === undefined) return false;
+    if (this.#deps.clock() - seen < PEER_ATTACH_LIMITS.pinIdleMs) return true;
+    this.#lastSeen.delete(key);
+    this.#firstSeen.delete(key);
+    return false;
   }
 
   /** The sessions held (for `/healthz` and tests). */
   get sessions(): readonly PeerSession[] {
     return [...this.#sessions.values()];
+  }
+
+  /** Map sizes for tests and diagnostics. */
+  get trackedCounts(): { readonly refused: number; readonly lastSeen: number; readonly firstSeen: number } {
+    return { refused: this.#refused.size, lastSeen: this.#lastSeen.size, firstSeen: this.#firstSeen.size };
   }
 
   async #signed(claims: AttachClaims, signature: string, pin: KeysetPin, now: number): Promise<boolean> {
@@ -389,10 +477,75 @@ export class PeerSessions {
   }
 
   #expire(now: number): string[] {
+    this.#prune(now);
     const out: string[] = [];
     for (const s of this.#sessions.values()) if (s.state === "unverified" && now - s.attachedMs >= PEER_ATTACH_LIMITS.unverifiedMs) out.push(s.session);
     for (const id of out) this.#sessions.delete(id);
     return out;
+  }
+
+  #activePairs(): Set<string> {
+    const active = new Set<string>();
+    for (const s of this.#sessions.values()) active.add(pairKey(s.relay, s.keyset));
+    return active;
+  }
+
+  #prune(now: number): void {
+    for (const [key, until] of this.#refused) {
+      if (now >= until) this.#refused.delete(key);
+    }
+    while (this.#refused.size > PEER_ATTACH_LIMITS.maxRefused) {
+      const oldest = this.#refused.keys().next().value;
+      if (oldest === undefined) break;
+      this.#refused.delete(oldest);
+    }
+    const active = this.#activePairs();
+    for (const [key, seen] of this.#lastSeen) {
+      if (now - seen >= PEER_ATTACH_LIMITS.pinIdleMs && !active.has(key)) {
+        this.#lastSeen.delete(key);
+        this.#firstSeen.delete(key);
+      }
+    }
+    for (const key of this.#firstSeen.keys()) {
+      if (!this.#lastSeen.has(key) && !active.has(key)) this.#firstSeen.delete(key);
+    }
+    if (this.#lastSeen.size > PEER_ATTACH_LIMITS.maxSeen) {
+      for (const key of this.#lastSeen.keys()) {
+        if (this.#lastSeen.size <= PEER_ATTACH_LIMITS.maxSeen) break;
+        if (active.has(key)) continue;
+        this.#lastSeen.delete(key);
+        this.#firstSeen.delete(key);
+      }
+    }
+    if (this.#firstSeen.size > PEER_ATTACH_LIMITS.maxSeen) {
+      for (const key of this.#firstSeen.keys()) {
+        if (this.#firstSeen.size <= PEER_ATTACH_LIMITS.maxSeen) break;
+        if (active.has(key)) continue;
+        this.#firstSeen.delete(key);
+      }
+    }
+  }
+
+  #setRefused(key: string, until: number): void {
+    this.#refused.delete(key);
+    this.#refused.set(key, until);
+    while (this.#refused.size > PEER_ATTACH_LIMITS.maxRefused) {
+      const oldest = this.#refused.keys().next().value;
+      if (oldest === undefined) break;
+      this.#refused.delete(oldest);
+    }
+  }
+
+  #touchSeen(key: string, now: number): void {
+    this.#lastSeen.delete(key);
+    this.#lastSeen.set(key, now);
+    if (this.#lastSeen.size > PEER_ATTACH_LIMITS.maxSeen) this.#prune(now);
+  }
+
+  #setFirstSeen(key: string, at: number): void {
+    this.#firstSeen.delete(key);
+    this.#firstSeen.set(key, at);
+    if (this.#firstSeen.size > PEER_ATTACH_LIMITS.maxSeen) this.#prune(this.#deps.clock());
   }
 
   #busy(claims: AttachClaims, cap: string): AttachVerdict {

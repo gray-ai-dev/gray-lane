@@ -1,18 +1,22 @@
 /**
  * Which Responses continuation references a request names and a reply creates
- * (crates/gray-gateway/src/continuation.rs). A stored response or conversation exists only in
- * the provider account that created it, and every Gray workspace reaches a provider through the
- * same supplier credential. A request naming `previous_response_id` or `conversation` is
- * therefore served only by the endpoint that produced that reference, and only for the workspace
- * that received it.
+ * (crates/gray-gateway/src/continuation.rs). A stored response, conversation, or output item
+ * exists only in the provider account (or zero-retention continuation state) that created it, and
+ * every Gray workspace reaches a provider through the same supplier credential. A request naming
+ * `previous_response_id`, `conversation`, or `input[].type = "item_reference"` is therefore served
+ * only by the endpoint that produced that reference, and only for the workspace that received it.
  */
 import { type Json, get, isObject, parseSerde } from "@gray/json";
 import { type Protocol, SseDecoder, utf8Length } from "@gray/protocol";
 
 /** The longest reference Gray binds or looks up, in UTF-8 bytes (continuation.rs `MAX_REFERENCE_BYTES`). */
 export const MAX_REFERENCE_BYTES = 256;
+/** The most distinct `item_reference` entries one request may name (continuation.rs `MAX_ITEM_REFERENCES`). */
+export const MAX_ITEM_REFERENCES = 256;
+/** The most distinct output item ids extracted from one reply (continuation.rs `MAX_REPLY_ITEM_REFERENCES`). */
+export const MAX_REPLY_ITEM_REFERENCES = 64;
 
-export type ReferenceKind = "response" | "conversation";
+export type ReferenceKind = "response" | "conversation" | "item";
 
 export interface Reference {
   readonly kind: ReferenceKind;
@@ -25,8 +29,9 @@ function id(value: Json | undefined): string | undefined {
 
 /**
  * `references`: the continuation references a Responses request names, in Rust's order
- * (`previous_response_id`, then `conversation`). Absent or null fields name none; any other
- * non-string shape is invalid (undefined).
+ * (`previous_response_id`, then `conversation`, then distinct `input[].type === "item_reference"`
+ * entries). Absent or null fields name none; any other non-string shape, or more than
+ * `MAX_ITEM_REFERENCES` distinct item references, is invalid (undefined).
  */
 export function continuationReferences(body: Json): Reference[] | undefined {
   const out: Reference[] = [];
@@ -49,6 +54,19 @@ export function continuationReferences(body: Json): Reference[] | undefined {
     if (reference === undefined) return undefined;
     out.push({ kind: "conversation", reference });
   }
+  const input = get(body, "input");
+  if (Array.isArray(input)) {
+    const seenItems = new Set<string>();
+    for (const item of input) {
+      if (!isObject(item) || get(item, "type") !== "item_reference") continue;
+      const reference = id(get(item, "id"));
+      if (reference === undefined) return undefined;
+      if (seenItems.has(reference)) continue;
+      if (seenItems.size >= MAX_ITEM_REFERENCES) return undefined;
+      seenItems.add(reference);
+      out.push({ kind: "item", reference });
+    }
+  }
   return out;
 }
 
@@ -58,9 +76,9 @@ export function storesContinuation(protocol: Protocol, request: Json): boolean {
 }
 
 /**
- * The references a successful reply names, as `Binding::record` binds them: its id, and its
- * conversation's (an object's `id`, or the value itself), each a non-empty string of at most
- * `MAX_REFERENCE_BYTES`.
+ * The references a successful reply names, as `Binding::record` binds them: its id, its
+ * conversation's (an object's `id`, or the value itself), and up to `MAX_REPLY_ITEM_REFERENCES`
+ * distinct valid `output[].id` values, each a non-empty string of at most `MAX_REFERENCE_BYTES`.
  */
 export function replyReferences(reply: Json): Reference[] {
   const out: Reference[] = [];
@@ -74,6 +92,18 @@ export function replyReferences(reply: Json): Reference[] {
   }
   const reference = id(conversation);
   if (reference !== undefined) out.push({ kind: "conversation", reference });
+  const output = get(reply, "output");
+  if (Array.isArray(output)) {
+    const seenItems = new Set<string>();
+    for (const item of output) {
+      if (seenItems.size >= MAX_REPLY_ITEM_REFERENCES) break;
+      if (!isObject(item)) continue;
+      const itemId = id(get(item, "id"));
+      if (itemId === undefined || seenItems.has(itemId)) continue;
+      seenItems.add(itemId);
+      out.push({ kind: "item", reference: itemId });
+    }
+  }
   return out;
 }
 

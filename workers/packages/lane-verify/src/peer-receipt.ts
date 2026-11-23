@@ -19,7 +19,9 @@
  * 3. when the outer receipt names the inner one, the served inner receipt is it (its JCS SHA-256 and its id);
  * 4. the inner receipt verifies under the attested stack keyset (`verifyResponseReceipt`: signature, grammar, the
  *    customer's bytes as `request.received`, each attempt's forwarded body replayed, the relay's own changes as
- *    `attempt:K:relay_changes`, the relay image the attested boot runs);
+ *    `attempt:K:relay_changes`, the relay image the attested boot runs, and for the served attempt when `responseBytes`
+ *    is supplied, `response_events_sha256` or `response_body_sha256` and `response_served_attempt`, including undoing
+ *    any declared `response.returned.rewrites` against the customer's response bytes);
  * 5. its `peer.entry` names this outer receipt (the entry's keyset digest, the outer receipt id and the attempt number),
  *    so an inner receipt cannot be shown under another request;
  * 6. inner `request.received` equals outer `request.received`, and for the attempt that served the answer, inner
@@ -38,25 +40,37 @@ import {
   EVENT_PEER_ENTRY,
   EVENT_PEER_FAILED,
   EVENT_PEER_FORWARDED,
+  EVENT_REQUEST_CONTINUATION_EXPANDED,
   EVENT_REQUEST_RECEIVED,
   EVENT_RESPONSE_RETURNED,
   adoptKeyset,
   bodyHash,
   eventType,
   findEvent,
+  findEvents,
+  isDigestField,
   isJcsValue,
   jcsBytes,
   peerCommitment,
   reportKeysetValue,
+  requestModifiedSchema,
   sha256BareHex,
   type RelayStackChanges,
   type RequestModifiedEvent,
 } from "@gray/attest";
-import { isLaneProtocol, replayForwarded } from "@gray/lane";
+import { GRAY_LANE_REWRITES_V1, GRAY_LANE_REWRITES_V2, GRAY_LANE_REWRITES_V2_TEXT, isLaneProtocol, replayForwarded, rewriteRuleFor, ruleAllowsValue } from "@gray/lane";
 import { get, isObject, parseStrict, type Json } from "@gray/json";
 import type { QuoteVerifier } from "./attestation.ts";
 import { verifyPeerAttestation, type PeerReleaseList } from "./peer.ts";
-import { protocolForEndpoint, verifyResponseReceipt, type ReceiptCheck, type StackReceiptSummary, type TemplateText } from "./receipt.ts";
+import {
+  checkContinuationExpandedEvent,
+  protocolForEndpoint,
+  verifyResponseReceipt,
+  type ReceiptCheck,
+  type ReceiptContinuationExpanded,
+  type StackReceiptSummary,
+  type TemplateText,
+} from "./receipt.ts";
 import { STACK_RELAY_ID_PATTERN } from "./stack-boot.ts";
 
 /** The stack VM's refusals before any frame (`@gray/lane-wire` PEER_REFUSAL_STATUS): it registered nothing, so it made no receipt. */
@@ -222,6 +236,10 @@ export interface VerifyPeerReceiptsOptions {
   readonly outer: Json;
   /** The exact request body the customer sent. */
   readonly receivedBody: Uint8Array;
+  /** Optional expanded body plaintext when the outer receipt records `request.continuation_expanded`. */
+  readonly expandedBody?: Uint8Array;
+  /** The raw response bytes the customer received, SSE framing included, when kept. */
+  readonly responseBytes?: Uint8Array;
   /** The relay's template texts, for its declared appends (as for a direct receipt). */
   readonly templates: readonly TemplateText[];
   /** Gray's signed stack list (`lane/stack/release-list.json`) with its key, and its freshness document when given. */
@@ -261,6 +279,17 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
     checks.push(skip("peers", "the receipt names no peer attempt: no stack VM served any part of the request"));
     return { ok: true, checks, peers };
   }
+  const outerEvents = get(options.outer, "event_log");
+  const outerExpandedEvents = Array.isArray(outerEvents) ? findEvents(outerEvents as readonly Json[], EVENT_REQUEST_CONTINUATION_EXPANDED) : [];
+  let outerExpanded: ReceiptContinuationExpanded | null = null;
+  if (outerExpandedEvents.length > 1) {
+    checks.push(fail("continuation_expanded", "outer receipt carries more than one request.continuation_expanded event"));
+  } else if (outerExpandedEvents.length === 1) {
+    const outerProtocol = protocolForEndpoint(String(get(options.outer, "endpoint") ?? ""));
+    const checked = checkContinuationExpandedEvent(outerExpandedEvents[0]!, outerProtocol, options.receivedBody, options.expandedBody);
+    checks.push(checked.check);
+    if (checked.ok) outerExpanded = checked.event;
+  }
   const lastOf = new Map<bigint, OuterPeerAttempt>();
   for (const attempt of attempts) lastOf.set(attempt.n, attempt);
   for (const [index, attempt] of attempts.entries()) {
@@ -284,12 +313,18 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
       peers.push(emptySummary(attempt.n));
       continue;
     }
-    peers.push(await checkPeer(attempt, answer, options, checks));
+    peers.push(await checkPeer(attempt, answer, options, checks, outerExpanded));
   }
   return { ok: checks.every((check) => check.status !== "fail"), checks, peers };
 }
 
-async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options: VerifyPeerReceiptsOptions, checks: ReceiptCheck[]): Promise<PeerReceiptSummary> {
+async function checkPeer(
+  attempt: OuterPeerAttempt,
+  answer: PeerAnswer,
+  options: VerifyPeerReceiptsOptions,
+  checks: ReceiptCheck[],
+  outerExpanded: ReceiptContinuationExpanded | null,
+): Promise<PeerReceiptSummary> {
   const id = `peer:${attempt.n}`;
   const summary = { ...emptySummary(attempt.n), host: answer.attestation.host, relay_id: answer.attestation.relay_id } as { -readonly [K in keyof PeerReceiptSummary]: PeerReceiptSummary[K] };
   if (answer.n !== attempt.n) {
@@ -361,9 +396,49 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
     checks.push(pass(`${id}:inner_digest`, `${attempt.inner.receipt_id}, SHA-256 ${digest}`));
   }
 
-  // What the stack VM received: the customer's bytes, after the entry's declared ops on the hop's body when it has any.
+  // What the stack VM received:
+  // - Without outer `request.continuation_expanded`: the customer's bytes, after any declared `peer.forwarded.modified` ops.
+  // - With verified outer `request.continuation_expanded`: the expanded body whose digest is `expanded_body_sha256`
+  //   (optionally after declared `peer.forwarded.modified` ops).
   let hopBody = options.receivedBody;
-  if (attempt.modified !== null) {
+  let expandedHopBody: Uint8Array | undefined = options.expandedBody;
+  let validatedEntryModified: RequestModifiedEvent[] | undefined;
+  if (outerExpanded !== null) {
+    if (attempt.modified !== null) {
+      const parsedOps: RequestModifiedEvent[] = [];
+      for (const rawOp of attempt.modified) {
+        const parsed = requestModifiedSchema.safeParse(rawOp);
+        if (!parsed.success) {
+          checks.push(fail(`${id}:entry_rewrite`, `malformed peer.forwarded.modified op: ${parsed.error.issues.map((i) => i.message).join("; ")}`));
+          return summary;
+        }
+        parsedOps.push(parsed.data as RequestModifiedEvent);
+      }
+      const policy = parsedOps.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const opsLabel = parsedOps.map((op) => `${op.op} ${op.path}`).join(", ");
+      const disallowed = parsedOps.filter((op) => {
+        if (op.declared_in !== policy.id) return true;
+        const rule = rewriteRuleFor(policy, "open_ai_responses", { op: op.op, path: op.path });
+        return rule === undefined || op.value_sha256 !== undefined || !ruleAllowsValue(rule, op.value);
+      });
+      if (disallowed.length > 0) {
+        checks.push(fail(`${id}:entry_rewrite`, `the entry's declared op(s) on the expanded hop body (${opsLabel}) are not allowed by ${policy.id}`));
+        return summary;
+      }
+      if (options.expandedBody !== undefined) {
+        const replayed = replayForwarded(options.expandedBody, "open_ai_responses", parsedOps, [], policy);
+        if (replayed === null) {
+          checks.push(fail(`${id}:entry_rewrite`, `the entry's declared op(s) on the expanded hop body (${opsLabel}) do not replay on the expanded body`));
+          return summary;
+        }
+        expandedHopBody = replayed;
+        checks.push(pass(`${id}:entry_rewrite`, `the entry sent the zero-retention expanded body with ${opsLabel}: ${bodyHash(replayed)}`));
+      } else {
+        checks.push(pass(`${id}:entry_rewrite`, `the entry declared ${opsLabel} on the zero-retention expanded body (${outerExpanded.expanded_body_sha256})`));
+      }
+      validatedEntryModified = parsedOps;
+    }
+  } else if (attempt.modified !== null) {
     const protocol = protocolForEndpoint(String(get(options.outer, "endpoint")));
     const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.receivedBody, protocol, attempt.modified as unknown as readonly RequestModifiedEvent[]) : null;
     const ops = attempt.modified.map((op) => `${String(get(op, "op"))} ${String(get(op, "path"))}`).join(", ");
@@ -375,21 +450,40 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
     hopBody = replayed;
   }
 
-  // 4. The inner receipt under the attested stack keyset (with the relay's changes per attempt).
+  // 4. The inner receipt under the attested stack keyset (with the relay's changes per attempt, and the
+  // customer's response bytes for the attempt that served the answer).
   const keysetValue = reportKeysetValue(served.report);
   const sealed = keysetValue === undefined ? null : adoptKeyset(keysetValue);
   if (sealed === null || sealed.digest !== v.keysetDigest) {
     checks.push(fail(`${id}:inner_keyset`, "the stack VM's report carries no keyset that hashes to its verified digest"));
     return summary;
   }
+  const outerEvents = get(options.outer, "event_log") as readonly Json[];
+  const outerReturned = findEvent(outerEvents, EVENT_RESPONSE_RETURNED);
+  const servedAttempt = get(outerReturned, "served_attempt") === attempt.n;
   const inner = await verifyResponseReceipt(receipt, {
-    receivedBody: hopBody,
+    receivedBody: outerExpanded !== null && expandedHopBody !== undefined ? expandedHopBody : hopBody,
     templates: options.templates,
     keyset: sealed,
     expectedKeysetDigest: v.keysetDigest,
     expectedRelayImage: relayImage,
+    ...(outerExpanded === null
+      ? {}
+      : {
+          ...(options.expandedBody === undefined ? {} : { expandedBody: options.expandedBody }),
+          outerContinuationExpanded: {
+            expandedBodySha256: outerExpanded.expanded_body_sha256,
+            ...(validatedEntryModified === undefined ? {} : { modified: validatedEntryModified }),
+          },
+        }),
+    ...(servedAttempt && options.responseBytes !== undefined
+      ? { responseBytes: options.responseBytes, allowKeepAliveComments: true }
+      : {}),
   });
-  // The response bytes are compared with the outer receipt's (L6) below, not with the customer's bytes.
+  // For the served attempt with responseBytes, stackChecks emits response_events_sha256 / response_body_sha256
+  // and response_served_attempt (including undoing declared rewrites) against the customer's bytes; without
+  // responseBytes (or for non-served attempts), suppress the inner response_stack_digest skip because step 6
+  // compares outer and inner digests directly.
   for (const check of inner.checks) if (check.id !== "response_stack_digest") checks.push({ ...check, id: `${id}:${check.id}` });
   summary.stack = inner.stack;
   const document = inner.receiptId === null ? null : receipt;
@@ -412,18 +506,60 @@ async function checkPeer(attempt: OuterPeerAttempt, answer: PeerAnswer, options:
   }
 
   // 6. The same request in, and for the served attempt the same answer out (L6).
-  const outerEvents = get(options.outer, "event_log") as readonly Json[];
   const outerReceived = get(findEvent(outerEvents, EVENT_REQUEST_RECEIVED), "body_hash");
   const innerReceived = get(findEvent(events, EVENT_REQUEST_RECEIVED), "body_hash");
-  if (attempt.modified !== null) {
+  if (outerExpanded !== null) {
+    if (attempt.modified === null) {
+      if (innerReceived === outerExpanded.expanded_body_sha256) {
+        checks.push(
+          pass(
+            `${id}:request_received`,
+            `the stack VM received the entry's zero-retention continuation expanded body (${outerExpanded.expanded_body_sha256})`,
+          ),
+        );
+      } else {
+        checks.push(
+          fail(
+            `${id}:request_received`,
+            `the outer request.continuation_expanded.expanded_body_sha256 is ${outerExpanded.expanded_body_sha256}, the inner request.received ${String(innerReceived)}`,
+          ),
+        );
+      }
+    } else if (expandedHopBody !== undefined) {
+      const sent = bodyHash(expandedHopBody);
+      if (innerReceived === sent) {
+        checks.push(
+          pass(
+            `${id}:request_received`,
+            `the stack VM received the zero-retention expanded body with declared entry op(s) (${sent})`,
+          ),
+        );
+      } else {
+        checks.push(
+          fail(
+            `${id}:request_received`,
+            `the expanded body with declared entry op(s) is ${sent}, the inner request.received ${String(innerReceived)}`,
+          ),
+        );
+      }
+    } else if (typeof innerReceived === "string" && isDigestField(innerReceived)) {
+      checks.push(
+        pass(
+          `${id}:request_received`,
+          `the stack VM received ${innerReceived} after zero-retention continuation expansion (${outerExpanded.expanded_body_sha256}) and ${attempt.modified.length} declared entry op(s)`,
+        ),
+      );
+    } else {
+      checks.push(fail(`${id}:request_received`, `the inner request.received is missing or malformed (${String(innerReceived)})`));
+    }
+  } else if (attempt.modified !== null) {
     // The outer receipt's own request.received is the customer's bytes (checked against them with the outer receipt).
     const sent = bodyHash(hopBody);
     if (innerReceived === sent) checks.push(pass(`${id}:request_received`, `the stack VM received the bytes the entry sent (${sent}): the entry's received ${String(outerReceived)} with its declared op(s)`));
     else checks.push(fail(`${id}:request_received`, `the entry's received ${String(outerReceived)} with its declared op(s) is ${sent}, the inner request.received ${String(innerReceived)}`));
   } else if (outerReceived === innerReceived) checks.push(pass(`${id}:request_received`, `the stack VM received the bytes the entry received (${String(outerReceived)})`));
   else checks.push(fail(`${id}:request_received`, `the outer request.received is ${String(outerReceived)}, the inner ${String(innerReceived)}`));
-  const outerReturned = findEvent(outerEvents, EVENT_RESPONSE_RETURNED);
-  if (get(outerReturned, "served_attempt") === attempt.n) {
+  if (servedAttempt) {
     const innerReturned = findEvent(events, EVENT_RESPONSE_RETURNED);
     const member = get(outerReturned, "events_sha256") !== undefined ? "events_sha256" : "body_sha256";
     const outerValue = get(outerReturned, member);

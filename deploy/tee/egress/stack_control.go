@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"io"
 	"net/http"
@@ -120,6 +122,7 @@ type wireAccount struct {
 	Vendor           *string         `json:"vendor"`
 	CredentialSHA256 *string         `json:"credential_sha256"`
 	CredentialType   *string         `json:"credential_type"`
+	CredentialGen    *uint64         `json:"credential_gen"`
 	Proxy            json.RawMessage `json:"proxy"`
 	ProxyID          *string         `json:"proxy_id"`
 }
@@ -132,7 +135,8 @@ var stackVendors = withCompat(map[string]string{
 }, false, func(v openAICompatibleVendor) string { return compatRouteName(v.id) })
 
 func (s *server) putAccounts(rec *responseRecorder, r *http.Request, entry *requestLog) {
-	body, readBytes, err := readRequestBody(r, s.cfg.maxBodyBytes)
+	body, readBytes, release, err := s.readRequestBody(r, s.cfg.maxBodyBytes)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		entry.Error = code
@@ -173,14 +177,10 @@ func (s *server) putAccounts(rec *responseRecorder, r *http.Request, entry *requ
 		ids[account.id] = true
 		accounts[*row.CredentialSHA256] = account
 	}
-	if !s.stack.setAccounts(version, push, accounts) {
+	if !s.stack.setAccounts(version, push, accounts, until, hasUntil) {
 		entry.Error = errStackAccountsStale
 		writeRefusal(rec, errStackAccountsStale)
 		return
-	}
-	// The table's lease end (stack_lease.go), with the table it came with; a stale table's is not taken.
-	if hasUntil {
-		s.stack.lease.setUntil(until)
 	}
 	rec.WriteHeader(http.StatusNoContent)
 }
@@ -217,6 +217,12 @@ func parseAccount(row wireAccount) (stackAccount, bool) {
 			return stackAccount{}, false
 		}
 		account.credentialType = *row.CredentialType
+	}
+	if row.CredentialGen != nil {
+		if *row.CredentialGen == 0 {
+			return stackAccount{}, false
+		}
+		account.credGen = *row.CredentialGen
 	}
 	if (row.Proxy == nil) != (row.ProxyID == nil) {
 		return stackAccount{}, false
@@ -259,6 +265,9 @@ type wireRegistration struct {
 	// Forwarded, optional (docs/design/relay-debug-sharing.md): true asks for each accepted call's body as the vendor
 	// got it, in a `forwarded` record after its `attempt` (stackRequest.recordForwarded); absent or false, none.
 	Forwarded *bool `json:"forwarded"`
+	// CountTokens, optional: true registers an Anthropic token-counting call (/anthropic/v1/messages/count_tokens),
+	// mutually exclusive with generation calls on /anthropic/v1/messages.
+	CountTokens bool `json:"count_tokens,omitempty"`
 }
 
 func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, entry *requestLog) {
@@ -267,7 +276,8 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 		writeRefusal(rec, code)
 	}
 	limit := int64(base64.StdEncoding.EncodedLen(int(s.cfg.maxBodyBytes))) + stackRegistrationSlack
-	body, readBytes, err := readRequestBody(r, limit)
+	body, readBytes, release, err := s.readRequestBody(r, limit)
+	defer release()
 	entry.RequestBytes = readBytes
 	if code := bodyReadCode(err); code != "" {
 		refuse(code)
@@ -289,6 +299,10 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 	protocol, vendor := *wire.Protocol, *wire.Vendor
 	if _, routed := stackProtocolRoutes[protocol][vendor]; !routed || string(wire.Rewrite) == "null" || *wire.AttemptsMax < 1 ||
 		!validQueryText(*wire.Query) || !validClientHeaders(protocol, *wire.Headers) {
+		refuse(errStackControlInvalid)
+		return
+	}
+	if wire.CountTokens && (protocol != protocolAnthropicMessages || vendor != "anthropic" || !countTokensRewriteValid(wire.Rewrite)) {
 		refuse(errStackControlInvalid)
 		return
 	}
@@ -327,12 +341,35 @@ func (s *server) putRequest(rec *responseRecorder, r *http.Request, rid string, 
 		expiresAt:   expiresAt,
 		size:        size,
 		forwarded:   wire.Forwarded != nil && *wire.Forwarded,
+		countTokens: wire.CountTokens,
 	})
 	if code != "" {
 		refuse(code)
 		return
 	}
 	rec.WriteHeader(http.StatusNoContent)
+}
+
+// countTokensRewriteValid enforces that a count_tokens registration carries no output cap and no non-empty set
+// list: token counting has no generation cap and no forced stream/store fields.
+func countTokensRewriteValid(rewrite json.RawMessage) bool {
+	if checkStrictJSON(rewrite) != nil {
+		return false
+	}
+	root, ok := objectOf(jsontext.Value(bytes.TrimSpace(rewrite)))
+	if !ok {
+		return false
+	}
+	if _, hasCap := root.members["cap"]; hasCap {
+		return false
+	}
+	if setVal, hasSet := root.members["set"]; hasSet {
+		entries, ok := elementsOf(setVal)
+		if !ok || len(entries) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // rewriteModel is a RewriteSpec's upstream model, `model.to` (S18), when it is one an entry can be scoped to;

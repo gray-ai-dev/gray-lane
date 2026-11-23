@@ -21,7 +21,7 @@ import { type GatewayConfig, LOCATION_HINTS, type LocationHint, SETTINGS, durabl
 import { ApiError } from "@gray/errors";
 import { type Json, parseSerdeBytes } from "@gray/json";
 import type { Protocol } from "@gray/protocol";
-import { type Reference, ResponseTap, continuationReferences, replyReferences } from "./references.ts";
+import { type Reference, type ReferenceKind, ResponseTap, continuationReferences, replyReferences } from "./references.ts";
 import type { BindAnswer, BindInput, LookupAnswer, LookupInput } from "./store.ts";
 
 const bucketsRow = SETTINGS.find((row) => row.name === "CONTINUATION_BUCKETS");
@@ -119,8 +119,26 @@ function within<T>(promise: Promise<T>, ms: number, timers?: CallTimers): Promis
   });
 }
 
+/** Bounded concurrency for multi-reference pin/bind batches (item_reference lists up to 256). */
+const REFERENCE_BATCH_CONCURRENCY = 16;
+
+async function mapConcurrent<T, U>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<U>): Promise<U[]> {
+  if (items.length <= limit) return Promise.all(items.map(fn));
+  const out = new Array<U>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      out[index] = await fn(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: limit }, worker));
+  return out;
+}
+
 type Resolution =
-  | { readonly kind: "found"; readonly endpoint: string; readonly model: string; readonly createdAt: number }
+  | { readonly kind: "found"; readonly endpoint: string; readonly model: string; readonly createdAt: number; readonly sealed?: string }
   | { readonly kind: "missing" }
   /** `unanswered`: the stores with no answer within the deadline. */
   | { readonly kind: "unavailable"; readonly unanswered: readonly ContinuationAddress[] };
@@ -137,7 +155,10 @@ async function ask(locate: ContinuationLocator, address: ContinuationAddress, re
       const answer = await within(locate(address).lookup({ kind: ref.kind, reference: ref.reference }), deadline - clock(), timers);
       // A refused lookup is a bug in this code, not an answer: it counts as no answer.
       if (!answer.ok) return { kind: "unavailable", unanswered: [address] };
-      return answer.found ? { kind: "found", endpoint: answer.endpoint, model: answer.model, createdAt: answer.createdAt } : { kind: "missing" };
+      if (!answer.found) return { kind: "missing" };
+      return answer.sealed === undefined
+        ? { kind: "found", endpoint: answer.endpoint, model: answer.model, createdAt: answer.createdAt }
+        : { kind: "found", endpoint: answer.endpoint, model: answer.model, createdAt: answer.createdAt, sealed: answer.sealed };
     } catch (error) {
       if (tries > 0 || !durableObjectReset(error) || deadline - clock() <= 0) return { kind: "unavailable", unanswered: [address] };
     }
@@ -198,7 +219,14 @@ async function resolve(o: PinOptions, ref: Reference): Promise<Resolution> {
  */
 function copyHere(o: PinOptions, here: ContinuationAddress, ref: Reference, found: Extract<Resolution, { kind: "found" }>): void {
   if (o.background === undefined) return;
-  const copy = { kind: ref.kind, reference: ref.reference, endpoint: found.endpoint, model: found.model, createdAt: found.createdAt };
+  const copy: BindInput = {
+    kind: ref.kind,
+    reference: ref.reference,
+    endpoint: found.endpoint,
+    model: found.model,
+    createdAt: found.createdAt,
+    ...(found.sealed === undefined ? {} : { sealed: found.sealed }),
+  };
   o.background(within(o.locate(here).bind(copy), o.timing.timeoutMs, o.timing.timers).then(
     (answer) => answer.ok,
     () => false,
@@ -237,13 +265,22 @@ export interface PinOptions {
   readonly background?: (work: Promise<unknown>) => void;
 }
 
+/** One reference's live encrypted zero-retention continuation state returned by a pin lookup. */
+export interface SealedContinuationHit {
+  readonly kind: ReferenceKind;
+  readonly reference: string;
+  readonly sealed: string;
+}
+
 /**
  * `unanswered` names the stores that gave no answer within the deadline when the error is 503
  * `continuation_lookup_unavailable`, and is empty for every other error. A lookup that misses asks
  * every region, so one slow region turns every unknown reference into a 503 everywhere: the gateway
  * counts these per region (the store's `region`) so operators see which one.
  */
-export type PinResult = { readonly ok: true; readonly pinned: string | null } | { readonly ok: false; readonly error: ApiError; readonly unanswered: readonly ContinuationAddress[] };
+export type PinResult =
+  | { readonly ok: true; readonly pinned: string | null; readonly sealed?: readonly SealedContinuationHit[] }
+  | { readonly ok: false; readonly error: ApiError; readonly unanswered: readonly ContinuationAddress[] };
 
 /**
  * The endpoint that created the response or conversation a Responses request continues (`restrict`
@@ -262,17 +299,22 @@ export async function pinContinuation(o: PinOptions & { readonly protocol: Proto
 /**
  * `pinContinuation` for references already read: the endpoint they are all bound to, null for none. The lane bridge
  * calls it with the references a lane entry hashed (`hashedReference`), so the stores it asks never hold an id.
+ * When any matched reference carries live sealed zero-retention state, `sealed` lists each hit in `refs` order.
  */
 export async function pinReferences(o: PinOptions, refs: readonly Reference[]): Promise<PinResult> {
-  const answers = await Promise.all(refs.map((ref) => resolve(o, ref)));
+  const answers = await mapConcurrent(refs, REFERENCE_BATCH_CONCURRENCY, (ref) => resolve(o, ref));
   let pinned: string | null = null;
-  for (const answer of answers) {
+  const sealed: SealedContinuationHit[] = [];
+  for (let i = 0; i < answers.length; i++) {
+    const answer = answers[i]!;
+    const ref = refs[i]!;
     if (answer.kind === "unavailable") return { ok: false, error: CONTINUATION_ERRORS.lookupUnavailable(), unanswered: answer.unanswered };
     if (answer.kind === "missing") return { ok: false, error: CONTINUATION_ERRORS.notFound(), unanswered: [] };
     if (pinned !== null && pinned !== answer.endpoint) return { ok: false, error: CONTINUATION_ERRORS.endpointConflict(), unanswered: [] };
     pinned = answer.endpoint;
+    if (answer.sealed !== undefined) sealed.push({ kind: ref.kind, reference: ref.reference, sealed: answer.sealed });
   }
-  return { ok: true, pinned };
+  return sealed.length === 0 ? { ok: true, pinned } : { ok: true, pinned, sealed };
 }
 
 /**
@@ -293,6 +335,14 @@ export interface BindOptions {
   /** The endpoint that served the reply. */
   readonly endpoint: string;
   readonly model: string;
+  /** Default TTL in milliseconds for any sealed state in this batch (overridden per reference if set). */
+  readonly stateTtlMs?: number;
+}
+
+/** One reference to bind, optionally carrying encrypted zero-retention continuation state. */
+export interface BindReference extends Reference {
+  readonly sealed?: string | null;
+  readonly stateTtlMs?: number;
 }
 
 /**
@@ -306,25 +356,28 @@ export async function bindContinuation(o: BindOptions & { readonly reply: Json }
 }
 
 /** `bindContinuation` for references already read (the lane bridge's, hashed by the lane entry that read the reply). */
-export async function bindReferences(o: BindOptions, refs: readonly Reference[]): Promise<{ readonly bound: number; readonly failed: number }> {
+export async function bindReferences(o: BindOptions, refs: readonly BindReference[]): Promise<{ readonly bound: number; readonly failed: number }> {
   // A deadline already spent (the gateway's request budget left none): nothing is asked, nothing bound.
   const timeoutMs = o.timing.timeoutMs;
   if (timeoutMs <= 0) return { bound: 0, failed: refs.length };
-  const results = await Promise.all(
-    refs.map(async (ref) => {
-      try {
-        const bucket = bucketOf(await referenceHash(ref), o.timing.buckets);
-        const answer = await within(
-          o.locate({ workspace: o.workspace, region: o.region, bucket }).bind({ kind: ref.kind, reference: ref.reference, endpoint: o.endpoint, model: o.model }),
-          timeoutMs,
-          o.timing.timers,
-        );
-        return answer.ok;
-      } catch {
-        return false;
-      }
-    }),
-  );
+  const results = await mapConcurrent(refs, REFERENCE_BATCH_CONCURRENCY, async (ref) => {
+    try {
+      const bucket = bucketOf(await referenceHash(ref), o.timing.buckets);
+      const stateTtlMs = ref.stateTtlMs ?? o.stateTtlMs;
+      const payload: BindInput = {
+        kind: ref.kind,
+        reference: ref.reference,
+        endpoint: o.endpoint,
+        model: o.model,
+        ...(ref.sealed === undefined || ref.sealed === null ? {} : { sealed: ref.sealed }),
+        ...(stateTtlMs === undefined ? {} : { stateTtlMs }),
+      };
+      const answer = await within(o.locate({ workspace: o.workspace, region: o.region, bucket }).bind(payload), timeoutMs, o.timing.timers);
+      return answer.ok;
+    } catch {
+      return false;
+    }
+  });
   const bound = results.filter(Boolean).length;
   return { bound, failed: results.length - bound };
 }

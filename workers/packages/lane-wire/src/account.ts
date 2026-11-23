@@ -10,6 +10,7 @@ import {
   type CountResult,
   type HoldToken,
   type PriorEnd,
+  type Region,
   type ReleaseInput,
   type ReleaseResult,
   type ScalarRecord,
@@ -221,6 +222,38 @@ export const releaseResultSchema = z.union([
 ]);
 
 export type ReleaseResultDto = z.infer<typeof releaseResultSchema>;
+
+/**
+ * `account.keyRevoked`: read-only revocation check against a workspace's account root (`AccountDO.keyRevoked`)
+ * while the snapshot is stale. `home` is mandatory so the bridge places the root stub with `{ locationHint: home }` (C51).
+ */
+export const keyRevokedInputSchema = z
+  .object({
+    workspace: id,
+    home: regionSchema,
+    key_id: id,
+  })
+  .strict();
+
+export type KeyRevokedInputDto = z.infer<typeof keyRevokedInputSchema>;
+
+export interface KeyRevokedInput {
+  readonly workspace: string;
+  readonly home: Region;
+  readonly keyId: string;
+}
+
+export const keyRevokedResultSchema = z
+  .object({
+    revoked: z.boolean(),
+  })
+  .strict();
+
+export type KeyRevokedResultDto = z.infer<typeof keyRevokedResultSchema>;
+
+export interface KeyRevokedResult {
+  readonly revoked: boolean;
+}
 
 // -------------------------------------------------------------------------------------------
 // DTO <-> the Durable Object's types. The only place a bigint and a JS number meet (ints.ts).
@@ -478,5 +511,21 @@ export function releaseResultOf(dto: ReleaseResultDto): ReleaseResult {
 export function releaseResultDtoOf(result: ReleaseResult): ReleaseResultDto {
   if (!result.ok) return { ok: false, code: result.code, message: result.message };
   return result.prior === undefined ? { ok: true, released: result.released } : { ok: true, released: result.released, prior: { outcome: result.prior.outcome, reason: result.prior.reason } };
+}
+
+export function keyRevokedInputOf(dto: KeyRevokedInputDto): KeyRevokedInput {
+  return { workspace: dto.workspace, home: dto.home as Region, keyId: dto.key_id };
+}
+
+export function keyRevokedInputDtoOf(input: KeyRevokedInput): KeyRevokedInputDto {
+  return { workspace: input.workspace, home: input.home, key_id: input.keyId };
+}
+
+export function keyRevokedResultOf(dto: KeyRevokedResultDto): KeyRevokedResult {
+  return { revoked: dto.revoked };
+}
+
+export function keyRevokedResultDtoOf(result: KeyRevokedResult): KeyRevokedResultDto {
+  return { revoked: result.revoked };
 }
 

@@ -22,6 +22,7 @@
       { "op": "remove_member", "path": "/user" },
       { "op": "remove_member", "path": "/safety_identifier" },
       { "op": "remove_member", "path": "/metadata" },
+      { "op": "set_member", "path": "/stream_options", "value": { "kind": "const", "value": { "include_usage": true } } },
       { "op": "insert_member", "path": "/stream_options", "value": { "kind": "const", "value": { "include_usage": true } } },
       { "op": "set_member", "path": "/stream_options/include_usage", "value": { "kind": "const", "value": true } },
       { "op": "insert_member", "path": "/stream_options/include_usage", "value": { "kind": "const", "value": true } },

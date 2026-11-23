@@ -301,18 +301,23 @@ export function stackRewriteSpec(input: {
   readonly appends: readonly StackRelayAppend[];
   /** False for a customer who chose relays that change nothing (routing preference `relay_changes: "exclude"`). */
   readonly relayChanges: boolean;
+  /** True for Anthropic `/v1/messages/count_tokens`: omits `cap` and `set`. */
+  readonly countTokens?: boolean;
 }): StackRewriteSpec {
   const { protocol } = input;
+  const count = input.countTokens === true;
   const set: { path: string; value: Json }[] = [];
-  // No OpenAI request is stored under a relay's account (docs/relay-request-changes.md P2), Codex's included (D129).
-  if ((protocol === "open_ai_chat" || protocol === "open_ai_responses") && stackStoreOff(input.route.vendor)) set.push({ path: "/store", value: false });
-  if (protocol === "open_ai_responses" && input.route.vendor === "chatgpt_codex") set.push({ path: "/stream", value: true });
-  if (protocol === "open_ai_chat" && input.stream) set.push({ path: "/stream_options/include_usage", value: true });
+  if (!count) {
+    // No OpenAI request is stored under a relay's account (docs/relay-request-changes.md P2), Codex's included (D129).
+    if ((protocol === "open_ai_chat" || protocol === "open_ai_responses") && stackStoreOff(input.route.vendor)) set.push({ path: "/store", value: false });
+    if (protocol === "open_ai_responses" && input.route.vendor === "chatgpt_codex") set.push({ path: "/stream", value: true });
+    if (protocol === "open_ai_chat" && input.stream) set.push({ path: "/stream_options/include_usage", value: true });
+  }
   const remove = GRAY_LANE_REWRITES_V1.protocols[protocol].filter((rule) => rule.op === "remove_member").map((rule) => rule.path);
   const append = input.appends.filter((entry) => isPositionForProtocol(protocol, entry.position));
   return {
     model: { to: input.upstreamModel },
-    ...(input.route.cap === null ? {} : { cap: { field: input.route.cap.field, max: input.route.cap.max } }),
+    ...(!count && input.route.cap !== null ? { cap: { field: input.route.cap.field, max: input.route.cap.max } } : {}),
     ...(set.length === 0 ? {} : { set }),
     ...(remove.length === 0 ? {} : { remove }),
     ...(append.length === 0 ? {} : { append }),
@@ -814,6 +819,8 @@ export interface StackCallInput {
    * backend's call, whose debug record the stack VM keeps. Absent: none, as before.
    */
   readonly captureForwarded?: boolean;
+  /** True for Anthropic `/v1/messages/count_tokens`: registers `count_tokens: true` and POSTs to `/v1/messages/count_tokens`. */
+  readonly countTokens?: boolean;
   readonly attemptsMax: number;
   /** The request's deadline, Unix seconds rounded up (S15: TTL = request deadline). */
   readonly expiresAt: number;
@@ -1070,6 +1077,7 @@ export class StackCall {
           attempts_max: input.attemptsMax,
           expires_at: input.expiresAt,
           ...(input.captureForwarded === true ? { forwarded: true } : {}),
+          ...(input.countTokens === true ? { count_tokens: true } : {}),
         }),
         signal: input.signal,
       });
@@ -1087,7 +1095,8 @@ export class StackCall {
       let response: Response | null = null;
       let stream: boolean;
       const stopQueueBound = this.#queueBound();
-      const path = `${STACK_RELAY_PATHS[input.protocol]}${input.query === "" ? "" : `?${input.query}`}`;
+      const basePath = input.countTokens === true ? "/v1/messages/count_tokens" : STACK_RELAY_PATHS[input.protocol];
+      const path = `${basePath}${input.query === "" ? "" : `?${input.query}`}`;
       try {
         this.#relayCalled = true;
         response = await input.relay(`${STACK_RELAY_ORIGIN}${path}`, { method: "POST", headers: input.headers, body: input.forwarded, signal: this.#relayAbort.signal, redirect: "manual" });
@@ -1117,6 +1126,10 @@ export class StackCall {
       // its body is no SSE the decoder takes, or its digest is not the feed's `body`.
       const decoded = stackDecodedBody(response!.body!, response!.headers.get("content-encoding"));
       if (stream) {
+        if (input.countTokens === true) {
+          await decoded.cancel().catch(() => {});
+          return { kind: "failed", outcome: await this.#failed({ by: "relay", why: "relay_stream_invalid" }) };
+        }
         this.streamed = true;
         return { kind: "answered", response: new Response(this.#verifiedStream(decoded), { status: 200, headers: { "content-type": "text/event-stream" } }) };
       }
@@ -1952,11 +1965,18 @@ export interface StackReturned {
  */
 export function addStackReceipt(
   builder: ReceiptBuilder,
-  input: { readonly receivedHash: string; readonly peerEntry?: Parameters<ReceiptBuilder["addPeerEntry"]>[0]; readonly calls: readonly StackCall[]; readonly returned: StackReturned },
+  input: {
+    readonly receivedHash: string;
+    readonly peerEntry?: Parameters<ReceiptBuilder["addPeerEntry"]>[0];
+    readonly continuationExpanded?: Parameters<ReceiptBuilder["addRequestContinuationExpanded"]>[0];
+    readonly calls: readonly StackCall[];
+    readonly returned: StackReturned;
+  },
 ): void {
   builder.addRequestReceivedHash(input.receivedHash);
   // Backend mode (docs/confidential-lane-stack-routing.md section 4.8): the entry this VM served the request for.
   if (input.peerEntry !== undefined) builder.addPeerEntry(input.peerEntry);
+  if (input.continuationExpanded !== undefined) builder.addRequestContinuationExpanded(input.continuationExpanded);
   const last = input.calls.at(-1);
   let n = 0n;
   let servedAttempt: bigint | null = null;

@@ -1,14 +1,16 @@
 import { type Json, toJsonString } from "@gray/json";
-import { type BodyLayout, type ClientBody, type Overlay, type Protocol, upstreamAuthHeaders, withDefaultAccept } from "@gray/protocol";
+import { passedClientHeaders } from "@gray/lane-wire";
+import { type BodyLayout, type ClientBody, type Overlay, type Protocol, credentialHeader, withDefaultAccept } from "@gray/protocol";
+import { EGRESS_HEADER } from "./lane/hooks.ts";
 import type { RouteRecord } from "./snapshot.ts";
 import { PlainCursor, SpoolBroken } from "./spool.ts";
 
 /**
  * The upstream request of one attempt (crates/gray-gateway/src/upstream.rs `request_overlaid`,
- * `authorize`, `native_headers`): Gray builds it itself and forwards none of the client's headers
- * but the protocol's own version and beta headers (docs/cloudflare-native.md section 7), and none
- * at all for a translated request; the client's key never leaves Gray; the body is the client's
- * bytes with the attempt's overlay spliced in (docs/cloudflare-native.md 2.3 rule 7).
+ * `authorize`, `client_headers`): Gray builds it itself and forwards only the client's allowlisted
+ * SDK and protocol headers (@gray/lane-wire `passedClientHeaders`), and none at all for a translated
+ * request; the client's key never leaves Gray; the body is the client's bytes with the attempt's
+ * overlay spliced in (docs/cloudflare-native.md 2.3 rule 7).
  *
  * A body is never copied whole to send it. Each attempt's body is a stream produced on demand,
  * pulled by the runtime as the upstream reads it, through a FixedLengthStream that carries its exact
@@ -30,19 +32,30 @@ export const UPSTREAM_BODY_CHUNK_BYTES = 4096;
 
 /**
  * The headers of one attempt at `route` under `protocol`; `client` the client's request headers, or
- * none for a translated request. With the Accept the server's HTTP client gives every request
- * (@gray/protocol `withDefaultAccept`), since none of the client's is forwarded.
+ * none for a translated request. Allowlisted client SDK headers pass bounded to 16 KiB, `content-type`
+ * and the route's provider credential always overwrite, Anthropic always carries a non-empty version
+ * (client's, else `ANTHROPIC_VERSION`), `x-gray-egress` is stripped, and blank/absent `accept` defaults
+ * to `@gray/protocol` `DEFAULT_ACCEPT`.
  *
  * A lane relay's route has no credential of this kind, and its auth headers come from the relay's
- * credential store, merged with the protocol's client headers by the lane's own builder (design v2
+ * credential store, merged with the client's headers by the lane's own builder (design v2
  * section C.6, M1). So this function refuses a lane route rather than send an account id or the
  * stored credential (the sentinel sealed as ciphertext, D107) as one: the main lane never has such
  * a route (it filters them out of its snapshot), and the lane never calls it.
  */
 export function upstreamHeaders(protocol: Protocol, route: RouteRecord, credential: string, client: Headers): Headers {
   if (route.auth === "lane_relay") throw new Error("a confidential-lane route's headers come from the relay's credential store");
-  const headers = new Headers({ "content-type": "application/json" });
-  for (const [name, value] of upstreamAuthHeaders(route.auth, protocol, credential, client)) headers.set(name, value);
+  const passed = passedClientHeaders(protocol, client);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(passed)) headers.set(name, value);
+  headers.set("content-type", "application/json");
+  const [credName, credValue] = credentialHeader(route.auth, protocol, credential);
+  headers.set(credName, credValue);
+  if (protocol === "anthropic_messages") {
+    const version = passed["anthropic-version"]?.trim() ?? "";
+    headers.set("anthropic-version", version !== "" ? passed["anthropic-version"]! : ANTHROPIC_VERSION);
+  }
+  headers.delete(EGRESS_HEADER);
   return withDefaultAccept(headers);
 }
 

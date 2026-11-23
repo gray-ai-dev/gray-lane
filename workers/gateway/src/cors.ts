@@ -9,10 +9,11 @@
 
 /** The methods the Media Playground calls with: a request, then the polls of a video job. */
 const METHODS = "GET, POST";
-/** The headers it sets beyond the CORS-safelisted ones: the key, the body's type, and the request's idempotency key. */
-const HEADERS = "authorization, content-type, idempotency-key";
-/** The answer headers it reads: the request's id, and when a key's limit opens again (frontend error-categories.ts). */
-export const EXPOSED = "x-request-id, x-gray-key-limit-reset";
+/** The headers browsers and SDKs send beyond the CORS-safelisted ones. */
+const HEADERS =
+  "authorization, content-type, idempotency-key, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-retry-count, x-stainless-runtime, x-stainless-runtime-version, x-stainless-timeout, x-goog-api-key, x-gray-routing";
+/** The answer headers it reads: the request's ids, and when a key's limit opens again (frontend error-categories.ts). */
+export const EXPOSED = "x-request-id, request-id, x-gray-key-limit-reset";
 /**
  * How long a browser may keep a preflight's answer: 2 hours, Chromium's cap (a longer value is cut to it; Firefox caps at
  * 24 hours), MDN Access-Control-Max-Age, read 2026-10-19.

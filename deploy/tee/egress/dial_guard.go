@@ -39,11 +39,28 @@ var internalPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	// Carrier-grade NAT (RFC 6598): a provider's internal network.
 	netip.MustParsePrefix("100.64.0.0/10"),
-	// The IPv4 limited broadcast.
+	// IANA special-purpose IPv4 ranges (RFC 6890, RFC 5737, RFC 2544, RFC 1112).
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	// The IPv4 limited broadcast (inside 240.0.0.0/4; kept explicit).
 	netip.MustParsePrefix("255.255.255.255/32"),
 	// The stack VM's own networks (compose.stack.yaml: front 10.231.12.0/24, relay_in 10.231.10.0/24, relay_out
 	// 10.231.11.0/24). Inside 10.0.0.0/8 (IsPrivate) already; named so that they stay refused whatever else changes.
 	netip.MustParsePrefix("10.231.0.0/16"),
+	// IANA special-purpose and IPv4/IPv6 transition ranges (NAT64 RFC 6052 & RFC 8215, discard RFC 6666,
+	// Teredo RFC 4380, benchmarking RFC 5180, documentation RFC 3849, 6to4 RFC 3056, deprecated site-local RFC 3879).
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fec0::/10"),
 }
 
 // dialAddressRefused reports whether egress refuses to dial addr for an account.

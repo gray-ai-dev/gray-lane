@@ -32,6 +32,7 @@ import { gatedStackConfig, gatedStackCredentials, KmsLeaseGate } from "./kms-lea
 import { StackConfigClient } from "./remote/stack.ts";
 import { guestGetKey, LaneVault, VAULT_PREV_DISK_URL, VAULT_RETRY_FIRST_MS, VAULT_RETRY_MAX_MS, vaultDiskClient, vaultKeys } from "./vault.ts";
 import { AFFINITY_KEY_PATH, affinityKeyFromMaterial } from "./affinity.ts";
+import { CONTINUATION_KEY_PATH, continuationKeyFromMaterial } from "./responses-continuation.ts";
 import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
 import { keepRequestAlive } from "./background.ts";
 import { bootDiskClient, LaneBootBox } from "./boot-intake.ts";
@@ -155,6 +156,13 @@ export interface LaneStateOptions {
    * Absent: a random key per boot (E3), as for local dev, the tests and the relay-stack layout.
    */
   readonly affinity?: LaneAffinitySettings;
+  /**
+   * Guest agent settings for deriving the per-app zero-retention continuation sealing key
+   * (`responses-continuation.ts`). Absent: a random 32-byte key per boot (or `continuationKey` in tests).
+   */
+  readonly continuation?: LaneAffinitySettings;
+  /** Test injection for a fixed 32-byte zero-retention continuation sealing key. */
+  readonly continuationKey?: Uint8Array;
 }
 
 /** ER7: the guest agent (`GUEST_AGENT`) the entry's affinity key comes from, its base URL and the bound on one call. */
@@ -234,6 +242,94 @@ export class LaneAffinityKey {
       this.#nextAt = this.#now() + wait;
       const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : error instanceof Error ? error.name : "error";
       this.#log({ level: "warn", event: "lane_affinity_key_failed", source: "boot", code, failures: this.#failures, retry_ms: wait });
+    } finally {
+      material?.fill(0);
+    }
+  }
+}
+
+/**
+ * Per-app AES-256-GCM sealing key for zero-retention Responses continuation state (`responses-continuation.ts`),
+ * mirroring `LaneAffinityKey`: derives from `GetKey("gray-lane/v1/responses-continuation")` via HKDF-SHA256 when a
+ * guest agent is present, retries on the vault schedule if boot-time `GetKey` fails, and falls back to 32 random
+ * bytes per boot (or a fixed test key) otherwise.
+ */
+export class LaneContinuationKey {
+  #key: Uint8Array;
+  #derived = false;
+  #failures = 0;
+  #nextAt = 0;
+  #deriving: Promise<void> | null = null;
+  readonly #settings: LaneAffinitySettings | null;
+  readonly #now: () => number;
+  readonly #log: (line: Record<string, unknown>) => void;
+
+  private constructor(
+    initialKey: Uint8Array,
+    settings: LaneAffinitySettings | null,
+    now: () => number,
+    log: (line: Record<string, unknown>) => void,
+    derived = false,
+  ) {
+    this.#key = initialKey;
+    this.#settings = settings;
+    this.#now = now;
+    this.#log = log;
+    this.#derived = derived;
+  }
+
+  /** Boot-time key derivation: fixed test key, app-derived key via guest agent, or 32 random bytes per boot. */
+  static async boot(options: {
+    readonly settings: LaneAffinitySettings | null;
+    readonly fixedKey?: Uint8Array;
+    readonly reason: string;
+    readonly now: () => number;
+    readonly log?: (line: Record<string, unknown>) => void;
+  }): Promise<LaneContinuationKey> {
+    const log = options.log ?? ((line) => console.log(JSON.stringify(line)));
+    if (options.fixedKey !== undefined) {
+      if (options.fixedKey.length !== 32) throw new Error("the continuation sealing key is 32 bytes");
+      return new LaneContinuationKey(options.fixedKey.slice(), null, options.now, log, true);
+    }
+    const holder = new LaneContinuationKey(randomBytes(32), options.settings, options.now, log);
+    if (options.settings === null) holder.#log({ level: "info", event: "lane_continuation_key", source: "boot", reason: options.reason });
+    else await holder.#derive();
+    return holder;
+  }
+
+  /** The 32-byte AES-256-GCM sealing key. Never logged. */
+  get key(): Uint8Array {
+    return this.#key;
+  }
+
+  /** `app` once derived from the app's KMS key (or fixed in a test), `boot` while random. */
+  get source(): "app" | "boot" {
+    return this.#derived ? "app" : "boot";
+  }
+
+  /** Retries `GetKey` behind requests when the boot fell back to a random key and the retry backoff has elapsed. */
+  async tick(): Promise<void> {
+    if (this.#derived || this.#settings === null || this.#now() < this.#nextAt) return;
+    this.#deriving ??= this.#derive().finally(() => {
+      this.#deriving = null;
+    });
+    await this.#deriving;
+  }
+
+  async #derive(): Promise<void> {
+    const settings = this.#settings as LaneAffinitySettings;
+    let material: Uint8Array | null = null;
+    try {
+      material = await guestGetKey({ guest: settings.guest, guestUrl: settings.guestUrl, timeoutMs: settings.guestTimeoutMs }, CONTINUATION_KEY_PATH);
+      this.#key = await continuationKeyFromMaterial(material);
+      this.#derived = true;
+      this.#log({ level: "info", event: "lane_continuation_key", source: "app", failures: this.#failures });
+    } catch (error) {
+      this.#failures += 1;
+      const wait = Math.min(VAULT_RETRY_FIRST_MS * 2 ** Math.min(this.#failures - 1, 10), VAULT_RETRY_MAX_MS);
+      this.#nextAt = this.#now() + wait;
+      const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : error instanceof Error ? error.name : "error";
+      this.#log({ level: "warn", event: "lane_continuation_key_failed", source: "boot", code, failures: this.#failures, retry_ms: wait });
     } finally {
       material?.fill(0);
     }
@@ -453,6 +549,8 @@ export interface LaneProcessState extends LaneState {
   readonly instanceRole: LaneInstanceRole | null;
   /** ER7: where `affinityKey` comes from, and the retry of a `GetKey` that failed (`tick`, behind requests). */
   readonly affinity: LaneAffinityKey;
+  /** Where `continuationKey` comes from, and the retry of a boot-time `GetKey` that failed (`tick`, behind requests). */
+  readonly continuation: LaneContinuationKey;
 }
 
 /** A boot's TLS identity: its one SPKI, the name it is scoped to, and an entry replica's own name beside it. */
@@ -516,6 +614,12 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   // comes from the app's KMS key through the guest agent (one bounded GetKey); otherwise E3's 32 random bytes.
   const affinity = await LaneAffinityKey.boot({
     settings: options.affinity ?? null,
+    reason: options.stack === undefined ? "no_guest_agent" : "stack_layout",
+    now: options.now ?? (() => Date.now()),
+  });
+  const continuation = await LaneContinuationKey.boot({
+    settings: options.continuation ?? null,
+    ...(options.continuationKey === undefined ? {} : { fixedKey: options.continuationKey }),
     reason: options.stack === undefined ? "no_guest_agent" : "stack_layout",
     now: options.now ?? (() => Date.now()),
   });
@@ -743,6 +847,10 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
       return affinity.key;
     },
     affinity,
+    get continuationKey() {
+      return continuation.key;
+    },
+    continuation,
     receiptKeyId,
     keysetDigest: keyset.digest,
     relays: registry,

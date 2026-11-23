@@ -675,6 +675,18 @@ func (c *stackChecker) nestedRules(path string, children map[string]stackPathRul
 		}
 		return firstDifference(path, received, forwarded)
 	case !receivedIsObject:
+		// A null parent replaced by the object of its set children (Chat's nullable stream_options).
+		if missing != "" && canonicalText(received) == "null" {
+			inserted := map[string]jsontext.Value{}
+			for _, name := range setNames {
+				inserted[name] = children[name].value
+			}
+			expected := canonicalObject(setNames, inserted)
+			if canonicalText(forwarded) != string(expected) {
+				return path
+			}
+			return c.modify("set_member", path, expected)
+		}
 		// No published op changes the parent's type.
 		return path
 	}

@@ -10,7 +10,7 @@ import { lookUpKey } from "../key-lookup.ts";
 import { countKeyRate } from "../key-rate.ts";
 import { Outbound } from "../outbound.ts";
 import type { GatewaySnapshot, RouteRecord } from "../snapshot.ts";
-import { bodyHashOf, egressSidecarFailure, laneUpstreamOf, receiptDraft, responseHash, type ResponseHash } from "./hooks.ts";
+import { bodyHashOf, egressOwnAnswer, egressSentNothing, laneUpstreamOf, receiptDraft, responseHash, type ResponseHash } from "./hooks.ts";
 import { signEntryReceipt } from "./standard-api.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 import { type VideoJobIo, advanceVideoJob, pollVideoJob, readWhole, videoJobHeaders, videoJobIo, videoJobRoute, videoJobTerminal, videoJobUrl, videoJobVisible } from "./video-jobs.ts";
@@ -207,25 +207,26 @@ async function serve(o: EntryVideoRequest, run: VideoRouteRun): Promise<Response
       waitMs: cfg.accountAdmitAttemptMs,
       clock,
       ...(deps.admissionTimers === undefined ? {} : { timers: deps.admissionTimers }),
+      lane: true,
     });
     if (over !== null) throw over;
   }
   const presented = presentedKey(request.headers);
   const owner = presented instanceof ApiError ? "" : await keyHash(presented.token);
-  return route.kind === "get" ? retrieve(io, run, snapshot, job, owner) : content(o, io, run, snapshot, job, owner, variant);
+  return route.kind === "get" ? retrieve(io, run, snapshot, job, owner, request.headers) : content(o, io, run, snapshot, job, owner, variant);
 }
 
 /** One poll of the provider for a client's read: the observation applied, and the request's receipt begun when the provider answered. */
-async function polled(io: VideoJobIo, run: VideoRouteRun, snapshot: GatewaySnapshot, job: LaneVideoJob, owner: string): Promise<{ readonly job: LaneVideoJob; readonly observed: Awaited<ReturnType<typeof pollVideoJob>> }> {
+async function polled(io: VideoJobIo, run: VideoRouteRun, snapshot: GatewaySnapshot, job: LaneVideoJob, owner: string, client: Headers): Promise<{ readonly job: LaneVideoJob; readonly observed: Awaited<ReturnType<typeof pollVideoJob>> }> {
   const route = videoJobRoute(snapshot, job);
-  const observed = await pollVideoJob(io, route, job);
+  const observed = await pollVideoJob(io, route, job, undefined, client);
   if (route !== undefined && (observed.kind !== "unknown" || observed.why === "status" || observed.why === "unreadable" || observed.why === "other_job")) run.forwarded(route, job, owner);
   return { job: await advanceVideoJob(io, job, observed, false), observed };
 }
 
-async function retrieve(io: VideoJobIo, run: VideoRouteRun, snapshot: GatewaySnapshot, job: LaneVideoJob, owner: string): Promise<Response> {
+async function retrieve(io: VideoJobIo, run: VideoRouteRun, snapshot: GatewaySnapshot, job: LaneVideoJob, owner: string, client: Headers): Promise<Response> {
   if (videoJobRoute(snapshot, job) === undefined) throw sourceUnavailable();
-  const after = await polled(io, run, snapshot, job, owner);
+  const after = await polled(io, run, snapshot, job, owner, client);
   const observed = after.observed;
   if (observed.kind !== "object") {
     // No object of this job to hand on: the provider answered something else, or could not be asked.
@@ -239,7 +240,7 @@ async function content(o: EntryVideoRequest, io: VideoJobIo, run: VideoRouteRun,
   let job = found;
   // A job whose state or hold is still open is polled once: a finished job is settled by it.
   if (!videoJobClosed(job) && !(job.state === "failed" && job.billing === "pending")) {
-    job = (await polled(io, run, snapshot, job, owner)).job;
+    job = (await polled(io, run, snapshot, job, owner, o.request.headers)).job;
   } else if (!videoJobClosed(job)) {
     job = await advanceVideoJob(io, job, { kind: "unknown", why: "route" }, false);
   }
@@ -265,17 +266,18 @@ async function content(o: EntryVideoRequest, io: VideoJobIo, run: VideoRouteRun,
   const timer = setTimeout(() => controller.abort("video_content_headers_timeout"), limits.headersMs);
   let upstream: Response;
   try {
-    upstream = await io.fetchFor(route)(address.toString(), { method: "GET", headers: videoJobHeaders(credential), signal: controller.signal, redirect: "manual" });
+    upstream = await io.fetchFor(route)(address.toString(), { method: "GET", headers: videoJobHeaders(credential, o.request.headers), signal: controller.signal, redirect: "manual" });
   } catch {
     throw new ApiError(502, "upstream_content_unavailable");
   } finally {
     clearTimeout(timer);
   }
   if (upstream.status < 200 || upstream.status > 299) {
-    // Not the video: an error, or a redirect, which Gray does not follow (the standard's clause 11.11). egress's own
-    // 502 from before it reached the provider sent the provider nothing.
+    // Not the video: an error, or a redirect, which Gray does not follow (the standard's clause 11.11). An answer egress
+    // gave itself (its mark) from before it reached the provider sent the provider nothing.
     const head = await readWhole(upstream, CONTENT_ERROR_BYTES, io.clock() + limits.idleMs, io.clock);
-    if (head === null || !egressSidecarFailure(upstream.status, head)) run.forwarded(route, job, owner);
+    const own = head === null ? null : egressOwnAnswer(upstream.headers, head);
+    if (own === null || !egressSentNothing(own)) run.forwarded(route, job, owner);
     throw new ApiError(502, "upstream_content_unavailable");
   }
   run.forwarded(route, job, owner);

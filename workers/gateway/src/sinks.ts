@@ -281,6 +281,14 @@ export interface AttemptRecord {
    * `Attempt::measures`; absent for an attempt that had no release.
    */
   readonly measures?: AttemptMeasures;
+  /**
+   * The confidential entry's attempts only: whether the attempt failed on its provider's answer, true exactly where a
+   * gateway that keeps traffic evidence notes `provider_failure` for it (traffic-evidence.ts `ProviderFailures`), false
+   * on every other attempt the entry records. The one yes/no the product owner let leave the TEE for it on 2026-11-23,
+   * which gray-jobs turns into that evidence (docs/design/one-address.md "Provider defects at the entry"). The index
+   * row's alone (`routeAttempts`); absent off the lane, whose evidence says it.
+   */
+  readonly providerFailure?: boolean;
 }
 
 /**
@@ -726,8 +734,9 @@ export function routeActivity(r: Pick<RequestRecord, "attempts" | "model" | "pro
  * Each attempt the request sent to a route, in order (r14, docs/error-rates.md "How it is recorded"): the route as
  * `routeActivity` keys it, the same attempts left out (what the server records `rejected`, a recovery probe never
  * dispatched, one without a model or a protocol), whether it served the answer, the class of its failure, its two
- * answer checks (null where not counted) and its measures (r15, docs/live-speed.md: its record's `measures`, absent
- * where it has none); past MAX_ROW_ATTEMPTS the latest. The server derives the same list (request_log/record.rs).
+ * answer checks (null where not counted), its measures (r15, docs/live-speed.md: its record's `measures`, absent
+ * where it has none) and, on the confidential entry, whether it failed on its provider's answer (`providerFailure`);
+ * past MAX_ROW_ATTEMPTS the latest. The server derives the same list (request_log/record.rs), without the last.
  */
 export function routeAttempts(r: Pick<RequestRecord, "attempts" | "model" | "protocol" | "upstreamProtocol">): RouteAttempt[] {
   const out: RouteAttempt[] = [];
@@ -737,7 +746,17 @@ export function routeAttempts(r: Pick<RequestRecord, "attempts" | "model" | "pro
     if (model === null) continue;
     const protocol = a.protocol ?? r.upstreamProtocol ?? r.protocol;
     if (protocol === null) continue;
-    out.push({ endpointId: a.endpointId, model, protocol, served: a.outcome === "success", retryClass: a.retryClass ?? null, toolCallCheck: a.toolCallCheck ?? null, outputCheck: a.outputCheck ?? null, ...a.measures });
+    out.push({
+      endpointId: a.endpointId,
+      model,
+      protocol,
+      served: a.outcome === "success",
+      retryClass: a.retryClass ?? null,
+      toolCallCheck: a.toolCallCheck ?? null,
+      outputCheck: a.outputCheck ?? null,
+      ...a.measures,
+      ...(a.providerFailure === undefined ? {} : { providerFailure: a.providerFailure }),
+    });
   }
   return out.slice(-MAX_ROW_ATTEMPTS);
 }

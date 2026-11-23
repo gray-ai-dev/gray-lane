@@ -112,7 +112,8 @@ func (r coolingWindowRule) covers(w stackWindow) bool {
 type coolingKey struct{ account, model string }
 
 // coolingEntry is S38's entry. untilMS is unix ms for a cool and unused for a hold; credHash is the
-// credential_sha256 the answer that set it came with ("" when unknown, as for a restored entry).
+// credential_sha256 the answer that set it came with ("" when unknown, as for a restored entry); credGen is the
+// TEE-owned credential generation when clears.credential is true (0 when legacy/absent or non-credential).
 type coolingEntry struct {
 	account    string
 	model      string
@@ -126,6 +127,7 @@ type coolingEntry struct {
 	observed   bool
 	clears     coolingClears
 	credHash   string
+	credGen    uint64
 }
 
 func (e *coolingEntry) ended(nowMS int64) bool { return e.kind == coolingCool && e.untilMS <= nowMS }
@@ -157,6 +159,7 @@ type stackObservation struct {
 	vendor         string
 	credentialType string
 	credHash       string
+	credGen        uint64
 	model          string
 	status         int
 	// answer is the classification of a status of 400 or more, and statedAt/stated its vendor-stated end.
@@ -171,7 +174,7 @@ type stackObservation struct {
 // newObservation reads one answer: its windows always, its classification and stated end when it is not 2xx.
 func newObservation(account stackAccount, credHash, model, routeName string, status int, header http.Header, body []byte, complete bool, now time.Time) stackObservation {
 	o := stackObservation{account: account.id, vendor: account.vendor, credentialType: account.credentialType, credHash: credHash,
-		model: model, status: status, windows: parseStackWindows(routeName, header, now)}
+		credGen: account.credGen, model: model, status: status, windows: parseStackWindows(routeName, header, now)}
 	if status < 200 || status > 299 {
 		o.answer = classifyStackAnswer(status, header, body, complete, o.windows)
 		o.statedAt, o.stated = stackStatedEnd(o.answer.vendorCode, o.windows, o.answer.fields, header, now)
@@ -180,11 +183,11 @@ func newObservation(account stackAccount, credHash, model, routeName string, sta
 	return o
 }
 
-// coolEnd is a cool rule's end: the stated end bounded by max_seconds for `stated` (seconds when none is stated),
-// now + seconds for `fixed`.
+// coolEnd is a cool rule's end: the stated end clamped to [stackCoolingSecondsMin, max_seconds] for `stated`
+// (seconds when none is stated), now + seconds for `fixed`.
 func (r coolingRule) coolEnd(o stackObservation, nowMS int64) int64 {
 	if r.until == "stated" && o.stated {
-		return min(o.statedAt.UnixMilli(), nowMS+r.maxSeconds*1000)
+		return min(max(o.statedAt.UnixMilli(), nowMS+int64(stackCoolingSecondsMin)*1000), nowMS+r.maxSeconds*1000)
 	}
 	return nowMS + r.seconds*1000
 }
@@ -251,12 +254,30 @@ func (h *stackHealth) makeEntryLocked(e *coolingEntry, o stackObservation, scope
 		}
 		e.model = o.model
 	}
-	if e.clears.credential && o.credHash != "" {
-		for _, hash := range h.tableHashes[o.account] {
-			if hash != o.credHash {
-				return false
+	if e.clears.credential {
+		if o.credGen > 0 {
+			for _, gen := range h.tableCredGens[o.account] {
+				if gen != o.credGen {
+					return false
+				}
+			}
+			e.credGen = o.credGen
+		} else if o.credHash != "" {
+			hashes := h.tableHashes[o.account]
+			gens := h.tableCredGens[o.account]
+			if len(hashes) == 1 && hashes[0] == o.credHash && len(gens) == 1 {
+				e.credGen = gens[0]
 			}
 		}
+		if o.credHash != "" {
+			for _, hash := range h.tableHashes[o.account] {
+				if hash != o.credHash {
+					return false
+				}
+			}
+		}
+	} else {
+		e.credGen = 0
 	}
 	e.gen = h.gens[o.account]
 	e.observed = h.mode == coolingObserve
@@ -278,14 +299,52 @@ func (h *stackHealth) setEntryLocked(e *coolingEntry, nowMS int64) (full bool) {
 		if h.modelEntries >= stackCoolingModelMax || h.modelPerAccount[e.account] >= stackCoolingAccountMax-1 {
 			h.sweepLocked(nowMS)
 		}
-		if h.modelEntries >= stackCoolingModelMax || h.modelPerAccount[e.account] >= stackCoolingAccountMax-1 {
-			return true
+		if h.modelPerAccount[e.account] >= stackCoolingAccountMax-1 {
+			if !h.evictCoolModelLocked(e.account, e) {
+				return true
+			}
+		}
+		if h.modelEntries >= stackCoolingModelMax {
+			if !h.evictCoolModelLocked("", e) {
+				return true
+			}
 		}
 		h.modelEntries++
 		h.modelPerAccount[e.account]++
 	}
 	h.entries[key] = e
 	return false
+}
+
+// evictCoolModelLocked evicts the soonest-expiring model-scope `cool` entry (smallest untilMS, oldest
+// setMS tiebreak) to make room for incoming. When account is non-empty, only entries of that account are
+// considered; otherwise entries across all accounts are considered. Holds are never evicted, and a cool
+// never evicts a cool that ends later than itself.
+func (h *stackHealth) evictCoolModelLocked(account string, incoming *coolingEntry) bool {
+	var victimKey coolingKey
+	var victim *coolingEntry
+	for key, entry := range h.entries {
+		if key.model == "" || entry.kind != coolingCool {
+			continue
+		}
+		if account != "" && key.account != account {
+			continue
+		}
+		if victim == nil ||
+			entry.untilMS < victim.untilMS ||
+			(entry.untilMS == victim.untilMS && entry.setMS < victim.setMS) ||
+			(entry.untilMS == victim.untilMS && entry.setMS == victim.setMS && (key.account < victimKey.account || (key.account == victimKey.account && key.model < victimKey.model))) {
+			victimKey, victim = key, entry
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	if incoming.kind == coolingCool && victim.untilMS > incoming.untilMS {
+		return false
+	}
+	h.deleteEntryLocked(victimKey)
+	return true
 }
 
 func (h *stackHealth) deleteEntryLocked(key coolingKey) {
@@ -394,7 +453,18 @@ func (h *stackHealth) putCooling(doc coolingDocument, push uint64, nowMS int64) 
 		if !listed || entry.gen != gen || entry.ended(nowMS) || h.entries[coolingKey{entry.account, entry.model}] != nil {
 			continue
 		}
-		if hashes := h.tableHashes[entry.account]; len(hashes) == 1 {
+		if entry.clears.credential && entry.credGen > 0 {
+			if gens := h.tableCredGens[entry.account]; len(gens) > 0 {
+				if len(gens) != 1 || gens[0] != entry.credGen {
+					continue
+				}
+				if hashes := h.tableHashes[entry.account]; len(hashes) == 1 {
+					entry.credHash = hashes[0]
+				}
+			}
+			// When h.tableCredGens[entry.account] is empty, restore with credHash="" and credGen>0 so
+			// the first tableChangedLocked validates credGen atomically before setAccounts releases st.mu.
+		} else if hashes := h.tableHashes[entry.account]; len(hashes) == 1 {
 			entry.credHash = hashes[0]
 		}
 		full = h.setEntryLocked(entry, nowMS) || full
@@ -403,14 +473,30 @@ func (h *stackHealth) putCooling(doc coolingDocument, push uint64, nowMS int64) 
 	return true, full
 }
 
-// tableChangedLocked takes a new account table's credentials by account (S40): an entry whose clears include
-// credential is dropped when the table gives its account a credential other than the one the entry was set
-// with. An entry set without a known credential (a restored one) takes the account's, when it has exactly one.
-func (h *stackHealth) tableChangedLocked(hashes map[string][]string) {
+// tableChangedLocked takes a new account table's credentials and credential generations by account (S40): an entry
+// whose clears include credential is dropped when the table gives its account another credential generation or another
+// credential_sha256 than the one the entry was set with. A legacy entry set without a known credential takes the
+// account's, when it has exactly one.
+func (h *stackHealth) tableChangedLocked(hashes map[string][]string, credGens map[string][]uint64) {
 	for key, entry := range h.entries {
 		listed, ok := hashes[key.account]
 		if !entry.clears.credential || !ok {
 			continue
+		}
+		if entry.credGen > 0 {
+			if gens := credGens[key.account]; len(gens) > 0 {
+				mismatch := false
+				for _, g := range gens {
+					if g != entry.credGen {
+						mismatch = true
+						break
+					}
+				}
+				if mismatch {
+					h.deleteEntryLocked(key)
+					continue
+				}
+			}
 		}
 		if entry.credHash == "" {
 			if len(listed) == 1 {
@@ -426,6 +512,7 @@ func (h *stackHealth) tableChangedLocked(hashes map[string][]string) {
 		}
 	}
 	h.tableHashes = hashes
+	h.tableCredGens = credGens
 	h.pruneLocked()
 }
 
@@ -523,6 +610,7 @@ type wireCoolingEntry struct {
 	Gen        *uint64   `json:"gen"`
 	Clears     *[]string `json:"clears"`
 	Observed   *bool     `json:"observed"`
+	CredGen    *uint64   `json:"cred_gen"`
 }
 
 // validRuleID is S38's `[a-z0-9_-]{1,64}`.
@@ -660,6 +748,12 @@ func parseRestoreEntry(w wireCoolingEntry) (*coolingEntry, bool) {
 	if w.Observed != nil {
 		entry.observed = *w.Observed
 	}
+	if w.CredGen != nil {
+		if *w.CredGen == 0 || !clears.credential {
+			return nil, false
+		}
+		entry.credGen = *w.CredGen
+	}
 	switch {
 	case entry.kind == coolingCool && (w.UntilMS == nil || *w.UntilMS < 0):
 		return nil, false
@@ -723,6 +817,14 @@ func modelOf(model string) *string {
 func appendUnique(list []string, s string) []string {
 	if i, found := slices.BinarySearch(list, s); !found {
 		list = slices.Insert(list, i, s)
+	}
+	return list
+}
+
+// appendUniqueUint64 adds v to a sorted uint64 list once.
+func appendUniqueUint64(list []uint64, v uint64) []uint64 {
+	if i, found := slices.BinarySearch(list, v); !found {
+		list = slices.Insert(list, i, v)
 	}
 	return list
 }

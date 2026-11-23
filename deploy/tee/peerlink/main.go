@@ -56,7 +56,7 @@ func run(cfg config) error {
 		return err
 	}
 	// No write timeout: CONNECT and the WebSocket routes hijack their connection and live as long as it does.
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, MaxHeaderBytes: 64 << 10}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

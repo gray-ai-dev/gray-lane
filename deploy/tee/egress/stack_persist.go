@@ -80,6 +80,10 @@ func (o *stackOps) ack(body []byte) string {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(o.now()) {
+		o.dropForLeaseLocked()
+		return errStackOpsAckStale
+	}
 	account := o.accounts[*wire.AccountID]
 	if account == nil {
 		return errStackOpsAckStale
@@ -250,6 +254,10 @@ func allGrantsKnown(grants []string) bool {
 func (o *stackOps) tokenCallRefusal(accountID string, presented []string) (string, string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.leaseEnded(o.now()) {
+		o.dropForLeaseLocked()
+		return errLoginAccountUnknown, ""
+	}
 	if o.hold {
 		return errLoginHeld, ""
 	}

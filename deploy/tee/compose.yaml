@@ -170,8 +170,14 @@ services:
     # `-route-max-body-bytes 26214400` is the /route/ kind's own body bound (docs/design/standard-media-at-entry.md
     # §2.3): 25 MiB, the lane's largest form (LANE_FORM_MAX_BYTES, @gray/config's default; the gate holds the flag to at
     # least it), which the entry forwards whole to a provider. The vendor and peer paths keep -max-body-bytes.
+    # `-max-inflight-body-bytes 402653184` (384 MiB) is what egress holds of request bodies at once, past which it
+    # answers 503 egress_limit: the forms the lane holds together (LANE_FORM_HELD_MAX_BYTES, 256 MiB, @gray/config's
+    # default; egress lets a body go once it is sent and its answer's head came, as the lane lets a form go at that
+    # head) and 128 MiB beside them for JSON bodies, peer hops and the tables' pushes. `-memory-limit 536870912` (512 MiB)
+    # is the Go runtime's soft limit: the budget and 128 MiB for the runtime and the answers' copy buffers. Ten 24 MiB
+    # forms held took egress to 515 to 545 MiB with no limit (that design's §6.1). The gate holds both to these sums.
     entrypoint: ["/usr/local/bin/gray-egress"]
-    command: ["-socket", "/run/gray/egress.sock", "-routes", "-route-deny-suffix", "usefallback.com", "-route-max-body-bytes", "26214400", "-max-body-bytes", "4194304"]
+    command: ["-socket", "/run/gray/egress.sock", "-routes", "-route-deny-suffix", "usefallback.com", "-route-max-body-bytes", "26214400", "-max-body-bytes", "4194304", "-max-inflight-body-bytes", "402653184", "-memory-limit", "536870912"]
     volumes:
       # D63: the egress socket, shared with the lane; it holds only the socket.
       - egress-socket:/run/gray

@@ -1,5 +1,6 @@
+import { MAX_ITEM_REFERENCES, MAX_REFERENCE_BYTES } from "@gray/continuation";
 import { ApiError } from "@gray/errors";
-import { type Json, type JsonObject, readSerdeBytes } from "@gray/json";
+import { isObject, type Json, type JsonObject, JsonError, SERDE_MAX_DEPTH, readSerdeBytes } from "@gray/json";
 import {
   type BodyLayout,
   type CanonicalRequest,
@@ -75,6 +76,76 @@ export interface ParsedRequest {
    * scrubbed (inference.ts `scrubbed`).
    */
   readonly scrubbed: readonly ScrubSpan[];
+  /**
+   * Tier B and C of a Responses body: the distinct `input[].id` values of `type === "item_reference"` items,
+   * in body order (up to `MAX_ITEM_REFERENCES`, each `<= MAX_REFERENCE_BYTES`), or `null` when an invalid
+   * `item_reference` (missing/non-string/empty/overlong `id`, or more than `MAX_ITEM_REFERENCES` distinct IDs)
+   * was encountered so continuation pinning surfaces the same 400 `invalid_continuation_reference` refusal as
+   * Tier A. Tier A and non-Responses: empty array (Tier A reads `parsed.value` directly).
+   */
+  readonly itemReferences: readonly string[] | null;
+  /**
+   * Whether the request body carries opaque provider-bound state that must not fail over across
+   * operators after an attempt dials upstream: Responses `encrypted_content` (non-empty string) or
+   * Anthropic `thinking.signature` / `redacted_thinking.data` (non-empty string). Detected in both
+   * Tier A (whole parse) and Tier B/C (streaming token scan without holding the conversation).
+   */
+  readonly opaqueProviderState: boolean;
+}
+
+const UTF8_ENCODER = new TextEncoder();
+
+/**
+ * Returns the body view read by continuation pinning and reference extraction (`continuationReferences`,
+ * `continuesEarlierResponse`, `pinContinuation`, `lanePin`): Tier A and non-Responses return `parsed.value`
+ * directly; Tier B/C Responses requests graft the streamed `itemReferences` back into `input` (or a
+ * sentinel invalid `item_reference` when `parsed.itemReferences === null`) so pinning and validation
+ * behave identically across all body tiers.
+ */
+export function continuationBody(protocol: Protocol, parsed: ParsedRequest): Json {
+  if (parsed.whole || protocol !== "open_ai_responses" || !isObject(parsed.value)) return parsed.value;
+  if (parsed.itemReferences === null) {
+    return { ...parsed.value, input: [{ type: "item_reference", id: "" }] };
+  }
+  if (parsed.itemReferences.length === 0) return parsed.value;
+  return { ...parsed.value, input: parsed.itemReferences.map((id) => ({ type: "item_reference", id })) };
+}
+
+/** Whether `node` or any nested object inside it carries a non-empty string `encrypted_content` field. */
+function hasEncryptedContent(node: Json): boolean {
+  if (Array.isArray(node)) {
+    for (const item of node) if (hasEncryptedContent(item)) return true;
+    return false;
+  }
+  if (!isObject(node)) return false;
+  if (typeof node.encrypted_content === "string" && node.encrypted_content.length > 0) return true;
+  for (const child of Object.values(node)) {
+    if (hasEncryptedContent(child)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a parsed Tier A request body carries opaque provider-bound state:
+ * - `open_ai_responses`: any top-level or nested non-empty string `encrypted_content`;
+ * - `anthropic_messages`: any `messages[].content[]` block with `type === "thinking"` and non-empty
+ *   string `signature`, or `type === "redacted_thinking"` and non-empty string `data`.
+ */
+export function hasOpaqueProviderState(protocol: Protocol, value: Json): boolean {
+  if (protocol === "open_ai_responses") return hasEncryptedContent(value);
+  if (protocol === "anthropic_messages") {
+    if (!isObject(value) || !Array.isArray(value.messages)) return false;
+    for (const message of value.messages) {
+      if (!isObject(message) || !Array.isArray(message.content)) continue;
+      for (const block of message.content) {
+        if (!isObject(block)) continue;
+        if (block.type === "thinking" && typeof block.signature === "string" && block.signature.length > 0) return true;
+        if (block.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0) return true;
+      }
+    }
+    return false;
+  }
+  return false;
 }
 
 /**
@@ -161,14 +232,29 @@ export function parseHeld(protocol: Protocol, tier: "A" | "B", bytes: Uint8Array
         return new ApiError(400, "invalid_json");
       }
     }
-    return { tier, value: body.value, canonical, layout, body, collapsed: new Map(), whole: true, breakpoints: {}, scrubbed: [], ...listed };
+    return {
+      tier,
+      value: body.value,
+      canonical,
+      layout,
+      body,
+      collapsed: new Map(),
+      whole: true,
+      breakpoints: {},
+      scrubbed: [],
+      itemReferences: [],
+      opaqueProviderState: hasOpaqueProviderState(protocol, body.value),
+      ...listed,
+    };
   }
   const scan = BreakpointScan.of(protocol, heldMax);
   const scrub = ScrubScan.of(protocol, heldMax);
+  const itemRefs = ItemReferenceScan.of(protocol);
+  const opaque = OpaqueStateScan.of(protocol);
   let layout: BodyLayout;
   let scrubbed: ScrubSpan[];
   try {
-    layout = lastOfEach(locateMembers(bytes, heldMax, listeners(scan?.listen, scrub?.listen)));
+    layout = lastOfEach(locateMembers(bytes, heldMax, listeners(scan?.listen, scrub?.listen, itemRefs?.listen, opaque?.listen)));
     scrubbed = scrub?.spans(layout) ?? [];
   } catch (error) {
     if (error instanceof TooManyMembers) return membersTooMany(error.limit);
@@ -176,7 +262,19 @@ export function parseHeld(protocol: Protocol, tier: "A" | "B", bytes: Uint8Array
     return new ApiError(400, "invalid_json");
   }
   const breakpoints = scan === null ? {} : scan.read(layout, (span) => bytes.subarray(span.start, span.end));
-  return fromMembers(protocol, tier, layout, (m) => bytes.subarray(m.valueStart, m.valueEnd), modelPath, bytes, take, breakpoints, scrubbed);
+  return fromMembers(
+    protocol,
+    tier,
+    layout,
+    (m) => bytes.subarray(m.valueStart, m.valueEnd),
+    modelPath,
+    bytes,
+    take,
+    breakpoints,
+    scrubbed,
+    itemRefs === null ? [] : itemRefs.result(),
+    opaque?.found ?? false,
+  );
 }
 
 /** One listener that hands each token to every one given, in order. */
@@ -364,12 +462,456 @@ export class BreakpointScan {
 }
 
 /**
- * The members other than the conversation, parsed as serde_json reads them, and the canonical
- * projection with an empty conversation. A member is parsed on its own, so its depth counts from the
- * member and not from the body: a member nested exactly 127 levels deep is read here, where the Rust
- * gateway refuses the whole body at 128 (serde_json's limit). Bodies this large never come that close.
+ * Streaming token scanner for Responses `input[].type === "item_reference"` entries on Tier B/C bodies.
+ * Matches `@gray/continuation` `continuationReferences` exactly (including serde_json last-key-wins for
+ * duplicate `"input"`, `"type"`, and `"id"` keys, `MAX_ITEM_REFERENCES` distinct-ID cap, and
+ * `MAX_REFERENCE_BYTES` UTF-8 byte cap) while holding at most 256 short strings in memory.
  */
-function fromMembers(protocol: Protocol, tier: "B" | "C", layout: BodyLayout, span: (m: MemberSpan) => Uint8Array, modelPath: string | null, bytes: Uint8Array | null, take: TakeFromBody | null, breakpoints: JsonObject | null, scrubbed: readonly ScrubSpan[]): ParsedRequest | ApiError {
+export class ItemReferenceScan {
+  private depth = 0;
+  private expectKey = false;
+  private inInput = false;
+  private inputShape: "pending" | "array" | "other" = "pending";
+  private inElemObject = false;
+  private elemExpectKey = false;
+  private elemKey: string | null = null;
+  private elemTypeIsRef = false;
+  private elemId: { readonly kind: "absent" } | { readonly kind: "invalid" } | { readonly kind: "valid"; readonly value: string } = { kind: "absent" };
+  private readonly seen = new Set<string>();
+  private readonly ids: string[] = [];
+  private invalid = false;
+
+  static of(protocol: Protocol): ItemReferenceScan | null {
+    return protocol === "open_ai_responses" ? new ItemReferenceScan() : null;
+  }
+
+  /** Distinct valid `item_reference` IDs in body order, or `null` when an invalid entry or overflow occurred. */
+  result(): readonly string[] | null {
+    return this.invalid ? null : this.ids;
+  }
+
+  readonly listen: LayoutListener = (token, value) => {
+    switch (token) {
+      case TokenType.LEFT_BRACE:
+        if (this.depth === 0) {
+          this.expectKey = true;
+        } else if (this.depth === 1 && this.inInput) {
+          this.inputShape = "other";
+        } else if (this.depth === 2 && this.inInput && this.inputShape === "array") {
+          this.inElemObject = true;
+          this.elemExpectKey = true;
+          this.elemKey = null;
+          this.elemTypeIsRef = false;
+          this.elemId = { kind: "absent" };
+        } else if (this.depth === 3 && this.inElemObject && !this.elemExpectKey && this.elemKey !== null) {
+          if (this.elemKey === "type") this.elemTypeIsRef = false;
+          else if (this.elemKey === "id") this.elemId = { kind: "invalid" };
+          this.elemKey = null;
+        }
+        this.depth += 1;
+        return;
+      case TokenType.LEFT_BRACKET:
+        if (this.depth === 1 && this.inInput) {
+          this.inputShape = "array";
+        } else if (this.depth === 3 && this.inElemObject && !this.elemExpectKey && this.elemKey !== null) {
+          if (this.elemKey === "type") this.elemTypeIsRef = false;
+          else if (this.elemKey === "id") this.elemId = { kind: "invalid" };
+          this.elemKey = null;
+        }
+        this.depth += 1;
+        return;
+      case TokenType.RIGHT_BRACE:
+        this.depth -= 1;
+        if (this.depth === 2 && this.inElemObject) {
+          if (this.elemTypeIsRef && !this.invalid) {
+            if (this.elemId.kind !== "valid") {
+              this.invalid = true;
+              this.seen.clear();
+              this.ids.length = 0;
+            } else if (!this.seen.has(this.elemId.value)) {
+              if (this.seen.size >= MAX_ITEM_REFERENCES) {
+                this.invalid = true;
+                this.seen.clear();
+                this.ids.length = 0;
+              } else {
+                this.seen.add(this.elemId.value);
+                this.ids.push(this.elemId.value);
+              }
+            }
+          }
+          this.inElemObject = false;
+          this.elemExpectKey = false;
+          this.elemKey = null;
+          this.elemTypeIsRef = false;
+          this.elemId = { kind: "absent" };
+        } else if (this.depth === 1 && this.inInput) {
+          this.inputShape = "other";
+        }
+        return;
+      case TokenType.RIGHT_BRACKET:
+        this.depth -= 1;
+        if (this.depth === 1 && this.inInput) this.inputShape = "other";
+        return;
+      case TokenType.COMMA:
+        if (this.depth === 1) {
+          this.inInput = false;
+          this.expectKey = true;
+        } else if (this.depth === 3 && this.inElemObject) {
+          this.elemExpectKey = true;
+          this.elemKey = null;
+        }
+        return;
+      case TokenType.STRING:
+        if (this.depth === 1 && this.expectKey) {
+          this.expectKey = false;
+          if (value === "input") {
+            this.inInput = true;
+            this.inputShape = "pending";
+            this.invalid = false;
+            this.seen.clear();
+            this.ids.length = 0;
+          } else {
+            this.inInput = false;
+          }
+          return;
+        }
+        if (this.depth === 3 && this.inElemObject) {
+          if (this.elemExpectKey) {
+            this.elemKey = value as string;
+            this.elemExpectKey = false;
+          } else if (this.elemKey !== null) {
+            const s = value as string;
+            if (this.elemKey === "type") {
+              this.elemTypeIsRef = s === "item_reference";
+            } else if (this.elemKey === "id") {
+              this.elemId =
+                s.length > 0 && s.length <= MAX_REFERENCE_BYTES && UTF8_ENCODER.encode(s).byteLength <= MAX_REFERENCE_BYTES
+                  ? { kind: "valid", value: s }
+                  : { kind: "invalid" };
+            }
+            this.elemKey = null;
+          }
+        }
+        return;
+      case TokenType.COLON:
+        return;
+      default:
+        if (this.depth === 3 && this.inElemObject && !this.elemExpectKey && this.elemKey !== null) {
+          if (this.elemKey === "type") this.elemTypeIsRef = false;
+          else if (this.elemKey === "id") this.elemId = { kind: "invalid" };
+          this.elemKey = null;
+        }
+        return;
+    }
+  };
+}
+
+type OpaqueFrame =
+  | { readonly kind: "object"; expectKey: boolean; key: string | null; hasEncrypted: boolean }
+  | { readonly kind: "array" };
+
+/**
+ * Streaming token scanner for opaque provider-bound state inside the skipped conversation member of
+ * Tier B/C bodies, using O(nesting depth) memory and retaining zero string values:
+ * - `open_ai_responses`: any object inside the last top-level `input` whose final `encrypted_content`
+ *   property is a non-empty string;
+ * - `anthropic_messages`: any block inside the last top-level `messages[].content[]` whose final
+ *   `type` is `"thinking"` with non-empty string `signature`, or `"redacted_thinking"` with non-empty
+ *   string `data`.
+ */
+export class OpaqueStateScan {
+  private readonly mode: "responses" | "anthropic";
+  private depth = 0;
+  private expectKey = false;
+  private inField = false;
+  private fieldShape: "pending" | "array" | "other" = "pending";
+  private readonly frames: OpaqueFrame[] = [];
+  // Anthropic message/block state (zero allocations).
+  private inMsg = false;
+  private msgExpectKey = false;
+  private msgKey: string | null = null;
+  private msgInContent = false;
+  private msgContentShape: "pending" | "array" | "other" = "pending";
+  private msgContentFound = false;
+  private inBlock = false;
+  private blockExpectKey = false;
+  private blockKey: string | null = null;
+  private blockType: "thinking" | "redacted_thinking" | "other" = "other";
+  private blockHasSignature = false;
+  private blockHasData = false;
+  private detected = false;
+
+  private constructor(mode: "responses" | "anthropic") {
+    this.mode = mode;
+  }
+
+  static of(protocol: Protocol): OpaqueStateScan | null {
+    if (protocol === "open_ai_responses") return new OpaqueStateScan("responses");
+    if (protocol === "anthropic_messages") return new OpaqueStateScan("anthropic");
+    return null;
+  }
+
+  get found(): boolean {
+    return this.detected;
+  }
+
+  readonly listen: LayoutListener = (token, value) => {
+    if (this.mode === "responses") this.listenResponses(token, value);
+    else this.listenAnthropic(token, value);
+  };
+
+  private listenResponses(token: TokenType, value: unknown): void {
+    switch (token) {
+      case TokenType.LEFT_BRACE:
+        if (this.depth === 0) {
+          this.expectKey = true;
+        } else if (this.inField) {
+          if (this.depth >= 2) {
+            const top = this.frames[this.frames.length - 1];
+            if (top?.kind === "object" && !top.expectKey && top.key !== null) {
+              if (top.key === "encrypted_content") top.hasEncrypted = false;
+              top.key = null;
+            }
+          }
+          this.frames.push({ kind: "object", expectKey: true, key: null, hasEncrypted: false });
+        }
+        this.depth += 1;
+        return;
+      case TokenType.LEFT_BRACKET:
+        if (this.inField) {
+          if (this.depth >= 2) {
+            const top = this.frames[this.frames.length - 1];
+            if (top?.kind === "object" && !top.expectKey && top.key !== null) {
+              if (top.key === "encrypted_content") top.hasEncrypted = false;
+              top.key = null;
+            }
+          }
+          this.frames.push({ kind: "array" });
+        }
+        this.depth += 1;
+        return;
+      case TokenType.RIGHT_BRACE:
+        this.depth -= 1;
+        if (this.inField && this.frames.length > 0) {
+          const popped = this.frames.pop();
+          if (popped?.kind === "object" && popped.hasEncrypted) this.detected = true;
+        }
+        return;
+      case TokenType.RIGHT_BRACKET:
+        this.depth -= 1;
+        if (this.inField && this.frames.length > 0) this.frames.pop();
+        return;
+      case TokenType.COMMA:
+        if (this.depth === 1) {
+          this.inField = false;
+          this.expectKey = true;
+        } else if (this.inField && this.frames.length > 0) {
+          const top = this.frames[this.frames.length - 1];
+          if (top?.kind === "object") {
+            top.expectKey = true;
+            top.key = null;
+          }
+        }
+        return;
+      case TokenType.STRING:
+        if (this.depth === 1 && this.expectKey) {
+          this.expectKey = false;
+          if (value === "input") {
+            this.inField = true;
+            this.detected = false;
+            this.frames.length = 0;
+          } else {
+            this.inField = false;
+          }
+          return;
+        }
+        if (this.inField && this.frames.length > 0) {
+          const top = this.frames[this.frames.length - 1];
+          if (top?.kind === "object") {
+            if (top.expectKey) {
+              top.key = value as string;
+              top.expectKey = false;
+            } else if (top.key !== null) {
+              if (top.key === "encrypted_content") top.hasEncrypted = (value as string).length > 0;
+              top.key = null;
+            }
+          }
+        }
+        return;
+      case TokenType.COLON:
+        return;
+      default:
+        if (this.inField && this.frames.length > 0) {
+          const top = this.frames[this.frames.length - 1];
+          if (top?.kind === "object" && !top.expectKey && top.key !== null) {
+            if (top.key === "encrypted_content") top.hasEncrypted = false;
+            top.key = null;
+          }
+        }
+        return;
+    }
+  }
+
+  private listenAnthropic(token: TokenType, value: unknown): void {
+    switch (token) {
+      case TokenType.LEFT_BRACE:
+        if (this.depth === 0) {
+          this.expectKey = true;
+        } else if (this.depth === 1 && this.inField) {
+          this.fieldShape = "other";
+        } else if (this.depth === 2 && this.inField && this.fieldShape === "array") {
+          this.inMsg = true;
+          this.msgExpectKey = true;
+          this.msgKey = null;
+          this.msgInContent = false;
+          this.msgContentShape = "pending";
+          this.msgContentFound = false;
+        } else if (this.depth === 3 && this.inMsg && this.msgInContent) {
+          this.msgContentShape = "other";
+        } else if (this.depth === 4 && this.inMsg && this.msgInContent && this.msgContentShape === "array") {
+          this.inBlock = true;
+          this.blockExpectKey = true;
+          this.blockKey = null;
+          this.blockType = "other";
+          this.blockHasSignature = false;
+          this.blockHasData = false;
+        } else if (this.depth === 5 && this.inBlock && !this.blockExpectKey && this.blockKey !== null) {
+          this.clearBlockField(this.blockKey);
+          this.blockKey = null;
+        }
+        this.depth += 1;
+        return;
+      case TokenType.LEFT_BRACKET:
+        if (this.depth === 1 && this.inField) {
+          this.fieldShape = "array";
+        } else if (this.depth === 3 && this.inMsg && this.msgInContent) {
+          this.msgContentShape = "array";
+        } else if (this.depth === 5 && this.inBlock && !this.blockExpectKey && this.blockKey !== null) {
+          this.clearBlockField(this.blockKey);
+          this.blockKey = null;
+        }
+        this.depth += 1;
+        return;
+      case TokenType.RIGHT_BRACE:
+        this.depth -= 1;
+        if (this.depth === 4 && this.inBlock) {
+          if ((this.blockType === "thinking" && this.blockHasSignature) || (this.blockType === "redacted_thinking" && this.blockHasData)) {
+            this.msgContentFound = true;
+          }
+          this.inBlock = false;
+          this.blockExpectKey = false;
+          this.blockKey = null;
+          this.blockType = "other";
+          this.blockHasSignature = false;
+          this.blockHasData = false;
+        } else if (this.depth === 2 && this.inMsg) {
+          if (this.msgContentFound) this.detected = true;
+          this.inMsg = false;
+          this.msgExpectKey = false;
+          this.msgKey = null;
+          this.msgInContent = false;
+          this.msgContentShape = "pending";
+          this.msgContentFound = false;
+        } else if (this.depth === 1 && this.inField) {
+          this.fieldShape = "other";
+        }
+        return;
+      case TokenType.RIGHT_BRACKET:
+        this.depth -= 1;
+        if (this.depth === 3 && this.inMsg && this.msgInContent) this.msgContentShape = "other";
+        else if (this.depth === 1 && this.inField) this.fieldShape = "other";
+        return;
+      case TokenType.COMMA:
+        if (this.depth === 1) {
+          this.inField = false;
+          this.expectKey = true;
+        } else if (this.depth === 3 && this.inMsg) {
+          this.msgExpectKey = true;
+          this.msgKey = null;
+          this.msgInContent = false;
+        } else if (this.depth === 5 && this.inBlock) {
+          this.blockExpectKey = true;
+          this.blockKey = null;
+        }
+        return;
+      case TokenType.STRING:
+        if (this.depth === 1 && this.expectKey) {
+          this.expectKey = false;
+          if (value === "messages") {
+            this.inField = true;
+            this.fieldShape = "pending";
+            this.detected = false;
+          } else {
+            this.inField = false;
+          }
+          return;
+        }
+        if (this.depth === 3 && this.inMsg && this.msgExpectKey) {
+          this.msgKey = value as string;
+          this.msgExpectKey = false;
+          if (this.msgKey === "content") {
+            this.msgInContent = true;
+            this.msgContentShape = "pending";
+            this.msgContentFound = false;
+          } else {
+            this.msgInContent = false;
+          }
+          return;
+        }
+        if (this.depth === 5 && this.inBlock) {
+          if (this.blockExpectKey) {
+            this.blockKey = value as string;
+            this.blockExpectKey = false;
+          } else if (this.blockKey !== null) {
+            const s = value as string;
+            if (this.blockKey === "type") {
+              this.blockType = s === "thinking" ? "thinking" : s === "redacted_thinking" ? "redacted_thinking" : "other";
+            } else if (this.blockKey === "signature") {
+              this.blockHasSignature = s.length > 0;
+            } else if (this.blockKey === "data") {
+              this.blockHasData = s.length > 0;
+            }
+            this.blockKey = null;
+          }
+        }
+        return;
+      case TokenType.COLON:
+        return;
+      default:
+        if (this.depth === 5 && this.inBlock && !this.blockExpectKey && this.blockKey !== null) {
+          this.clearBlockField(this.blockKey);
+          this.blockKey = null;
+        }
+        return;
+    }
+  }
+
+  private clearBlockField(key: string): void {
+    if (key === "type") this.blockType = "other";
+    else if (key === "signature") this.blockHasSignature = false;
+    else if (key === "data") this.blockHasData = false;
+  }
+}
+
+/**
+ * The members other than the conversation, parsed as serde_json reads them, and the canonical
+ * projection with an empty conversation. Whole-body nesting depth (`SERDE_MAX_DEPTH`) is enforced
+ * during the layout scan (`locateMembers` / `locateMembersStream`), including inside unread
+ * conversation members, matching `parseClientBody` and Rust `serde_json`.
+ */
+function fromMembers(
+  protocol: Protocol,
+  tier: "B" | "C",
+  layout: BodyLayout,
+  span: (m: MemberSpan) => Uint8Array,
+  modelPath: string | null,
+  bytes: Uint8Array | null,
+  take: TakeFromBody | null,
+  breakpoints: JsonObject | null,
+  scrubbed: readonly ScrubSpan[],
+  itemReferences: readonly string[] | null,
+  scannedOpaqueState: boolean,
+): ParsedRequest | ApiError {
   const conversation = conversationFields(protocol);
   const value: JsonObject = {};
   const collapsed = new Map<string, Json>();
@@ -397,7 +939,8 @@ function fromMembers(protocol: Protocol, tier: "B" | "C", layout: BodyLayout, sp
     return refusal(protocol, error);
   }
   const body: ClientBody | null = bytes === null ? null : { bytes, value, duplicateKeys: false };
-  return { tier, value, canonical, layout, body, collapsed, whole: false, breakpoints, scrubbed, ...listed };
+  const opaqueProviderState = scannedOpaqueState || (protocol === "open_ai_responses" && hasEncryptedContent(value));
+  return { tier, value, canonical, layout, body, collapsed, whole: false, breakpoints, scrubbed, itemReferences, opaqueProviderState, ...listed };
 }
 
 /**
@@ -505,6 +1048,7 @@ export async function locateMembersStream(stream: ReadableStream<Uint8Array>, to
           open = offset;
         }
         depth += 1;
+        if (depth > SERDE_MAX_DEPTH) throw new JsonError("recursion limit exceeded");
         return;
       case TokenType.RIGHT_BRACE:
       case TokenType.RIGHT_BRACKET:
@@ -631,6 +1175,8 @@ export async function parseStored(
   let layout: BodyLayout;
   const scan = BreakpointScan.of(protocol, smallMax);
   const scrub = ScrubScan.of(protocol, smallMax);
+  const itemRefs = ItemReferenceScan.of(protocol);
+  const opaque = OpaqueStateScan.of(protocol);
   let scrubbed: ScrubSpan[];
   try {
     const plain = await open();
@@ -638,7 +1184,7 @@ export async function parseStored(
     // Its members held as records within what a document parsed whole may take (`smallMax`), the conversation's
     // elements that may state a cache breakpoint within as much again (`BreakpointScan`), and the places of the
     // reasoning items only a translation reads within as much again (`ScrubScan`).
-    layout = lastOfEach(await locateMembersStream(plain, tokenMax, smallMax, listeners(scan?.listen, scrub?.listen)));
+    layout = lastOfEach(await locateMembersStream(plain, tokenMax, smallMax, listeners(scan?.listen, scrub?.listen, itemRefs?.listen, opaque?.listen)));
     scrubbed = scrub?.spans(layout) ?? [];
   } catch (error) {
     if (error instanceof TokenTooLong) return valueTooLong(error.limit);
@@ -700,5 +1246,17 @@ export async function parseStored(
   const members = layout.members.map((m) => trimmedOf.get(m.key) ?? m);
   const exact: BodyLayout = { open: layout.open, close: layout.close, members };
   const breakpoints = scan === null ? {} : scan.read(layout, (span) => spanBytes.get(span) ?? new Uint8Array(0));
-  return fromMembers(protocol, "C", exact, (m) => read.get(m.key) ?? new Uint8Array(0), modelPath, null, take, breakpoints, scrubbed);
+  return fromMembers(
+    protocol,
+    "C",
+    exact,
+    (m) => read.get(m.key) ?? new Uint8Array(0),
+    modelPath,
+    null,
+    take,
+    breakpoints,
+    scrubbed,
+    itemRefs === null ? [] : itemRefs.result(),
+    opaque?.found ?? false,
+  );
 }

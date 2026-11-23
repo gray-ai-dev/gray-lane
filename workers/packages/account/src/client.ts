@@ -162,9 +162,11 @@ export async function admitWithRetry(o: {
   while (attempt < attempts) {
     const picked = await nextShard(o, attempt, first, ended, againAfterReset);
     const shard = picked.shard;
-    degraded = picked.degraded;
+    const homeIndex = o.request.clientKey ? await shardIndex(o.request.requestKey, 0, o.counts.get(o.workspace, o.home)) : -1;
+    const onHome = o.request.clientKey && shard.region === o.home && shard.index === homeIndex;
+    degraded = picked.degraded && !onHome;
     last = shard;
-    if (picked.pinned) home = shard;
+    if (picked.pinned || onHome) home = shard;
     const left = deadline - clock();
     if (left <= 0) break;
     // The shard is told how long this attempt waits, so it issues no hold after the gateway has moved on.

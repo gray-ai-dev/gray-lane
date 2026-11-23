@@ -4,7 +4,7 @@
  * and the Cloudflare bridge Worker (`workers/lane-bridge`) — so neither can drift from the other.
  *
  * What is here:
- * - **Ops** (`ops.ts`): `account.admit|count|settle|release`, `endpoint.acquire|release|note|reserveRetry`,
+ * - **Ops** (`ops.ts`): `account.admit|count|settle|release|keyRevoked`, `endpoint.acquire|release|note|reserveRetry`,
  *   `snapshot.current`, `scheduler.forward`, `records.index|events|points|service_events`, `stack.config`,
  *   `stack.proxy_checks`, `stack.rules`, `stack.report`, `stack.tests`, `stack.debug_shares`, `stack.vault.get|put` (Gray's
  *   ciphertext copy of a VM's sealed records, stack-vault.ts), `stack.vault.share_nonce|share` (Gray's share of the

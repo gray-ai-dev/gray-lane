@@ -22,6 +22,7 @@ import {
   relayStackAppendedEvent,
   relayStackChangedEvent,
   relayStackFeedIncompleteEvent,
+  requestContinuationExpandedEvent,
   requestModifiedEvent,
   requestTranslatedEvent,
   requestForwardedEvent,
@@ -373,6 +374,15 @@ export class ReceiptBuilder {
     readonly declaredIn: string;
   }): void {
     this.#push(requestModifiedEvent(input));
+  }
+
+  /**
+   * Gray's `request.continuation_expanded`: the entry applied zero-retention continuation expansion
+   * inside the attested TEE while keeping upstream calls `store: false`. After `request.received`
+   * and before `request.modified`, `peer.forwarded`, or `request.forwarded`.
+   */
+  addRequestContinuationExpanded(input: Parameters<typeof requestContinuationExpandedEvent>[0]): void {
+    this.#push(requestContinuationExpandedEvent(input));
   }
 
   /**

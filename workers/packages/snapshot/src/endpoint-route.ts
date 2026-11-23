@@ -102,11 +102,18 @@ export function validRouteHost(host: string, deny: readonly string[]): boolean {
 }
 
 /**
- * `validRoutePathPrefix`: starts and ends with '/', does not start with "//", holds no '?' or '#', and passes the vendor
- * routes' path rule (`validRawPath`: no backslash, no byte at or below 0x20, no 0x7f).
+ * Percent-encoded path separators (`%2f` and `%5c`, any hex case). Upstream proxies that percent-decode before
+ * routing treat them as separators, letting payloads like `..%2f..%2fadmin` escape a row's path prefix.
+ */
+const ENCODED_SEPARATOR = /%(?:2f|5c)/i;
+
+/**
+ * `validRoutePathPrefix`: starts and ends with '/', does not start with "//", holds no '?', '#', '\\', or encoded
+ * path separator (`%2f` / `%5c`), and passes the vendor routes' path rule (`validRawPath`: no byte at or below 0x20,
+ * no 0x7f).
  */
 export function validRoutePathPrefix(prefix: string): boolean {
-  if (!prefix.startsWith("/") || !prefix.endsWith("/") || prefix.startsWith("//") || /[?#\\]/.test(prefix)) return false;
+  if (!prefix.startsWith("/") || !prefix.endsWith("/") || prefix.startsWith("//") || /[?#\\]/.test(prefix) || ENCODED_SEPARATOR.test(prefix)) return false;
   const bytes = utf8ToBytes(prefix);
   return bytes.every((b) => b > 0x20 && b !== 0x7f);
 }
@@ -227,7 +234,7 @@ export function endpointRoutePath(url: string, target: EndpointRouteTarget): str
   const mark = rest.indexOf("?");
   const path = mark < 0 ? rest : rest.slice(0, mark);
   const query = mark < 0 ? null : rest.slice(mark + 1);
-  if (!path.startsWith(target.pathPrefix) || path.startsWith("//") || !VERBATIM_PATH.test(path)) return null;
+  if (!path.startsWith(target.pathPrefix) || path.startsWith("//") || !VERBATIM_PATH.test(path) || ENCODED_SEPARATOR.test(path)) return null;
   // An empty query (`?` alone) is kept: egress passes it on as the client wrote it (ForceQuery).
   if (query !== null && !VERBATIM_QUERY.test(query)) return null;
   if (path.split("/").some((segment) => [".", "%2e", "..", ".%2e", "%2e.", "%2e%2e"].includes(segment.toLowerCase()))) return null;

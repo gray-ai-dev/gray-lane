@@ -1,11 +1,12 @@
 import type { GatewayConfig } from "@gray/config";
 import { ApiError, shapeOf } from "@gray/errors";
+import { compareUtf8 } from "@gray/json";
 import { newRequestId } from "@gray/ledger-keys";
 import { within } from "@gray/snapshot";
 import { geminiModelValue, listedIn, openaiModelValue, reachable, suggest, type CatalogJson } from "./catalog.ts";
 import type { GatewayEnv } from "./env.ts";
 import { originsOf } from "./hosts.ts";
-import { checkStaleKey, lookUpKey, type KeyLookup } from "./key-lookup.ts";
+import { checkStaleKey, lookUpKey, type KeyLookup, type KeyRevocationCheck } from "./key-lookup.ts";
 import { Outbound } from "./outbound.ts";
 import type { GatewaySnapshot, SnapshotCache, SnapshotSource } from "./snapshot.ts";
 import { viaEntryOf } from "./entry-forward.ts";
@@ -74,8 +75,12 @@ export interface KeyStatusInput {
 export type KeyStatusAnswer = { readonly ok: true; readonly body: string } | { readonly ok: false; readonly reason: string };
 
 export interface CatalogDeps {
-  /** The main gateway's bindings, for `/v1/key`'s console call; null on the lane, which serves only the OpenAI listings. */
+  /** Whether this entry serves `GET /v1/key` (true on the main gateway, false on the confidential entry). */
+  readonly serveKeyStatus: boolean;
+  /** The main gateway's bindings, for `/v1/key`'s console call; null on the lane, which serves only the listings. */
   readonly env: GatewayEnv | null;
+  /** Real-time revocation check when the snapshot is stale (`checkStaleKey`). */
+  readonly keyRevoked: KeyRevocationCheck;
   readonly cfg: GatewayConfig;
   readonly snapshots: SnapshotCache;
   readonly source: SnapshotSource;
@@ -107,20 +112,22 @@ export async function serveCatalog(request: Request, route: CatalogRoute, path: 
       case "models":
       case "model": {
         const looked = await lookUpKey(request.headers, lookup, true);
-        return listing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request));
+        await checkStaleKey(looked, d.keyRevoked, lookup, "catalog_key_check_failed");
+        return listing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request), url);
       }
       case "gemini_models":
       case "gemini_model": {
         if (queryCredentials(url)) throw new ApiError(400, "query_credentials_unsupported");
         const looked = await lookUpKey(request.headers, lookup, true);
+        await checkStaleKey(looked, d.keyRevoked, lookup, "catalog_key_check_failed");
         return geminiListing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request));
       }
       case "key": {
-        // The lane serves no key status (its entry routes only the OpenAI listings here).
-        if (d.env === null) throw new ApiError(404, "unsupported_protocol");
+        // The lane serves no key status (its entry routes only the listings here).
+        if (!d.serveKeyStatus || d.env === null) throw new ApiError(404, "unsupported_protocol");
         const env = d.env;
         const looked = await lookUpKey(request.headers, lookup, false);
-        await checkStaleKey(looked, env, lookup, "key_status_key_check_failed");
+        await checkStaleKey(looked, d.keyRevoked, lookup, "key_status_key_check_failed");
         const key = looked.key!;
         let answer: KeyStatusAnswer;
         try {
@@ -141,19 +148,88 @@ export async function serveCatalog(request: Request, route: CatalogRoute, path: 
   } catch (error) {
     const refusal = error instanceof ApiError ? error : new ApiError(500, "internal_error");
     if (!(error instanceof ApiError)) {
-      console.error(JSON.stringify({ level: "error", event: "catalog_route_failed", path, message: error instanceof Error ? error.message : String(error) }));
+      // The confidential entry's container log is readable outside the VM (deploy/tee/IMPLEMENTATION_NOTES.md §9,
+      // "public_logs"): there the line has the error's class, never the client's path or the error's message.
+      const line = d.lane === true
+        ? { level: "error", event: "catalog_route_failed", code: error instanceof Error ? error.name : "error" }
+        : { level: "error", event: "catalog_route_failed", path, message: error instanceof Error ? error.message : String(error) };
+      console.error(JSON.stringify(line));
     }
     const rendered = refusal.render({ shape: shapeOf(path), origins: originsOf(d.cfg, url), requestId });
     return new Response(head ? null : rendered.body, { status: rendered.status, headers: rendered.headers });
   }
 }
 
-function json(body: string, requestId: string, head: boolean): Response {
-  return new Response(head ? null : body, { status: 200, headers: { "content-type": "application/json", "x-request-id": requestId } });
+function json(body: string, requestId: string, head: boolean, anthropicId = false): Response {
+  const headers: Record<string, string> = { "content-type": "application/json", "x-request-id": requestId };
+  if (anthropicId) headers["request-id"] = requestId;
+  return new Response(head ? null : body, { status: 200, headers });
 }
 
-function value(v: CatalogJson, requestId: string, head: boolean): Response {
-  return json(JSON.stringify(v), requestId, head);
+function value(v: CatalogJson, requestId: string, head: boolean, anthropicId = false): Response {
+  return json(JSON.stringify(v), requestId, head, anthropicId);
+}
+
+/** Anthropic `/v1/models` cursor pagination query parameters (`?limit`, `?before_id`, `?after_id`). */
+interface ModelPagination {
+  readonly limit: number | null;
+  readonly beforeId: string | null;
+  readonly afterId: string | null;
+}
+
+const MAX_MODEL_PAGE_LIMIT = 1000;
+
+function parseModelPagination(url: URL): ModelPagination {
+  let limit: number | null = null;
+  let beforeId: string | null = null;
+  let afterId: string | null = null;
+  for (const [key, raw] of url.searchParams) {
+    if (key === "limit") {
+      if (!/^[0-9]+$/.test(raw)) {
+        throw new ApiError(400, "invalid_limit").withMessage("`limit` must be an integer from 1 to 1000.").withParam("limit");
+      }
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n < 1 || n > MAX_MODEL_PAGE_LIMIT) {
+        throw new ApiError(400, "invalid_limit").withMessage("`limit` must be an integer from 1 to 1000.").withParam("limit");
+      }
+      limit = n;
+    } else if (key === "before_id") {
+      if (raw === "") throw new ApiError(400, "invalid_request_field").withMessage("`before_id` must be a non-empty string.").withParam("before_id");
+      beforeId = raw;
+    } else if (key === "after_id") {
+      if (raw === "") throw new ApiError(400, "invalid_request_field").withMessage("`after_id` must be a non-empty string.").withParam("after_id");
+      afterId = raw;
+    }
+  }
+  if (beforeId !== null && afterId !== null) {
+    throw new ApiError(400, "invalid_request_field").withMessage("`before_id` and `after_id` cannot both be specified.");
+  }
+  return { limit, beforeId, afterId };
+}
+
+/**
+ * Slices UTF-8 byte-ordered `ids` according to Anthropic's `/v1/models` cursor pagination. When none of `limit`,
+ * `before_id` or `after_id` are set, returns the full list (`hasMore: false`) so OpenAI/OpenRouter clients still
+ * receive the entire catalog.
+ */
+export function paginateModelIds(ids: readonly string[], page: ModelPagination): { readonly ids: readonly string[]; readonly hasMore: boolean } {
+  let filtered: readonly string[];
+  if (page.afterId !== null) {
+    const after = page.afterId;
+    filtered = ids.filter((id) => compareUtf8(id, after) > 0);
+  } else if (page.beforeId !== null) {
+    const before = page.beforeId;
+    filtered = ids.filter((id) => compareUtf8(id, before) < 0);
+  } else {
+    filtered = ids;
+  }
+  if (page.limit === null) return { ids: filtered, hasMore: false };
+  const hasMore = filtered.length > page.limit;
+  if (page.beforeId !== null) {
+    const start = Math.max(0, filtered.length - page.limit);
+    return { ids: filtered.slice(start), hasMore };
+  }
+  return { ids: filtered.slice(0, page.limit), hasMore };
 }
 
 /**
@@ -168,10 +244,20 @@ function rulesFor(d: CatalogDeps, request: Request): (snapshot: GatewaySnapshot)
 }
 
 /** `list` and `model`: the OpenAI listing, every API (`listed(rt, auth, None)`). */
-function listing(route: Extract<CatalogRoute, { kind: "models" | "model" }>, snapshot: GatewaySnapshot | null, scope: readonly string[] | null, cfg: GatewayConfig, requestId: string, head: boolean, rules: (snapshot: GatewaySnapshot) => TranslationRules): Response {
+function listing(
+  route: Extract<CatalogRoute, { kind: "models" | "model" }>,
+  snapshot: GatewaySnapshot | null,
+  scope: readonly string[] | null,
+  cfg: GatewayConfig,
+  requestId: string,
+  head: boolean,
+  rules: (snapshot: GatewaySnapshot) => TranslationRules,
+  url: URL,
+): Response {
+  const pagination = route.kind === "models" ? parseModelPagination(url) : null;
   const nowMs = Date.now();
   if (snapshot === null) {
-    if (route.kind === "models") return value({ data: [], object: "list" }, requestId, head);
+    if (route.kind === "models") return value({ data: [], first_id: null, has_more: false, last_id: null, object: "list" }, requestId, head, true);
     throw notListed(route.id, []);
   }
   const policy = rules(snapshot);
@@ -179,8 +265,13 @@ function listing(route: Extract<CatalogRoute, { kind: "models" | "model" }>, sna
   const facts = snapshot.facts ?? {};
   // A model id is client text (`constructor` is a valid one): only the record's own entries count.
   const objectOf = (id: string) => openaiModelValue(id, models.get(id)!, Object.hasOwn(facts, id) ? facts[id]! : {}, reachable(policy, id, models.get(id)!.protocols));
-  if (route.kind === "models") return value({ data: [...models.keys()].map(objectOf), object: "list" }, requestId, head);
-  if (models.has(route.id)) return value(objectOf(route.id), requestId, head);
+  if (route.kind === "models") {
+    const page = paginateModelIds([...models.keys()], pagination!);
+    const firstId = page.ids[0] ?? null;
+    const lastId = page.ids.at(-1) ?? null;
+    return value({ data: page.ids.map(objectOf), first_id: firstId, has_more: page.hasMore, last_id: lastId, object: "list" }, requestId, head, true);
+  }
+  if (models.has(route.id)) return value(objectOf(route.id), requestId, head, true);
   throw notListed(route.id, suggest(route.id, models.keys()));
 }
 

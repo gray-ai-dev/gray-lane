@@ -250,6 +250,20 @@ export class PeerLink implements PeerChannel {
     return changes;
   }
 
+  /** Closes unverified sessions of (relay, keyset) without banning the keyset in `#refused`. */
+  async closeUnverified(relay: string, keyset: string): Promise<SessionChanges> {
+    const changes = this.sessions.closeUnverified(relay, keyset);
+    await this.apply(changes);
+    return changes;
+  }
+
+  /** Verifies session ownership under `receiptKeys` before recording a refusal ban; closes forged sessions without banning. */
+  async refuseVerified(relay: string, keyset: string, receiptKeys: readonly string[], forMs?: number): Promise<SessionChanges & { readonly banned: boolean }> {
+    const changes = await this.sessions.refuseVerified(relay, keyset, receiptKeys, forMs);
+    await this.apply(changes);
+    return changes;
+  }
+
   /** Egress reported `peer_pin_mismatch` on `session`: close that session only. */
   async mismatch(session: string): Promise<void> {
     await this.apply(this.sessions.condemn(session));

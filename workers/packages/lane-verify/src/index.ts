@@ -21,7 +21,7 @@
  * 3. `verifyPeerAttestation(report, {layout, releaseList, nonce, tlsSpkiSha256, host, quoteVerifier})` is
  *    the first question as one lane VM asks it of another (docs/confidential-lane-stack-routing.md §4.3):
  *    the signed list of the peer's layout read and pinned, every pin required, the layout checked.
- * 4. `verifyPeerReceipts({outer, receivedBody, templates, releaseList, quoteVerifier, nowSecs, answers})` is the
+ * 4. `verifyPeerReceipts({outer, receivedBody, responseBytes, templates, releaseList, quoteVerifier, nowSecs, answers})` is the
  *    second question for a request the entry forwarded to relay stack VMs (§4.8): per peer attempt, the stack VM's
  *    attestation the entry served, the outer receipt's commitment to it, and the stack VM's inner receipt (what the
  *    relay changed included), tied to the outer receipt by its `peer.entry`.
@@ -118,6 +118,7 @@ export {
   CLIENT_CONNECTION_CHECK,
   protocolForEndpoint,
   receiptVerdictOf,
+  type ReceiptContinuationExpanded,
   type ReceiptProtocol,
   type ResponseReceiptVerdict,
   verifyResponseReceipt,

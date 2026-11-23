@@ -1,13 +1,13 @@
 import { releaseWithRetry, settleWithRetry, type RetryTiming, type ScalarRecord, type SettleInput, type ShardLocator } from "@gray/account";
 import type { GatewayConfig } from "@gray/config";
 import { readVideoObject, type VideoObject } from "@gray/lane";
-import { videoJobClosed, type LaneVideoJob, type LaneVideoJobChange, type VideoBillingReason, type VideoJobFailure, type VideoLeaseAction } from "@gray/lane-wire";
+import { passedClientHeaders, videoJobClosed, type LaneVideoJob, type LaneVideoJobChange, type VideoBillingReason, type VideoJobFailure, type VideoLeaseAction } from "@gray/lane-wire";
 import { accrualId, checkEvidence, customerRates, evidenceHash, parseEvidence, storedEvidence, usageCost } from "@gray/ledger-keys";
 import { VIDEO_POLL_RESPONSE_BYTES, VIDEO_POLL_TIMEOUT_MS, jobUrl, type MediaRoute } from "@gray/media";
-import { DEFAULT_ACCEPT } from "@gray/protocol";
+import { withDefaultAccept } from "@gray/protocol";
 import type { GatewayDeps } from "../inference.ts";
 import type { GatewaySnapshot, KeyRecord, RouteRecord } from "../snapshot.ts";
-import { egressSidecarFailure } from "./hooks.ts";
+import { EGRESS_HEADER, egressOwnAnswer } from "./hooks.ts";
 import type { LaneVideoStore } from "./remote/video.ts";
 import type { LaneDeps, LaneEndpointCredentials } from "./types.ts";
 
@@ -128,9 +128,20 @@ export function videoJobUrl(route: Pick<RouteRecord, "url">, job: Pick<LaneVideo
   return jobUrl({ url: route.url } as MediaRoute, content ? [job.providerJobId, "content"] : [job.providerJobId]);
 }
 
-/** The headers of a job's GET (the provider standard's clause 11.3): no body and no content type, any answer type, the key. */
-export function videoJobHeaders(credential: string): Headers {
-  return new Headers({ accept: DEFAULT_ACCEPT, authorization: `Bearer ${credential}` });
+/**
+ * The headers of a job's GET: allowlisted client SDK headers when initiated by a client (omitted on background
+ * polls), the provider's bearer credential, no `content-type`, no `x-gray-egress`, and default `accept`
+ * (`DEFAULT_ACCEPT`) when absent/blank.
+ */
+export function videoJobHeaders(credential: string, client?: Headers): Headers {
+  const headers = new Headers();
+  if (client !== undefined) {
+    for (const [name, value] of Object.entries(passedClientHeaders("open_ai_videos", client))) headers.set(name, value);
+  }
+  headers.set("authorization", `Bearer ${credential}`);
+  headers.delete("content-type");
+  headers.delete(EGRESS_HEADER);
+  return withDefaultAccept(headers);
 }
 
 /** What one poll of the provider said. */
@@ -184,7 +195,7 @@ export async function readWhole(response: Response, limit: number, deadlineMs: n
  * key, no redirect followed. Never throws. `budgetMs` bounds the wait for the key; the exchange has
  * VIDEO_POLL_TIMEOUT_MS.
  */
-export async function pollVideoJob(io: VideoJobIo, route: RouteRecord | undefined, job: LaneVideoJob, budgetMs: number = VIDEO_POLL_TIMEOUT_MS): Promise<VideoObserved> {
+export async function pollVideoJob(io: VideoJobIo, route: RouteRecord | undefined, job: LaneVideoJob, budgetMs: number = VIDEO_POLL_TIMEOUT_MS, client?: Headers): Promise<VideoObserved> {
   if (route === undefined) return { kind: "unknown", why: "route" };
   const url = videoJobUrl(route, job, false);
   if (url === undefined) return { kind: "unknown", why: "route" };
@@ -199,11 +210,11 @@ export async function pollVideoJob(io: VideoJobIo, route: RouteRecord | undefine
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("video_poll_timeout"), VIDEO_POLL_TIMEOUT_MS);
   try {
-    const response = await io.fetchFor(route)(url, { method: "GET", headers: videoJobHeaders(credential), signal: controller.signal, redirect: "manual" });
+    const response = await io.fetchFor(route)(url, { method: "GET", headers: videoJobHeaders(credential, client), signal: controller.signal, redirect: "manual" });
     const body = await readWhole(response, VIDEO_POLL_RESPONSE_BYTES, deadline, io.clock);
     if (body === null) return { kind: "unknown", why: "transport" };
-    // egress's own 502 is not the provider's word about the job.
-    if (egressSidecarFailure(response.status, body)) return { kind: "unknown", why: "transport" };
+    // An answer egress gave itself (its mark) is not the provider's word about the job.
+    if (egressOwnAnswer(response.headers, body) !== null) return { kind: "unknown", why: "transport" };
     if (response.status === 404 || response.status === 410) return { kind: "missing" };
     if (response.status < 200 || response.status > 299) return { kind: "unknown", why: "status" };
     const object = readVideoObject(body);

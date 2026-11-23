@@ -33,8 +33,9 @@ import { fitStackTrace, stackTraceDtoOf, stackTraceOf, stackTraceSchema, type St
  * - the index row's `clientIp`, `userAgent`, `client`, `clientVersion`, `sessionId`,
  *   `parentSessionId`, `toolCount`, `turnStart`, `toolCalls` and `toolNames` are `null`
  *   (`LANE_FORBIDDEN_ROW_FIELDS`; bridge-7), and its `routeAttempts` are each exactly a
- *   `RouteAttempt` of route keys and closed words (`laneRouteAttemptSchema`, r14) and its five
- *   measures, a word, a boolean and bounded counts (r15);
+ *   `RouteAttempt` of route keys and closed words (`laneRouteAttemptSchema`, r14), its five
+ *   measures, a word, a boolean and bounded counts (r15), and whether it failed on its
+ *   provider's answer, one boolean (2026-11-23);
  * - the wide event carries no `client_app`, `client_app_version` (the parsed User-Agent), no
  *   `request_tools`, no `response_tool_calls`, no `trust_request_violations`/
  *   `trust_response_violations` and no `trust_outcome` (`LANE_FORBIDDEN_EVENT_COLUMNS`; hooks-8),
@@ -63,7 +64,8 @@ export const LANE_FORBIDDEN_EVENT_COLUMNS = Object.freeze(["client_app", "client
  * stack relay's account; S43 `stackTrace`, a stack relay's per-request trace, which is no column; the
  * charge's input and output sides and the route's API of a translated request, workers/db/migrations/0076;
  * r14's `routeAttempts`, the route attempts with their two answer checks, workers/db/migrations/0079; r15's five
- * measures on each attempt are later still, docs/live-speed.md, and go first when a bridge refuses them):
+ * measures on each attempt are later still, docs/live-speed.md, and each attempt's `providerFailure` of 2026-11-23
+ * later again, so it goes first when a bridge refuses a document, then the measures):
  * absent from the wire document when null, and taken absent. A bridge that predates one still takes
  * every row that does not carry it (every row but a stack relay's), and a bridge that knows it takes
  * the rows of a lane that predates it, so neither deploy order loses rows of the lanes that existed
@@ -86,11 +88,13 @@ const measureCount = (max: number) => z.bigint().min(0n).max(BigInt(max));
  * answer checks; null where a class or a check does not apply), and its five measures (docs/live-speed.md "The TEE
  * lane", r15), each absent where the attempt has none: how it counted for its route (`SUPPLIER_OUTCOMES`), whether it
  * streamed, and three counts within their bounds (`ATTEMPT_MEASURE_MAX_MS`, `ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS`): its
- * own time to first token, its latency and its charged output tokens. No code, tool name, argument, schema, call count,
- * raw finish reason or free text: the product owner let these, and nothing more, leave the TEE (2026-11-12 for the
- * seven, 2026-11-13 for the measures), as metadata of the attempt, not the customer's content; the lane already
- * reports each attempt's latency, time to first token, output tokens and failure kind to its endpoint shard through
- * the bridge (`ReleaseInput.measure`).
+ * own time to first token, its latency and its charged output tokens. And one yes/no, `providerFailure`: whether the
+ * attempt failed on its provider's answer, as a gateway that keeps traffic evidence would note `provider_failure` for
+ * it (docs/design/one-address.md "Provider defects at the entry"), absent from an entry before it. No code, tool name,
+ * argument, schema, call count, raw finish reason or free text: the product owner let these, and nothing more, leave
+ * the TEE (2026-11-12 for the seven, 2026-11-13 for the measures, 2026-11-23 for `providerFailure`), as metadata of the
+ * attempt, not the customer's content; the lane already reports each attempt's latency, time to first token, output
+ * tokens and failure kind to its endpoint shard through the bridge (`ReleaseInput.measure`).
  */
 const laneRouteAttemptSchema = z
   .object({
@@ -106,6 +110,7 @@ const laneRouteAttemptSchema = z
     ttftMs: measureCount(ATTEMPT_MEASURE_MAX_MS).optional(),
     durationMs: measureCount(ATTEMPT_MEASURE_MAX_MS).optional(),
     outputTokens: measureCount(ATTEMPT_MEASURE_MAX_OUTPUT_TOKENS).optional(),
+    providerFailure: z.boolean().optional(),
   })
   .strict();
 type LaneRouteAttemptDto = z.infer<typeof laneRouteAttemptSchema>;
@@ -117,8 +122,9 @@ const MEASURE_COUNTS = ["ttftMs", "durationMs", "outputTokens"] as const;
 
 /**
  * A row's route attempts as the CVM sends them: the latest MAX_ROW_ATTEMPTS (the gateway keeps no more), each projected
- * to its seven members and its measures (r15: those it has, all five or none as @gray/request-index `attemptMeasuresOf`
- * keeps them, the counts as bigints), so nothing else on an attempt ever leaves. Null when the list would not pass
+ * to its seven members, its measures (r15: those it has, all five or none as @gray/request-index `attemptMeasuresOf`
+ * keeps them, the counts as bigints) and its `providerFailure` when it is a boolean, so nothing else on an attempt ever
+ * leaves. Null when the list would not pass
  * `laneRouteAttemptSchema` (a word the wire does not know, a key past its bound): the row goes without it, as a row of
  * a gateway before it, and counts in no error rate; the row itself is never lost with it.
  */
@@ -138,6 +144,7 @@ function routeAttemptsDtoOf(attempts: readonly RouteAttempt[]): LaneRouteAttempt
       toolCallCheck: a.toolCallCheck ?? null,
       outputCheck: a.outputCheck ?? null,
       ...measures,
+      ...(typeof a.providerFailure === "boolean" ? { providerFailure: a.providerFailure } : {}),
     };
   });
   const parsed = routeAttemptsSchema.safeParse(projected);
@@ -215,8 +222,8 @@ function indexIntegerKind(key: string): "int8" | "int4" | null {
 /**
  * The real row as its wire document: forbidden fields null, integers bigint. A trace is sent within S43's
  * bounds (`fitStackTrace`); one the bridge's schema would refuse is left out, so the row it belongs to is
- * never lost with it. The route attempts go as their seven members and their measures (`routeAttemptsDtoOf`), or not
- * at all.
+ * never lost with it. The route attempts go as their seven members, their measures and their provider failure
+ * (`routeAttemptsDtoOf`), or not at all.
  * `routes` and `admitted` are no lane row's (the console's route view reads the row's final route instead).
  */
 export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
@@ -550,8 +557,9 @@ export type RecordsAcceptedDto = z.infer<typeof recordsAcceptedSchema>;
  * arguments still do not. The row's route attempts say it in two closed words per attempt
  * (`laneRouteAttemptSchema`): a tool-call word other than `none` means the answer had a call, or was
  * truncated while the request declared tools; an output word other than `not_requested` means the
- * request asked for structured output. Metadata the product owner let out on 2026-11-12. The
- * `gray.usage_refusal/1` envelope has none
+ * request asked for structured output. Metadata the product owner let out on 2026-11-12. Since
+ * 2026-11-23 each attempt also says whether it failed on its provider's answer, one boolean
+ * (`providerFailure`) and nothing else with it. The `gray.usage_refusal/1` envelope has none
  * of them — its members are identifiers Gray already assigns, closed counters and Gray's own words —
  * so nothing is nulled here, and `strict` is what keeps it that way: a document carrying one of those
  * names (`LANE_FORBIDDEN_SERVICE_EVENT_FIELDS`) is refused, and `laneServiceEventDtoOf` never copies
