@@ -2044,7 +2044,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 1,
     max: 2678400,
     source: "GRAY_REST_QUOTA_SECONDS, default 900 (config/requests.rs): magpie's `quotaRest`, \"out of quota, with no word of when it resets\". At most 31 days.",
-    doc: "How long an endpoint (or only its model, when the upstream names it) rests after its allowance was used up, when the upstream states no reset",
+    doc: "How long an endpoint's model rests after its allowance was used up, when the upstream states no reset; the whole endpoint when the supplier's code is quota_exhausted",
   },
   {
     name: "REST_QUOTA_MAX_SECONDS",
@@ -2068,7 +2068,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 1,
     max: 2678400,
     source: "GRAY_REST_CREDIT_SECONDS, default 1800 (config/requests.rs): magpie's `creditRest`, \"out of credit: until someone tops it up\". At most 31 days.",
-    doc: "How long an endpoint rests after its upstream refused its balance or payment (402, insufficient balance)",
+    doc: "How long an endpoint's model rests after its upstream refused its balance or payment (402, insufficient balance); the whole endpoint when the supplier's code is balance_exhausted",
   },
   {
     name: "REST_AUTH_SECONDS",

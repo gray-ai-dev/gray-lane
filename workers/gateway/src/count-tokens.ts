@@ -10,6 +10,7 @@ import {
   classify,
   countStep,
   headerReader,
+  noCountStatus,
   shapeOf,
   type ClassifyContext,
   type Origins,
@@ -146,7 +147,9 @@ import { originsOf } from "./hosts.ts";
  *    receipt before reporting zero-usage outcome to the scheduler, and handles policy refusals with receipts.
  * 4. Confidential Entry peer hop -> Stack VM (Anthropic): signs the peer envelope with `count_tokens: true`,
  *    fails over cleanly across un-upgraded stack VMs or declining containers, validates count fields and
- *    body digests, and produces matching outer and inner receipts.
+ *    body digests, and produces matching outer and inner receipts. A route whose stack VMs all predate the
+ *    count hop (`LanePeerCall.predatesCountHop`), or whose relay container answers the count 404, 405 or 501
+ *    before any vendor call (`end.relay_status`), has no counter, as a route whose API answers 404 (#972).
  */
 
 const encoder = new TextEncoder();
@@ -184,13 +187,16 @@ interface LaneServing {
 }
 
 type PeerOutcome =
-  | { readonly kind: "not_dialed"; readonly code: string }
+  /** `relayStatus`: the container's own error status before any vendor call (`end.relay_status`), when the VM said it. */
+  | { readonly kind: "not_dialed"; readonly code: string; readonly relayStatus: number | null }
   | { readonly kind: "vendor_error"; readonly status: number; readonly body: Uint8Array; readonly headers: Readonly<Record<string, string>> }
   | { readonly kind: "relay_failed"; readonly code: string };
 
 type AttemptResult =
   | { readonly kind: "answered"; readonly counts: JsonObject }
   | { readonly kind: "rejected" }
+  /** The route's API has no token count (@gray/errors `noCounter`): no failure, and the next route is asked. */
+  | { readonly kind: "uncounted" }
   | { readonly kind: "connect" }
   | { readonly kind: "unavailable" }
   | { readonly kind: "pass" }
@@ -690,7 +696,8 @@ export class CountTokensRun {
       }
     }
 
-    // 12. Failover loop (count_tokens.rs:259-364).
+    // 12. Failover loop (count_tokens.rs:259-364). `index` numbers the attempts sent; `spent` counts those the attempt cap
+    // bounds: an API without a token count is no failed count, and each route is asked once.
     const deadline = clock() + Math.min(cfg.nonStreamTotalMs, COUNT_MAX_DEADLINE_MS);
     const maxAttempts = Math.max(1, cfg.retryMaxAttempts);
     const attempted = new Set<string>();
@@ -699,9 +706,12 @@ export class CountTokensRun {
     let onlyOperator: string | null = null;
     let repeat: Route | null = null;
     let index = 0;
+    let spent = 0;
     let oversized = false;
+    let uncounted = 0;
+    let failed = false;
 
-    while (index < maxAttempts) {
+    while (spent < maxAttempts) {
       if (clock() >= deadline || this.presence.gone) break;
       let route: Route | null;
       if (repeat !== null) {
@@ -735,6 +745,11 @@ export class CountTokensRun {
       }
       onlyOperator ??= route.record.operator;
       index += 1;
+      if (result.kind === "uncounted") {
+        uncounted += 1;
+        continue;
+      }
+      spent += 1;
 
       if (result.kind === "answered") {
         return this.renderSuccess(result.counts);
@@ -742,6 +757,7 @@ export class CountTokensRun {
       if (result.kind === "rejected") {
         return this.renderError(new ApiError(400, "count_tokens_request_rejected"), "routes");
       }
+      failed = true;
       if (result.kind === "connect" && !repeatedConnect.has(route.record.endpointId)) {
         repeatedConnect.add(route.record.endpointId);
         repeat = route;
@@ -757,6 +773,11 @@ export class CountTokensRun {
           .withMeta("limit_source", "restored tool-call ids exceeded the API request limit"),
         "routes",
       );
+    }
+    // Every route asked has no token count, which the provider standard leaves optional: the model cannot be counted, and
+    // asking again changes nothing. A route that counts and failed makes it the 502 that says to retry.
+    if (uncounted > 0 && !failed) {
+      return this.renderError(new ApiError(400, "count_tokens_unsupported"), "routes");
     }
     return this.renderError(new ApiError(502, "count_tokens_unavailable"), "routes");
   }
@@ -1264,6 +1285,13 @@ export class CountTokensRun {
         if (call.egressRefusal !== null) {
           return { kind: "stop", stage: "routes", error: call.egressRefusal === "capacity" ? egressCapacity() : egressRefused() };
         }
+        if (call.predatesCountHop) {
+          // Its stack VMs run a release before the count hop: the route has no counter until they take one, as a route
+          // whose API answers the count path 404 (#972). Nothing was registered or dialed, and nothing counts against it;
+          // the receipt keeps the stack VM's refusal (`peer.failed`, `peer_malformed`).
+          this.pushAttempt(route, startedAt, null, "count_unsupported", "count_tokens_unsupported", true);
+          return { kind: "uncounted" };
+        }
         this.pushAttempt(route, startedAt, null, "upstream_error", sent.code);
         return { kind: "unavailable" };
       }
@@ -1276,6 +1304,12 @@ export class CountTokensRun {
         const outcome = peerEndedOutcome(sent.end, sent.head, sent.body);
         call.close();
         if (outcome.kind === "not_dialed") {
+          if (outcome.code === "relay_error_status" && noCountStatus(outcome.relayStatus)) {
+            // The relay's container has no count path: it answered 404, 405 or 501 before any vendor call (relay standard
+            // section 2), as a route whose API answers the count path so (#972). Its decline (503 `relay_declined`) stays one.
+            this.pushAttempt(route, startedAt, outcome.relayStatus, "count_unsupported", "count_tokens_unsupported", true);
+            return { kind: "uncounted" };
+          }
           this.pushAttempt(route, startedAt, null, "upstream_error", outcome.code);
           return { kind: "unavailable" };
         }
@@ -1289,6 +1323,8 @@ export class CountTokensRun {
             elapsed,
             clock(),
           );
+          // A stack route reaches only an official vendor, which counts tokens: its vendor's missing count path is a failure
+          // (`uncounted` goes on as `next`). A container without a count path answers before any vendor call (`not_dialed`).
           const step = countStep(classified.outcome, false, false);
           this.pushAttempt(route, startedAt, outcome.status, "upstream_error", step === "rejected" ? "count_tokens_request_rejected" : "count_tokens_unavailable");
           if (step === "rejected") {
@@ -1462,7 +1498,16 @@ export class CountTokensRun {
         }
 
         const classified = classify(status, headerReader(response.headers), errBytes, this.classifyContext(model, route, restoredPairs), elapsed, clock());
-        const step = countStep(classified.outcome, unvouched, repeatedConnect);
+        const counted = countStep(classified.outcome, unvouched, repeatedConnect);
+        // A relay route reaches only an official vendor's API, which counts tokens: a count path missing there is its failure.
+        const step = counted === "uncounted" && laneContext?.kind === "relay" ? "next" : counted;
+        if (step === "uncounted") {
+          // The route's API has no token count, which no standard asks of it: the attempt counts neither for nor against
+          // the route (recorded `rejected`, as the server records it), and nothing here reaches its circuit, rests,
+          // ranking, evidence or `providerFailure`.
+          this.pushAttempt(route, startedAt, status, "count_unsupported", "count_tokens_unsupported", true);
+          return { kind: "uncounted" };
+        }
         this.pushAttempt(route, startedAt, status, "upstream_error", step === "rejected" ? "count_tokens_request_rejected" : "count_tokens_unavailable");
 
         if (laneContext?.kind === "relay") {
@@ -2044,9 +2089,10 @@ export class CountTokensRun {
     this.skippedRoutes.push({ endpointId: route.record.endpointId, reason });
   }
 
-  private pushAttempt(route: Route, startedAt: number, status: number | null, outcome: string, code: string | null): void {
+  private pushAttempt(route: Route, startedAt: number, status: number | null, outcome: string, code: string | null, rejected = false): void {
     const now = this.deps.clock();
     this.attempts.push({
+      ...(rejected ? { rejected: true } : {}),
       endpointId: route.record.endpointId,
       operator: route.record.operator,
       startedAt,
@@ -2287,7 +2333,7 @@ async function countTokensAtShard(o: KeyRateCount): Promise<CountResult> {
 }
 
 function peerEndedOutcome(end: PeerEndDto, head: PeerHeadDto, body: Uint8Array): PeerOutcome {
-  if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid" };
+  if (end.outcome === "not_dialed") return { kind: "not_dialed", code: end.code ?? "peer_invalid", relayStatus: end.relay_status === undefined ? null : Number(end.relay_status) };
   if (end.outcome === "vendor_error") {
     const headers: Record<string, string> = {};
     if (head.headers !== undefined) {

@@ -596,13 +596,35 @@ export function attemptsAllowed(shape: PlanShape, config: RetryConfig): number {
  *   (`unvouched`), which may be what it refused;
  * - `repeat`: a refused connection, which nothing reached, is repeated once on its route at once (gRPC's
  *   transparent retry; `repeatedConnect` says it was already);
+ * - `uncounted`: the route's API has no token count (`noCounter`): the next route is asked, and the attempt is
+ *   no failure of the route's, since the provider standard asks no API to count tokens;
  * - `next`: anything else goes to the next route, the issuer's first, another operator's before the failed
  *   one's, and only that operator's when the customer refused fallbacks. A flagged conversation is the
  *   supplier's account, so the next route counts.
  */
-export function countStep(outcome: Outcome, unvouched: boolean, repeatedConnect: boolean): "rejected" | "repeat" | "next" {
+export function countStep(outcome: Outcome, unvouched: boolean, repeatedConnect: boolean): "rejected" | "repeat" | "uncounted" | "next" {
   const refused = outcome.class === "final_refusal" || (outcome.class === "refusal" && !outcome.serverCode && outcome.shouldRetry !== true);
   if (refused && !unvouched) return "rejected";
   if (outcome.class === "connect" && !repeatedConnect) return "repeat";
+  if (noCounter(outcome)) return "uncounted";
   return "next";
+}
+
+/**
+ * The count path does not exist at the route's API: it answered the count with 404, 405 or 501, which the classifier
+ * reads as a route fault (not a rate limit, a refused account or a block, whose codes decide first). Gray sends a count
+ * to the route's Messages path with `/count_tokens` appended, or to Gemini's `:countTokens`, and the API provider
+ * standard requires neither (docs/api-provider-standard.en.md clause 2.7); a relay's container may decline it too
+ * (docs/relay-integration-standard.en.md section 2). Such an API counts nothing, so nothing counts against its route.
+ */
+export function noCounter(outcome: Outcome): boolean {
+  return outcome.class === "route_fault" && !outcome.answered && noCountStatus(outcome.status);
+}
+
+/**
+ * The statuses of an API without a count path (`noCounter`): 404, 405 and 501. A relay's container answers a count it
+ * does not serve with one of them before any vendor call (docs/relay-integration-standard.en.md section 2).
+ */
+export function noCountStatus(status: number | null | undefined): boolean {
+  return status === 404 || status === 405 || status === 501;
 }

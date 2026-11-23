@@ -40,12 +40,15 @@ export type RestScope = (typeof REST_SCOPES)[number];
 /**
  * What a failure says about its route's rest (`Reading`): its cause, the reset its upstream stated (uncapped, in
  * milliseconds; fractions of one kept), whether its text names the route's model or a pool of models, and its
- * message as the client would be shown it.
+ * message as the client would be shown it. Whether the model is named no longer changes the rest (`restScopeOf`).
+ * `accountWide`: Gray's own contract code said the refusal covers the supplier's whole account (`quota_exhausted`,
+ * `balance_exhausted`).
  */
 export interface RestReading {
   readonly cause: RestCause;
   readonly resetMs: number | undefined;
   readonly modelNamed: boolean;
+  readonly accountWide: boolean;
   readonly said: string | undefined;
 }
 
@@ -71,9 +74,10 @@ export interface RestConfig {
  * The rest a reading gets (`decide`), as magpie's `restAfter` gives each cause its own:
  * - `rate`: the stated reset, at most REST_RATE_MAX_SECONDS; none without one, so the circuit alone decides. Its
  *   scope is the route.
- * - `quota`: the stated reset, at most REST_QUOTA_MAX_SECONDS, else REST_QUOTA_SECONDS; the endpoint, or only its
- *   model when the text names the model or a pool of models.
- * - `credit`, `auth` and `restricted`: their own settings, whatever reset is stated; the endpoint.
+ * - `quota`: the stated reset, at most REST_QUOTA_MAX_SECONDS, else REST_QUOTA_SECONDS.
+ * - `credit`, `auth` and `restricted`: their own settings, whatever reset is stated.
+ *
+ * What each covers is `restScopeOf`'s.
  */
 export function decideRest(reading: RestReading, config: RestConfig): DecidedRest | undefined {
   const cause = reading.cause;
@@ -97,8 +101,32 @@ export function decideRest(reading: RestReading, config: RestConfig): DecidedRes
       [lengthMs, stated] = [config.restrictedMs, false];
       break;
   }
-  const scope: RestScope = cause === "rate" ? "route" : cause === "quota" && reading.modelNamed ? "model" : "endpoint";
-  return { cause, scope, lengthMs, stated };
+  return { cause, scope: restScopeOf(reading), lengthMs, stated };
+}
+
+/**
+ * What a rest after `reading` covers (`scope_of`): a rate limit its route, as its circuit does; a key refused or an
+ * account restricted the endpoint; a balance, payment or allowance refused the endpoint when Gray's contract code says
+ * the supplier's whole account is out (`quota_exhausted`, `balance_exhausted`), and otherwise the endpoint's model that
+ * met it.
+ *
+ * Vendors bill and meter by model: Tencent TokenHub refused one DeepSeek model's payment with a bare 402 while another
+ * model on the same key served (production 2026-11-23). A bare 402, or a vendor's own payment or quota code or words,
+ * says nothing reliable about the key's other models, so it never rests them; an account out of everything costs each
+ * of them one refused attempt per rest, which fails over as any failure does. A supplier that sends the contract code
+ * has said the account is out, and its endpoint rests without a refused call per model.
+ */
+export function restScopeOf(reading: Pick<RestReading, "cause" | "accountWide">): RestScope {
+  switch (reading.cause) {
+    case "rate":
+      return "route";
+    case "quota":
+    case "credit":
+      return reading.accountWide ? "endpoint" : "model";
+    case "auth":
+    case "restricted":
+      return "endpoint";
+  }
 }
 
 /** What `readRest` reads a failure from, as `classify` hands it over. */
@@ -134,24 +162,25 @@ export function readRest(f: RestFailure, text: boolean): RestReading | undefined
   const contract = contractCause(f.codes);
   if (contract !== undefined) {
     if (contract.cause === undefined) return undefined;
-    return { cause: contract.cause, resetMs: stated ?? headerReset(f.headers, f.nowMs), modelNamed: contract.model, said: f.said };
+    const accountWide = !contract.model && (contract.cause === "quota" || contract.cause === "credit");
+    return { cause: contract.cause, resetMs: stated ?? headerReset(f.headers, f.nowMs), modelNamed: contract.model, accountWide, said: f.said };
   }
   const coded = codedCause(f.class, f.codes, error);
   if (!text) {
     const cause = coded?.cause ?? statusCause(f.class, f.status);
-    return cause === undefined ? undefined : { cause, resetMs: stated ?? headerReset(f.headers, f.nowMs), modelNamed: coded?.model === true, said: f.said };
+    return cause === undefined ? undefined : { cause, resetMs: stated ?? headerReset(f.headers, f.nowMs), modelNamed: coded?.model === true, accountWide: false, said: f.said };
   }
   const words = wordsOf(error, value, f.body);
   const cause = coded !== undefined ? coded.cause : f.class === "throttled" ? throttled(f.status, words) : credential(f.status, f.opening, words);
   if (cause === undefined) return undefined;
-  return { cause, resetMs: stated ?? wordsReset(words, f.nowMs) ?? headerReset(f.headers, f.nowMs), modelNamed: coded?.model === true || modelNamed(words, f.models), said: f.said };
+  return { cause, resetMs: stated ?? wordsReset(words, f.nowMs) ?? headerReset(f.headers, f.nowMs), modelNamed: coded?.model === true || modelNamed(words, f.models), accountWide: false, said: f.said };
 }
 
 /**
  * Whether two readings rest a route alike (`same_rest`): the same cause, the same reset for a rate limit or a quota
- * (the other causes rest their own lengths), and the same scope for a quota. A rate limit that states no reset rests
- * nothing, as no reading does. `classify` compares the reading with and without the words: when they differ, the
- * words decided the rest (`Outcome.legacyText`).
+ * (the other causes rest their own lengths), and for a balance or a quota whether the contract made it the account's
+ * (`restScopeOf`). A rate limit that states no reset rests nothing, as no reading does. `classify` compares the reading with and without the words: when
+ * they differ, the words decided the rest (`Outcome.legacyText`).
  */
 export function sameRest(a: RestReading | undefined, b: RestReading | undefined): boolean {
   const effect = (r: RestReading | undefined) => (r === undefined || (r.cause === "rate" && r.resetMs === undefined) ? undefined : r);
@@ -159,7 +188,7 @@ export function sameRest(a: RestReading | undefined, b: RestReading | undefined)
   if (x === undefined || y === undefined) return x === y;
   if (x.cause !== y.cause) return false;
   if ((x.cause === "rate" || x.cause === "quota") && x.resetMs !== y.resetMs) return false;
-  return x.cause !== "quota" || x.modelNamed === y.modelNamed;
+  return !((x.cause === "credit" || x.cause === "quota") && x.accountWide !== y.accountWide);
 }
 
 /**

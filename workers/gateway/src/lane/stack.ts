@@ -995,6 +995,8 @@ export class StackCall {
   registered = false;
   /** Why the answer was not released, when it was not. */
   fault: StackFault | null = null;
+  /** The container's own error status (`relay_error_status`, not its decline), when it answered one. */
+  relayStatus: number | null = null;
   /** How many container events were released to the client. */
   released = 0;
   /**
@@ -1106,6 +1108,7 @@ export class StackCall {
           const errorBody = response.body === null ? null : stackDecodedBody(response.body, response.headers.get("content-encoding"));
           const declined = DECLINE_CODES.has(response.status) && relayDeclined(response.status, await readAtMost(errorBody, DECLINE_READ_MAX_BYTES));
           await errorBody?.cancel().catch(() => {});
+          if (!declined) this.relayStatus = response.status;
           return { kind: "failed", outcome: await this.#failed({ by: "relay", why: declined ? RELAY_DECLINED : "relay_error_status" }) };
         }
         if (response.body === null) return { kind: "failed", outcome: await this.#failed({ by: "relay", why: "relay_no_body" }) };

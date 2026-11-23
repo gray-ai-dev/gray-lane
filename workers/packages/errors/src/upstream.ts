@@ -15,7 +15,8 @@
  * - a rate limit: `429 upstream_rate_limited` with the provider's own `retry-after`, and none when it
  *   stated none (`rateLimited`);
  * - no image drawn: `502 upstream_no_image`, which the client may send again (`noImage`);
- * - the provider's own account: `502 upstream_auth_failed`;
+ * - the provider's own account: `502 upstream_auth_failed`; its balance, payment or allowance:
+ *   `503 upstream_model_unavailable`;
  * - any other failure: `502 upstream_rejected` with the provider's status (`failed`), or
  *   `502 upstream_unavailable` when no upstream answered.
  *
@@ -511,7 +512,18 @@ export function rateLimited(retryAfterMs: number | undefined): ApiError {
 /** `502 upstream_auth_failed`: the provider's upstream refused Gray's credential or the provider's account. */
 export function credentialRefused(model: string): ApiError {
   return new ApiError(502, "upstream_auth_failed").withMessage(
-    `The provider serving \`${model}\` could not use its own upstream account (its credentials, credit or standing were refused), and no other provider could take the request. This is not a problem with your API key or your Gray balance; retry later, or choose another model.`,
+    `The provider serving \`${model}\` could not use its own upstream account (its credentials or standing were refused), and no other provider could take the request. This is not a problem with your API key or your Gray balance; retry later, or choose another model.`,
+  );
+}
+
+/**
+ * `503 upstream_model_unavailable`: the provider's upstream refused the balance, payment or allowance of the provider's
+ * account (a 402, a billing or quota code), which holds the model at that provider, or the whole provider when its
+ * contract code says its account is out (rests.ts `restScopeOf`). Neither the client's key nor its balance was refused.
+ */
+export function modelUnavailable(model: string): ApiError {
+  return new ApiError(503, "upstream_model_unavailable").withMessage(
+    `The provider serving \`${model}\` cannot serve this model right now, and no other provider could take the request. This is not a problem with your API key or your Gray balance; retry later, or choose another model.`,
   );
 }
 

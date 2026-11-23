@@ -171,10 +171,37 @@ export interface PeerSession {
   tunnels: number;
   /** Whether peerlink's table has listed it (until then it is pending, PENDING_MS at most). */
   seen: boolean;
+  /**
+   * The first read of peerlink's table (`PeerSessions.beginRead`) that began after peerlink answered the session's
+   * hand-over (`handedOver`), or null while that answer is on its way. A read from it on lists the session while
+   * peerlink holds it.
+   */
+  heldFrom: number | null;
+  /**
+   * A read from `heldFrom` on did not list it: peerlink took it and it ended before any read saw it (the VM closed it
+   * right after it attached). It carries nothing and counts for no boot; it is kept until PENDING_MS, as a read can
+   * miss a session peerlink is still accepting (its table lists one once the WebSocket is accepted, a moment after the
+   * answer), and a later read that lists it makes it live again rather than a stranger to close.
+   */
+  missed: boolean;
 }
 
-/** How long an admitted session may be missing from peerlink's table before it counts as gone: the upgrade's way. */
+/**
+ * How long an admitted session may be missing from peerlink's table before it is forgotten: the upgrade's way. Such a
+ * session counts against the caps meanwhile, but carries nothing (`isHeld`): the boot it names is routed only over the
+ * sessions peerlink holds.
+ */
 export const PENDING_MS = 10_000;
+
+/**
+ * Whether peerlink holds the session as far as this boot knows: its last read listed it, or peerlink took the hand-over
+ * and no read since missed it. Only such a session makes its boot routable and is counted (tee peer e2e D3: a session
+ * the VM closed 3 ms after it attached was counted for 10 s, and every request for the relay's model went to a boot
+ * peerlink held no session of).
+ */
+function isHeld(session: PeerSession): boolean {
+  return session.seen || (session.heldFrom !== null && !session.missed);
+}
 
 /** A keyset pinned by the registry: its receipt keys (64 hex each) and how long the pin holds. */
 export interface KeysetPin {
@@ -216,18 +243,33 @@ export class PeerSessions {
    * entry boot knows it (docs/design/relay-zero-downtime.md, the order of two boots of one relay).
    */
   readonly #firstSeen = new Map<string, number>();
+  /** The reads of peerlink's table begun (`beginRead`). */
+  #reads = 0;
 
   constructor(deps: PeerSessionsDeps) {
     this.#deps = deps;
   }
 
+  /** A read of peerlink's table begins, before its call: its number, for `sync`. */
+  beginRead(): number {
+    this.#reads += 1;
+    return this.#reads;
+  }
+
+  /** peerlink answered the hand-over of `session` (it took the upgrade): a read begun from now on lists it while it holds it. */
+  handedOver(session: string): void {
+    const known = this.#sessions.get(session);
+    if (known !== undefined && known.heldFrom === null) known.heldFrom = this.#reads + 1;
+  }
+
   /**
-   * peerlink's table: a session peerlink no longer holds is forgotten (one admitted within PENDING_MS may not be in it
-   * yet: the upgrade is still on its way), and the tunnel counts are peerlink's. Returns the sessions peerlink holds
-   * that this boot never admitted (the lane restarted under them, or they differ from what was admitted): the caller
-   * closes them, and the VM redials with freshly signed attaches.
+   * peerlink's table as read by read number `read` (`beginRead`): a session peerlink no longer holds is forgotten (one
+   * admitted within PENDING_MS may not be in it yet: the upgrade is still on its way; one peerlink took is no longer
+   * held once a read begun after it took it does not list it), and the tunnel counts are peerlink's. Returns the
+   * sessions peerlink holds that this boot never admitted (the lane restarted under them, or they differ from what was
+   * admitted): the caller closes them, and the VM redials with freshly signed attaches.
    */
-  sync(live: readonly LiveSession[]): readonly string[] {
+  sync(live: readonly LiveSession[], read: number): readonly string[] {
     const now = this.#deps.clock();
     this.#prune(now);
     const open = new Map(live.map((row) => [row.session, row]));
@@ -240,6 +282,10 @@ export class PeerSessions {
       const row = open.get(id);
       if (row === undefined) {
         if (session.seen || now - session.attachedMs >= PENDING_MS) this.#sessions.delete(id);
+        else if (session.heldFrom !== null && read >= session.heldFrom && !session.missed) {
+          session.missed = true;
+          this.#deps.log({ level: "warn", event: "lane_peer_session_ended", relay: session.relay, keyset_digest: session.keyset, session: session.session, age_ms: now - session.attachedMs });
+        }
         continue;
       }
       if (row.relay !== session.relay || row.keyset !== session.keyset) {
@@ -247,6 +293,7 @@ export class PeerSessions {
         continue;
       }
       session.seen = true;
+      session.missed = false;
       session.tunnels = row.tunnels;
       if (session.state === "pinned") this.#touchSeen(pairKey(session.relay, session.keyset), now);
     }
@@ -285,7 +332,7 @@ export class PeerSessions {
       if (unverified >= PEER_ATTACH_LIMITS.unverifiedPerRelay) return this.#busy(claims, "unverified");
       state = "unverified";
     }
-    this.#sessions.set(claims.session, { session: claims.session, relay: claims.relay, keyset: claims.keyset, state, attachedMs: now, claims, signature, tunnels: 0, seen: false });
+    this.#sessions.set(claims.session, { session: claims.session, relay: claims.relay, keyset: claims.keyset, state, attachedMs: now, claims, signature, tunnels: 0, seen: false, heldFrom: null, missed: false });
     // Only record boot-age and pin-retention timestamps once ownership of the keyset is verified, so an
     // unauthenticated caller cannot spoof boot ordering or grow `#lastSeen`/`#firstSeen` with arbitrary keysets.
     if (state === "pinned") {
@@ -376,7 +423,7 @@ export class PeerSessions {
   async refuseVerified(relay: string, keyset: string, receiptKeys: readonly string[], forMs: number = PEER_ATTACH_LIMITS.refusedMs): Promise<SessionChanges & { readonly banned: boolean }> {
     const now = this.#deps.clock();
     this.#prune(now);
-    if (this.hasPinnedSession(relay, keyset)) return { ...this.refuse(relay, keyset, forMs), banned: true };
+    if (this.#admittedPinned(relay, keyset)) return { ...this.refuse(relay, keyset, forMs), banned: true };
     const unverified: PeerSession[] = [];
     for (const session of this.#sessions.values()) {
       if (session.relay === relay && session.keyset === keyset && session.state === "unverified") unverified.push(session);
@@ -413,14 +460,14 @@ export class PeerSessions {
   }
 
   /**
-   * The keysets of `relay` that have sessions, the newest boot first (first seen, then latest attach), each with its
-   * sessions by state, its open streams (peerlink's count at the last sync: requests and tunnels) and when it was first
-   * seen.
+   * The keysets of `relay` that have sessions peerlink holds (`isHeld`), the newest boot first (first seen, then latest
+   * attach), each with those sessions by state, its open streams (peerlink's count at the last sync: requests and
+   * tunnels) and when it was first seen.
    */
   keysetsOf(relay: string): readonly { readonly keyset: string; readonly pinned: number; readonly unverified: number; readonly streams: number; readonly firstSeenMs: number }[] {
     const by = new Map<string, { keyset: string; pinned: number; unverified: number; streams: number; firstSeenMs: number; newest: number }>();
     for (const s of this.#sessions.values()) {
-      if (s.relay !== relay) continue;
+      if (s.relay !== relay || !isHeld(s)) continue;
       const row = by.get(s.keyset) ?? { keyset: s.keyset, pinned: 0, unverified: 0, streams: 0, firstSeenMs: this.firstSeenOf(relay, s.keyset) ?? s.attachedMs, newest: 0 };
       if (s.state === "pinned") row.pinned += 1;
       else row.unverified += 1;
@@ -443,8 +490,14 @@ export class PeerSessions {
     return this.#firstSeen.get(key) ?? null;
   }
 
-  /** Whether (relay, keyset) has a pinned session now (routing prefers such a peer; O5). */
+  /** Whether (relay, keyset) has a pinned session peerlink holds now (`isHeld`): routing goes only to such a boot (O5). */
   hasPinnedSession(relay: string, keyset: string): boolean {
+    for (const s of this.#sessions.values()) if (s.relay === relay && s.keyset === keyset && s.state === "pinned" && isHeld(s)) return true;
+    return false;
+  }
+
+  /** Whether (relay, keyset) has an admitted pinned session, held or not: its attach was signed under the pin. */
+  #admittedPinned(relay: string, keyset: string): boolean {
     for (const s of this.#sessions.values()) if (s.relay === relay && s.keyset === keyset && s.state === "pinned") return true;
     return false;
   }

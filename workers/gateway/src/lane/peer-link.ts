@@ -140,7 +140,10 @@ export class PeerLink implements PeerChannel {
     // The verdict is the lane's alone: whatever the VM sent under this name is not forwarded.
     headers.set(PEER_SESSION_STATE_HEADER, verdict.state);
     // The un-accepted WebSocket peerlink answers is returned as it is: workerd pumps it (X-O3).
-    return this.#deps.peerlink(new Request(`${PEERLINK_ORIGIN}/v1/attach`, { method: "GET", headers }));
+    const answer = await this.#deps.peerlink(new Request(`${PEERLINK_ORIGIN}/v1/attach`, { method: "GET", headers }));
+    // peerlink took the session: from the next read on, its table says whether it still holds it.
+    if (answer.status < 300) this.sessions.handedOver(read.claims.session);
+    return answer;
   }
 
   /**
@@ -220,6 +223,7 @@ export class PeerLink implements PeerChannel {
 
   /** Reads peerlink's table into the sessions, and closes the unverified sessions held too long. False when peerlink did not answer. */
   async sync(): Promise<boolean> {
+    const read = this.sessions.beginRead();
     let rows: LiveSession[];
     try {
       const answer = await this.#deps.peerlink(new Request(`${PEERLINK_ORIGIN}/v1/sessions`, { method: "GET" }));
@@ -229,7 +233,7 @@ export class PeerLink implements PeerChannel {
       return false;
     }
     this.#listed = rows.length;
-    const strangers = this.sessions.sync(rows);
+    const strangers = this.sessions.sync(rows, read);
     const closed = [...strangers, ...this.sessions.expired()];
     if (strangers.length > 0) this.#deps.log({ level: "warn", event: "lane_peer_session_unknown", sessions: strangers.length });
     if (closed.length > 0) await this.apply({ promoted: [], closed });

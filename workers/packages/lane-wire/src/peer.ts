@@ -22,9 +22,9 @@ import { stackTraceSchema } from "./stack-trace.ts";
  *   for the late-facts follow-up (`GET /v1/peer/attempts/<rid>`), so neither can be presented as the other.
  * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream, headers?}`), `data` (standard
  *   base64 of the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts,
- *   relay_account_id, usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?}`). Between them the stack
- *   VM writes `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused`, `vendor_event` and `head.headers`
- *   (`error_headers`) go only to an entry that named them in `PEER_READS_HEADER`.
+ *   relay_account_id, usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?, relay_status?}`). Between
+ *   them the stack VM writes `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused`, `vendor_event`,
+ *   `relay_status` and `head.headers` (`error_headers`) go only to an entry that named them in `PEER_READS_HEADER`.
  * - **A refusal** of checks 1 to 6 (`peer_*`, `route_unconfigured`, `foreign_relay`): an HTTP 4xx whose body is
  *   `{code, dialed: false}`, before any frame; the status is `PEER_REFUSAL_STATUS`'s.
  * - **The attempts answer**: `{state, receipt, trace?}` from the stack VM's memory (`trace` once done, to an entry
@@ -81,8 +81,12 @@ export const PEER_READS_HEADER = "x-gray-peer-reads";
  * `vendor_error` `head` frame (`head.headers`), so the entry drives rest classification and passes `Retry-After` /
  * `Content-Type` to the client. Sent only to an entry that named `error_headers` in `PEER_READS_HEADER`: an older
  * entry's strict `peerHeadSchema` refuses a `head` that carries `headers`.
+ *
+ * `relay_status`: the status the relay's container answered a token count with, when it answered an error before any
+ * vendor call (`not_dialed`, `relay_error_status`), so the entry reads a container without a count path (404, 405 or
+ * 501, docs/relay-integration-standard.en.md section 2) as a route without a counter, not as its failure.
  */
-export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers"] as const;
+export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers", "relay_status"] as const;
 export type PeerEndRead = (typeof PEER_END_READS)[number];
 
 /**
@@ -451,6 +455,11 @@ export const peerEndSchema = z
      * Sent only to an entry that named `vendor_event` in PEER_READS_HEADER.
      */
     vendor_event: z.record(z.string(), z.unknown()).optional(),
+    /**
+     * The status the relay's container answered a token count with, an error before any vendor call (`not_dialed`,
+     * `relay_error_status`). Sent only to an entry that named `relay_status` in PEER_READS_HEADER.
+     */
+    relay_status: uintSchema.min(100n).max(599n).optional(),
   })
   .strict()
   .superRefine((end, ctx) => {
@@ -465,6 +474,7 @@ export const peerEndSchema = z
     if (dialed && end.receipt === null && end.receipt_refused === undefined) issue("receipt", "a dialed attempt has its receipt, or says why not (receipt_refused)");
     if (end.receipt_refused !== undefined && (!dialed || end.receipt !== null)) issue("receipt_refused", "receipt_refused names why a dialed attempt has no receipt");
     if (end.vendor_event !== undefined && end.outcome !== "relay_failed") issue("vendor_event", "vendor_event names the vendor's error that ended an answer nothing of which was released");
+    if (end.relay_status !== undefined && (end.outcome !== "not_dialed" || end.code !== "relay_error_status")) issue("relay_status", "relay_status names the container's error before any vendor call");
   });
 export type PeerEndDto = z.infer<typeof peerEndSchema>;
 

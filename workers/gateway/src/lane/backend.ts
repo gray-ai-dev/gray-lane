@@ -288,6 +288,8 @@ class BackendRun {
   readonly #readsVendorEvent: boolean;
   /** The entry named `error_headers`: it reads allowlisted vendor error response headers on a non-200 `head`. */
   readonly #readsErrorHeaders: boolean;
+  /** The entry named `relay_status`: it reads the container's own error status on a token count not dialed. */
+  readonly #readsRelayStatus: boolean;
   /** The vendor's own error event that ended its stream before the commit (`primeStream`'s `event`), as it came. */
   #vendorEvent: Json | null = null;
   /** Why the receipt was not signed (a closed word, `receiptProblem`), once `#receipt` failed. */
@@ -308,6 +310,7 @@ class BackendRun {
     this.#readsReceiptRefused = reads.has("receipt_refused");
     this.#readsVendorEvent = reads.has("vendor_event");
     this.#readsErrorHeaders = reads.has("error_headers");
+    this.#readsRelayStatus = reads.has("relay_status");
     this.#presence = new ClientPresence(null, input.clock, 0);
     hop.onLeave(() => this.#presence.leave("client_left"));
     this.#presence.onLeave(() => {
@@ -409,6 +412,11 @@ class BackendRun {
       // (no vendor error is) goes without it, and the entry answers as before.
       ...(ended.outcome === "relay_failed" && this.#readsVendorEvent && isObject(vendorEvent) && toJsonString(vendorEvent).length <= VENDOR_EVENT_MAX_BYTES
         ? { vendor_event: vendorEvent as Record<string, unknown> }
+        : {}),
+      // A token count the container answered with an error of its own before any vendor call: its status, to an entry that
+      // reads it, which takes 404, 405 and 501 for a container without a count path (relay standard section 2).
+      ...(this.#input.countTokens === true && ended.outcome === "not_dialed" && ended.code === "relay_error_status" && call?.relayStatus !== null && call?.relayStatus !== undefined && this.#readsRelayStatus
+        ? { relay_status: BigInt(call.relayStatus) }
         : {}),
     };
   }

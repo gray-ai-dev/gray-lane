@@ -266,8 +266,9 @@ export interface AttemptRecord {
   /**
    * The server's telemetry records the attempt `rejected` (inference.rs `close_attempt`), not as one sent to
    * its route: Gray never sent it (the route could not be asked: its mapping, a lane origin, a body Gray
-   * refused for it; or the attempt's bound ran out while it still waited in the gateway), or the model
-   * refused the request in an answer of its own (`refused_answer`). Absent otherwise.
+   * refused for it; or the attempt's bound ran out while it still waited in the gateway), the model
+   * refused the request in an answer of its own (`refused_answer`), or a token count's route has no token count
+   * (count-tokens.ts, count_tokens.rs `Failure::Uncounted`). Absent otherwise.
    */
   readonly rejected?: boolean;
   /**

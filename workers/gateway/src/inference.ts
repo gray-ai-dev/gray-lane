@@ -6367,8 +6367,8 @@ export class InferenceRun {
    * or 403, a quota, the provider's key, credit or standing, or the vendor's block of the account) is the provider's
    * failure, not the client's: passed on, its status and text would tell the client that its own key was refused. So
    * it is not the client's answer (`passthrough`): the attempt failed with its classification as any route's does
-   * (`upstream_auth_failed`, `upstream_account_refused`, nothing charged), and the dispatcher's rules for its class
-   * decide the next route (the vendor did no work for it). With none left the client gets that error, Gray's own
+   * (`upstream_auth_failed`, `upstream_model_unavailable`, `upstream_account_refused`, nothing charged), and the
+   * dispatcher's rules for its class decide the next route (the vendor did no work for it). With none left the client gets that error, Gray's own
    * (`replaced_error` true, no served attempt). The account stays named on the request's row (S27: errors per
    * account) unless a later attempt's answer ends the request.
    */

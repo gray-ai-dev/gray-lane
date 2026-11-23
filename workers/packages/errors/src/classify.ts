@@ -38,6 +38,7 @@ import {
   diagnose,
   failed,
   isContextOverflow,
+  modelUnavailable,
   namesWhatTheRequestReferenced,
   noImage,
   OVERFLOW_CODES,
@@ -609,7 +610,9 @@ export function classify(status: number, headers: HeaderReader, body: Uint8Array
       error = rateLimited(retryAfterMs);
       break;
     case "credential":
-      error = credentialRefused(model);
+      // A balance, payment or allowance refused: the provider cannot serve this model now, and nothing of a key was
+      // refused.
+      error = rest?.cause === "credit" || rest?.cause === "quota" ? modelUnavailable(model) : credentialRefused(model);
       break;
     case "account_request":
       // Only a block makes the class.

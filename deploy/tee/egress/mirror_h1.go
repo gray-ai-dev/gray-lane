@@ -165,6 +165,15 @@ func (t *mirrorH1Client) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, errMirrorNoDial
 	}
 	ctx := req.Context()
+	// A request whose context has already ended is not written, as net/http's Transport checks before it takes a
+	// connection: an idle one would otherwise get it while the context's end closes it. A relay call whose KMS lease
+	// ended after its last check comes here with such a context (stack_relay.go: lease.withContext).
+	if ctx.Err() != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, context.Cause(ctx)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 && req.GetBody != nil {
 			body, err := req.GetBody()

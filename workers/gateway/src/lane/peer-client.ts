@@ -15,6 +15,7 @@ import {
   PEER_HEADER,
   PEER_READS_HEADER,
   PEER_REQUEST_ID_HEADER,
+  readPeerEnvelope,
   signPeerDebugEnvelope,
   signPeerEnvelope,
   stackTraceOf,
@@ -1071,6 +1072,11 @@ export class PeerCall implements LanePeerCall {
   /** The peer of `peers` the next send starts at: a dial that sent nothing moves it on, an answer keeps it. */
   #at = 0;
   readonly startedAt: number;
+  /** The `x-gray-peer` value of the last send, read again only when a stack VM refuses it (`predatesCountHop`). */
+  #header: string | null = null;
+  /** A token count's peers that refused it as a release before the count hop does (`send`), and whether any ended otherwise. */
+  #countRefused = 0;
+  #countOther = false;
 
   constructor(input: PeerCallInput) {
     this.#input = input;
@@ -1081,6 +1087,19 @@ export class PeerCall implements LanePeerCall {
 
   get n(): number {
     return this.#input.n;
+  }
+
+  /**
+   * Whether this token count's route has no counter: every stack VM it went to runs a release before the count hop
+   * (lane-wire's `count_tokens` envelope member), which refuses `/v1/messages/count_tokens` before any frame as
+   * `peer_malformed` (its peer routes check the path before the envelope). A stack VM with the count hop answers
+   * `peer_malformed` only for an envelope its reader refuses or a member that disagrees with the path, and the entry
+   * signs `count_tokens` on that path alone, so each refusal counts here only when the header that went reads under the
+   * same reader (`readPeerEnvelope`). False for a generation, for any other outcome on any of its peers, and for a
+   * header the entry made wrong: those stay the route's failure.
+   */
+  get predatesCountHop(): boolean {
+    return this.#countRefused > 0 && !this.#countOther;
   }
 
   /**
@@ -1236,7 +1255,12 @@ export class PeerCall implements LanePeerCall {
       this.peer = peer;
       last = await this.#sendTo(peer);
       // An un-upgraded stack VM rejects `count_tokens: true` with `peer_malformed`; try the next peer without marking it down.
-      if (last.kind === "unsent" && input.countTokens === true && last.code === "peer_malformed") continue;
+      if (last.kind === "unsent" && input.countTokens === true && last.code === "peer_malformed") {
+        if (this.failure?.sent === true && readPeerEnvelope(this.#header) !== null) this.#countRefused += 1;
+        else this.#countOther = true;
+        continue;
+      }
+      if (input.countTokens === true) this.#countOther = true;
       if (last.kind !== "unsent" || !(UNSENT_CODES.has(last.code) || last.code === STALE_PIN_CODE)) break;
       input.registry.failed(peer, last.code, this.#session);
     }
@@ -1258,6 +1282,7 @@ export class PeerCall implements LanePeerCall {
       ...(input.countTokens === true ? { count_tokens: true as const } : {}),
     };
     const header = await signPeerEnvelope("request", envelope, input.signer);
+    this.#header = header;
     this.envelopeSha256 = sha256BareHex(peerEnvelopeBytes(envelope));
     this.failure = null;
     this.egressRefusal = null;

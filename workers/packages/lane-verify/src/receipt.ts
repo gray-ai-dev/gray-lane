@@ -522,9 +522,16 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     checks.push(fail("protocol", `the receipt endpoint ${JSON.stringify(document.endpoint)} is not a lane protocol`));
     return result();
   }
+  const translatedAt = document.event_log.findIndex((event) => eventType(event) === EVENT_REQUEST_TRANSLATED);
   const expandedRaw = findEvent(document.event_log, EVENT_REQUEST_CONTINUATION_EXPANDED);
   let continuationExpanded: ReceiptContinuationExpanded | null = null;
   if (expandedRaw !== undefined) {
+    // The entry writes the event only on a request it does not translate (a continuation that would need translating
+    // is refused, 400 lane_continuation_unsupported), so it never signs this shape; nothing in it is checked.
+    if (translatedAt >= 0) {
+      checks.push(fail("continuation_expanded", "a translated receipt carries request.continuation_expanded: Gray's entry never expands a continuation it translates"));
+      return result();
+    }
     const checkedExpanded = checkContinuationExpandedEvent(expandedRaw, state.protocol, options.receivedBody, options.expandedBody);
     checks.push(checkedExpanded.check);
     if (!checkedExpanded.ok) return result();
@@ -533,11 +540,10 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   }
   // A request the entry translated onto another text API, Gemini included on either side. The event-log check held the
   // event to once, in a single-forward log, between request.received and request.forwarded, with no relay policy.
-  const translatedAt = document.event_log.findIndex((event) => eventType(event) === EVENT_REQUEST_TRANSLATED);
   if (translatedAt >= 0) {
     checks.push(pass("protocol", state.protocol));
     if (options.expectedRelayImage !== undefined) checks.push(relayImageCheck(document.relay_image, options.expectedRelayImage));
-    translationChecks({ document, at: translatedAt, protocol: state.protocol, forwardedHash: state.forwardedBodyHash, options, checks, state, continuationExpanded });
+    translationChecks({ document, at: translatedAt, protocol: state.protocol, forwardedHash: state.forwardedBodyHash, options, checks, state });
     return result();
   }
   if (state.protocol === "gemini") {
@@ -675,15 +681,21 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
         checks.push(pass("forwarded_body_hash", `${forwardedHash} equals request.continuation_expanded.expanded_body_sha256 (zero-retention continuation expansion applied inside the attested entry TEE)`));
       }
     } else {
+      // Gray's declared changes apply to the expanded body, which stays sealed in the entry: without its bytes nothing
+      // is replayed, so nothing is compared. The ops are still held to their policy.
       const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
       const bad = disallowedOps(policy, protocol, modified);
+      const what = [
+        ...(modified.length > 0 ? [`${modified.length} declared op(s) (each one ${policy.id} allows)`] : []),
+        ...(relayApplied ? [`${applied.length} declared append(s)`] : []),
+      ].join(" and ");
       if (bad.length > 0) {
         checks.push(fail("forwarded_body_hash", `declared request.modified op(s) disallowed by ${policy.id}: ${bad.join("; ")}`));
       } else {
         checks.push(
-          pass(
+          skip(
             "forwarded_body_hash",
-            `pre-rewrite commitment ${continuationExpanded.expanded_body_sha256} accepted for zero-retention continuation expansion inside the attested entry TEE before ${modified.length} declared op(s)${relayApplied ? ` and ${applied.length} declared append(s)` : ""}; forwarded ${forwardedHash}`,
+            `not compared: ${forwardedHash} is ${what} over the expanded body ${continuationExpanded.expanded_body_sha256}, which stays sealed in the entry, so they are not replayed`,
           ),
         );
       }
@@ -886,9 +898,8 @@ function translationChecks(input: {
   readonly options: VerifyResponseReceiptOptions;
   readonly checks: ReceiptCheck[];
   readonly state: { translation: ReceiptTranslation | null; modified: RequestModifiedEvent[] };
-  readonly continuationExpanded: ReceiptContinuationExpanded | null;
 }): void {
-  const { document, at, protocol, options, checks, continuationExpanded } = input;
+  const { document, at, protocol, options, checks } = input;
   const events = document.event_log;
   const parsed = requestTranslatedSchema.safeParse(events[at]);
   if (!parsed.success) {
@@ -950,18 +961,7 @@ function translationChecks(input: {
     checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
     return;
   }
-  const sourceBody = continuationExpanded !== null ? options.expandedBody : options.receivedBody;
-  if (continuationExpanded !== null && sourceBody === undefined) {
-    checks.push(
-      pass(
-        "forwarded_body_hash",
-        `pre-rewrite commitment ${continuationExpanded.expanded_body_sha256} accepted for zero-retention continuation expansion inside the attested entry TEE before translation from ${from} to ${to}; forwarded ${forwardedHash}`,
-      ),
-    );
-    checks.push(skip("translation_dropped", "not replayed: zero-retention continuation expansion was applied inside the attested entry TEE"));
-    return;
-  }
-  const replay = replayTranslated(sourceBody!, { endpoint: document.endpoint, from, to, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
+  const replay = replayTranslated(options.receivedBody, { endpoint: document.endpoint, from, to, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
   const what = `${before.length} declared op(s), the translation from ${from} to ${to}${cap === null ? "" : ` with output cap ${cap.toString()}`}, ${after.length} declared op(s)`;
   if (!replay.ok) {
     checks.push(fail("forwarded_body_hash", `${forwardedHash} is not checked: the received body does not replay (${replay.reason})`));
@@ -1103,7 +1103,12 @@ function stackChecks(
       if (bad.length > 0) {
         checks.push(fail(`${id}:forwarded_body_jcs_sha256`, `declared request.modified op(s) disallowed by ${policy.id}: ${bad.join("; ")}`));
       } else {
-        checks.push(skip(`${id}:forwarded_body_jcs_sha256`, `not replayed: zero-retention continuation expansion was applied inside the attested entry TEE (pre-rewrite commitment ${expandedDigest})`));
+        checks.push(
+          skip(
+            `${id}:forwarded_body_jcs_sha256`,
+            `not compared: the attempt's body (${expected}) is built on the expanded body ${expandedDigest}, which stays sealed in the entry, so its ${attempt.modified.length} op(s) and ${applied.length} append(s) are not replayed`,
+          ),
+        );
       }
       continue;
     }
@@ -1395,7 +1400,12 @@ function receiptChecks(
         checks.push(fail("request_received_hash", `request.received.body_hash is ${String(receivedHash)}, expected ${String(expected)} after outer declared op(s)`));
       }
     } else if (receivedHash !== null && isDigestField(receivedHash)) {
-      checks.push(pass("request_received_hash", `${receivedHash} (derived from outer expanded_body_sha256 ${outer.expandedBodySha256} with ${outer.modified.length} declared entry op(s))`));
+      checks.push(
+        skip(
+          "request_received_hash",
+          `not compared: ${receivedHash} is the entry's ${outer.modified.length} declared op(s) over the expanded body ${outer.expandedBodySha256}, which stays sealed in the entry, so they are not replayed`,
+        ),
+      );
     } else {
       checks.push(fail("request_received_hash", `request.received.body_hash is missing or malformed: ${String(receivedHash)}`));
     }

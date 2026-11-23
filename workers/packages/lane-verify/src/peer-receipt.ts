@@ -434,7 +434,12 @@ async function checkPeer(
         expandedHopBody = replayed;
         checks.push(pass(`${id}:entry_rewrite`, `the entry sent the zero-retention expanded body with ${opsLabel}: ${bodyHash(replayed)}`));
       } else {
-        checks.push(pass(`${id}:entry_rewrite`, `the entry declared ${opsLabel} on the zero-retention expanded body (${outerExpanded.expanded_body_sha256})`));
+        checks.push(
+          skip(
+            `${id}:entry_rewrite`,
+            `not compared: the entry declared ${opsLabel} (each one ${policy.id} allows) on the expanded body ${outerExpanded.expanded_body_sha256}, which stays sealed in the entry, so they are not replayed`,
+          ),
+        );
       }
       validatedEntryModified = parsedOps;
     }
@@ -544,9 +549,9 @@ async function checkPeer(
       }
     } else if (typeof innerReceived === "string" && isDigestField(innerReceived)) {
       checks.push(
-        pass(
+        skip(
           `${id}:request_received`,
-          `the stack VM received ${innerReceived} after zero-retention continuation expansion (${outerExpanded.expanded_body_sha256}) and ${attempt.modified.length} declared entry op(s)`,
+          `not compared: the stack VM received ${innerReceived}, the entry's ${attempt.modified.length} declared op(s) over the expanded body ${outerExpanded.expanded_body_sha256}, which stays sealed in the entry, so they are not replayed`,
         ),
       );
     } else {

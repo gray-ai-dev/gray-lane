@@ -77,6 +77,7 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "served_at_lane",
       "count_tokens_request_rejected",
       "count_tokens_translation_unsupported",
+      "count_tokens_unsupported",
       "streaming_unsupported",
       "multipart_form_required",
       "duplicate_form_field",

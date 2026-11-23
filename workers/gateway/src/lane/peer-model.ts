@@ -280,6 +280,11 @@ export interface LanePeerCall {
   readonly failure: { readonly code: PeerFailedCode; readonly sent: boolean } | null;
   /** Egress refused the request itself, nothing sent: its body budget full (`capacity`), or anything else (`refused`). */
   readonly egressRefusal: "capacity" | "refused" | null;
+  /**
+   * A token count whose every stack VM refused it as a release before the count hop does (`peer_malformed` before any
+   * frame, for a header that reads as an envelope): its route has no counter (`PeerCall.predatesCountHop`).
+   */
+  readonly predatesCountHop: boolean;
   /** Whether a vendor was dialed, as `end`, `head` or the follow-up said; null when none did. */
   readonly dialed: boolean | null;
   /** The relay account of `end` (S27), or null. */
