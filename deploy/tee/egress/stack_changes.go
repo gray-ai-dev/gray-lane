@@ -102,18 +102,12 @@ const (
 	stackValuesOmitted  = "omitted"
 )
 
-// P7 kept limits (docs/relay-changes-v2.md §2.10, workers/packages/lane/src/method/format.ts):
-// top-level members starting with "prompt_cache" and "cache_control" at any depth cannot be added,
-// removed or modified by a relay.
-const (
-	stackKeptPrefix   = "prompt_cache"
-	stackKeptAnyDepth = "cache_control"
-)
-
-// keeps is whether the top-level member name keeps a limit, so a difference there stays a refusal.
+// keeps is whether the top-level member name keeps a limit, so a difference there stays a refusal. A relay's change to
+// cache_control or to a prompt_cache* member is its change, declared like any other: P7 of docs/relay-changes-v2.md
+// §2.10 (keeping them as the customer sent them) is part of that parked design (owner, 2026-11-03), and standard v4.3
+// lists no such limit.
 func (c *stackChecker) keeps(name string) bool {
-	if name == "model" || name == "models" || name == "stream" ||
-		name == stackKeptAnyDepth || strings.HasPrefix(name, stackKeptPrefix) {
+	if name == "model" || name == "models" || name == "stream" {
 		return true
 	}
 	if rule, ok := c.spec.top[name]; ok && !rule.remove {
@@ -142,9 +136,6 @@ func (c *stackChecker) changed(name, path string, received, forwarded jsontext.V
 		if refused := c.keptTools(path, received, forwarded); refused != "" {
 			return refused
 		}
-	}
-	if refused := cacheControlDiff(path, received, forwarded); refused != "" {
-		return refused
 	}
 	c.diff(path, received, forwarded)
 	return ""
@@ -316,103 +307,6 @@ func (c *stackChecker) diffElements(path string, left, right []jsontext.Value) {
 	for index := middleLeft - 1; index >= paired; index-- {
 		c.change("remove", at(index), left[prefix+index], nil)
 	}
-}
-
-// firstCacheControl returns the RFC 6901 path of the first "cache_control" member inside v (in JCS
-// order), or "" when v holds none.
-func firstCacheControl(path string, v jsontext.Value) string {
-	if v == nil {
-		return ""
-	}
-	if obj, ok := objectOf(v); ok {
-		for _, name := range obj.names {
-			childPath := path + "/" + pointerToken(name)
-			if name == stackKeptAnyDepth {
-				return childPath
-			}
-			if found := firstCacheControl(childPath, obj.members[name]); found != "" {
-				return found
-			}
-		}
-		return ""
-	}
-	if elems, ok := elementsOf(v); ok {
-		for index, elem := range elems {
-			if found := firstCacheControl(path+"/"+strconv.Itoa(index), elem); found != "" {
-				return found
-			}
-		}
-	}
-	return ""
-}
-
-// cacheControlDiff returns the RFC 6901 path of the first added, removed or modified "cache_control"
-// member anywhere between received and forwarded, regardless of pointer length (fitRefusalPath trims
-// the returned refusal path to whole tokens within stackPointerMaxLength), or "" when none differs.
-func cacheControlDiff(path string, received, forwarded jsontext.Value) string {
-	switch {
-	case received == nil && forwarded == nil:
-		return ""
-	case received == nil:
-		return firstCacheControl(path, forwarded)
-	case forwarded == nil:
-		return firstCacheControl(path, received)
-	case sameStackJSON(received, forwarded):
-		return ""
-	}
-	if left, ok := objectOf(received); ok {
-		if right, ok := objectOf(forwarded); ok {
-			for _, name := range unionNames(left.names, right.names) {
-				childPath := path + "/" + pointerToken(name)
-				l, r := left.members[name], right.members[name]
-				if name == stackKeptAnyDepth {
-					if (l == nil) != (r == nil) || (l != nil && !sameStackJSON(l, r)) {
-						return childPath
-					}
-					continue
-				}
-				if found := cacheControlDiff(childPath, l, r); found != "" {
-					return found
-				}
-			}
-			return ""
-		}
-	}
-	if left, ok := elementsOf(received); ok {
-		if right, ok := elementsOf(forwarded); ok {
-			prefix := 0
-			for prefix < len(left) && prefix < len(right) && sameStackJSON(left[prefix], right[prefix]) {
-				prefix++
-			}
-			suffix := 0
-			for suffix < len(left)-prefix && suffix < len(right)-prefix && sameStackJSON(left[len(left)-1-suffix], right[len(right)-1-suffix]) {
-				suffix++
-			}
-			middleLeft, middleRight := len(left)-prefix-suffix, len(right)-prefix-suffix
-			paired := min(middleLeft, middleRight)
-			at := func(index int) string { return path + "/" + strconv.Itoa(prefix+index) }
-			for index := 0; index < paired; index++ {
-				if found := cacheControlDiff(at(index), left[prefix+index], right[prefix+index]); found != "" {
-					return found
-				}
-			}
-			for index := paired; index < middleRight; index++ {
-				if found := firstCacheControl(at(index), right[prefix+index]); found != "" {
-					return found
-				}
-			}
-			for index := paired; index < middleLeft; index++ {
-				if found := firstCacheControl(at(index), left[prefix+index]); found != "" {
-					return found
-				}
-			}
-			return ""
-		}
-	}
-	if found := firstCacheControl(path, received); found != "" {
-		return found
-	}
-	return firstCacheControl(path, forwarded)
 }
 
 // change records one body change; past stackChangeKeepMax entries it only counts.
