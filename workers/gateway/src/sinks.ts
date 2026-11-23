@@ -3,7 +3,7 @@ import { VIA_ENTRY_HEADER } from "@gray/lane-wire";
 import { IMAGE_USAGE_UNSPLIT_POLICIES } from "@gray/config";
 import { attemptRecord, type AttemptRecord as ContentAttempt, type AttemptToolCallIds, type ContentReason, type WriterResult } from "@gray/content";
 import { ACCOUNT_BLOCKS, errorCategory } from "@gray/errors";
-import type { DispatchPermit, RankingResult } from "@gray/routing";
+import type { Constraint, MetricSource, RankingResult, RequestRoutingRecord, RoutingEvidence, SessionState, TtftPercentile, UtilityEvidence } from "@gray/routing";
 import { type AnswerChecks, type CanonicalRequest, type OutputCheck, TRANSLATION_CODES, type ToolCallCheck, UNCOUNTED_CHECKS } from "@gray/protocol";
 import type { TrafficEvidenceWire } from "@gray/control";
 import { NOT_COUNTED, type Outcome as EndpointOutcome, type OutcomeMeasure } from "@gray/endpoint";
@@ -120,13 +120,15 @@ export type RetryNext = (typeof RETRY_NEXTS)[number];
 export const SELECTIONS = ["plan", "rerank", "same_route"] as const;
 export type Selection = (typeof SELECTIONS)[number];
 /**
- * Why the first route is first (record.rs Routing `head_reason`, gray.request/1 `routing_head_reason`):
- * `recovery_trial` (every route was recovering and this one's probe had answered) and `tool_call_issuer`
+ * Why the first route is first (record.rs Routing `head_reason`, gray.request/1 `routing_head_reason`, plan-order.ts
+ * `headReason`): `recovery_trial` (every route was recovering and this one's probe had answered) and `tool_call_issuer`
  * (the request sends back tool-call ids this route's upstream issued) since main's releases 2 and 3;
  * `account_block` (release 4: admission put the route first because a vendor's block on another supplier's
- * account holds the request's client and tool shape off that supplier).
+ * account holds the request's client and tool shape off that supplier); since r17 (docs/utility-routing.md "Evidence")
+ * `session` (the session's provider; was `affinity`), `unselected` (the unselected share's pick; was `exploration`)
+ * and `ranking` (the formula's draw).
  */
-export const HEAD_REASONS = ["affinity", "order", "recovery_probe", "recovery_trial", "account_block", "tool_call_issuer", "exploration", "ranking"] as const;
+export const HEAD_REASONS = ["session", "order", "recovery_probe", "recovery_trial", "account_block", "tool_call_issuer", "unselected", "ranking"] as const;
 export type HeadReason = (typeof HEAD_REASONS)[number];
 /**
  * Reasons a ranked candidate carries beside the ranker's own (gray.request/1 `routing_candidates`):
@@ -232,10 +234,11 @@ export interface AttemptRecord {
    */
   readonly usageNote?: string | null;
   /**
-   * Its routing group's dispatch, once it went out (@gray/routing `DispatchPermit` committed): the group its permit was
-   * reserved in, whether it explored, whether the budget counted it (a measured route was available), when the group's
-   * budget window began, what the ranking that chose its route read (routes.ts `rankedWith`: the base's age and span, null
-   * when none) and when it went out. The soak's per-dispatch point (`rankingPoints`); not in the request log.
+   * Its dispatch, once it went out: the ranking group of the ranking that chose its route, what that ranking read
+   * (routes.ts `rankedWith`: the base's age and span, null when none) and when it went out. The soak's per-dispatch point
+   * (`rankingPoints`); not in the request log. No route is explored and no budget counts a dispatch since r17
+   * (docs/utility-routing.md "Decisions"): `exploratory` and `counted` are false and `windowStartedMs` -1, kept so the
+   * point keeps its shape.
    */
   readonly dispatch?: {
     readonly group: string;
@@ -356,12 +359,18 @@ export interface CandidateRecord {
 /** The candidates a record keeps (record.rs MAX_CANDIDATES). */
 export const MAX_CANDIDATES = 8;
 
+/** The largest u32, where a record's count saturates (evidence.rs `u32::try_from(..).unwrap_or(u32::MAX)`). */
+const U32_MAX = 4_294_967_295;
+/** The largest int32, the stream's column for a count (wide_event/request.rs `small`). */
+const I32_MAX = 2_147_483_647;
+
 /**
  * The candidates of a ranking as the record keeps them (capture.rs `ranking`): those ranking returned in its order,
- * then the rest it left out, at most MAX_CANDIDATES, each with its evidence and reasons (the steering's
- * `account_block_steered` among them). The quote is the reference basket's, as ranking compared it.
+ * then the rest it left out, at most MAX_CANDIDATES, each with its evidence and reasons, `account_block_steered` added to
+ * the routes of a steered supplier (`steered`, plan-order.ts `PlanOrder.steeredRoutes`). The quote is the reference
+ * basket's, as ranking compared it.
  */
-export function candidatesOf(result: Pick<RankingResult, "orderedIds" | "evidence">): CandidateRecord[] {
+export function candidatesOf(result: Pick<RankingResult, "orderedIds" | "evidence">, steered: readonly string[] = []): CandidateRecord[] {
   const ordered = result.orderedIds.map((id) => result.evidence.find((e) => e.endpointId === id)).filter((e) => e !== undefined);
   const rest = result.evidence.filter((e) => !result.orderedIds.includes(e.endpointId));
   return [...ordered, ...rest].slice(0, MAX_CANDIDATES).map((e) => ({
@@ -373,8 +382,94 @@ export function candidatesOf(result: Pick<RankingResult, "orderedIds" | "evidenc
     ttftP50Ms: e.ttftP50Ms ?? null,
     latencyP95Ms: e.latencyP95Ms ?? null,
     quotedMicrousd: e.quotedPrice === undefined ? null : Number(e.quotedPrice),
-    reasons: [...e.reasons],
+    reasons: steered.includes(e.endpointId) ? [...e.reasons, "account_block_steered"] : [...e.reasons],
   }));
+}
+
+/**
+ * `routing_policy` (docs/utility-routing.md "Evidence"; request_log/evidence.rs `routing_policy_text`):
+ * `utility;preset=<p>;policy=<version>;snapshot=<version>;feed=<epoch>:<seq>|none;window=<n>;session=<s>;multiple=<x.xxxx>|-`,
+ * the window the routes inside Δ (0 without the formula's evidence), the session `sessionText`, the multiple the
+ * cheapest passing route's `c_workload` over the reference's (`multipleText`).
+ */
+export function routingPolicyText(evidence: RoutingEvidence): string {
+  const feed = evidence.feed === null ? "none" : `${evidence.feed.epoch}:${evidence.feed.seq}`;
+  const utility = evidence.utility;
+  return `utility;preset=${evidence.preset};policy=${evidence.policyVersion};snapshot=${evidence.snapshotVersion};feed=${feed};window=${utility?.window ?? 0};session=${sessionText(evidence.session)};multiple=${multipleText(utility?.priceMultiple ?? null)}`;
+}
+
+/** The session as `routing_policy` names it (`session_text`): `hit`, `new`, `redraw:<reason>`, `none` or `off`. */
+function sessionText(session: SessionState): string {
+  return session.kind === "redraw" ? `redraw:${session.reason}` : session.kind;
+}
+
+/**
+ * A price multiple with four decimals, `-` for none (`multiple_text`): the multiple times 10,000 rounded half up (one
+ * double on every machine, `Math.round` and `f64::round` agreeing on positive halves) and written from that integer; a
+ * multiple too large for that, as a whole number.
+ */
+function multipleText(multiple: number | null): string {
+  if (multiple === null) return "-";
+  const scaled = Math.round(multiple * 10_000);
+  if (!(scaled >= 0 && scaled <= Number.MAX_SAFE_INTEGER)) return Number.isFinite(multiple) && multiple >= 0 ? BigInt(Math.round(multiple)).toString() : "-";
+  return `${Math.floor(scaled / 10_000)}.${String(scaled % 10_000).padStart(4, "0")}`;
+}
+
+/** A constraint as `routing_skipped` names an exclusion by it (`constraint_reason`). */
+function constraintReason(constraint: Constraint): string {
+  return `constraint:${constraint}`;
+}
+
+/** Each route a constraint excluded, by its endpoint (`endpointOf` its rank key), in the formula's evidence order (`constraint_skips`). */
+export function constraintSkips(utility: UtilityEvidence, endpointOf: (key: string) => string): { readonly endpointId: string; readonly reason: string }[] {
+  return utility.routes.filter((r) => r.excludedBy !== null).map((r) => ({ endpointId: endpointOf(r.key), reason: constraintReason(r.excludedBy!) }));
+}
+
+/**
+ * `routing_candidates` from the formula's evidence (`utility_candidates`): the routes of the plan's `order` (rank keys),
+ * at most MAX_CANDIDATES, each with its `ln U` as its score, the source of the TTFT it was scored at as its stage (at
+ * `percentile`), its cumulative TTFT samples (`samplesOf`), its effective availability as its success rate, the TTFT it was
+ * scored at, its `c_workload` in micro-USD (rounded half up) and its reasons: `window` or `outside`, then the plan's own
+ * (`reasonsOf`: `session`, `probe`, `unselected`, `order`, `account_block_steered`). A key the evidence does not hold (a
+ * probe, a trial) is the stage `circuit`, without the formula's columns.
+ */
+export function utilityCandidates(
+  utility: UtilityEvidence,
+  order: readonly string[],
+  endpointOf: (key: string) => string,
+  samplesOf: (key: string) => number,
+  percentile: TtftPercentile,
+  reasonsOf: (key: string) => readonly string[],
+): CandidateRecord[] {
+  return order.slice(0, MAX_CANDIDATES).map((key) => {
+    const route = utility.routes.find((r) => r.key === key);
+    const reasons = [...(route === undefined ? [] : [route.inWindow ? "window" : "outside"]), ...reasonsOf(key)];
+    const samples = Math.min(samplesOf(key), U32_MAX);
+    if (route === undefined) return { endpointId: endpointOf(key), stage: "circuit", score: null, samples, successRate: null, ttftP50Ms: null, latencyP95Ms: null, quotedMicrousd: null, reasons };
+    const ttft = route.metrics.ttftMs[percentile];
+    const source: MetricSource = percentile === "p99" ? route.metrics.source.ttftP99 : route.metrics.source.ttft;
+    const micro = Math.round(route.cWorkload * 1_000_000);
+    return {
+      endpointId: endpointOf(key),
+      stage: source,
+      score: route.lnU,
+      samples,
+      successRate: route.metrics.availability,
+      ttftP50Ms: ttft,
+      latencyP95Ms: null,
+      quotedMicrousd: micro >= 0 && micro <= Number.MAX_SAFE_INTEGER ? micro : null,
+      reasons,
+    };
+  });
+}
+
+/**
+ * The session's columns (`session_columns`): `routing_affinity_key_present` (a key was derived),
+ * `routing_affinity_pinned_endpoint` (its provider) and `routing_affinity_honoured` (the request hit it; only with a
+ * provider).
+ */
+export function sessionColumns(evidence: RoutingEvidence): { readonly keyPresent: boolean; readonly endpoint: string | null; readonly hit: boolean | null } {
+  return { keyPresent: evidence.sessionKeyPresent, endpoint: evidence.sessionEndpoint, hit: evidence.sessionEndpoint === null ? null : evidence.session.kind === "hit" };
 }
 
 /** What a request's retries were, beside its attempts (the server's request log and routing columns). */
@@ -389,12 +484,6 @@ export interface RetryRecord {
   readonly headReason: string | null;
   /** The endpoint the request carried a recovery probe to (`routing_recovery_probe_endpoint`). */
   readonly recoveryProbeEndpoint: string | null;
-  /**
-   * Cache affinity at admission (record.rs Routing `affinity_key_present`, `affinity_pinned`): null before the
-   * request was ranked (the wide event's `routing_affinity_key_present` is then absent), else whether it had an
-   * affinity key and the endpoint the key pinned the head to (`routing_affinity_pinned_endpoint`).
-   */
-  readonly affinity?: { readonly keyPresent: boolean; readonly pinned: string | null } | null;
   /** The Retry-After of a 503 all_endpoints_in_recovery, in seconds (`recovery_retry_after_s`). */
   readonly recoveryRetryAfterS: number | null;
   /** The model the customer asked for first and the fallback models it listed (`models`), when it listed any. */
@@ -534,8 +623,15 @@ export interface RequestRecord {
   readonly admissions: readonly { readonly model: string; readonly atMs: number }[];
   /** The request's retries and the models it listed; absent before it was routed. */
   readonly retry?: RetryRecord;
-  /** The exploration budget's routing group (inference.rs `routing_group`); absent before it was ranked. */
+  /** The ranking group its dispatches' points name (model, protocol, egress, mode, region); absent before it was ranked. */
   readonly routingGroup?: string;
+  /**
+   * How the request was routed (record.rs Routing `evidence`, docs/utility-routing.md "Evidence"): written to
+   * `routing_policy` and the session's columns. Absent before it was ranked: those columns are then absent too.
+   */
+  readonly routingEvidence?: RoutingEvidence;
+  /** The routes entering the formula's constraints (`routing_eligible_routes`); absent before it was ranked. */
+  readonly eligibleRoutes?: number;
   /** The age of the isolate's ranking base its ranking read (ms since the collector's word, ranking-base.ts); null: unmeasured. Absent before it was ranked. */
   readonly rankingBaseAgeMs?: number | null;
   /**
@@ -545,11 +641,11 @@ export interface RequestRecord {
   readonly isolateGapMs?: number | null;
   /**
    * The refusals of its routes' endpoint shards at acquisition, by their own reason: the route, its rank key in the
-   * request's mode, the routing group of the ranking that asked, whether the route was that ranking's exploration, when,
-   * and whether its permit was still being borrowed (endpoints.ts `borrowing`: a `busy` while the shard's borrow may still
-   * come, or a shard that did not answer, is not a full route).
+   * request's mode, the ranking group of the ranking that asked, when, and whether its permit was still being borrowed
+   * (endpoints.ts `borrowing`: a `busy` while the shard's borrow may still come, or a shard that did not answer, is not a
+   * full route).
    */
-  readonly routeRefusals?: readonly { readonly endpointId: string; readonly rankKey: string; readonly group: string; readonly reason: string; readonly exploration: boolean; readonly atMs: number; readonly borrowing: boolean }[];
+  readonly routeRefusals?: readonly { readonly endpointId: string; readonly rankKey: string; readonly group: string; readonly reason: string; readonly atMs: number; readonly borrowing: boolean; readonly exploration?: boolean }[];
   /**
    * Why the client got its answer free (`FREE_NO_USAGE`); then `billing` is `free` and the outcome
    * `completed`. Absent or null otherwise.
@@ -557,6 +653,12 @@ export interface RequestRecord {
   readonly freeReason?: FreeReason | null;
   /** The ranked candidates, best first (gray.request/1 `routing_candidates`); none are kept yet. */
   readonly routingCandidates?: readonly CandidateRecord[];
+  /**
+   * How the request was routed (docs/utility-routing-reads.md "Request routing evidence"; request-routing.ts): the record
+   * its index row's `routing` column holds, the confidential entry's projection on a lane's. Absent or null for a request
+   * that did not reach routing, and for a record that could not be built within its bound.
+   */
+  readonly routing?: RequestRoutingRecord | null;
   /**
    * The customer's layered routing preference as the request log records it (request_log/capture.rs
    * `preference_facts`; the wide event's `routing_preference_sources`, `routing_order_len`, ...): absent
@@ -672,6 +774,9 @@ export function indexRow(r: RequestRecord, result: WriterResult): RequestIndexRo
     admitted: r.admissions.map((a) => ({ model: a.model, atMs: a.atMs })),
     // r14 (docs/error-rates.md): the TEE lane's rows carry it too, each entry these closed fields alone.
     routeAttempts: routeAttempts(r),
+    // r18 (docs/utility-routing-reads.md): set only on a row of a request that reached routing, so every other row is the
+    // one a gateway before it sent (and a lane's row one a bridge before it takes, `LANE_LATER_ROW_FIELDS`).
+    ...(r.routing === undefined || r.routing === null ? {} : { routing: r.routing }),
   };
 }
 
@@ -1305,27 +1410,37 @@ export function retryPoint(event: RetryEvent): AnalyticsEngineDataPoint {
 }
 
 /**
- * A committed dispatch as its attempt's record keeps it (`AttemptRecord.dispatch`, the `ranking_dispatch` point): its
- * permit's own group and budget facts, what the ranking that chose the route read (routes.ts `rankedWith`), when it went
- * out (-1 unknown).
+ * A dispatch that went out, as its attempt's record keeps it (`AttemptRecord.dispatch`, the `ranking_dispatch` point):
+ * the ranking group of the ranking that chose the route with its budget facts (since r17 `unbudgeted`: never explored,
+ * never counted, no window, so the point's columns keep their places for its readers), what that ranking read (routes.ts
+ * `rankedWith`), when it went out (-1 unknown).
  */
-export function dispatchRecord(permit: DispatchPermit, ranked: { readonly ageMs: number | null; readonly spanMs: number | null } | undefined, dispatchedAtMs: number | undefined): NonNullable<AttemptRecord["dispatch"]> {
-  return { group: permit.group, exploratory: permit.exploratory, counted: permit.counted, windowStartedMs: permit.windowStartedMs, baseAgeMs: ranked?.ageMs ?? null, spanMs: ranked?.spanMs ?? null, dispatchedAtMs: dispatchedAtMs ?? -1 };
+export function dispatchRecord(
+  group: { readonly group: string; readonly exploratory: boolean; readonly counted: boolean; readonly windowStartedMs: number },
+  ranked: { readonly ageMs: number | null; readonly spanMs: number | null } | undefined,
+  dispatchedAtMs: number | undefined,
+): NonNullable<AttemptRecord["dispatch"]> {
+  return { group: group.group, exploratory: group.exploratory, counted: group.counted, windowStartedMs: group.windowStartedMs, baseAgeMs: ranked?.ageMs ?? null, spanMs: ranked?.spanMs ?? null, dispatchedAtMs: dispatchedAtMs ?? -1 };
+}
+
+/** The budget facts of a dispatch in `group` since r17, which has no exploration and no dispatch budget (`dispatchRecord`). */
+export function unbudgeted(group: string): { readonly group: string; readonly exploratory: false; readonly counted: false; readonly windowStartedMs: -1 } {
+  return { group, exploratory: false, counted: false, windowStartedMs: -1 };
 }
 
 /**
  * The ranking's points of a request (review r31 findings 9, 10, 13 and the second review's 2 and 5; the staging soak's
  * criteria (a), (b), (e), docs/cloudflare-native/endpoint.md section 12.2), in the request points' dataset as the retry
- * points are. One per committed dispatch, `ranking_dispatch`: blob 2 the routing group its permit was reserved in (a
- * request that falls back to another model dispatches in that model's group), blob 3 the isolate; doubles 1 the count, 2
- * explored (0/1), 3 counted by the budget (0/1: a measured route was available), 4 the budget window's start (ms), 5 the
- * ranking base's age at the ranking that chose the route (ms; -1 unmeasured), 6 when it went out (ms: the points are
+ * points are. One per dispatch that went out, `ranking_dispatch`: blob 2 the ranking group (model, protocol, egress, mode,
+ * region: a request that falls back to another model dispatches in that model's group), blob 3 the isolate; doubles 1
+ * the count, 2 explored and 3 counted by a budget (0 since r17, which removed exploration and the dispatch budget: the
+ * point keeps its shape), 4 the budget window's start (-1: none), 5 the ranking base's age at the ranking that chose the route (ms; -1 unmeasured), 6 when it went out (ms: the points are
  * written at the request's end), 7 the isolate's gap before the request (ms; -1 its first), 8 the base's span at that
  * ranking (ranking-base.ts `spanAt`, ms; -1 none). One per refusal of a route's shard at acquisition, `route_refusal`:
  * blob 2 its own reason (`busy`, `unanswered`, `breaker_open`, `breaker_recovering`, `resting`..., which the record's
  * `routing_skipped` folds into `capacity` and `circuit` as the server's labels do), blob 3 the isolate, blob 4 the route
- * (endpoint id), blob 5 its rank key in the request's mode (the `circuit_trip` point's key), blob 6 the routing group of
- * the ranking that asked; doubles 1 the count, 2 the route was that ranking's exploration (0/1), 3 when (ms), 4 its permit
+ * (endpoint id), blob 5 its rank key in the request's mode (the `circuit_trip` point's key), blob 6 the ranking group of
+ * the ranking that asked; doubles 1 the count, 2 the route was that ranking's exploration (0 since r17), 3 when (ms), 4 its permit
  * was still being borrowed (0/1: endpoints.ts `borrowing`, the shard answered `busy` while a borrow may still come, its
  * `leasePending`, or did not answer; criterion (b2) counts the `busy` of a full route, 0). A request
  * makes a handful of attempts and refusals at most (RETRY_MAX_ATTEMPTS), well within the 250 points one invocation may
@@ -1340,7 +1455,7 @@ export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals
     out.push({ indexes: ["ranking_dispatch"], blobs: ["ranking_dispatch", d.group, service.instance], doubles: [1, d.exploratory ? 1 : 0, d.counted ? 1 : 0, d.windowStartedMs, d.baseAgeMs ?? -1, d.dispatchedAtMs, gap, d.spanMs ?? -1] });
   }
   for (const refusal of r.routeRefusals ?? []) {
-    out.push({ indexes: ["route_refusal"], blobs: ["route_refusal", refusal.reason, service.instance, refusal.endpointId, refusal.rankKey, refusal.group], doubles: [1, refusal.exploration ? 1 : 0, refusal.atMs, refusal.borrowing ? 1 : 0] });
+    out.push({ indexes: ["route_refusal"], blobs: ["route_refusal", refusal.reason, service.instance, refusal.endpointId, refusal.rankKey, refusal.group], doubles: [1, refusal.exploration === true ? 1 : 0, refusal.atMs, refusal.borrowing ? 1 : 0] });
   }
   return out;
 }
@@ -1484,8 +1599,8 @@ export class IsolateLoad {
 const iso = (ms: number) => new Date(ms).toISOString();
 
 /** One `routing_candidates` struct: a stream row holds no null, so an unknown measure is left out. */
-function candidateRow(c: CandidateRecord, rank: number): Record<string, unknown> {
-  const row: Record<string, unknown> = { endpoint_id: c.endpointId, rank, stage: c.stage, samples: Math.round(c.samples), reasons: [...c.reasons] };
+export function candidateRow(c: CandidateRecord, rank: number): Record<string, unknown> {
+  const row: Record<string, unknown> = { endpoint_id: c.endpointId, rank, stage: c.stage, samples: Math.min(Math.round(c.samples), I32_MAX), reasons: [...c.reasons] };
   if (c.score !== null && Number.isFinite(c.score)) row.score = c.score;
   if (c.successRate !== null && Number.isFinite(c.successRate)) row.success_rate = c.successRate;
   if (c.ttftP50Ms !== null && Number.isFinite(c.ttftP50Ms)) row.ttft_p50_ms = c.ttftP50Ms;
@@ -1499,9 +1614,10 @@ function candidateRow(c: CandidateRecord, rank: number): Record<string, unknown>
  * change once it exists, so a column no longer written stays in its file, and a row that writes it is a
  * bug. `response_model_check` said whether an answer's model name was one its route allowed, until Gray
  * stopped judging that name (main 2c165fb7; owner 2026-10-16: never compare the reply's self-reported
- * model name).
+ * model name). The exploration's columns went with the utility formula (r17, docs/utility-routing.md "Decisions"): no
+ * route is explored, and no dispatch budget counts mature dispatches.
  */
-export const RETIRED_REQUEST_COLUMNS: readonly string[] = ["response_model_check"];
+export const RETIRED_REQUEST_COLUMNS: readonly string[] = ["response_model_check", "routing_exploration", "routing_exploration_endpoint", "routing_mature_available"];
 
 /** The stream this gateway's wide events go to (docs/design/wide-events.md, "Streams and schema files"). */
 export const REQUEST_STREAM = "gray_request_v2";
@@ -1635,14 +1751,14 @@ export function wideEvent(r: RequestRecord, result: WriterResult, service: { rea
     routing_skipped: r.retry !== undefined && r.retry.skipped.length > 0 ? r.retry.skipped.map((k) => ({ endpoint_id: k.endpointId, reason: k.reason })) : undefined,
     routing_head_reason: r.retry?.headReason ?? undefined,
     routing_recovery_probe_endpoint: r.retry?.recoveryProbeEndpoint ?? undefined,
-    // Cache affinity (wide_event/request.rs): whether a ranked request had an affinity key, the endpoint the key
-    // pinned the head to, and whether the first attempt went there.
-    routing_affinity_key_present: r.retry?.affinity?.keyPresent,
-    routing_affinity_pinned_endpoint: r.retry?.affinity?.pinned ?? undefined,
-    routing_affinity_honoured: (() => {
-      const pinned = r.retry?.affinity?.pinned;
-      return pinned === undefined || pinned === null ? undefined : r.attempts[0]?.endpointId === pinned;
-    })(),
+    // The routing evidence (wide_event/request.rs, docs/utility-routing.md "Evidence"): the formula's parameters, the
+    // feed and the session the request ranked by, the routes entering the constraints; then the session's columns:
+    // a key derived, its provider, a hit.
+    routing_policy: r.routingEvidence === undefined ? undefined : routingPolicyText(r.routingEvidence),
+    routing_eligible_routes: r.eligibleRoutes,
+    routing_affinity_key_present: r.routingEvidence === undefined ? undefined : sessionColumns(r.routingEvidence).keyPresent,
+    routing_affinity_pinned_endpoint: r.routingEvidence === undefined ? undefined : (sessionColumns(r.routingEvidence).endpoint ?? undefined),
+    routing_affinity_honoured: r.routingEvidence === undefined ? undefined : (sessionColumns(r.routingEvidence).hit ?? undefined),
     recovery_retry_after_s: r.retry?.recoveryRetryAfterS ?? undefined,
     routing_candidates: r.routingCandidates !== undefined && r.routingCandidates.length > 0 ? r.routingCandidates.slice(0, MAX_CANDIDATES).map(candidateRow) : undefined,
     // The layered routing preference (wide_event/request.rs `routing_preference_sources` .. `routing_affinity_mode`):

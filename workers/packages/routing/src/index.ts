@@ -1,55 +1,57 @@
 /**
- * @gray/routing: the ranking of endpoints already eligible for a request, from rolling observations
- * (crates/gray-gateway/src/ranking.rs), held to the conformance fixtures of area `ranking`.
+ * @gray/routing: the ranking of endpoints already eligible for a request (crates/gray-gateway/src/ranking.rs), held to
+ * the conformance fixtures of area `ranking`.
  *
- * Ported here: the configuration and its bounds, the checkpoint a state is restored from, the
- * rolling statistics and percentiles, the score of each policy, the buckets (measured, unproven,
- * stale, recovery), the order and its tie-breaks, the exploration and recovery-probe choice and the
- * probe lease it takes, the circuit health a state reads as, whether a cache pin holds, the
- * measurement key, and the rests put on rank keys after failures (`rest`, `resting`,
- * `end_rests_checked`, and the answers that end them through `observe`, which records an observation
- * outside any probe as `record` does), the dispatch budget (`reserve_dispatch`: `DispatchBudgets`, which
- * the gateway keeps per isolate), and the ranking feed an isolate's ranker takes the endpoint roots'
- * samples from (`FeedAnswer`, `Ranker.applyFeed`).
+ * Since r17 (docs/utility-routing.md "The rankers") ranking scores nothing: the request path orders a request's routes
+ * by the utility formula (utility.ts), and the ranker keeps the circuits, the rests and the recovery leases, and reads
+ * each key's circuit (`circuitOf`) and each route's long-record summary (`routeSummary`) for it. Ported here: the
+ * configuration and its bounds, the checkpoint a state is restored from, the rolling statistics and percentiles the
+ * evidence shows, the circuit stage of a ranking (`rankWith`: the closed candidates in the caller's order, the
+ * recovery probe and the lease it takes, the trials), the circuit health a state reads as, the measurement key, the
+ * rests put on rank keys after failures (`rest`, `resting`, `end_rests_checked`, and the answers that end them through
+ * `observe`, which records an observation outside any probe as `record` does), the records of the replays' own
+ * observations (`recordAttempt`), and the ranking feed an isolate's ranker takes the endpoint roots' samples, circuits
+ * and records from (`FeedAnswer`, `Ranker.applyFeed`).
  *
  * Ranking never establishes model identity or relaxes eligibility: candidates must already be gated.
- * Tie-breaks hash the request key with SHA-256 (WebCrypto), so ranking is async; everything else is
- * synchronous. Each async method awaits its digests before it reads any state and never after, so a
- * check and the lease it leads to cannot interleave with another request in the same isolate.
- * Times and counts are `number` (milliseconds and counts stay far below 2^53; a checkpoint's u64
- * above that is held as the nearest double); a quoted price is a `bigint` (u64).
+ * A recovery lease is held under the SHA-256 of the request key (WebCrypto), so ranking is async; everything else is
+ * synchronous. Each async method awaits its digests before it reads any state and never after, so a check and the
+ * lease it leads to cannot interleave with another request in the same isolate.
+ * Times and counts are `number` (milliseconds and counts stay far below 2^53; a checkpoint's u64 above that is held as
+ * the nearest double); a quoted price is a `bigint` (u64).
  */
 import { sha256 } from "@noble/hashes/sha2";
 import { compareUtf8, isObject, asArray, asBool, asF64, asStr, asU64, get, item, toJsonString, type Json } from "@gray/json";
 import { PROTOCOLS, type Protocol } from "@gray/protocol";
+import { recordParamsWithinBounds } from "./policy.ts";
+import { addAttempt, emptyDelta, deltaEmpty, emptyRecord, mergeDelta, recordFromJson, summaryOf, type AttemptMeasure } from "./record.ts";
 import { feedColumnSample, feedColumnsCount, SampleColumns, type FeedColumns } from "./samples.ts";
+import { DEFAULT_RECORD_PARAMS, type FeedCircuit, type FeedRecord, type LongRecord, type RecordParams, type RecordSummary } from "./utility-types.ts";
 
 export { feedColumnSample, feedColumnsCount, SampleColumns, type ColumnSample, type FeedColumns } from "./samples.ts";
 
+/**
+ * The four fixed ranking policies of the releases before utility routing (r17, docs/utility-routing.md "Decisions":
+ * gone, with no mapping). Ranking reads none of them any more; the type stays until its callers have moved off it, and
+ * goes after the r17 merge.
+ */
 export type RankingPolicy = "balanced" | "latency" | "throughput" | "price";
 
 /**
- * Whether ranking may place an unproven, stale or recovery-due candidate ahead of the best measured
- * one. A request with an explicit customer provider order suppresses it; suppression never withholds
- * the recovery probe of a request that has nothing else to send to.
+ * Whether a recovery probe that is due may lead a request's ranking (`allowed`), or only when nothing else can serve it
+ * (`suppressed`, `rank_with`). There is no exploration any more (r17: no exploration quota, no trial gate), so a
+ * candidate whose circuit is closed is never held back either way; a request with an explicit customer provider order
+ * suppresses the probe. Suppression never withholds the recovery probe of a request that has nothing else to send to.
+ * The type goes after the r17 merge, when the request path places the probe itself.
  */
 export type Exploration = "allowed" | "suppressed";
 
-/**
- * The share of the reliability weight (success rate squared) of the most reliable rated alternative
- * that a cache-pinned endpoint must keep for the pin to hold (`PIN_RELIABILITY_FLOOR`).
- */
-export const PIN_RELIABILITY_FLOOR = 0.5;
-
 export interface RankingConfig {
   readonly minimumSamples: number;
-  readonly minimumStableWindows: number;
-  readonly trialWindowMs: number;
   readonly maxSamplesPerEndpoint: number;
   readonly maxEndpoints: number;
   readonly halfLifeMs: number;
   readonly staleAfterMs: number;
-  readonly explorationOneIn: number;
   readonly failureThreshold: number;
   readonly failureRateThreshold: number;
   readonly cooldownMs: number;
@@ -67,13 +69,10 @@ export interface RankingConfig {
 /** The server's defaults (`RankingConfig::default`, ranking.rs). */
 export const DEFAULT_RANKING_CONFIG: RankingConfig = {
   minimumSamples: 5,
-  minimumStableWindows: 3,
-  trialWindowMs: 10_000,
   maxSamplesPerEndpoint: 128,
   maxEndpoints: 4096,
   halfLifeMs: 120_000,
   staleAfterMs: 600_000,
-  explorationOneIn: 10,
   failureThreshold: 3,
   failureRateThreshold: 0.6,
   cooldownMs: 30_000,
@@ -86,10 +85,6 @@ export const DEFAULT_RANKING_CONFIG: RankingConfig = {
 export function rankingConfigProblem(config: RankingConfig): string | null {
   const bad =
     config.minimumSamples === 0 ||
-    config.minimumStableWindows === 0 ||
-    config.minimumStableWindows > 100 ||
-    config.trialWindowMs === 0 ||
-    config.trialWindowMs > 3_600_000 ||
     config.maxSamplesPerEndpoint < config.minimumSamples ||
     config.maxSamplesPerEndpoint > 4096 ||
     config.maxEndpoints === 0 ||
@@ -97,7 +92,6 @@ export function rankingConfigProblem(config: RankingConfig): string | null {
     config.maxEndpoints * config.maxSamplesPerEndpoint > 1_048_576 ||
     config.halfLifeMs === 0 ||
     config.staleAfterMs < config.halfLifeMs ||
-    config.explorationOneIn === 0 ||
     config.failureThreshold === 0 ||
     !(config.failureRateThreshold >= 0 && config.failureRateThreshold <= 1) ||
     config.failureRateThreshold === 0 ||
@@ -122,16 +116,19 @@ const WEIGHT_FLOOR = 0.05;
 
 export interface Candidate {
   readonly endpointId: string;
-  /** The customer price of a fixed basket (1M input + 1M output tokens, or 1M units); unset without an approved quote. */
+  /**
+   * The customer price of a fixed basket (1M input + 1M output tokens, or 1M units); unset without an approved quote.
+   * Evidence only since r17: ranking compares no prices (the utility formula does, utility.ts).
+   */
   readonly quotedPrice?: QuotedPrice | undefined;
   /**
-   * ModelTrace's routing weight in `WEIGHT_FLOOR..=1`, which its mixing decisions move (@gray/modeltrace
-   * `weightAfter`); unset, or what is not one, ranks at 1.
+   * ModelTrace's routing weight in `WEIGHT_FLOOR..=1`, which its mixing decisions move (@gray/modeltrace `weightAfter`).
+   * Evidence only since r17: no weight moves a candidate in the order.
    */
   readonly behavioralScore?: number | undefined;
 }
 
-/** `c`'s ModelTrace weight as ranking reads it (`Candidate::modeltrace_weight`): unset when it is not one, which ranks at 1. */
+/** `c`'s ModelTrace weight as the evidence shows it (`Candidate::modeltrace_weight`): unset when it is not one. */
 function modeltraceWeight(c: Candidate): number | undefined {
   const w = c.behavioralScore;
   return w !== undefined && Number.isFinite(w) && w >= WEIGHT_FLOOR && w <= 1 ? w : undefined;
@@ -147,7 +144,7 @@ export interface Observation {
   /**
    * The attempt repeated its request at an operator it had already called, or it is a refusal that
    * operator served on a later attempt: no independent evidence that the route fails the requests sent
-   * to it. Ranking scores it like any call; the circuit's trips leave it out.
+   * to it. Its sample counts like any call's; the circuit's trips leave it out.
    */
   readonly retry?: boolean | undefined;
 }
@@ -160,12 +157,22 @@ export function failureLabel(failure: AttemptFailure): string {
   return failure === "timeout" ? "timeout" : failure === "rate_limited" ? "rate_limited" : failure === "protocol" ? "invalid_response" : "upstream_error";
 }
 
+/**
+ * A key's trial before r17. There is none any more (docs/utility-routing.md "Decisions": no trial gate): a state's
+ * `trial` is always the one never begun (`noTrial`), kept while readers outside this package still read the member; it
+ * goes after the r17 merge.
+ */
 export interface TrialProgress {
   windowStarted: number | undefined;
   samples: number;
   failures: number;
   stableWindows: number;
   graduated: boolean;
+}
+
+/** The trial never begun: what every state's `trial` holds. */
+function noTrial(): TrialProgress {
+  return { windowStarted: undefined, samples: 0, failures: 0, stableWindows: 0, graduated: false };
 }
 
 /**
@@ -181,6 +188,7 @@ export interface EndpointState {
   recovery: { readonly key: string; readonly until: number } | undefined;
   recoveryPasses: number;
   failures: [number, AttemptFailure][];
+  /** Never read: always the trial never begun (`TrialProgress`). */
   trial: TrialProgress;
   /**
    * When the clock of the current half-open spell started: when its first probe that went out was
@@ -200,6 +208,11 @@ export interface EndpointState {
  */
 function takesTrials(state: EndpointState, now: number, config: RankingConfig): boolean {
   return state.quarantinedUntil !== undefined && (state.answered || (state.probingSince !== undefined && now >= state.probingSince + config.recoveryWaitMs));
+}
+
+/** Whether a recovery probe holds the state's lease at `now` (`EndpointState::probe_out`). */
+function probeOut(state: EndpointState, now: number): boolean {
+  return state.recovery !== undefined && now <= state.recovery.until;
 }
 
 /** The circuit closed, or its probe failed: the half-open spell is over (`EndpointState::end_spell`). */
@@ -239,31 +252,6 @@ export function refusedShareOf(recent: readonly RefusalClass[], samples: number)
   return { refusal: share("refusal"), finalRefusal: share("final_refusal"), accountRequest: share("account_request") };
 }
 
-/** `TrialProgress::stable_windows`. */
-function stableWindows(trial: TrialProgress, config: RankingConfig): number {
-  const current = trial.samples >= config.minimumSamples && trial.failures === 0 ? 1 : 0;
-  return Math.min(trial.stableWindows + current, config.minimumStableWindows);
-}
-
-/** `TrialProgress::observe`: a window of `trialWindowMs` with enough samples and no failure is stable. */
-export function trialObserve(trial: TrialProgress, at: number, success: boolean, config: RankingConfig): void {
-  if (trial.windowStarted === undefined) {
-    trial.windowStarted = at;
-  } else if (Math.max(at - trial.windowStarted, 0) >= config.trialWindowMs) {
-    if (trial.samples >= config.minimumSamples && trial.failures === 0) {
-      trial.stableWindows = Math.min(trial.stableWindows + 1, config.minimumStableWindows);
-    } else if (trial.failures > 0) {
-      trial.stableWindows = 0;
-    }
-    trial.windowStarted = at;
-    trial.samples = 0;
-    trial.failures = 0;
-  }
-  trial.samples += 1;
-  if (!success) trial.failures += 1;
-  if (stableWindows(trial, config) >= config.minimumStableWindows) trial.graduated = true;
-}
-
 /** The state a key starts from (`EndpointState::default`). */
 function newState(): EndpointState {
   return {
@@ -274,7 +262,7 @@ function newState(): EndpointState {
     recovery: undefined,
     recoveryPasses: 0,
     failures: [],
-    trial: { windowStarted: undefined, samples: 0, failures: 0, stableWindows: 0, graduated: false },
+    trial: noTrial(),
     probingSince: undefined,
     probeSent: false,
     answered: false,
@@ -382,20 +370,6 @@ export function quantiles(state: EndpointState, now: number, config: RankingConf
 }
 
 /**
- * Whether the circuit is closed and the state has enough recent samples to rate its success: not
- * quarantined, not stale, not short of samples (`rated`).
- */
-export function rated(state: EndpointState, now: number, config: RankingConfig): boolean {
-  const s = stats(state, now, config);
-  return (
-    state.quarantinedUntil === undefined &&
-    !(state.lastObserved !== undefined && (state.lastObserved > now || now - state.lastObserved > config.staleAfterMs)) &&
-    s.count >= config.minimumSamples &&
-    s.effective >= config.minimumSamples / 2
-  );
-}
-
-/**
  * Whether a state may give its slot to a new key (`idle`): nothing observed for longer than
  * `staleAfterMs`, no cooldown running and no recovery probe out.
  */
@@ -429,12 +403,6 @@ async function recoveryKey(requestKey: string): Promise<string> {
   return hex(await digest(requestKey, "recovery"));
 }
 
-/** The tie-break number of `b` for request `a`: the first eight digest bytes as a little-endian u64 (`number`). */
-export async function tieNumber(a: string, b: string): Promise<bigint> {
-  const bytes = await digest(a, b);
-  return new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true);
-}
-
 /**
  * The key an endpoint's observations are kept under: the hex SHA-256 of the serde JSON of
  * (endpoint, model, protocol, fingerprint, generation, egress region, stream). The region comes from
@@ -454,31 +422,24 @@ function measurementText(endpoint: string, model: string, protocol: Protocol, fi
   return `[${JSON.stringify(endpoint)},${JSON.stringify(model)},${JSON.stringify(protocol)},${JSON.stringify(fingerprint)},${generation.toString()},${JSON.stringify(egressRegion)},${stream ? "true" : "false"}]`;
 }
 
-/** `f64::total_cmp` for the finite values ranking compares (-0 orders before +0). */
-function totalCmp(a: number, b: number): number {
-  if (a < b) return -1;
-  if (a > b) return 1;
-  if (a === 0 && b === 0) {
-    const negA = Object.is(a, -0);
-    const negB = Object.is(b, -0);
-    return negA === negB ? 0 : negA ? -1 : 1;
-  }
-  return 0;
-}
-
-function compareBig(a: bigint, b: bigint): number {
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-
-/** The evidence of one candidate (`RankEvidence`). */
+/**
+ * What ranking read of one candidate, for the request log (`RankEvidence`). Since r17 the candidate's samples are the
+ * circuit's (docs/utility-routing.md "Decisions": the 128 recent samples serve only the circuit breaker), shown as they
+ * were; nothing in them orders the candidates.
+ */
 export interface RankEvidence {
   endpointId: string;
+  /** The policy the caller named, which ranking no longer reads. */
   policy: RankingPolicy;
+  /** Unset: ranking scores nothing (the utility formula's `ln U` is the request path's evidence). */
   score: number | undefined;
   behavioralScore: number | undefined;
+  /** 1: no weight multiplies anything any more. */
   behavioralWeight: number;
   samples: number;
-  stage: "recovery" | "normal" | "trial";
+  /** `recovery` while the candidate's circuit is open, else `normal`: there is no trial stage any more. */
+  stage: "recovery" | "normal";
+  /** Always 0: no trial windows (it goes after the r17 merge, with the server's). */
   stableWindows: number;
   effectiveSamples: number;
   successRate: number | undefined;
@@ -501,6 +462,7 @@ export interface RankEvidence {
 export interface RankingResult {
   readonly orderedIds: string[];
   readonly evidence: RankEvidence[];
+  /** Always unset since r17: nothing is explored. It goes after the r17 merge, once its readers have moved off it. */
   readonly explorationId: string | undefined;
   readonly recoveryProbeId: string | undefined;
   /**
@@ -829,23 +791,12 @@ function stateFromJson(value: Json | undefined): EndpointState | undefined {
       failures.push([at, kind as AttemptFailure]);
     }
   }
-  const rawTrial = get(value, "trial");
-  let trial: TrialProgress = { windowStarted: undefined, samples: 0, failures: 0, stableWindows: 0, graduated: false };
-  if (rawTrial !== undefined) {
-    if (!isObject(rawTrial)) return undefined;
-    const windowStarted = optional(get(rawTrial, "window_started"), u64Number);
-    const trialSamples = u64Number(get(rawTrial, "samples"));
-    const trialFailures = u64Number(get(rawTrial, "failures"));
-    const windows = u32Number(get(rawTrial, "stable_windows"));
-    const graduated = get(rawTrial, "graduated") === undefined ? false : asBool(get(rawTrial, "graduated"));
-    if (!windowStarted.ok || trialSamples === undefined || trialFailures === undefined || windows === undefined || graduated === undefined) return undefined;
-    trial = { windowStarted: windowStarted.value, samples: trialSamples, failures: trialFailures, stableWindows: windows, graduated };
-  }
+  // A release before r17 wrote each key's `trial`, which is not read (serde passes an unknown member over).
   const probingSince = optional(get(value, "probing_since"), u64Number);
   const probeSent = get(value, "probe_sent") === undefined ? false : asBool(get(value, "probe_sent"));
   const answered = get(value, "answered") === undefined ? false : asBool(get(value, "answered"));
   if (!probingSince.ok || probeSent === undefined || answered === undefined) return undefined;
-  return { samples, lastObserved: lastObserved.value, consecutiveFailures, quarantinedUntil: quarantinedUntil.value, recovery: undefined, recoveryPasses, failures, trial, probingSince: probingSince.value, probeSent, answered };
+  return { samples, lastObserved: lastObserved.value, consecutiveFailures, quarantinedUntil: quarantinedUntil.value, recovery: undefined, recoveryPasses, failures, trial: noTrial(), probingSince: probingSince.value, probeSent, answered };
 }
 
 /** An `EndpointState` in its checkpoint JSON (serde's form of the server's), the inverse of `stateFromJson`. */
@@ -860,7 +811,6 @@ function stateJson(state: EndpointState): Json {
     recovery: lease === undefined ? null : [Array.from({ length: 32 }, (_, i) => BigInt(Number.parseInt(lease.key.slice(i * 2, i * 2 + 2), 16))), BigInt(lease.until)],
     recovery_passes: BigInt(state.recoveryPasses),
     failures: state.failures.map(([at, failure]) => [BigInt(at), failure]),
-    trial: { window_started: opt(state.trial.windowStarted), samples: BigInt(state.trial.samples), failures: BigInt(state.trial.failures), stable_windows: BigInt(state.trial.stableWindows), graduated: state.trial.graduated },
     probing_since: opt(state.probingSince),
     probe_sent: state.probeSent,
     answered: state.answered,
@@ -879,6 +829,68 @@ function statesFromJson(value: Json | undefined): Map<string, EndpointState> | u
 }
 
 /**
+ * The most routes whose long records a ranker keeps (r17, docs/utility-routing.md "The feed": the collector's bound,
+ * 16,384 roots; ranking.rs `RECORDS_BOUND`): a record is never dropped for being idle; past the bound, the one updated
+ * longest ago goes (a new one past it, of the feed's, is not taken).
+ */
+export const RECORDS_BOUND = 16_384;
+
+/** When `record` was last merged into: the latest of its groups' times (`updated_at`), null before any. */
+function updatedAt(record: LongRecord): number | null {
+  let latest: number | null = null;
+  for (const at of [record.avail.at, record.tps.at, record.ttft.at]) if (at !== null && (latest === null || at > latest)) latest = at;
+  return latest;
+}
+
+/** `record` in its JSON form, as the server's serde writes it: counts and times as integers, sums and weights as floats. */
+function recordJson(record: LongRecord): Json {
+  const at = (v: number | null): Json => (v === null ? null : BigInt(v));
+  return {
+    v: BigInt(record.v),
+    params: BigInt(record.params),
+    avail: { s: record.avail.s, f: record.avail.f, at: at(record.avail.at) },
+    tps: { tokens: record.tps.tokens, decodeMs: record.tps.decodeMs, n: record.tps.n, at: at(record.tps.at) },
+    ttft: { buckets: record.ttft.buckets.map(([bucket, weight]) => [BigInt(bucket), weight]), at: at(record.ttft.at) },
+    ttftCount: BigInt(record.ttftCount),
+    tpsCount: BigInt(record.tpsCount),
+  };
+}
+
+/**
+ * `value` as JSON.parse gives it, which `recordFromJson` reads (a root's stored row): @gray/json's integers (`bigint`) as
+ * numbers. One past 2^53 − 1 becomes a number that is not a safe integer, which `recordFromJson` refuses.
+ */
+function plainNumbers(value: Json | undefined): unknown {
+  if (typeof value === "bigint") return Number(value);
+  if (Array.isArray(value)) return value.map(plainNumbers);
+  if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, member]) => [key, plainNumbers(member)]));
+  return value;
+}
+
+/**
+ * The routes' long records a checkpoint carries (`records`), as `restore` takes them (ranking.rs `records_from_checkpoint`):
+ * each that this build reads as it reads a root's stored row (`recordFromJson`, its numbers by value: the checkpoint's
+ * integers, `bigint` here, and a whole number written as a float alike), under a key of 1 to 512 bytes; past
+ * `RECORDS_BOUND`, the most recently updated ones. Anything else is left out alone.
+ */
+function recordsFromCheckpoint(value: Json | undefined): Map<string, LongRecord> {
+  const out = new Map<string, LongRecord>();
+  if (!isObject(value)) return out;
+  const read: [string, LongRecord][] = [];
+  for (const key of Object.keys(value)) {
+    if (key.length === 0 || utf8.encode(key).length > 512) continue;
+    const record = recordFromJson(plainNumbers(value[key]));
+    if (record !== null) read.push([key, record]);
+  }
+  if (read.length > RECORDS_BOUND) {
+    read.sort(([aKey, a], [bKey, b]) => compareOptional(updatedAt(b) ?? undefined, updatedAt(a) ?? undefined) || compareUtf8(aKey, bKey));
+    read.length = RECORDS_BOUND;
+  }
+  for (const [key, record] of read) out.set(key, record);
+  return out;
+}
+
+/**
  * One sample as an endpoint root pushes it (the roots' samples, r30 ranking design 2.4-2.6): its number within its key's
  * current run of samples (`n`, rising by one per sample; a reset starts a new run, sent whole), when the root heard it,
  * whether it succeeded, whether it was a repeat, its latency, time to first token (null: unmeasured) and output tokens.
@@ -888,17 +900,26 @@ export type FeedSample = readonly [n: number, atMs: number, success: 0 | 1, retr
 
 /**
  * A feed answer's data bytes (the soak's bytes per check, endpoint.md section 12): each key's columns (their typed arrays'
- * bytes), its text (UTF-8), 16 bytes per failure and 48 for its own fields (its run, last observation and trial), and each
- * removed key's text. Within a few percent of a full answer's V8-serialized size (17.25 MB V8 against 16.32 MB of data at
- * 4,096 keys x 128 samples, ten failures a key; workers/gateway/measure/ranking-heap.ts); a delta's V8 size per key is
- * about 140 bytes more (each key's object and its failures' field names), docs/cloudflare-native/endpoint.md 12.1.
+ * bytes), its text (UTF-8), 16 bytes per failure, 48 for its own fields (its run, last observation and trial) and 10 for
+ * its circuit when it carries one (r17: the cooldown's end and two flags), each removed key's text, and each root's
+ * record (r17, `FeedAnswer.records`: the root's name and 80 for the summary's ten numbers) and each removed record's name.
+ * Within a few percent of a full answer's V8-serialized size (17.25 MB V8 against 16.32 MB of data at 4,096 keys x 128
+ * samples, ten failures a key; workers/gateway/measure/ranking-heap.ts); a delta's V8 size per key is about 140 bytes more
+ * (each key's object and its failures' field names), docs/cloudflare-native/endpoint.md 12.1.
  */
 export function feedAnswerBytes(answer: FeedAnswer): number {
   let bytes = 0;
-  for (const k of answer.keys) bytes += k.samples.nAt.byteLength + k.samples.measures.byteLength + k.samples.flags.byteLength + utf8.encode(k.key).length + 16 * (k.failures?.length ?? 0) + 48;
+  for (const k of answer.keys) bytes += k.samples.nAt.byteLength + k.samples.measures.byteLength + k.samples.flags.byteLength + utf8.encode(k.key).length + 16 * (k.failures?.length ?? 0) + 48 + (k.circuit === undefined ? 0 : FEED_CIRCUIT_BYTES);
   for (const key of answer.removed) bytes += utf8.encode(key).length;
+  for (const r of answer.records ?? []) bytes += utf8.encode(r.root).length + FEED_RECORD_BYTES;
+  for (const root of answer.removedRecords ?? []) bytes += utf8.encode(root).length;
   return bytes;
 }
+
+/** A key's circuit in a feed answer's data bytes (`feedAnswerBytes`): the cooldown's end and two flags. */
+export const FEED_CIRCUIT_BYTES = 10;
+/** A root's record summary in a feed answer's data bytes (`feedAnswerBytes`), beside its name: its ten numbers. */
+export const FEED_RECORD_BYTES = 80;
 
 /** `samples` in columns, as a feed answer carries them (`FeedKey.samples`). */
 export function feedColumns(samples: readonly FeedSample[]): FeedColumns {
@@ -937,6 +958,11 @@ export interface FeedKey {
   readonly failures?: readonly (readonly [atMs: number, failure: AttemptFailure])[];
   readonly lastObserved: number | null;
   readonly trial: FeedTrial;
+  /**
+   * The key's circuit (r17, docs/utility-routing.md "The feed"): open, the cooldown's end while open, a probe lease out.
+   * Absent from a root or a collector of an earlier release.
+   */
+  readonly circuit?: FeedCircuit;
 }
 
 /** What a feed's reader holds: the collector's epoch and the sequence number of the last change it has. */
@@ -959,6 +985,12 @@ export interface FeedAnswer {
   readonly full: boolean;
   readonly keys: readonly FeedKey[];
   readonly removed: readonly string[];
+  /**
+   * The roots' long-record summaries changed since the reader's have, all of them in a `full` answer (r17,
+   * docs/utility-routing.md "The feed"), and the roots whose record went. Absent from a collector of an earlier release.
+   */
+  readonly records?: readonly FeedRecord[];
+  readonly removedRecords?: readonly string[];
 }
 
 const FEED_FAILURES: readonly string[] = ATTEMPT_FAILURES;
@@ -972,14 +1004,26 @@ export function feedSampleValid(value: unknown): value is FeedSample {
 }
 
 /**
- * Whether `value` has a feed answer's shape (`FeedAnswer`): its epoch, numbers and lists. Its keys are each checked as they
- * are taken (`feedKeyValid`, one that is not passed over alone); an answer of another shape (another build's) is not read.
+ * Whether `value` has a feed answer's shape (`FeedAnswer`): its epoch, numbers and lists, and its records' lists when it
+ * carries them (r17). Its keys and its records are each checked as they are taken (`feedKeyValid`, `feedRecordValid`: one
+ * that is not is passed over alone); an answer of another shape (another build's) is not read.
  */
 export function feedAnswerValid(value: unknown): value is FeedAnswer {
   if (value === null || typeof value !== "object") return false;
   const a = value as Record<string, unknown>;
   const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-  return a.v === FEED_VERSION && typeof a.epoch === "string" && count(a.seq) && count(a.asOf) && typeof a.full === "boolean" && Array.isArray(a.keys) && Array.isArray(a.removed) && a.removed.every((k) => typeof k === "string");
+  return (
+    a.v === FEED_VERSION &&
+    typeof a.epoch === "string" &&
+    count(a.seq) &&
+    count(a.asOf) &&
+    typeof a.full === "boolean" &&
+    Array.isArray(a.keys) &&
+    Array.isArray(a.removed) &&
+    a.removed.every((k) => typeof k === "string") &&
+    (a.records === undefined || Array.isArray(a.records)) &&
+    (a.removedRecords === undefined || (Array.isArray(a.removedRecords) && a.removedRecords.every((r) => typeof r === "string")))
+  );
 }
 
 /**
@@ -1008,7 +1052,17 @@ export function feedColumnsValid(value: unknown, max: number): value is FeedColu
   return true;
 }
 
-/** Whether `value` is a feed key (`FeedKey`) within `config`'s bounds: one that is not is passed over alone. */
+/** Whether `value` is a key's circuit as the feed carries it (`FeedCircuit`, r17). */
+function feedCircuitValid(value: unknown): value is FeedCircuit {
+  if (value === null || typeof value !== "object") return false;
+  const c = value as Record<string, unknown>;
+  return typeof c.open === "boolean" && (c.until === null || (typeof c.until === "number" && Number.isSafeInteger(c.until) && c.until >= 0)) && typeof c.probe === "boolean";
+}
+
+/**
+ * Whether `value` is a feed key (`FeedKey`) within `config`'s bounds: one that is not is passed over alone. Its trial is
+ * still required (a reader of an earlier release ranks by it; this one reads none of it), its circuit optional (r17).
+ */
 export function feedKeyValid(value: unknown, config: RankingConfig = DEFAULT_RANKING_CONFIG): value is FeedKey {
   if (value === null || typeof value !== "object") return false;
   const k = value as Record<string, unknown>;
@@ -1019,129 +1073,25 @@ export function feedKeyValid(value: unknown, config: RankingConfig = DEFAULT_RAN
   if (k.failures !== undefined && (!Array.isArray(k.failures) || k.failures.length > config.maxSamplesPerEndpoint || !k.failures.every((f) => Array.isArray(f) && f.length === 2 && count(f[0]) && typeof f[1] === "string" && FEED_FAILURES.includes(f[1])))) return false;
   if (!(k.lastObserved === null || count(k.lastObserved))) return false;
   if (trial === null || typeof trial !== "object" || !(trial.windowStarted === null || count(trial.windowStarted)) || !count(trial.samples) || !count(trial.failures) || !count(trial.stableWindows) || typeof trial.graduated !== "boolean") return false;
+  if (k.circuit !== undefined && !feedCircuitValid(k.circuit)) return false;
   return true;
 }
 
-/** How long a routing group's exploration budget counts its dispatches before it starts again (ranking.rs `reserve_dispatch`: 60_000). */
-export const DISPATCH_WINDOW_MS = 60_000;
-
-/** A routing group's dispatches in its current window (`DispatchBudget`): committed, committed exploratory, reserved exploratory. */
-interface DispatchBudget {
-  total: number;
-  exploratory: number;
-  windowStartedMs: number;
-  reservedExploratory: number;
+/** Whether `value` is a record summary (`RecordSummary`): every count and sum a finite number of at least 0. */
+export function recordSummaryValid(value: unknown): value is RecordSummary {
+  if (value === null || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  const amount = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  const ms = (v: unknown) => v === null || amount(v);
+  return amount(r.s) && amount(r.f) && amount(r.tokens) && amount(r.decodeMs) && ms(r.ttftP50) && ms(r.ttftP90) && ms(r.ttftP99) && count(r.ttftCount) && count(r.tpsCount) && (r.at === null || count(r.at));
 }
 
-/**
- * A reserved dispatch of a routing group (`DispatchPermit`): `commit` as the attempt goes out (`mark_dispatched`), `drop`
- * when it never does (the server's `Drop`). Either once; a committed permit's drop does nothing. A permit neither
- * committed nor dropped keeps its exploratory slot until its window ends, as a leaked one would on the server.
- */
-export class DispatchPermit {
-  readonly group: string;
-  readonly exploratory: boolean;
-  private readonly budgets: Map<string, DispatchBudget>;
-  /** Counted: a measured route was available (`mature_available`), so the budget counts the dispatch. */
-  readonly counted: boolean;
-  /** When the group's budget window it was reserved in began (the soak reads the windows, endpoint.md section 12). */
-  readonly windowStartedMs: number;
-  private ended = false;
-  private committed_ = false;
-
-  constructor(budgets: Map<string, DispatchBudget>, group: string, exploratory: boolean, counted: boolean, windowStartedMs: number) {
-    this.budgets = budgets;
-    this.group = group;
-    this.exploratory = exploratory;
-    this.counted = counted;
-    this.windowStartedMs = windowStartedMs;
-  }
-
-  /** The attempt went out: a counted dispatch adds to its group's total, an exploratory one to its explorations. */
-  commit(): void {
-    if (this.ended) return;
-    this.ended = true;
-    this.committed_ = true;
-    if (!this.counted) return;
-    const budget = this.budgets.get(this.group);
-    if (budget === undefined) return;
-    budget.total += 1;
-    if (this.exploratory) {
-      budget.exploratory += 1;
-      if (budget.windowStartedMs === this.windowStartedMs) budget.reservedExploratory = Math.max(0, budget.reservedExploratory - 1);
-    }
-  }
-
-  /** The attempt went out (`commit`). */
-  get committed(): boolean {
-    return this.committed_;
-  }
-
-  /** The attempt never went out: an exploratory reservation of the current window gives its slot back. */
-  drop(): void {
-    if (this.ended) return;
-    this.ended = true;
-    if (!this.counted) return;
-    const budget = this.budgets.get(this.group);
-    if (budget === undefined || budget.windowStartedMs !== this.windowStartedMs) return;
-    if (this.exploratory) budget.reservedExploratory = Math.max(0, budget.reservedExploratory - 1);
-  }
-}
-
-/**
- * The exploration budget of routing groups (`EndpointRanker::reserve_dispatch`): while a measured route is among a
- * request's candidates, a group's exploratory dispatches (to a key ranking has not measured, whose circuit is open, or
- * that has not left its trial: `Ranker.dispatchExploratory`) in a window of DISPATCH_WINDOW_MS are at most one in
- * `explorationOneIn` of its committed dispatches; the first of a window passes (0 > 0 is false). Only committed
- * dispatches count, and an exploratory reservation holds its slot until it is committed or dropped. At most
- * `maxEndpoints` groups; a new group past them takes a slot whose window ran out, or is refused.
- *
- * The gateway keeps one per isolate (tables.ts), the server one per process, checkpointed (r30 ranking design D3:
- * fleet-wide at most a tenth plus one per isolate that dispatched to the group in the window).
- */
-export class DispatchBudgets {
-  private readonly groups = new Map<string, DispatchBudget>();
-  private readonly config: Pick<RankingConfig, "maxEndpoints" | "explorationOneIn">;
-
-  constructor(config: Pick<RankingConfig, "maxEndpoints" | "explorationOneIn"> = DEFAULT_RANKING_CONFIG) {
-    this.config = config;
-  }
-
-  /**
-   * Reserves `group`'s dispatch at `atMs` (`reserve_dispatch`): undefined when the group's exploration is spent (a
-   * measured route is available and the dispatch is `exploratory`) or no group slot is free. Call it at the dispatch
-   * boundary only, once the route's permit is taken; ranking itself spends nothing.
-   */
-  reserve(group: string, exploratory: boolean, matureAvailable: boolean, atMs: number): DispatchPermit | undefined {
-    const groups = this.groups;
-    if (!groups.has(group) && groups.size >= this.config.maxEndpoints) {
-      // A budget whose window has run out is reset by its next reservation, so dropping it loses nothing.
-      for (const [name, budget] of groups) if (Math.max(0, atMs - budget.windowStartedMs) >= DISPATCH_WINDOW_MS) groups.delete(name);
-      if (groups.size >= this.config.maxEndpoints) return undefined;
-    }
-    let budget = groups.get(group);
-    if (budget === undefined) {
-      budget = { total: 0, exploratory: 0, windowStartedMs: 0, reservedExploratory: 0 };
-      groups.set(group, budget);
-    }
-    if (Math.max(0, atMs - budget.windowStartedMs) >= DISPATCH_WINDOW_MS) {
-      budget.total = 0;
-      budget.exploratory = 0;
-      budget.reservedExploratory = 0;
-      budget.windowStartedMs = atMs;
-    }
-    if (matureAvailable && exploratory && budget.exploratory + budget.reservedExploratory > Math.floor(budget.total / this.config.explorationOneIn)) return undefined;
-    // Only a committed mature dispatch earns exploration credit: a reserved and dropped one mints no slot.
-    if (matureAvailable && exploratory) budget.reservedExploratory += 1;
-    return new DispatchPermit(groups, group, exploratory, matureAvailable, budget.windowStartedMs);
-  }
-
-  /** The groups' budgets as the server's checkpoint writes them (`dispatches`): committed, exploratory, the window's start. */
-  checkpoint(): Record<string, { readonly total: number; readonly exploratory: number; readonly windowStartedMs: number }> {
-    const out: Record<string, { readonly total: number; readonly exploratory: number; readonly windowStartedMs: number }> = {};
-    for (const [group, budget] of this.groups) out[group] = { total: budget.total, exploratory: budget.exploratory, windowStartedMs: budget.windowStartedMs };
-    return out;
-  }
+/** Whether `value` is a root's record in a feed answer (`FeedRecord`, r17): a root's name of 1 to 512 bytes, a summary. */
+export function feedRecordValid(value: unknown): value is FeedRecord {
+  if (value === null || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  return typeof r.root === "string" && r.root.length > 0 && utf8.encode(r.root).length <= 512 && recordSummaryValid(r.summary);
 }
 
 /**
@@ -1165,6 +1115,17 @@ export class Ranker {
    * most `maxEndpoints` keys together, checkpointed with the circuits.
    */
   private rests = new Rests();
+  /**
+   * Each route's long record by its capacity key, of this ranker's own observations (`recordAttempt`, the server's
+   * `record_attempt`: the conformance replays'), at most `RECORDS_BOUND`, checkpointed with the circuits.
+   */
+  private records = new Map<string, LongRecord>();
+  /** The record parameters merges use: the highest version given (`setRecordParams`), the code's defaults before any. */
+  private recordParams: RecordParams = DEFAULT_RECORD_PARAMS;
+  /** The roots' record summaries the feed brought, by root name (a capacity key), at most `RECORDS_BOUND` (r17). */
+  private readonly feedRecords = new Map<string, RecordSummary>();
+  /** Each rank key's circuit as the feed brought it, for the keys this ranker holds (r17, `FeedKey.circuit`). */
+  private readonly feedCircuits = new Map<string, FeedCircuit>();
 
   constructor(config: RankingConfig = DEFAULT_RANKING_CONFIG) {
     const problem = rankingConfigProblem(config);
@@ -1182,11 +1143,16 @@ export class Ranker {
    * A checkpoint written by another build carries over what the endpoints were measured at, not what was
    * concluded from it: whether an attempt failed is the writing build's own classification, and builds
    * change it. So from another build every circuit is closed again, and the failures behind it go
-   * (failed samples, the failure log, the failure streak and a trial window's failure count); what
-   * answered stays, latency and output rate with it, so ranking stays warm.
+   * (failed samples, the failure log and the failure streak); what answered stays, latency and output rate
+   * with it.
    *
    * Rests (`Rest`) are verdicts of the same kind, the writing build's reading of a failure: the same
    * build's checkpoint carries those still running, another build's none.
+   *
+   * The long records (r17) are outcome counts, which no release reinterprets: they carry over from any build. A record
+   * this build cannot read (`recordFromJson`: another `v`, a bad shape), or a `records` member that is no map, is left out
+   * alone. A checkpoint of a release before r17 has no records, and its keys' trials and its dispatch budgets
+   * (`dispatches`) are not read.
    */
   restore(checkpoint: Json, atMs: number, build: CheckpointBuild = "same"): boolean {
     const version = get(checkpoint, "version");
@@ -1202,33 +1168,13 @@ export class Ranker {
     for (const f of filed.values()) restKeys += f.keys.length;
     if (restKeys > this.config.maxEndpoints || [...filed].some(([scope, f]) => utf8.encode(scope).length > 512 || f.keys.some((k) => utf8.encode(k).length > 512))) return false;
     for (const [scope, f] of [...filed]) if (f.rest.untilMs <= atMs) filed.delete(scope);
-    const dispatches = get(checkpoint, "dispatches");
-    if (!isObject(dispatches)) return false;
-    const budgets: { total: bigint; exploratory: bigint }[] = [];
-    for (const key of Object.keys(dispatches)) {
-      const budget = dispatches[key];
-      const total = asU64(get(budget, "total"));
-      const exploratory = asU64(get(budget, "exploratory"));
-      const windowStarted = asU64(get(budget, "window_started_ms"));
-      if (total === undefined || exploratory === undefined || windowStarted === undefined) return false;
-      if (key.length > 2048) return false;
-      budgets.push({ total, exploratory });
-    }
     const rawTripped = get(checkpoint, "tripped");
     const tripped = rawTripped === undefined || rawTripped === null ? new Map<string, EndpointState>() : statesFromJson(rawTripped);
     if (tripped === undefined) return false;
     const { config } = this;
     const tooBig = (key: string, state: EndpointState) => utf8.encode(key).length > 512 || state.samples.length > config.maxSamplesPerEndpoint || state.failures.length > config.maxSamplesPerEndpoint;
-    if (
-      states.size > config.maxEndpoints ||
-      tripped.size > config.maxEndpoints ||
-      budgets.length > config.maxEndpoints ||
-      [...states, ...tripped].some(([key, state]) => tooBig(key, state)) ||
-      Object.keys(dispatches).some((key) => utf8.encode(key).length > 2048) ||
-      budgets.some((budget) => budget.exploratory > budget.total)
-    ) {
-      return false;
-    }
+    if (states.size > config.maxEndpoints || tripped.size > config.maxEndpoints || [...states, ...tripped].some(([key, state]) => tooBig(key, state))) return false;
+    const records = recordsFromCheckpoint(get(checkpoint, "records"));
     for (const state of states.values()) {
       state.recovery = undefined;
       state.probingSince = undefined;
@@ -1242,7 +1188,6 @@ export class Ranker {
         state.consecutiveFailures = 0;
         samples.retain((i) => samples.success(i));
         state.failures = [];
-        state.trial.failures = 0;
       }
     }
     // An evicted open circuit is a verdict and nothing else.
@@ -1255,13 +1200,20 @@ export class Ranker {
     this.rests = Rests.fromFiled(filed);
     this.states = states;
     this.tripped = tripped;
+    this.records = records;
+    // A restored ranker holds nothing of the feed: its next answer replaces what it holds.
+    this.feedCircuits.clear();
+    this.feedRecords.clear();
+    this.feedLastN.clear();
+    this.feedHave = null;
     return true;
   }
 
   /**
    * The ranker's checkpoint (`EndpointRanker::checkpoint`), version 1, as `restore` reads it: every state and every
-   * evicted circuit in serde's form (a lease as its 32 digest bytes and its end), no dispatch budget (the endpoint
-   * objects keep those here), and the rests.
+   * evicted circuit in serde's form (a lease as its 32 digest bytes and its end), an empty `dispatches` (no budget is
+   * kept; a build of an earlier release requires the member), the rests, and the records of its own observations in their
+   * JSON form (r17; the feed's summaries are the feed's, not checkpointed).
    */
   checkpoint(): Json {
     const statesJson = (states: ReadonlyMap<string, EndpointState>): Json => {
@@ -1269,7 +1221,9 @@ export class Ranker {
       for (const [key, state] of states) out[key] = stateJson(state);
       return out;
     };
-    return { version: 1n, states: statesJson(this.states), tripped: statesJson(this.tripped), dispatches: {}, rests: this.checkpointRests() };
+    const records: Record<string, Json> = {};
+    for (const [key, record] of this.records) records[key] = recordJson(record);
+    return { version: 1n, states: statesJson(this.states), tripped: statesJson(this.tripped), dispatches: {}, rests: this.checkpointRests(), records };
   }
 
   /** The `rests` member of a checkpoint (`EndpointRanker::checkpoint`): each rest by its scope, with the keys it covers. */
@@ -1365,7 +1319,7 @@ export class Ranker {
   }
 
   /**
-   * An observation of `endpointId` (`record`): the circuit breaker, the trial and the samples, and the
+   * An observation of `endpointId` (`record`): the circuit breaker and the samples, and the
    * rests an answer ends. `request` is the recovery key of the attempt, when it may be the probe.
    */
   private record(endpointId: string, request: string | undefined, observation: Observation, failure: AttemptFailure | undefined): boolean {
@@ -1412,7 +1366,6 @@ export class Ranker {
       // A repeat of one request failing again is no independent evidence that the route is dead.
       state.consecutiveFailures = Math.min(state.consecutiveFailures + 1, 0xffff_ffff);
     }
-    trialObserve(state.trial, at, observation.success, config);
     state.lastObserved = at;
     if (failure !== undefined) state.failures.push([at, failure]);
     while (state.failures.length > config.maxSamplesPerEndpoint) state.failures.shift();
@@ -1426,7 +1379,6 @@ export class Ranker {
       const failureRate = trip.rate === undefined ? 0 : 1 - trip.rate;
       if (state.consecutiveFailures >= config.failureThreshold || (trip.count >= config.minimumSamples && trip.effective >= config.minimumSamples / 2 && failureRate >= config.failureRateThreshold)) {
         state.quarantinedUntil = at + config.cooldownMs;
-        state.trial = { windowStarted: undefined, samples: 0, failures: 0, stableWindows: 0, graduated: false };
         endSpell(state);
       }
     }
@@ -1457,6 +1409,8 @@ export class Ranker {
     if (victim === undefined) return false;
     const state = this.states.get(victim) as EndpointState;
     this.states.delete(victim);
+    // The feed's circuit is kept for the keys held only.
+    this.feedCircuits.delete(victim);
     if (state.quarantinedUntil !== undefined) {
       state.samples.clear();
       state.failures = [];
@@ -1565,18 +1519,6 @@ export class Ranker {
   }
 
   /**
-   * Whether a dispatch to `endpointId` at `atMs` explores (`reserve_dispatch`'s reading of the key): it has no state, too
-   * few recent samples or too little recent weight, its circuit is open, or it has not left its trial.
-   */
-  dispatchExploratory(endpointId: string, atMs: number): boolean {
-    const state = this.states.get(endpointId);
-    if (state === undefined) return true;
-    const { config } = this;
-    const s = stats(state, atMs, config);
-    return s.count < config.minimumSamples || s.effective < config.minimumSamples / 2 || state.quarantinedUntil !== undefined || !state.trial.graduated;
-  }
-
-  /**
    * The ranking feed's state (`applyFeed`): the epoch and sequence number this ranker holds, and each key's last sample
    * number. Empty until a feed answer is applied.
    */
@@ -1588,14 +1530,27 @@ export class Ranker {
     return this.feedHave;
   }
 
+  /** How many roots' records and keys' circuits this ranker holds of the feed (r17; the isolate's base, ranking-base.ts). */
+  feedHeld(): { readonly records: number; readonly circuits: number } {
+    return { records: this.feedRecords.size, circuits: this.feedCircuits.size };
+  }
+
   /**
    * Takes a ranking feed answer (r30 ranking design 2.6, `restore`'s rules for each state): a `full` one replaces every
    * state; each key replaces its state (`whole`) or drops its samples numbered below `firstN` and appends the new ones;
    * a removed key goes. Times after `nowMs` are taken as `nowMs` (the clocks of the root that stamped them and of this
    * isolate differ; a sample from the future would be dropped, and a last observation in the future reads as stale), and
    * samples and failures past the stale window are dropped, as `restore` drops them. A key that is not valid
-   * (`feedKeyValid`) is passed over alone; a new key with no room (`maxEndpoints` live keys) is not taken. No circuit
-   * travels: ranking reads samples (design D5).
+   * (`feedKeyValid`) is passed over alone; a new key with no room (`maxEndpoints` live keys) is not taken. A key's trial
+   * is not read (there is none since r17).
+   *
+   * Since r17 (docs/utility-routing.md "The feed") each key's circuit (`FeedKey.circuit`: the root's, kept for the keys
+   * this ranker holds, `circuitOf`; a key without one, from a root of an earlier release, reads as closed) and the roots'
+   * records (`records`, `removedRecords`; all of them in a `full` answer, which replaces those held: `routeSummary`) come
+   * with it; a record that is not one (`feedRecordValid`) is passed over alone, and a new one past `RECORDS_BOUND` is not
+   * taken. The circuits do not reach this ranker's own circuits: the request path leaves an open one out of the formula,
+   * and with every candidate open its shard decides (the probe, a trial, a wait). A recovery lease this ranker holds on
+   * a key (`claimRecovery`) ends when the key's circuit shows the root's lease out, or a cooldown begun after it.
    */
   applyFeed(answer: FeedAnswer, nowMs: number): void {
     const { config } = this;
@@ -1603,10 +1558,13 @@ export class Ranker {
       this.states.clear();
       this.tripped.clear();
       this.feedLastN.clear();
+      this.feedCircuits.clear();
+      this.feedRecords.clear();
     }
     for (const key of answer.removed) {
       this.states.delete(key);
       this.feedLastN.delete(key);
+      this.feedCircuits.delete(key);
     }
     const clamp = (at: number) => Math.min(at, nowMs);
     const live = (at: number) => nowMs - at <= config.staleAfterMs;
@@ -1636,46 +1594,93 @@ export class Ranker {
       this.feedLastN.set(k.key, lastN);
       if (k.failures !== undefined) state.failures = k.failures.filter(([at]) => live(clamp(at))).map(([at, failure]) => [clamp(at), failure]);
       state.lastObserved = k.lastObserved === null ? undefined : clamp(k.lastObserved);
-      state.trial = { windowStarted: k.trial.windowStarted ?? undefined, samples: k.trial.samples, failures: k.trial.failures, stableWindows: Math.min(k.trial.stableWindows, config.minimumStableWindows), graduated: k.trial.graduated };
+      if (k.circuit === undefined) this.feedCircuits.delete(k.key);
+      else {
+        this.feedCircuits.set(k.key, { open: k.circuit.open, until: k.circuit.until, probe: k.circuit.probe });
+        // The isolate's own lease (`claimRecovery`) keeps it to one probe of the key until the root has the probe: once
+        // the feed shows the root's lease out, or a cooldown that began after this lease was taken (its probe answered and
+        // the circuit cools again), the lease goes, so the next probe is due when the root's is, as on the server, and
+        // not a recoveryLeaseMs later (review r17-ranker-1 finding 3; requirement 4.7: the cooldowns and probe counts
+        // do not change).
+        const held = state.recovery;
+        if (held !== undefined) {
+          const leasedAt = held.until - config.recoveryLeaseMs;
+          const cooledFrom = k.circuit.until === null ? null : k.circuit.until - config.cooldownMs;
+          if (k.circuit.probe || (cooledFrom !== null && cooledFrom > leasedAt)) state.recovery = undefined;
+        }
+      }
+    }
+    for (const root of answer.removedRecords ?? []) this.feedRecords.delete(root);
+    for (const r of answer.records ?? []) {
+      if (!feedRecordValid(r) || (!this.feedRecords.has(r.root) && this.feedRecords.size >= RECORDS_BOUND)) continue;
+      const s = r.summary;
+      this.feedRecords.set(r.root, { s: s.s, f: s.f, tokens: s.tokens, decodeMs: s.decodeMs, ttftP50: s.ttftP50, ttftP90: s.ttftP90, ttftP99: s.ttftP99, ttftCount: s.ttftCount, tpsCount: s.tpsCount, at: s.at });
     }
     this.feedHave = { epoch: answer.epoch, seq: answer.seq };
   }
 
-  /** Whether the key has left its trial: it served enough clean windows (`graduated`). */
-  graduated(endpointId: string): boolean {
-    return (this.states.get(endpointId) ?? this.tripped.get(endpointId))?.trial.graduated === true;
-  }
-
   /**
-   * Whether a cache pin at `pinned` may put it ahead of what ranking would serve from `candidates`
-   * (`pin_holds`): only while its circuit is closed or unobserved, and it keeps at least
-   * `PIN_RELIABILITY_FLOOR` of the reliability weight of the most reliable rated alternative. Never on an endpoint
-   * ModelTrace demoted, one its entry in `candidates` carries below weight 1: it keeps no stickiness, and ranking alone
-   * places it, at its weight.
+   * The long-record summary of the route of capacity key `capacityKey` as this ranker holds it (r17, docs/utility-routing.md
+   * "The feed"): of its own record (`recordAttempt`, the conformance replays'), else of the feed's (on Workers). Null: none.
    */
-  pinHolds(pinned: string, candidates: readonly Candidate[], atMs: number): boolean {
-    const entry = candidates.find((c) => c.endpointId === pinned);
-    if (entry !== undefined && (modeltraceWeight(entry) ?? 1) < 1) return false;
-    const health = this.operationsHealth(pinned, atMs).state;
-    if (health !== "closed" && health !== "unobserved") return false;
-    const weight = (state: EndpointState) => {
-      const success = stats(state, atMs, this.config).success ?? 1;
-      return success * success;
-    };
-    const own = this.states.has(pinned) ? weight(this.states.get(pinned) as EndpointState) : 1;
-    let best = own;
-    for (const c of candidates) {
-      if (c.endpointId === pinned) continue;
-      const state = this.states.get(c.endpointId);
-      if (state === undefined || !rated(state, atMs, this.config)) continue;
-      best = Math.max(best, weight(state));
-    }
-    return own >= PIN_RELIABILITY_FLOOR * best;
+  routeSummary(capacityKey: string): RecordSummary | null {
+    const own = this.records.get(capacityKey);
+    if (own !== undefined) return summaryOf(own);
+    return this.feedRecords.get(capacityKey) ?? null;
   }
 
   /**
-   * Takes the recovery lease of `endpoint` for `requestKey` when its cooldown has passed and no other
-   * probe holds one, as `rankWith` does for the probe it proposes (`claim_recovery`).
+   * Rank key `rankKey`'s circuit at `nowMs` as this ranker holds it (r17, the server's `circuit_state`): open, the
+   * cooldown's end while open, a probe lease out. On Workers the root's, as the feed brought it, a probe out too when
+   * this ranker holds the key's lease (`claimRecovery`); else the ranker's own (the conformance replays'). Null: a key it
+   * does not hold, which is closed.
+   */
+  circuitOf(rankKey: string, nowMs: number): FeedCircuit | null {
+    const state = this.states.get(rankKey) ?? this.tripped.get(rankKey);
+    const fed = this.feedCircuits.get(rankKey);
+    if (fed !== undefined) return fed.open && !fed.probe && state !== undefined && probeOut(state, nowMs) ? { ...fed, probe: true } : fed;
+    if (state === undefined) return null;
+    return { open: state.quarantinedUntil !== undefined, until: state.quarantinedUntil ?? null, probe: probeOut(state, nowMs) };
+  }
+
+  /**
+   * One attempt's increments merged into the record of `capacityKey` at `nowMs` (the server's `record_attempt`, which the
+   * conformance replays follow: a ranker of its own observations): `success` as the circuit reads the outcome (null: not
+   * counted), its measure if any, merged with record.ts's math at the parameters given last (`setRecordParams`). An
+   * attempt that adds nothing makes no record. Past `RECORDS_BOUND` routes the record updated longest ago goes; a key that
+   * is empty or longer than 512 bytes is kept by none.
+   */
+  recordAttempt(capacityKey: string, success: boolean | null, measure: AttemptMeasure | undefined, nowMs: number): void {
+    if (capacityKey.length === 0 || utf8.encode(capacityKey).length > 512) return;
+    const params = this.recordParams;
+    const delta = addAttempt(emptyDelta(), success, measure, params.maxRateTps);
+    if (deltaEmpty(delta)) return;
+    if (!this.records.has(capacityKey) && this.records.size >= RECORDS_BOUND) {
+      let oldest: { key: string; at: number | null } | undefined;
+      for (const [key, record] of this.records) {
+        const at = updatedAt(record);
+        if (oldest === undefined || compareOptional(at ?? undefined, oldest.at ?? undefined) < 0 || (at === oldest.at && compareUtf8(key, oldest.key) < 0)) oldest = { key, at };
+      }
+      if (oldest !== undefined) this.records.delete(oldest.key);
+    }
+    this.records.set(capacityKey, mergeDelta(this.records.get(capacityKey) ?? emptyRecord(), delta, nowMs, params));
+  }
+
+  /**
+   * The record parameters `recordAttempt` merges with from now on, when their version is not lower than that of those it
+   * holds and they lie within the policy's bounds (`recordParamsWithinBounds`); else it keeps its own. The root's rule
+   * (docs/utility-routing.md "Parameters at the root"): the same version replaces too, since a policy whose document
+   * cannot be read is the code's defaults at its row's version; version 0 is the code's defaults, which it starts with.
+   */
+  setRecordParams(params: RecordParams): void {
+    if (recordParamsWithinBounds(params) && params.version >= this.recordParams.version) this.recordParams = params;
+  }
+
+  /**
+   * Takes the recovery lease of `endpoint` for `requestKey` when its cooldown has passed and no other probe holds one, as
+   * `rankWith` does for the probe it proposes (`claim_recovery`). On Workers a key's circuit is its root's: one the feed
+   * shows open, its cooldown over and no probe out at the root (`circuitOf`), is due too, and this lease keeps the
+   * isolate to one probe of it at a time (the root's lease keeps the fleet to one).
    */
   async claimRecovery(endpoint: string, requestKey: string, nowMs: number): Promise<boolean> {
     // The digest is awaited before the state is read: from the due check to the lease nothing may
@@ -1683,7 +1688,9 @@ export class Ranker {
     const key = await recoveryKey(requestKey);
     const state = this.states.get(endpoint);
     if (state === undefined) return false;
-    const due = state.quarantinedUntil !== undefined && nowMs >= state.quarantinedUntil && !(state.recovery !== undefined && nowMs <= state.recovery.until);
+    const fed = this.feedCircuits.get(endpoint);
+    const cooledAt = state.quarantinedUntil ?? (fed !== undefined && fed.open && !fed.probe && fed.until !== null ? fed.until : undefined);
+    const due = cooledAt !== undefined && nowMs >= cooledAt && !probeOut(state, nowMs);
     if (due) lease(state, key, nowMs, this.config);
     return due;
   }
@@ -1723,6 +1730,19 @@ export class Ranker {
     if (state !== undefined) state.answered = true;
   }
 
+  /**
+   * The open circuit ranking files `endpoint` by (review combined-r1 blocker 2): the ranker's own when it holds one (its
+   * observations': the conformance replays'), else the root's as the feed brought it (`circuitOf`; an isolate observes no
+   * circuit), open until its cooldown's end (unknown: null), its probe out at the root or under this ranker's lease.
+   * `own` says which. Undefined: closed.
+   */
+  private openCircuitOf(endpoint: string, state: EndpointState | undefined, nowMs: number): { readonly until: number | null; readonly out: boolean; readonly own: boolean } | undefined {
+    if (state?.quarantinedUntil !== undefined) return { until: state.quarantinedUntil, out: probeOut(state, nowMs), own: true };
+    const fed = this.feedCircuits.get(endpoint);
+    if (fed === undefined || !fed.open) return undefined;
+    return { until: fed.until, out: fed.probe || (state !== undefined && probeOut(state, nowMs)), own: false };
+  }
+
   /** Whether `endpoint` takes ordinary traffic now: its circuit is closed, so no recovery spell runs there (`serves_ordinary`). */
   servesOrdinary(endpoint: string): boolean {
     return !this.tripped.has(endpoint) && this.states.get(endpoint)?.quarantinedUntil === undefined;
@@ -1741,13 +1761,24 @@ export class Ranker {
   }
 
   /**
-   * Ranks `candidates` under `policy` (`rank_with`). Measured candidates are scored and ordered best
-   * first; one exploratory candidate (a due recovery probe, then the unproven one with the fewest
-   * samples, then a stale one) may be proposed ahead of them; `suppressed` proposes none while any
-   * candidate is selectable without one and keeps every candidate that is not quarantined, measured
-   * first, then unproven, then stale, then the unproven and stale ones ModelTrace demoted (weight below 1).
-   * A recovery probe proposed takes its lease. Only input ids are returned. A candidate resting
-   * (`rests`; the ranker's own, `resting`, unless the caller keeps them elsewhere) is passed over.
+   * The candidates as their circuits and rests let them serve, in the caller's order (`rank_with`; r17: ranking scores
+   * nothing, the request path orders the candidates by the utility formula, and the policy is not read).
+   *
+   * Every candidate whose circuit is closed (or that the ranker has not observed) is returned, in the order given, however
+   * few its samples: there is no exploration and no trial gate. A resting candidate (`rests`; the ranker's own,
+   * `resting`, unless the caller keeps them elsewhere) is passed over, as an open circuit's is in its cooldown. A
+   * candidate whose circuit is open is left out while it cools or its probe is out; one whose recovery probe is due is
+   * proposed ahead of the others, and takes the lease, where the caller lets a probe lead (`allowed`), and whatever the
+   * caller says when no candidate's circuit is closed; of several due, the first in the caller's order. With nothing else
+   * to serve either, a candidate whose probe answered (or has been out for `recoveryWaitMs`) takes the request as a
+   * trial, behind the probe. Only input ids are returned. A circuit this ranker holds from the feed (`circuitOf`: on
+   * Workers every one) is filed as its own would be (review combined-r1 blocker 2): due, its probe out or cooling. Whether
+   * it takes a trial is its shard's to decide (the feed carries no answered probe), so with nothing else to serve one that
+   * is not due goes as a trial, unless the ranking leased a due probe: then it is left out, as the server leaves out a
+   * route that takes no trial, so no customer order or tool-call issuer's pin can put it ahead of the probe (review r17
+   * combined-r2 blocker 2).
+   *
+   * Kept until the request path has moved off it (r17: it goes after the merge).
    */
   async rankWith(candidates: readonly Candidate[], policy: RankingPolicy, requestKey: string, nowMs: number, exploration: Exploration, rests?: RestView): Promise<RankingResult> {
     return this.rankLeasing(candidates, policy, requestKey, nowMs, exploration, true, rests);
@@ -1764,12 +1795,9 @@ export class Ranker {
 
   private async rankLeasing(candidates: readonly Candidate[], policy: RankingPolicy, requestKey: string, nowMs: number, exploration: Exploration, leaseProbe: boolean, rests?: RestView): Promise<RankingResult> {
     const { config } = this;
-    // Every digest is computed before any state is read, so the rest runs without an await, as the
-    // server runs it under its lock: no other request can lease the probe this one finds due.
-    const ties = new Map<string, bigint>();
-    for (const c of candidates) if (!ties.has(c.endpointId)) ties.set(c.endpointId, await tieNumber(requestKey, c.endpointId));
+    // The digest is computed before any state is read, so the rest runs without an await, as the server runs it under
+    // its lock: no other request can lease the probe this one finds due.
     const probeKey = await recoveryKey(requestKey);
-    const tie = (id: string) => ties.get(id) as bigint;
     const result: { orderedIds: string[]; evidence: RankEvidence[]; explorationId: string | undefined; recoveryProbeId: string | undefined; awaitedProbeUntilMs: number | undefined; cooldownUntilMs: number | undefined } = {
       orderedIds: [],
       evidence: [],
@@ -1796,30 +1824,12 @@ export class Ranker {
         else this.tripped.set(id, state);
       }
     }
-    const exploreSlot = exploration === "allowed";
-    const minimumPrice = (meter: PriceMeter): bigint | undefined => {
-      let least: bigint | undefined;
-      for (const c of candidates) {
-        if (c.quotedPrice?.meter === meter && (least === undefined || c.quotedPrice.amount < least)) least = c.quotedPrice.amount;
-      }
-      return least;
-    };
-    const minimum = { tokens: minimumPrice("tokens"), units: minimumPrice("units") };
-    const throughputMeasured =
-      policy === "throughput" &&
-      candidates.some((c) => {
-        const state = this.states.get(c.endpointId);
-        return state !== undefined && stats(state, nowMs, config).throughput !== undefined;
-      });
-    const mature: [number, string][] = [];
-    const cold: [number, string, number][] = [];
-    const stale: string[] = [];
+    // The candidates whose circuits are closed, those whose recovery probe is due and those that take trials beside
+    // their probe (`feed`: a circuit the feed brought, not due), each in the caller's order; and the soonest moments the
+    // others may be served: when an awaited probe stops holding requests back, and when a cooldown or a rest ends.
+    const closed: string[] = [];
     const recovery: string[] = [];
-    // Each candidate's ModelTrace weight: one below 1 is demoted.
-    const weights = new Map<string, number>();
-    // Quarantined candidates that take trials beside their probe, and the soonest moments the others may
-    // be served: when an awaited probe stops holding requests back, and when a cooldown ends.
-    const trials: string[] = [];
+    const trials: { readonly id: string; readonly feed: boolean }[] = [];
     let awaitedUntil: number | undefined;
     let cooldownUntil: number | undefined;
     const seen = new Set<string>();
@@ -1827,11 +1837,8 @@ export class Ranker {
     for (const c of candidates) {
       if (c.endpointId.length === 0 || seen.has(c.endpointId)) continue;
       seen.add(c.endpointId);
-      const behavioralScore = modeltraceWeight(c);
-      // Multiplies the measured score: a demoted endpoint keeps its place only against candidates that much worse.
-      const behavioralWeight = behavioralScore ?? 1;
-      weights.set(c.endpointId, behavioralWeight);
       const state = this.states.get(c.endpointId);
+      const open = this.openCircuitOf(c.endpointId, state, nowMs);
       const s = state === undefined ? NO_STATS : stats(state, nowMs, config);
       const q: Quantiles = state === undefined ? { ttftP50: undefined, ttftP95: undefined, latencyP50: undefined, latencyP95: undefined } : quantiles(state, nowMs, config);
       const failureCount = (kind: AttemptFailure) => (state === undefined ? 0 : state.failures.filter(([at, failure]) => at <= nowMs && nowMs - at <= config.staleAfterMs && failure === kind).length);
@@ -1839,11 +1846,11 @@ export class Ranker {
         endpointId: c.endpointId,
         policy,
         score: undefined,
-        behavioralScore,
-        behavioralWeight,
+        behavioralScore: modeltraceWeight(c),
+        behavioralWeight: 1,
         samples: s.count,
-        stage: state?.quarantinedUntil !== undefined ? "recovery" : state?.trial.graduated === true ? "normal" : "trial",
-        stableWindows: state === undefined ? 0 : stableWindows(state.trial, config),
+        stage: open !== undefined ? "recovery" : "normal",
+        stableWindows: 0,
         effectiveSamples: s.effective,
         successRate: s.success,
         ttftMs: s.ttft,
@@ -1866,13 +1873,13 @@ export class Ranker {
       const rest = resting.get(c.endpointId);
       if (rest !== undefined) {
         evidence.reasons.push("failure_rest", `rest_${rest.cause}`);
-        const until = state?.quarantinedUntil === undefined ? rest.untilMs : Math.max(state.quarantinedUntil, rest.untilMs);
+        const until = open?.until === undefined || open.until === null ? rest.untilMs : Math.max(open.until, rest.untilMs);
         cooldownUntil = cooldownUntil === undefined ? until : Math.min(cooldownUntil, until);
         result.evidence.push(evidence);
         continue;
       }
       if (state === undefined && this.tripped.has(c.endpointId)) {
-        // An evicted open circuit with no room to come back in is left out, never offered as unproven.
+        // An evicted open circuit with no room to come back in is left out, never offered as closed.
         evidence.reasons.push("ranking_capacity_exceeded");
         result.evidence.push(evidence);
         continue;
@@ -1891,112 +1898,54 @@ export class Ranker {
         }
         spare -= 1;
       }
-      if (state?.quarantinedUntil !== undefined) {
+      if (open !== undefined) {
         evidence.reasons.push("failure_quarantine");
-        const probeOut = state.recovery !== undefined && nowMs <= state.recovery.until;
-        if (nowMs >= state.quarantinedUntil && !probeOut) {
+        if (open.until !== null && nowMs >= open.until && !open.out) {
           recovery.push(c.endpointId);
           evidence.reasons.push("recovery_probe_due");
-        } else if (takesTrials(state, nowMs, config)) {
-          trials.push(c.endpointId);
-        } else if (probeOut) {
-          evidence.reasons.push("recovery_probe_in_flight");
-          const holdsUntil = (state.probingSince ?? nowMs) + config.recoveryWaitMs;
-          awaitedUntil = awaitedUntil === undefined ? holdsUntil : Math.min(awaitedUntil, holdsUntil);
+        } else if (open.own && state !== undefined && takesTrials(state, nowMs, config)) {
+          trials.push({ id: c.endpointId, feed: false });
         } else {
-          cooldownUntil = cooldownUntil === undefined ? state.quarantinedUntil : Math.min(cooldownUntil, state.quarantinedUntil);
+          if (open.out) {
+            evidence.reasons.push("recovery_probe_in_flight");
+            const holdsUntil = (state?.probingSince ?? nowMs) + config.recoveryWaitMs;
+            awaitedUntil = awaitedUntil === undefined ? holdsUntil : Math.min(awaitedUntil, holdsUntil);
+          } else if (open.until !== null) {
+            cooldownUntil = cooldownUntil === undefined ? open.until : Math.min(cooldownUntil, open.until);
+          }
+          // The root's circuit: whether it takes a request as a trial is its shard's to decide, since the feed carries no
+          // answered probe, which the server's trials go by; with nothing else to serve, the request goes there as one
+          // (docs/utility-routing.md "Draw and order": every candidate open, the shard's probe and trial rules decide),
+          // unless the ranking leases a due probe (below).
+          if (!open.own) trials.push({ id: c.endpointId, feed: true });
         }
-      } else if (state?.lastObserved !== undefined && (state.lastObserved > nowMs || nowMs - state.lastObserved > config.staleAfterMs)) {
-        evidence.reasons.push("stale_observations_excluded");
-        stale.push(c.endpointId);
-      } else if (s.count < config.minimumSamples || s.effective < config.minimumSamples / 2 || state === undefined || !state.trial.graduated) {
-        evidence.reasons.push("insufficient_recent_samples");
-        cold.push([s.count, c.endpointId, behavioralWeight]);
       } else {
-        const success = s.success ?? 0;
-        // First-output experience is primary for streaming; sync has no TTFT, so its latency.
-        const primary = q.ttftP50 ?? q.latencyP50;
-        const tail = q.ttftP95 ?? q.latencyP95;
-        const firstQuality = primary === undefined ? 0 : 1 / (1 + primary / 500);
-        const tailQuality = tail === undefined ? undefined : 1 / (1 + tail / 1000);
-        const latencyQuality = tailQuality ?? firstQuality;
-        const throughputQuality = s.throughput === undefined ? 0 : s.throughput / (s.throughput + 50);
-        let priceQuality = 0;
-        if (c.quotedPrice !== undefined) {
-          const least = minimum[c.quotedPrice.meter];
-          if (least !== undefined) priceQuality = (Number(least) + 1) / (Number(c.quotedPrice.amount) + 1);
-        }
-        // Fixed documented scale constants avoid inventing measurements.
-        let utility: number;
-        if (policy === "balanced") utility = 0.6 * firstQuality + 0.25 * latencyQuality + 0.15 * success;
-        else if (policy === "latency") utility = 0.55 * firstQuality + 0.35 * latencyQuality + 0.1 * success;
-        else if (policy === "throughput" && throughputMeasured) utility = 0.7 * throughputQuality + 0.2 * firstQuality + 0.1 * success;
-        else if (policy === "throughput") utility = 0.55 * firstQuality + 0.35 * latencyQuality + 0.1 * success;
-        else utility = 0.9 * priceQuality + 0.1 * success;
-        const score = success * success * utility * behavioralWeight;
-        evidence.score = score;
-        evidence.reasons.push("rolling_observed_percentiles");
-        if (tail === undefined) evidence.reasons.push("tail_sample_count_insufficient");
-        if (policy === "throughput") evidence.reasons.push(throughputMeasured ? "e2e_output_rate_primary" : "throughput_unmeasured_latency_shape");
-        if (s.ttft === undefined) evidence.reasons.push("ttft_unmeasured");
-        if (s.throughput === undefined) evidence.reasons.push("throughput_unmeasured");
-        if (policy === "price" && c.quotedPrice === undefined) evidence.reasons.push("supplier_quote_unavailable");
-        mature.push([score, c.endpointId]);
+        closed.push(c.endpointId);
       }
       result.evidence.push(evidence);
     }
-    mature.sort((a, b) => totalCmp(b[0], a[0]) || compareBig(tie(a[1]), tie(b[1])) || compareUtf8(a[1], b[1]));
-    const demoted = (id: string): boolean => (weights.get(id) ?? 1) < 1;
-    // A demoted endpoint comes after every other unproven or stale one.
-    cold.sort((a, b) => Number(a[2] < 1) - Number(b[2] < 1) || a[0] - b[0] || totalCmp(Number(tie(a[1])) / a[2], Number(tie(b[1])) / b[2]) || compareUtf8(a[1], b[1]));
-    stale.sort((a, b) => Number(demoted(a)) - Number(demoted(b)) || compareBig(tie(a), tie(b)));
-    recovery.sort((a, b) => Number(demoted(a)) - Number(demoted(b)) || compareBig(tie(a), tie(b)));
-    // A suppressed ranking still proposes the recovery probe when nothing else is selectable.
-    //
-    // Exploration does not buy a demoted endpoint traffic: its rounds go on without, and win its weight back. So the
-    // exploration slot, and with nothing measured the head, go to an unproven candidate at full weight, else (exploring)
-    // a stale one at full weight. A demoted one goes first only when no candidate at full weight is selectable, by the
-    // same rule: an unproven one, else (exploring) a stale one. Nor does a demoted endpoint's recovery probe take the
-    // slot: it is leased only as the last resort, after any probe at full weight, and while no endpoint at full weight
-    // takes the request as a trial. A probe at full weight that is out and unanswered serves no one, so the demoted one
-    // does not wait for it.
-    const lastResort = mature.length === 0 && cold.length === 0 && stale.length === 0;
-    const fullTrial = trials.some((id) => !demoted(id));
-    let exploratory: string | undefined;
+    // A suppressed ranking still proposes the recovery probe when nothing else is selectable: with no closed candidate
+    // there is no choice for it to displace, and a recovery probe is the only way a quarantined endpoint comes back.
+    const lastResort = closed.length === 0;
     const probe = recovery[0];
-    const unproven = cold[0] !== undefined && !demoted(cold[0][1]) ? cold[0][1] : undefined;
-    const old = stale[0] !== undefined && !demoted(stale[0]) ? stale[0] : undefined;
-    if (probe !== undefined && leaseProbe && (demoted(probe) ? lastResort && !fullTrial : exploreSlot || lastResort)) {
-      const state = this.states.get(probe) as EndpointState;
-      lease(state, probeKey, nowMs, config);
+    if (probe !== undefined && leaseProbe && (exploration === "allowed" || lastResort)) {
+      lease(this.states.get(probe) as EndpointState, probeKey, nowMs, config);
+      result.evidence.find((e) => e.endpointId === probe)?.reasons.push("reserved_recovery_probe");
+      result.orderedIds.push(probe);
       result.recoveryProbeId = probe;
-      exploratory = probe;
-    } else if (unproven !== undefined && (exploreSlot || mature.length === 0)) {
-      exploratory = unproven;
-    } else if (old !== undefined && exploreSlot) {
-      exploratory = old;
-    } else if (mature.length === 0 && unproven === undefined && old === undefined) {
-      exploratory = cold[0]?.[1] ?? (exploreSlot ? stale[0] : undefined);
     }
-    if (exploratory !== undefined) {
-      result.explorationId = exploratory;
-      result.orderedIds.push(exploratory);
-      result.evidence.find((e) => e.endpointId === exploratory)?.reasons.push(result.recoveryProbeId !== undefined ? "reserved_recovery_probe" : "bounded_exploration");
-    }
-    for (const [, id] of mature) if (!result.orderedIds.includes(id)) result.orderedIds.push(id);
-    if (exploration === "suppressed") {
-      // Every non-quarantined candidate stays selectable: the unproven, then the stale, and the demoted ones after all
-      // of them, in the same order.
-      const unmeasured = [...cold.map(([, id]) => id), ...stale];
-      for (const id of [...unmeasured.filter((id) => !demoted(id)), ...unmeasured.filter(demoted)]) if (!result.orderedIds.includes(id)) result.orderedIds.push(id);
-    }
+    result.orderedIds.push(...closed);
     // A circuit shifts traffic away from a failing endpoint; with nowhere else to send it, refusing
     // protects no one. So an endpoint whose probe answered serves a request with nothing else selectable
     // as a trial, behind the probe when one is due, and never ahead of a candidate whose circuit is
-    // closed. Trials do not decide the circuit: the probes do. A demoted endpoint's trials come after the others'.
+    // closed. Trials do not decide the circuit: the probes do. A circuit the feed brought that is not due
+    // goes as one only when the ranking leased no probe (review r17 combined-r2 blocker 2): the server's
+    // would take none beside the probe (no probe of its spell answered that the feed could show), and in
+    // the plan a customer's order or a tool-call issuer's pin could put it ahead of the probe, whose lease
+    // would then go back (plan-order.ts `settleHead`), the due route waiting behind one that cools.
     if (lastResort) {
-      trials.sort((a, b) => Number(demoted(a)) - Number(demoted(b)) || compareBig(tie(a), tie(b)));
-      for (const id of trials) {
+      for (const { id, feed } of trials) {
+        if (feed && result.recoveryProbeId !== undefined) continue;
         result.evidence.find((e) => e.endpointId === id)?.reasons.push("recovery_trial");
         result.orderedIds.push(id);
       }
@@ -2042,7 +1991,6 @@ export function candidatesFromJson(value: Json | undefined): Candidate[] {
 export {
   AFFINITY_PER_WORKSPACE,
   AFFINITY_WORKSPACES,
-  Affinity,
   type AffinityMode,
   type RelayChangesMode,
   type HeaderSource,
@@ -2056,5 +2004,15 @@ export {
   parseTagPattern,
   tagSentinel,
   affinityKey,
-  affinityTtlMs,
+  keyDefaultPreset,
 } from "./preferences.ts";
+
+export * from "./utility-types.ts";
+export { overKeyPreset, parseRoutingRequest, resolveRoutingParams, takeRouting, type ModeSource, type RoutingTaken } from "./params.ts";
+export { COST_FLOOR_USD, TPS_FLOOR, TTFT_FLOOR_MS, drawNumber, effectiveMetrics, excludesEveryRankedCandidate, failedConstraint, lnUtility, rankByUtility, workloadCost } from "./utility.ts";
+export { addAttempt, bucketValue, deltaEmpty, emptyDelta, emptyRecord, mergeDelta, recordFromJson, summaryOf, ttftBucket, type AttemptMeasure } from "./record.ts";
+export { SessionStore, sessionKey, sessionRedraw, sessionSeed, type SessionRecord, type SessionRouteState } from "./session.ts";
+export { catalogReferencePrice, recordParamsOf, recordParamsWithinBounds, referencePricesOf, routingPolicyDocument, routingPolicyOf, routingPolicyOfText, tauOf, type CatalogPricing, type PolicyRead } from "./policy.ts";
+export * from "./request-routing.ts";
+export { confidentialRouting } from "./request-routing-confidential.ts";
+export * from "./standing.ts";

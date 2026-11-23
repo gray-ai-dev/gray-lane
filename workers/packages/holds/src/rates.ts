@@ -223,14 +223,15 @@ export function includeRate(bound: RateBound, rate: CustomerRate, ttlAsRequested
 }
 
 /**
- * `CustomerRate::within`: none of the request's, the dearest input, the output or the unit rate of
- * this route exceeds what the hold was priced at. Failover never moves to a route priced above it.
+ * `CustomerRate::within`: none of the request's, the dearest input, the output, the cache-read (a token rate's) or the
+ * unit rate of this route exceeds what the hold was priced at. Failover never moves to a route priced above it.
  */
 export function within(rate: CustomerRate, bound: RateBound, ttlAsRequested: boolean): boolean {
   return (
     reserveInput(rate) <= bound.input &&
     reserveRequestInput(rate, bound.billed, ttlAsRequested) <= bound.requestInput &&
     reserveOutput(rate) <= bound.output &&
+    (billsUnits(rate) || tokenRates(rate).cacheRead <= bound.cacheRead) &&
     tokenRates(rate).unit <= bound.unit
   );
 }

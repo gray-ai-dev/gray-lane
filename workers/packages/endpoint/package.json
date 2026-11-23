@@ -15,6 +15,7 @@
     "@gray/config": "0.0.0",
     "@gray/errors": "0.0.0",
     "@gray/json": "0.0.0",
+    "@gray/protocol": "0.0.0",
     "@gray/routing": "0.0.0"
   },
   "devDependencies": {

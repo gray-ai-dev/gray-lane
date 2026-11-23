@@ -14,23 +14,25 @@
  * Here: how a request states one (`Preference.take`, `fromHeader`) and a key or workspace stores one
  * (`parseDefault`), read exactly as routing.rs reads `Preference` (see `statedOf`); how the
  * levels layer (`layered`) and what the layered preference decides (`admits`, `position`, `selected`,
- * `affinityAllowed`, `exploration`, `allowsOtherOperators`, `withinMaxPrice`); and cache affinity
- * (`affinityKey`, `Affinity`, `affinityTtlMs`). The route references themselves (`provider_ref`,
- * `supplier_ref`, `registered_refs`) are @gray/snapshot's. Where the gateway applies a preference
- * (inference.rs `layered_over`, `retain_admitted`, `within_max_price`) is workers/gateway's.
+ * `affinityAllowed`, `optsIn`, `allowsOtherOperators`, `withinMaxPrice`); and the cache key a session of
+ * kind `cache` is made of (`affinityKey`; session.ts). Since r17 a `sort` orders and admits nothing. The
+ * route references themselves (`provider_ref`, `supplier_ref`, `registered_refs`) are @gray/snapshot's. Where
+ * the gateway applies a preference (inference.rs `layered_over`, `retain_admitted`, `within_max_price`) is
+ * workers/gateway's.
  *
- * Pure code: no I/O; the affinity map is the caller's to keep.
+ * Pure code: no I/O.
  */
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { type Json, type JsonObject, get, isArray, isObject, parseStrict, toJsonString } from "@gray/json";
-import { type CanonicalRequest, type Protocol, anthropicCache, promptBlocks } from "@gray/protocol";
-import type { Exploration, RankingPolicy } from "./index.ts";
+import { type CanonicalRequest, anthropicCache, promptBlocks } from "@gray/protocol";
+import { PRESETS, type Preset } from "./utility-types.ts";
 
 /**
- * What the customer wants the eligible candidates ordered by (`RequestedSort`). Deliberately its own type
- * rather than the deployment's `RankingPolicy`: the deployment policy also decides whether an approved
- * supplier quote is required, and a customer may not change admission by asking for a different order.
+ * What the customer asked the eligible candidates to be ordered by (`RequestedSort`). Since r17
+ * (docs/utility-routing.md) every request is ordered by the utility formula, and a `sort` still sent is accepted
+ * whatever it holds and ignored (`ignoredSort`): the request log records one of these when it names one, nothing
+ * orders or admits by it.
  */
 export type RequestedSort = "balanced" | "latency" | "throughput" | "price";
 const SORTS: readonly RequestedSort[] = ["balanced", "latency", "throughput", "price"];
@@ -210,6 +212,20 @@ function optionalCeiling(value: Json): bigint | null {
 }
 
 /**
+ * A `sort`, accepted and ignored since r17 whatever its value or type, in a request and in a stored default alike
+ * (routing.rs `ignored_sort`): one of the four as serde reads a `RequestedSort` (its name, or a map of that one key to
+ * null) for the request log, anything else null.
+ */
+function ignoredSort(value: Json): RequestedSort | null {
+  try {
+    return unitVariant(value, SORTS);
+  } catch (error) {
+    if (error instanceof Refused) return null;
+    throw error;
+  }
+}
+
+/**
  * A unit variant of a `snake_case` enum, as serde_json reads an enum: the variant's name as a string, or a
  * map of exactly that one key whose value is the unit (null).
  */
@@ -280,7 +296,7 @@ function statedOf(value: Json): Stated {
         allowFallbacks = member;
         break;
       case "sort":
-        sort = member === null ? null : unitVariant(member, SORTS);
+        sort = ignoredSort(member);
         break;
       case "max_price":
         maxPrice = member === null ? null : maxPriceOf(member);
@@ -391,8 +407,20 @@ export class Preference {
    * `resolved` did not read, every entry of its `order` and `only` is a reference and opts in itself).
    */
   private readonly resolution: Resolution;
+  /**
+   * The request's routing parameters are explicit (`withRoutingExplicit`): every route with a tier is opted in. Not
+   * a `provider` member: what the request's `routing` decides (`routing_explicit`).
+   */
+  private readonly routingExplicit: boolean;
 
-  private constructor(stated: Stated, narrowedBy: readonly (readonly string[])[], requested: readonly string[] | null, ownOnly: number | null = null, resolution: Resolution = UNRESOLVED) {
+  private constructor(
+    stated: Stated,
+    narrowedBy: readonly (readonly string[])[],
+    requested: readonly string[] | null,
+    ownOnly: number | null = null,
+    resolution: Resolution = UNRESOLVED,
+    routingExplicit = false,
+  ) {
     this.order = stated.order;
     this.only = stated.only;
     this.ignore = stated.ignore;
@@ -406,6 +434,7 @@ export class Preference {
     this.requested = requested;
     this.ownOnly = ownOnly;
     this.resolution = resolution;
+    this.routingExplicit = routingExplicit;
   }
 
   /** No preference (`Preference::default`). */
@@ -421,7 +450,7 @@ export class Preference {
     }
   }
 
-  /** `serde_json::from_str::<Preference>` of `text`, validated: a key stated twice at any depth is refused (a derived struct refuses a duplicate field, and every object of a preference is one; the sort's and affinity's one-key map form takes no second key at all). */
+  /** `text` read strictly as a preference (routing.rs `strictly`), validated: a key stated twice at any depth is refused, inside a `sort` (which holds any value) too. */
   private static readText(text: string): Preference | null {
     let value: Json;
     try {
@@ -439,6 +468,35 @@ export class Preference {
    */
   static parseDefault(stored: string): Preference | "routing_default_invalid" {
     return Preference.readText(stored) ?? "routing_default_invalid";
+  }
+
+  /**
+   * An API key's stored default (`PUT /keys/{id}/routing`, `Preference::parse_key_default`): the provider preference
+   * `parseDefault` reads, beside the key's routing mode, its member `mode` (one of the four presets; null or absent:
+   * none). Anything else in `mode` makes the default unreadable, as any member this version cannot apply. Only a key's
+   * default carries a mode: a workspace's is read by `parseDefault`, which refuses one as a member it does not know.
+   */
+  static parseKeyDefault(stored: string): { readonly preference: Preference; readonly preset: Preset | null } | "routing_default_invalid" {
+    let value: Json;
+    try {
+      value = parseStrict(stored);
+    } catch {
+      return "routing_default_invalid";
+    }
+    let preset: Preset | null = null;
+    if (isObject(value) && Object.hasOwn(value, "mode")) {
+      const stated = get(value, "mode")!;
+      if (stated !== null) {
+        const named = PRESETS.find((p) => p === stated);
+        if (named === undefined) return "routing_default_invalid";
+        preset = named;
+      }
+      const rest: JsonObject = { ...value };
+      delete rest.mode;
+      value = rest;
+    }
+    const preference = Preference.read(value);
+    return preference === null ? "routing_default_invalid" : { preference, preset };
   }
 
   /** The header form alone, for a request whose body has no place for a routing object, a multipart form (`Preference::from_header`). */
@@ -498,16 +556,39 @@ export class Preference {
     const ignore = list(this.ignore, false);
     const narrowedBy = modelTag === null ? this.narrowedBy : [...this.narrowedBy, list([modelTag], true)];
     const stated: Stated = { order, only, ignore, allowFallbacks: this.allowFallbacks, sort: this.sort, maxPrice: this.maxPrice, affinity: this.affinity, relayChanges: this.relayChanges, verifiable: this.verifiable };
-    return new Preference(stated, narrowedBy, this.requested, this.only.length, { known, opted, resolved: true });
+    return new Preference(stated, narrowedBy, this.requested, this.only.length, { known, opted, resolved: true }, this.routingExplicit);
   }
 
   /**
-   * Whether a route with a tier may serve the request (`opts_in`): such a route is opt-in. The layered sort asks
-   * for throughput or price, or a selection of some level names the route by its own reference or by a pattern
-   * holding its tier. Its supplier's name or a pattern without the tier does not.
+   * The request's own level, as a request whose routing parameters are explicit (`RoutingParams.explicit`: a preset
+   * or any member stated) or not (`with_routing_explicit`): an explicit one opts every route with a tier in
+   * (`optsIn`). Set on the request's preference before it is layered, so layering keeps an order naming only tiered
+   * routes, and `tierAdmitted` reads it from the layered preference. A stored default carries no routing parameters
+   * and never sets it.
+   */
+  withRoutingExplicit(explicit: boolean): Preference {
+    const stated: Stated = {
+      order: this.order,
+      only: this.only,
+      ignore: this.ignore,
+      allowFallbacks: this.allowFallbacks,
+      sort: this.sort,
+      maxPrice: this.maxPrice,
+      affinity: this.affinity,
+      relayChanges: this.relayChanges,
+      verifiable: this.verifiable,
+    };
+    return new Preference(stated, this.narrowedBy, this.requested, this.ownOnly, this.resolution, explicit);
+  }
+
+  /**
+   * Whether a route with a tier may serve the request (`opts_in`): such a route is opt-in. The request's routing
+   * parameters are explicit (`withRoutingExplicit`), or a selection of some level names the route by its own reference
+   * or by a pattern holding its tier. Its supplier's name or a pattern without the tier does not, nor, since r17, a
+   * `sort` (docs/utility-routing.md "Request parameters").
    */
   optsIn(provider: string): boolean {
-    return this.sort === "throughput" || this.sort === "price" || this.resolution.opted.includes(provider);
+    return this.routingExplicit || this.resolution.opted.includes(provider);
   }
 
   /** Whether `named` is registered for this request by a pattern's resolution (`knows`). */
@@ -589,7 +670,8 @@ export class Preference {
       opted: stated.flatMap((p) => [...p.resolution.opted, ...(p.resolution.resolved ? [] : [...p.order, ...p.only])]),
       resolved: stated.some((p) => p.resolution.resolved),
     };
-    const unsettled = new Preference(base, narrowedBy, requested, ownOnly, resolution);
+    // The request's own: a stored default states no routing.
+    const unsettled = new Preference(base, narrowedBy, requested, ownOnly, resolution, this.routingExplicit);
     // With fallbacks allowed, a name keeps its place only while some route it names survives the filters; a
     // route knows both of its names. A name that names no registered endpoint at all stays when the request
     // wrote it, so the request is refused as `routing_unknown_provider`; one whose routes left the snapshot
@@ -608,10 +690,14 @@ export class Preference {
       if (routes.length === 0) return (ordersItself && !registered.has(named) && !unsettled.knows(named)) || !unsettled.allowFallbacks;
       return routes.some(([provider, supplier, tiered]) => survives(provider, supplier, tiered === true));
     });
-    return new Preference({ ...base, order: settled }, narrowedBy, requested, ownOnly, resolution);
+    return new Preference({ ...base, order: settled }, narrowedBy, requested, ownOnly, resolution, this.routingExplicit);
   }
 
-  /** An explicit customer order always wins over cache affinity: the customer asked for a specific endpoint (`affinity_allowed`). */
+  /**
+   * An explicit customer order always wins over a session (cache affinity before r17): the customer asked for a
+   * specific endpoint (`affinity_allowed`). `affinity: "off"` turns the session off too (docs/utility-routing.md
+   * "Sessions").
+   */
   affinityAllowed(): boolean {
     return this.affinity === "auto" && this.order.length === 0;
   }
@@ -664,51 +750,24 @@ export class Preference {
     return (price.input === null || input <= price.input) && (price.output === null || output <= price.output);
   }
 
-  /** An explicit order suppresses exploration (`exploration`). */
-  exploration(): Exploration {
-    return this.order.length === 0 ? "allowed" : "suppressed";
-  }
-
   /** Whether a route of an operator not yet tried may serve this request after an attempt failed: `allow_fallbacks` (`allows_other_operators`). */
   allowsOtherOperators(): boolean {
     return this.allowFallbacks;
   }
-
-  /** The ranking policy the request is ordered by: its sort (`RequestedSort::ordering_policy`), else the deployment's. */
-  orderingPolicy(deployment: RankingPolicy): RankingPolicy {
-    return this.sort ?? deployment;
-  }
 }
 
-// ---------------------------------------------------------------- cache affinity
-
-/**
- * Per-protocol lifetime of an affinity entry, in milliseconds (`affinity_ttl_ms`). Upstream prompt caches
- * expire on their own schedule, and these are at or below the shortest documented upstream lifetime: an
- * entry that expires early only costs a cache hit, while one that outlives its upstream cache sends a
- * request somewhere for a benefit that is no longer there.
- */
-export function affinityTtlMs(protocol: Protocol): bigint {
-  switch (protocol) {
-    // An ephemeral breakpoint lives at least five minutes, refreshed on each read (platform.claude.com, Prompt caching).
-    case "anthropic_messages":
-      return 300_000n;
-    // In-memory retention, the default for an organization with Zero Data Retention, typically keeps an entry
-    // five to ten minutes of inactivity (developers.openai.com, Prompt caching). Only GPT-5.6 and later promise
-    // thirty minutes, and the protocol does not say which model generation a relay serves.
-    case "open_ai_chat":
-    case "open_ai_responses":
-      return 300_000n;
-    // Only the text-generation protocols carry a prompt prefix an upstream could have cached; a Gemini
-    // `cachedContent` lives as long as its creator set, which the request does not say. The shorter lifetime
-    // is the safe default.
-    default:
-      return 300_000n;
-  }
-}
+// ---------------------------------------------------------------- the cache key of a session
 
 /** Marks an entry a request may read but does not write, in an affinity key (`READ_ONLY`). */
-const READ_ONLY = "~";
+export const READ_ONLY = "~";
+
+/**
+ * Marks the anchor of an affinity key (`ANCHOR`): the prefix of the prompt's first block (its first tool, else its
+ * system prompt, else its first message's), which every turn of a conversation names, also once its breakpoints have
+ * moved past the positions it reads back. It is no entry, never read nor written (`namedEntries` skips it): it seeds a
+ * session's draw (session.ts `sessionSeed`, lead decision T26).
+ */
+export const ANCHOR = "^";
 
 const encoder = new TextEncoder();
 
@@ -724,7 +783,8 @@ function lengthBytes(length: number): Uint8Array {
  * field: an upstream entry is a hash of the prefix ending at a breakpoint, written only there, and a request
  * reads it by walking back from each of its own breakpoints (@gray/protocol `anthropicCache`). The key names
  * the entry at each breakpoint, which this request writes, and every position in those windows, longest
- * prefix first, which it may read. These are stability hashes, not the provider's own.
+ * prefix first, which it may read; last, marked `ANCHOR`, the prefix of the first block. These are stability
+ * hashes, not the provider's own.
  */
 function prefixKey(seed: Uint8Array, body: Json): string | null {
   const blocks = promptBlocks("anthropic_messages", body);
@@ -746,22 +806,29 @@ function prefixKey(seed: Uint8Array, body: Json): string | null {
     if (!cache.reads[index]) continue;
     entries.push(cache.writes.includes(index) ? prefixes[index]! : `${READ_ONLY}${prefixes[index]!}`);
   }
+  entries.push(`${ANCHOR}${prefixes[0]!}`);
   return entries.join(" ");
 }
 
-/** The entries an affinity key names, in the order they are worth reading, each with whether the request writes it (`named_entries`). */
-function namedEntries(key: string): (readonly [entry: string, written: boolean])[] {
+/** The entries an affinity key names, in the order they are worth reading, each with whether the request writes it, its anchor left out (`named_entries`); a session key of kind `cache` is read so too (session.ts). */
+export function namedEntries(key: string): (readonly [entry: string, written: boolean])[] {
   return key
     .split(" ")
-    .filter((entry) => entry !== "")
+    .filter((entry) => entry !== "" && !entry.startsWith(ANCHOR))
     .map((entry) => (entry.startsWith(READ_ONLY) ? ([entry.slice(READ_ONLY.length), false] as const) : ([entry, true] as const)));
+}
+
+/** The anchor an affinity key names, without its mark, or null when it names none (`key_anchor`; a session key of kind `cache` names it so too). */
+export function keyAnchor(key: string): string | null {
+  for (const token of key.split(" ")) if (token.startsWith(ANCHOR) && token.length > ANCHOR.length) return token.slice(ANCHOR.length);
+  return null;
 }
 
 /**
  * The affinity key for one request, or null when it states no cache intent (`affinity_key`). Gray acts only
  * on a cache intent the request states: an explicit cache key, or an explicit Anthropic cache breakpoint; it
- * never infers one from the shape of a prompt. The key is opaque outside this module, and the workspace is
- * part of every entry, so an entry can only ever be read or written by the workspace that created it.
+ * never infers one from the shape of a prompt. The key is opaque outside this module and session.ts, and the
+ * workspace is part of every entry, so an entry can only ever be read or written by the workspace that created it.
  */
 export function affinityKey(workspaceId: string, request: CanonicalRequest, body: Json): string | null {
   const hints = request.cache_hints;
@@ -776,112 +843,21 @@ export function affinityKey(workspaceId: string, request: CanonicalRequest, body
 }
 
 /**
- * The server's affinity bounds (`Affinity::default`): at most this many entries per workspace, for at most this
- * many workspaces, constants in routing.rs, where the map lives in the server's process. A map built without
- * bounds takes them (the conformance fixtures' default); the gateway's isolate map takes its own,
+ * The server's session bounds (session.rs `SessionStore::default`): at most this many entries per workspace, for at
+ * most this many workspaces, where the store lives in the server's process. A store built without bounds takes them
+ * (session.ts `SessionStore`, the conformance fixtures' default); the gateway's isolate store takes its own,
  * AFFINITY_ENTRIES_PER_WORKSPACE and AFFINITY_WORKSPACES (@gray/config), sized from the isolate's memory.
  */
 export const AFFINITY_PER_WORKSPACE = 512;
 export const AFFINITY_WORKSPACES = 4096;
 
-interface AffinityEntry {
-  readonly endpointId: string;
-  readonly expiresAtMs: bigint;
-}
-
-interface AffinityShard {
-  readonly entries: Map<string, AffinityEntry>;
-  /** When the shard's last entry expires: entries only ever expire or are evicted closest to expiry first. */
-  expiresAtMs: bigint;
-}
-
 /**
- * Which endpoint last served a given cache prefix, so the next request in the same conversation can reuse
- * the upstream cache that is only warm there (`Affinity`). Upstream prompt caches are isolated per provider
- * account, so a warm conversation routed to another supplier is a guaranteed miss.
- *
- * It is a latency optimization, not a routing authority: losing it only costs the next request of each
- * conversation a cache miss. Times are Unix milliseconds as u64 (`bigint`): an expiry saturates at u64's
- * largest value, as `saturating_add` does.
+ * The routing mode an API key's stored default (`stored`, null: none) sets (`key_default_preset`,
+ * `Preference.parseKeyDefault`); null for none and for a default that does not read, which refuses the request when its
+ * preference is layered.
  */
-export class Affinity {
-  /** Keyed by workspace, then by affinity key: one workspace filling its own shard can never evict another's entries. */
-  private readonly workspaces = new Map<string, AffinityShard>();
-  /** While every workspace slot is taken, the earliest time any shard can have emptied, before which looking for a free slot cannot find one. */
-  private nextSweepMs = 0n;
-  /** Sweeps run, which is what bounds the time a full map is walked for (the tests read it). */
-  sweeps = 0;
-  private readonly perWorkspace: number;
-  private readonly maxWorkspaces: number;
-
-  /** At most `perWorkspace` entries for each of at most `maxWorkspaces` workspaces; the server's by default (`Affinity::default`). */
-  constructor(perWorkspace = AFFINITY_PER_WORKSPACE, maxWorkspaces = AFFINITY_WORKSPACES) {
-    this.perWorkspace = perWorkspace;
-    this.maxWorkspaces = maxWorkspaces;
-  }
-
-  /**
-   * The endpoint that last served the longest live entry this key may read, if any (`target`). The caller
-   * must still confirm the endpoint is eligible: this is a preference among candidates, never a route source.
-   */
-  target(workspaceId: string, key: string, nowMs: bigint): string | null {
-    const entries = this.workspaces.get(workspaceId)?.entries;
-    if (entries === undefined) return null;
-    for (const [entry] of namedEntries(key)) {
-      const found = entries.get(entry);
-      if (found !== undefined && found.expiresAtMs > nowMs) return found.endpointId;
-    }
-    return null;
-  }
-
-  /**
-   * Records the endpoint that served this key, under each entry the key writes, with `nowMs` the time the
-   * attempt was dispatched, when the upstream read the prefix (`record`). Called when an attempt closes as a
-   * delivered answer: the first request of a conversation is always a miss, and a failed attempt warmed no
-   * cache, so it neither forms an entry nor renews one.
-   */
-  record(workspaceId: string, key: string, endpointId: string, protocol: Protocol, nowMs: bigint): void {
-    if (this.workspaces.size >= this.maxWorkspaces && !this.workspaces.has(workspaceId)) {
-      // Expired workspaces are only collected under pressure, and a sweep drops whole shards; while the map
-      // stays full no sweep runs until a shard can have emptied.
-      if (nowMs < this.nextSweepMs) return;
-      this.sweeps += 1;
-      for (const [id, shard] of this.workspaces) if (!(shard.expiresAtMs > nowMs)) this.workspaces.delete(id);
-      if (this.workspaces.size >= this.maxWorkspaces) {
-        let soonest: bigint | null = null;
-        for (const shard of this.workspaces.values()) if (soonest === null || shard.expiresAtMs < soonest) soonest = shard.expiresAtMs;
-        this.nextSweepMs = soonest ?? 0n;
-        return;
-      }
-    }
-    let shard = this.workspaces.get(workspaceId);
-    if (shard === undefined) {
-      shard = { entries: new Map(), expiresAtMs: 0n };
-      this.workspaces.set(workspaceId, shard);
-    }
-    const sum = nowMs + affinityTtlMs(protocol);
-    const expiresAtMs = sum > U64_MAX ? U64_MAX : sum;
-    const entries = shard.entries;
-    for (const [entry, written] of namedEntries(key)) {
-      if (!written) continue;
-      if (entries.size >= this.perWorkspace && !entries.has(entry)) {
-        for (const [name, held] of entries) if (!(held.expiresAtMs > nowMs)) entries.delete(name);
-        if (entries.size >= this.perWorkspace) {
-          // Drop the entry closest to expiry rather than refuse to record: the newest conversation is the one
-          // still running. Rust's `HashMap` order decides between equal expiries; that tie is not pinned.
-          let oldest: string | null = null;
-          let oldestAt: bigint | null = null;
-          for (const [name, held] of entries) {
-            if (oldestAt === null || held.expiresAtMs < oldestAt) {
-              oldest = name;
-              oldestAt = held.expiresAtMs;
-            }
-          }
-          if (oldest !== null) entries.delete(oldest);
-        }
-      }
-      entries.set(entry, { endpointId, expiresAtMs });
-    }
-    if (expiresAtMs > shard.expiresAtMs) shard.expiresAtMs = expiresAtMs;
-  }
+export function keyDefaultPreset(stored: string | null): Preset | null {
+  if (stored === null) return null;
+  const read = Preference.parseKeyDefault(stored);
+  return typeof read === "string" ? null : read.preset;
 }

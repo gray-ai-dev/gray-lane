@@ -103,7 +103,7 @@ export const RPC_SURFACES = {
   continuation: { callee: "gateway", target: "ContinuationDO", kind: "object", callers: ["gateway"], calls: ["lookup", "bind", "stats"] },
   toolCallIds: { callee: "gateway", target: "ToolCallIdDO", kind: "object", callers: ["gateway"], calls: ["find", "issue", "lookup", "write", "import", "deleteBefore", "close", "stats"] },
   toolCallIdDeletions: { callee: "gateway", target: "ToolCallIdDeletionDO", kind: "object", callers: ["console", "gateway"], calls: ["request", "status"] },
-  setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog"] },
+  setupCatalog: { callee: "gateway", target: "SetupCatalog", kind: "entrypoint", callers: ["console"], calls: ["setupCatalog", "routingViews"] },
   publicSetup: { callee: "console", target: "PublicSetup", kind: "entrypoint", callers: ["gateway"], calls: ["fetch", "keyStatus"] },
   consoleBackground: { callee: "console", target: "ConsoleBackground", kind: "entrypoint", callers: ["jobs"], calls: ["refreshReconciliationCases"] },
   laneStackConfig: { callee: "console", target: "LaneStackConfig", kind: "entrypoint", callers: ["lane-bridge"], calls: ["bridgeKeys", "stackConfig", "proxyChecks", "stackRules", "stackReport", "stackTests", "debugShares", "vaultGet", "vaultPut", "vaultShareNonce", "vaultShare", "stackInstance", "entryRole"] },
@@ -134,6 +134,10 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // The lane bridge asks a lane route's shard to hold its standing permit before the route's first request (M13): a shard
   // of a release before `warm` throws, the bridge answers unavailable, and the lane serves as before (its first request borrows).
   "endpointShard.warm": "lane-bridge/test/workerd/bridge.test.ts > a shard of a release before warm answers that it has no such method: unavailable, and the lane serves as before",
+  // The console's route reads ask the gateway how routing sees a workspace's routes (docs/utility-routing-reads.md "The
+  // route reads"): a gray-gateway of a release before `routingViews` throws, the provider read answers 503
+  // routing_unavailable, and the operator's route health answers without the routing members.
+  "setupCatalog.routingViews": "console/test/workerd/routes.test.ts > a gateway of a release before routingViews: the provider read answers 503 routing_unavailable",
   // A relay's VM reports its debug shares (docs/design/relay-debug-sharing.md section 7): a gray-console of a release before
   // `debugShares` throws, the bridge answers unavailable, and the VM sends the shares again with its next poll.
   "laneStackConfig.debugShares": "lane-bridge/test/workerd/stack-health.test.ts > a console of a release before debugShares answers that it has no such method: unavailable, and the VM sends the shares again",

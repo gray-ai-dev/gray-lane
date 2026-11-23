@@ -1,10 +1,28 @@
 import { billsUnits, includeRate, rateBound, reserveOutput, tokenRates, within, type BilledInput, type CustomerRate, type RateBound } from "@gray/holds";
 import { parseStrict } from "@gray/json";
 import { type CanonicalRequest, type Protocol, reasoningRequested, structured } from "@gray/protocol";
-import { measurementKeySync, Ranker, type Candidate, type Exploration, type MaxPrice, type QuotedPrice, type RankingPolicy, type RankingResult, type RestView } from "@gray/routing";
+import {
+  effectiveMetrics,
+  excludesEveryRankedCandidate,
+  failedConstraint,
+  measurementKeySync,
+  rankByUtility,
+  Ranker,
+  type Candidate,
+  type MaxPrice,
+  type QuotedPrice,
+  type RankingResult,
+  type ReferencePrice,
+  type RestView,
+  type RoutePrice,
+  type RoutingParams,
+  type RoutingPolicy,
+  type UtilityResult,
+  type UtilityRoute,
+} from "@gray/routing";
 import { imageUsageKnown as imageGate, trafficEnded } from "@gray/snapshot";
 import { generationPriceOf } from "./money.ts";
-import { rankKeyLeases, type ProbeLeases } from "./plan-order.ts";
+import { rankKeyLeases, type Ordered, type ProbeLeases } from "./plan-order.ts";
 import { RankingBase } from "./ranking-base.ts";
 import { REST_EGRESS_REGION } from "@gray/endpoint";
 import { chatFor, type GatewaySnapshot, type RouteRecord, routeServes } from "./snapshot.ts";
@@ -49,6 +67,7 @@ export function nativeRoutes(snapshot: GatewaySnapshot, request: CanonicalReques
  * traffic, as a route that is not available; the request record names it as passed over for this word.
  */
 export const RELEASE_OUTDATED = "release_outdated";
+
 /**
  * The `routing_skipped` reason of an entry's stack route left out because its relay's VM has no usable peer now (resting
  * after dials that sent nothing, or being attested again after its workerd restarted): the request goes to the routes it
@@ -77,7 +96,7 @@ export function regionMatches(preference: string, serviceRegion: string | null):
 
 export type Priced =
   | { readonly ok: true; readonly routes: Route[]; readonly bound: RateBound }
-  | { readonly ok: false; readonly status: 400 | 503; readonly code: "routing_max_price_excluded_all" | "supplier_quote_unavailable" };
+  | { readonly ok: false; readonly status: 400 | 503; readonly code: "routing_max_price_excluded_all" | "supplier_quote_unavailable"; readonly pricedOut?: readonly PricedOut<RouteRecord>[] };
 
 /**
  * Whether a route may serve under its quote (`image_gate`, then `image_usage_known`, @gray/snapshot
@@ -101,6 +120,12 @@ export type { MaxPrice };
  */
 export function withinMaxPrice(maxPrice: MaxPrice | null, rate: CustomerRate, billed: BilledInput): boolean {
   if (maxPrice === null || billsUnits(rate)) return true;
+  const { input, output } = comparedRates(rate, billed);
+  return (maxPrice.input === null || input <= maxPrice.input) && (maxPrice.output === null || output <= maxPrice.output);
+}
+
+/** The two rates a `maxPrice` ceiling is compared with (`compared_rates`): the dearest input rate the request can be billed at, and the output rate. */
+export function comparedRates(rate: CustomerRate, billed: BilledInput): { readonly input: bigint; readonly output: bigint } {
   const r = tokenRates(rate);
   let input = r.input;
   if (billed.cacheWrite && r.cacheWrite > input) input = r.cacheWrite;
@@ -109,7 +134,14 @@ export function withinMaxPrice(maxPrice: MaxPrice | null, rate: CustomerRate, bi
     if (r.imageInput > input) input = r.imageInput;
     if (r.audioInput > input) input = r.audioInput;
   }
-  return (maxPrice.input === null || input <= maxPrice.input) && (maxPrice.output === null || reserveOutput(rate) <= maxPrice.output);
+  return { input, output: reserveOutput(rate) };
+}
+
+/** A route the request's `maxPrice` priced out, with the two rates the ceiling was compared with (`comparedRates`). */
+export interface PricedOut<T> {
+  readonly route: T;
+  readonly input: bigint;
+  readonly output: bigint;
 }
 
 /**
@@ -119,7 +151,8 @@ export function withinMaxPrice(maxPrice: MaxPrice | null, rate: CustomerRate, bi
  * the cache lifetime asked for (`ttlOf`, read only for a route that enters the bound). With no route left,
  * the refusal: 400 `routing_max_price_excluded_all` when the ceiling excluded any, else 503
  * `supplier_quote_unavailable`; a route the image gate dropped was never priced, so it never makes it the
- * first. The kept routes keep their order.
+ * first. The kept routes keep their order. The ceiling's refusal names the routes it priced out, with the rates it
+ * compared (`bound_routes_noting`): what the request's routing record says of it.
  */
 export function boundRoutes<T>(
   routes: readonly T[],
@@ -128,7 +161,9 @@ export function boundRoutes<T>(
   ttlOf: (route: T) => boolean,
   maxPrice: MaxPrice | null,
   billed: BilledInput,
-): { readonly ok: true; readonly kept: { readonly route: T; readonly rate: CustomerRate }[]; readonly bound: RateBound } | { readonly ok: false; readonly status: 400 | 503; readonly code: "routing_max_price_excluded_all" | "supplier_quote_unavailable" } {
+):
+  | { readonly ok: true; readonly kept: { readonly route: T; readonly rate: CustomerRate }[]; readonly bound: RateBound }
+  | { readonly ok: false; readonly status: 400 | 503; readonly code: "routing_max_price_excluded_all" | "supplier_quote_unavailable"; readonly pricedOut?: readonly PricedOut<T>[] } {
   const gated = routes.filter((r) => {
     const gate = gateOf(r);
     return imageGate(gate.protocol, gate.proved, gate.pricesImageTokens);
@@ -136,19 +171,19 @@ export function boundRoutes<T>(
   let bound = rateBound(billed);
   // A customer price ceiling is applied here rather than after ranking, so the reservation is sized
   // from the routes that survive it.
-  let pricedOut = false;
+  const pricedOut: PricedOut<T>[] = [];
   const kept: { route: T; rate: CustomerRate }[] = [];
   for (const route of gated) {
     const rate = rateOf(route);
     if (rate === undefined) continue;
     if (!withinMaxPrice(maxPrice, rate, billed)) {
-      pricedOut = true;
+      pricedOut.push({ route, ...comparedRates(rate, billed) });
       continue;
     }
     bound = includeRate(bound, rate, ttlOf(route));
     kept.push({ route, rate });
   }
-  if (kept.length === 0) return pricedOut ? { ok: false, status: 400, code: "routing_max_price_excluded_all" } : { ok: false, status: 503, code: "supplier_quote_unavailable" };
+  if (kept.length === 0) return pricedOut.length > 0 ? { ok: false, status: 400, code: "routing_max_price_excluded_all", pricedOut } : { ok: false, status: 503, code: "supplier_quote_unavailable" };
   return { ok: true, kept, bound };
 }
 
@@ -287,26 +322,25 @@ export function rankKeyOf(record: RouteRecord, stream: boolean, region: string =
 }
 
 /**
- * Ranks `routes` with @gray/routing (`rank_with`): measured routes by score, one exploratory route
- * ahead of them when the policy allows, and with suppressed exploration every route not quarantined.
- * A route ranking leaves out is still eligible for a failover re-rank (D3). Circuit state is the
- * endpoint root's (its shards refuse a permit), so the order here only decides who is asked first. A route resting
- * after a failure (`rests`: the rests its endpoint shard holds, rests.ts `shardRestView`) is passed over, as its shard
- * refuses it. `stream`: the request's mode, whose rank keys rank it; `regionOf`: each route's keys' egress region
- * (`RankRegionOf`, the gateway's own by default).
+ * The routes as the ranker's circuits leave them, until the utility formula orders them (r17, docs/utility-routing.md
+ * "Draw and order"; the server's `circuit_ranking`): every route whose circuit is closed and that does not rest, the due
+ * recovery probes and the trials in the evidence, and with `probe` the recovery probe it leases when nothing else is
+ * selectable (`rank_without_probe` without). Circuit state is the endpoint root's (its shards refuse a permit), so the
+ * order here only decides who is asked first. A route resting after a failure (`rests`: the rests its endpoint shard
+ * holds, rests.ts `shardRestView`) is passed over, as its shard refuses it. `stream`: the request's mode, whose rank keys
+ * rank it; `regionOf`: each route's keys' egress region (`RankRegionOf`, the gateway's own by default). The ranking
+ * policies and exploration are gone ("The rankers"): what `rankWith` still takes of them is passed as nothing, here only,
+ * until it goes.
  */
-export async function rank(snapshot: GatewaySnapshot, routes: readonly Route[], requestKey: string, nowMs: number, policy: RankingPolicy, exploration: Exploration, rests: RestView, stream: boolean, regionOf?: RankRegionOf): Promise<Route[]> {
-  return (await rankDetailed(snapshot, routes, requestKey, nowMs, policy, exploration, rests, stream, true, regionOf)).ordered;
+export async function rank(snapshot: GatewaySnapshot, routes: readonly Route[], requestKey: string, nowMs: number, rests: RestView, stream: boolean, regionOf?: RankRegionOf): Promise<Route[]> {
+  return (await rankDetailed(snapshot, routes, requestKey, nowMs, rests, stream, true, regionOf)).ordered;
 }
 
 /**
- * `rank`, the route it explored (`exploration_id`: the request log's head reason `exploration` when it leads the
- * plan), the routes it left out for want of recent samples (reasons `insufficient_recent_samples` or
- * `stale_observations_excluded`, not a quarantine after failures): the routes an account block's steering
- * puts first when every ranked route is held off (inference.rs `admit`, "The steering"), and the ranking itself,
- * which admission orders its plan from (plan-order.ts `orderPlan`). `probe: false` ranks without a recovery
- * probe (`rank_without_probe`). The routes' rests are read from `rests`, the rests their endpoint shards hold
- * (rests.ts `shardRestView`), never from the ranker: the shards' are the only ones the gateway keeps.
+ * `rank` and the ranking itself, which admission orders its plan from (plan-order.ts `orderPlan`, through `orderedOf`).
+ * `probe: false` ranks without a recovery probe (`rank_without_probe`). The routes' rests are read from `rests`, the
+ * rests their endpoint shards hold (rests.ts `shardRestView`), never from the ranker: the shards' are the only ones the
+ * gateway keeps.
  *
  * The candidates are the routes' rank keys in the request's mode (`rankKeyOf`), each in its egress region (`regionOf`);
  * the ranking's ids are given back as the routes' endpoint ids, which the plan's ordering, the steering and the request
@@ -317,13 +351,11 @@ export async function rankDetailed(
   routes: readonly Route[],
   requestKey: string,
   nowMs: number,
-  policy: RankingPolicy,
-  exploration: Exploration,
   rests: RestView,
   stream: boolean,
   probe = true,
   regionOf?: RankRegionOf,
-): Promise<{ readonly ordered: Route[]; readonly explored: Route | null; readonly unsampled: Route[]; readonly result: RankingResult }> {
+): Promise<{ readonly ordered: Route[]; readonly result: RankingResult }> {
   const byKey = new Map<string, Route>();
   const candidates: Candidate[] = [];
   for (const r of routes) {
@@ -332,43 +364,212 @@ export async function rankDetailed(
     candidates.push({ endpointId: key, quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore });
   }
   const ranker = rankerFor(snapshot, nowMs);
-  const ranked = probe ? await ranker.rankWith(candidates, policy, requestKey, nowMs, exploration, rests) : await ranker.rankWithoutProbe(candidates, policy, requestKey, nowMs, exploration, rests);
+  const ranked = probe ? await ranker.rankWith(candidates, "balanced", requestKey, nowMs, "suppressed", rests) : await ranker.rankWithoutProbe(candidates, "balanced", requestKey, nowMs, "suppressed", rests);
   const idOf = (key: string) => byKey.get(key)?.record.endpointId ?? key;
   const result: RankingResult = {
     ...ranked,
     orderedIds: ranked.orderedIds.map(idOf),
-    explorationId: ranked.explorationId === undefined ? undefined : idOf(ranked.explorationId),
+    explorationId: undefined,
     recoveryProbeId: ranked.recoveryProbeId === undefined ? undefined : idOf(ranked.recoveryProbeId),
     evidence: ranked.evidence.map((e) => ({ ...e, endpointId: idOf(e.endpointId) })),
   };
-  const left = new Map(byKey);
-  const explored = ranked.explorationId === undefined ? null : (byKey.get(ranked.explorationId) ?? null);
   const ordered: Route[] = [];
   for (const key of ranked.orderedIds) {
-    const route = left.get(key);
-    if (route !== undefined) {
-      ordered.push(route);
-      left.delete(key);
-    }
+    const route = byKey.get(key);
+    if (route !== undefined && !ordered.includes(route)) ordered.push(route);
   }
-  const unsampled: Route[] = [];
-  for (const evidence of ranked.evidence) {
-    const route = left.get(evidence.endpointId);
-    if (route !== undefined && evidence.reasons.some((reason) => reason === "insufficient_recent_samples" || reason === "stale_observations_excluded")) unsampled.push(route);
-  }
-  return { ordered, explored, unsampled, result };
+  return { ordered, result };
 }
 
 /**
- * Whether a dispatch to `route` explores, as the ranker that ranks `snapshot`'s routes reads its rank key in the
- * request's mode (`Ranker.dispatchExploratory`, the server's `reserve_dispatch`): what the isolate's exploration budget
- * counts.
+ * Whether ranking reads the feed (docs/utility-routing.md "Effective metrics", "The feed"): the isolate's ranking base
+ * while it is current and its producer carries the roots' records (`RankingBase.recordsSupported`); a checkpoint a
+ * snapshot carries as text (a test's) ranks as the server's own ranker does, whose records are always there; without a
+ * base, none.
  */
-export function dispatchExploratory(snapshot: GatewaySnapshot, route: Route, nowMs: number, stream: boolean, regionOf?: RankRegionOf): boolean {
-  return rankerFor(snapshot, nowMs).dispatchExploratory(rankKeyOf(route.record, stream, regionOf?.(route.record)), nowMs);
+export function feedAvailable(snapshot: GatewaySnapshot, nowMs: number): boolean {
+  const r = snapshot.ranking;
+  if (r instanceof RankingBase) return r.current(nowMs) !== null && r.recordsSupported();
+  return r !== null;
 }
 
-/** The recovery leases of the ranker that ranks `snapshot`'s routes, which settle a plan's head (plan-order.ts `settleHead`). */
+/** A route's customer price as the formula reads it (docs/utility-routing.md "Score"): per token, or its unit price. */
+export function routePrice(rate: CustomerRate): RoutePrice {
+  if (billsUnits(rate)) return { meter: "units", unit: rate.media.unit ?? 0n };
+  return { meter: "tokens", input: rate.input, output: rate.output, cacheRead: rate.cacheRead ?? null };
+}
+
+/** What a request ranks its routes by besides them (docs/utility-routing.md "Request parameters", "Score", "Draw and order"). */
+export interface UtilityAsk {
+  readonly params: RoutingParams;
+  readonly policy: RoutingPolicy;
+  /** The draw's seed: the session's (`sessionSeed`), else the request key. */
+  readonly seed: string;
+  readonly sessionHit: boolean;
+  readonly reference: ReferencePrice | null;
+  readonly contextTokens: number | null;
+  /** A generation API's request; else price only. */
+  readonly generative: boolean;
+}
+
+/** A request's routes as the formula reads them (`utilityRoutesOf`). */
+export interface UtilityRoutes {
+  /** One per rank key in the request's mode, its first route's. */
+  readonly routes: readonly UtilityRoute[];
+  /** Every serving route of the request's model in the snapshot, candidates included: the start values' population. */
+  readonly population: readonly UtilityRoute[];
+  readonly feedAvailable: boolean;
+}
+
+/** The price of a population route that is no candidate: the start values read none. */
+const UNPRICED: RoutePrice = { meter: "tokens", input: 0n, output: 0n, cacheRead: null };
+
+/**
+ * `routes`, a request's of one model, and their population as the formula reads them (docs/utility-routing.md "The
+ * rankers"): each route's rank key in the request's mode, operator, protocol and customer price, and its record's summary
+ * at its capacity key and whether its circuit for that key is open, as the snapshot's ranker holds them (`routeSummary`,
+ * `circuitOf`). Each key is in the route's egress region (`regionOf`, the gateway's own by default): an entry reads its
+ * endpoint routes' circuits under the keys their attempts take permits under; the record is the endpoint root's, one for
+ * every region.
+ */
+export function utilityRoutesOf(snapshot: GatewaySnapshot, routes: readonly Route[], nowMs: number, stream: boolean, regionOf?: RankRegionOf): UtilityRoutes {
+  const ranker = rankerFor(snapshot, nowMs);
+  const of = (record: RouteRecord, price: RoutePrice): UtilityRoute => {
+    const key = rankKeyOf(record, stream, regionOf?.(record));
+    return { key, endpointId: record.endpointId, operator: record.operator, protocol: record.protocol, price, summary: ranker.routeSummary(record.capacityKey), open: ranker.circuitOf(key, nowMs)?.open === true };
+  };
+  const keyed = new Map<string, UtilityRoute>();
+  for (const r of routes) {
+    const route = of(r.record, routePrice(r.rate));
+    if (!keyed.has(route.key)) keyed.set(route.key, route);
+  }
+  const model = routes[0]?.record.model;
+  const population = model === undefined ? [] : snapshot.routes.filter((r) => r.model === model && routeServes(r.expiresAt, nowMs)).map((r) => keyed.get(rankKeyOf(r, stream, regionOf?.(r))) ?? of(r, UNPRICED));
+  return { routes: [...keyed.values()], population, feedAvailable: feedAvailable(snapshot, nowMs) };
+}
+
+/** `route` passes the request's constraints and price cap (`failedConstraint`), as a due probe must (docs "Draw and order"). */
+export function passesConstraints(route: UtilityRoute, ask: UtilityAsk, routes: UtilityRoutes): boolean {
+  const metrics = effectiveMetrics(route, routes.population, ask.policy, routes.feedAvailable);
+  return failedConstraint(route, metrics, { params: ask.params, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative, feedAvailable: routes.feedAvailable }) === null;
+}
+
+/**
+ * `routes` parted into those the request's constraints and price cap pass, as the formula reads them now
+ * (`passesConstraints`; no draw), and those they exclude (review r17-gateway-5 finding 31): the hold and the cost ceiling
+ * are sized over the passing ones alone, as over the routes within the customer's max price, while the formula still ranks
+ * every route and names the ones it excludes. When none passes, every route is sized for and the formula's ranking refuses
+ * the model, recording what it ranked by (finding 33; the server's `screen_constraints`).
+ */
+export function screenConstraints(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, regionOf?: RankRegionOf): { readonly passing: Route[]; readonly excluded: Route[] } {
+  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf);
+  const passing: Route[] = [];
+  const excluded: Route[] = [];
+  for (const r of routes) {
+    const key = rankKeyOf(r.record, stream, regionOf?.(r.record));
+    const route = u.routes.find((x) => x.key === key);
+    (route === undefined || passesConstraints(route, ask, u) ? passing : excluded).push(r);
+  }
+  return passing.length === 0 ? { passing: [...routes], excluded: [] } : { passing, excluded };
+}
+
+/**
+ * Whether the request's constraints and price cap exclude every one of `routes` its ranking judges (`rests`: those that
+ * do not rest, or all of them when every one rests; @gray/routing `excludesEveryRankedCandidate`, no draw): a translation
+ * target whose ranking would refuse the model or keep nothing, so the selection tries the next target first (the server's
+ * `constraints_exclude_all`; docs/utility-routing.md "Constraints and the price cap").
+ */
+export function constraintsExcludeAll(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, rests: RestView, regionOf?: RankRegionOf): boolean {
+  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf);
+  const input = { params: ask.params, policy: ask.policy, seed: ask.seed, sessionHit: ask.sessionHit, candidates: u.routes, population: u.population, feedAvailable: u.feedAvailable, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative };
+  return excludesEveryRankedCandidate(input, (key) => rests(key, nowMs) !== undefined);
+}
+
+/**
+ * A request's ranking by the formula (`rankUtility`): its routes in order and the ranking's facts, and the routes the
+ * formula kept, which are the only ones any attempt may go to (review r17-gateway-5 blocker 26: a same-operator repeat
+ * included); or the formula's refusal.
+ */
+export type UtilityRanking =
+  | { readonly ok: true; readonly ordered: Route[]; readonly result: RankingResult; readonly utility: UtilityResult | null; readonly routes: UtilityRoutes; readonly kept: readonly Route[] }
+  | { readonly ok: false; readonly utility: UtilityResult; readonly routes: UtilityRoutes };
+
+/**
+ * The utility formula's order of `routes` (as `utilityRoutesOf` reads them: `u`) and the circuits' stage after it
+ * (docs/utility-routing.md "Draw and order"; the server's `admit`). The formula orders the routes whose circuit is closed and that do not rest, or, when none can serve,
+ * every route that does not rest; the ranker then takes them in that order (`rankDetailed`: the closed ones as given, the
+ * probe it leases when nothing else serves, the trials), with the open routes that pass the request's constraints and
+ * price cap behind them, whose due probes the plan may carry, and the resting ones that pass them, which it leaves out and
+ * dates. A route the constraints excluded is no candidate; a refusal of the formula (`utilityRefusal`) leaves none.
+ * `regionOf`: each route's keys' egress region, as `u` was read with (`utilityRoutesOf`).
+ */
+export async function rankUtility(
+  snapshot: GatewaySnapshot,
+  routes: readonly Route[],
+  u: UtilityRoutes,
+  ask: UtilityAsk,
+  requestKey: string,
+  nowMs: number,
+  rests: RestView,
+  stream: boolean,
+  probe = true,
+  regionOf?: RankRegionOf,
+): Promise<UtilityRanking> {
+  const free = u.routes.filter((r) => rests(r.key, nowMs) === undefined);
+  let closed = free.filter((r) => !r.open);
+  const formula = closed.length > 0 ? closed : free;
+  const rank = (candidates: readonly UtilityRoute[]) => rankByUtility({ params: ask.params, policy: ask.policy, seed: ask.seed, sessionHit: ask.sessionHit, candidates, population: u.population, feedAvailable: u.feedAvailable, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative });
+  let utility = formula.length === 0 ? null : rank(formula);
+  // The constraints and the price cap left no closed route: while an open one passes them, nothing is left out yet, and
+  // the request ranks as when every candidate is open, the formula over every route that does not rest (the open ones
+  // that pass are its order), for the shard's probe and trial rules to decide (docs/utility-routing.md "Constraints and
+  // the price cap"; review combined-r1 finding 3; the server's `utility_order`). The model fails only when no route
+  // passes, closed or open.
+  if (utility !== null && !utility.ok && closed.length > 0 && free.length > closed.length) {
+    utility = rank(free);
+    closed = [];
+  }
+  if (utility !== null && !utility.ok) return { ok: false, utility, routes: u };
+  const byKey = new Map<string, Route>();
+  for (const r of routes) {
+    const key = rankKeyOf(r.record, stream, regionOf?.(r.record));
+    if (!byKey.has(key)) byKey.set(key, r);
+  }
+  // A resting route is kept only if it passes the constraints and the price cap, as every other kept route (review
+  // combined-r1 blocker 1): one that fails them is no candidate once its rest ends, and its rest dates no refusal.
+  const keys = [...(utility?.order ?? []), ...(closed.length > 0 ? u.routes.filter((r) => r.open && rests(r.key, nowMs) === undefined && passesConstraints(r, ask, u)).map((r) => r.key) : []), ...u.routes.filter((r) => rests(r.key, nowMs) !== undefined && passesConstraints(r, ask, u)).map((r) => r.key)];
+  const kept = new Set(keys);
+  const ranked = await rankDetailed(snapshot, keys.map((key) => byKey.get(key)!), requestKey, nowMs, rests, stream, probe, regionOf);
+  return { ok: true, ...ranked, utility, routes: u, kept: routes.filter((r) => kept.has(rankKeyOf(r.record, stream, regionOf?.(r.record)))) };
+}
+
+/**
+ * The endpoint of the route the formula's unselected share moved to the head of its order (`u` its routes), when it did
+ * (docs/utility-routing.md "Draw and order" 5; the server's `unselected_of`): what a plan's `Ordered.unselected` is, so
+ * that its head's reason names it (review r17-gateway-5 finding 34).
+ */
+export function unselectedOf(utility: UtilityResult | null, u: UtilityRoutes): string | null {
+  if (utility === null || !utility.ok || !utility.evidence.unselected) return null;
+  const key = utility.order[0];
+  return key === undefined ? null : (u.routes.find((r) => r.key === key)?.endpointId ?? key);
+}
+
+/**
+ * What a plan is ordered from in a ranking (`rankDetailed`'s `result`; the server's `ordered_of`): its order, the probe
+ * it leased, the routes it files as due (in candidate order) and its trials; the formula's unselected head is set by its
+ * caller (`unselectedOf`).
+ */
+export function orderedOf(result: Pick<RankingResult, "orderedIds" | "evidence" | "recoveryProbeId">): Ordered {
+  const withReason = (reason: string) => result.evidence.filter((e) => e.reasons.includes(reason)).map((e) => e.endpointId);
+  return {
+    order: [...result.orderedIds],
+    leased: result.recoveryProbeId ?? null,
+    due: withReason("recovery_probe_due"),
+    trials: withReason("recovery_trial"),
+    unselected: null,
+  };
+}
+
 /**
  * The age of the ranking base a ranking of `snapshot` at `nowMs` reads (ms since the collector's word on it,
  * ranking-base.ts), or null when ranking reads none (no base, or one past CONFIG_ALERT_AGE_MS: unmeasured): the soak's
@@ -389,6 +590,18 @@ export function rankedWith(snapshot: GatewaySnapshot, nowMs: number): { readonly
   return r instanceof RankingBase ? { ageMs: r.ageAt(nowMs), spanMs: r.spanAt(nowMs) } : { ageMs: null, spanMs: null };
 }
 
+/**
+ * The feed a ranking of `snapshot` at `nowMs` reads (its evidence's `feed`, docs/utility-routing.md "Evidence"): the
+ * epoch and sequence number the isolate's ranking base holds while it is current, else null (none: no base, one past
+ * CONFIG_ALERT_AGE_MS, or a test's checkpoint).
+ */
+export function rankedFeed(snapshot: GatewaySnapshot, nowMs: number): { readonly epoch: string; readonly seq: number } | null {
+  const r = snapshot.ranking;
+  const feed = r instanceof RankingBase ? (r.current(nowMs)?.feed() ?? null) : null;
+  return feed === null ? null : { epoch: feed.epoch, seq: feed.seq };
+}
+
+/** The recovery leases of the ranker that ranks `snapshot`'s routes, which settle a plan's head (plan-order.ts `settleHead`). */
 export function probeLeases(snapshot: GatewaySnapshot, nowMs: number): ProbeLeases {
   return rankerFor(snapshot, nowMs);
 }
@@ -405,15 +618,4 @@ export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, route
     const record = records.get(id);
     return record === undefined ? id : rankKeyOf(record, stream, regionOf?.(record));
   });
-}
-
-/**
- * Whether `route` holds the reliability a pin needs among `routes` (`pin_holds`): its circuit closed or
- * unobserved and its score near the best's, by their rank keys in the request's mode. The issuer of a conversation's
- * tool-call ids leads the routing only so (inference.rs: "as long as it is about as reliable as the best route";
- * tool-ids.ts).
- */
-export function pinHolds(snapshot: GatewaySnapshot, routes: readonly Route[], route: Route, nowMs: number, stream: boolean, regionOf?: RankRegionOf): boolean {
-  const candidates: Candidate[] = routes.map((r) => ({ endpointId: rankKeyOf(r.record, stream, regionOf?.(r.record)), quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore }));
-  return rankerFor(snapshot, nowMs).pinHolds(rankKeyOf(route.record, stream, regionOf?.(route.record)), candidates, nowMs);
 }

@@ -46,21 +46,39 @@ function unmeasured(a: RouteAttempt): RouteAttempt {
   return out as unknown as RouteAttempt;
 }
 
+/** A row whose routing record states where its preset came from (r20). */
+const statesModeSource = (row: RequestIndexMessage["rows"][number]): boolean => row.routing !== undefined && row.routing !== null && Object.hasOwn(row.routing, "mode_source");
+
+/** A routing record without where its preset came from: what a bridge of r18 knows (the member left out, not null). */
+function withoutModeSource<R extends object>(routing: R): R {
+  const { mode_source: _source, ...rest } = routing as Record<string, unknown>;
+  return rest as R;
+}
+
 /** A route attempt without its provider failure (2026-11-23): what a bridge before it knows. */
 const withoutProviderFailure = ({ providerFailure: _failure, ...a }: RouteAttempt): RouteAttempt => a;
 
 /**
  * `message` without what a bridge that answered `error` to it may have refused it for (`RemoteSinks.sendIndex`): its
  * rows' traces after a 404; after a 400 the newest member first, so a bridge that knows the older ones still gets them:
- * their route attempts' provider failure (2026-11-23, docs/design/one-address.md "Provider defects at the entry"); then
- * their five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept; then the route
- * attempts (r14); then their charge sides and route API (0076). Null when the failure is another, or the rows carry
- * nothing of that kind to take out: the failure stands.
+ * their routing records' preset source (r20), then their routing records (r18, docs/utility-routing-reads.md); then their
+ * route attempts' provider failure (2026-11-23, docs/design/one-address.md "Provider defects at the entry"); then their
+ * five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept; then the route attempts
+ * (r14); then their charge sides and route API (0076). Null when the failure is another, or the rows carry nothing of
+ * that kind to take out: the failure stands.
  */
 function withoutRefused(error: unknown, message: RequestIndexMessage): RequestIndexMessage | null {
   if (!(error instanceof BridgeCallError)) return null;
   if (error.status === 404 && message.rows.some((row) => row.stackTrace !== undefined)) {
     return { ...message, rows: message.rows.map(({ stackTrace: _stackTrace, ...row }) => row) };
+  }
+  // r20's member of the routing record, where its preset came from, the newest: a bridge of r18 knows the record without it.
+  if (error.status === 400 && message.rows.some(statesModeSource)) {
+    return { ...message, rows: message.rows.map((row) => (statesModeSource(row) ? { ...row, routing: withoutModeSource(row.routing!) } : row)) };
+  }
+  // r18's routing record (docs/utility-routing-reads.md "The confidential entry's record").
+  if (error.status === 400 && message.rows.some((row) => row.routing !== undefined)) {
+    return { ...message, rows: message.rows.map(({ routing: _routing, ...row }) => row) };
   }
   if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some((a) => a.providerFailure !== undefined) === true)) {
     return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(withoutProviderFailure) })) };

@@ -76,7 +76,9 @@ const epochSchema = z.string().regex(RANKING_EPOCH_PATTERN);
  * pair `judge_now`/`judge_age_ms` (bridge-3). The judge pair is both present or both absent: one
  * without the other describes no judgement, and a reader must not guess which half was meant.
  * The ranking members (r16) are absent, or `ranking` is one of `SNAPSHOT_RANKING_ASKS`, with `ranking_epoch` and
- * `ranking_seq` exactly when it is `since`.
+ * `ranking_seq` exactly when it is `since`. `ranking_records` (r17, docs/utility-routing.md "The feed"): `1` from an entry
+ * that takes the roots' long records and each key's circuit with the feed's changes, only beside a ranking ask; a bridge
+ * answers them to no other read.
  */
 export const snapshotCurrentRequestSchema = z
   .object({
@@ -87,6 +89,7 @@ export const snapshotCurrentRequestSchema = z
     ranking: z.enum(SNAPSHOT_RANKING_ASKS).optional(),
     ranking_epoch: epochSchema.optional(),
     ranking_seq: uintSchema.optional(),
+    ranking_records: z.literal("1").optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -96,6 +99,9 @@ export const snapshotCurrentRequestSchema = z
     const since = value.ranking === "since";
     if (since !== (value.ranking_epoch !== undefined) || since !== (value.ranking_seq !== undefined)) {
       ctx.addIssue({ code: "custom", path: ["ranking"], message: "ranking=since names ranking_epoch and ranking_seq, and no other read names them" });
+    }
+    if (value.ranking_records !== undefined && value.ranking === undefined) {
+      ctx.addIssue({ code: "custom", path: ["ranking_records"], message: "ranking_records comes with a ranking ask" });
     }
   });
 export type SnapshotCurrentRequest = z.infer<typeof snapshotCurrentRequestSchema>;
@@ -139,6 +145,7 @@ export function snapshotCurrentQuery(request: SnapshotCurrentRequest): string {
   if (judge !== null) parts.push(`judge_now=${judge.now}`, `judge_age_ms=${judge.ageMs}`);
   if (parsed.ranking !== undefined) parts.push(`ranking=${parsed.ranking}`);
   if (parsed.ranking === "since") parts.push(`ranking_epoch=${parsed.ranking_epoch}`, `ranking_seq=${parsed.ranking_seq}`);
+  if (parsed.ranking_records !== undefined) parts.push("ranking_records=1");
   return parts.join("&");
 }
 
@@ -148,7 +155,7 @@ export function snapshotCurrentCall(request: SnapshotCurrentRequest): BridgeCall
 }
 
 /** The names a snapshot read's query may carry: before r16's, then the ranking members. */
-const SNAPSHOT_PARAMETERS: ReadonlySet<string> = new Set(["have", "confirmed_after", "judge_now", "judge_age_ms", "ranking", "ranking_epoch", "ranking_seq"]);
+const SNAPSHOT_PARAMETERS: ReadonlySet<string> = new Set(["have", "confirmed_after", "judge_now", "judge_age_ms", "ranking", "ranking_epoch", "ranking_seq", "ranking_records"]);
 
 /**
  * Read a `current` request from its query; refuses another name. A repeated name reads as its first
@@ -178,6 +185,8 @@ export function snapshotCurrentRequestOf(search: string): SnapshotCurrentRequest
   const epoch = params.get("ranking_epoch");
   if (epoch !== null && !RANKING_EPOCH_PATTERN.test(epoch)) throw new BridgeWireError("invalid_document", "ranking_epoch", "ranking_epoch is 1 to 128 URL-unreserved characters");
   const seq = integer("ranking_seq");
+  const records = params.get("ranking_records");
+  if (records !== null && records !== "1") throw new BridgeWireError("invalid_document", "ranking_records", "ranking_records is 1");
   const request = {
     have,
     confirmed_after: after,
@@ -186,6 +195,7 @@ export function snapshotCurrentRequestOf(search: string): SnapshotCurrentRequest
     ...(ask === null ? {} : { ranking: ask }),
     ...(epoch === null ? {} : { ranking_epoch: epoch }),
     ...(seq === null ? {} : { ranking_seq: seq }),
+    ...(records === null ? {} : { ranking_records: "1" as const }),
   };
   const parsed = snapshotCurrentRequestSchema.safeParse(request);
   if (!parsed.success) {
@@ -223,6 +233,22 @@ export interface SnapshotRankingKey {
     readonly stableWindows: number;
     readonly graduated: boolean;
   };
+  /** The key's circuit (r17, @gray/routing `FeedCircuit`), in an answer to a read that asked for the records. */
+  readonly circuit?: { readonly open: boolean; readonly until: number | null; readonly probe: boolean };
+}
+
+/** A root's long-record summary in a feed answer (r17, @gray/routing `RecordSummary`). */
+export interface SnapshotRecordSummary {
+  readonly s: number;
+  readonly f: number;
+  readonly tokens: number;
+  readonly decodeMs: number;
+  readonly ttftP50: number | null;
+  readonly ttftP90: number | null;
+  readonly ttftP99: number | null;
+  readonly ttftCount: number;
+  readonly tpsCount: number;
+  readonly at: number | null;
 }
 
 /**
@@ -238,6 +264,14 @@ export interface SnapshotRanking {
   readonly full: boolean;
   readonly keys: readonly SnapshotRankingKey[];
   readonly removed: readonly string[];
+  /** The roots' records changed since the reader's have, and the roots whose record went (r17), when the read asked. */
+  readonly records?: readonly { readonly root: string; readonly summary: SnapshotRecordSummary }[];
+  readonly removedRecords?: readonly string[];
+}
+
+/** What the writer of a feed answer carries: the records and circuits (r17) only to a read that asked (`ranking_records`). */
+export interface SnapshotRankingOptions {
+  readonly records?: boolean;
 }
 
 /** The measures' width on the wire: 32-bit unsigned integers, or 64-bit floats for a key with a value past 32 bits. */
@@ -247,6 +281,25 @@ export const RANKING_MEASURES_TYPES = ["u32", "f64"] as const;
  * The wire form of `SnapshotRanking`: integers as bigints (M27), each typed array as canonical standard base64 of its
  * little-endian bytes (an empty one is ""), and the measures' width named (`measures_type`). Strict, as every document.
  */
+/** A float of a record's summary: finite, not negative (`@gray/json` writes a JS number as one, `0.0` included). */
+const amountSchema = z.number().finite().min(0);
+
+/** A record's summary on the wire (r17): its counts and time integers (M27), its sums and quantiles floats. */
+const recordSummarySchema = z
+  .object({
+    s: amountSchema,
+    f: amountSchema,
+    tokens: amountSchema,
+    decode_ms: amountSchema,
+    ttft_p50: amountSchema.nullable(),
+    ttft_p90: amountSchema.nullable(),
+    ttft_p99: amountSchema.nullable(),
+    ttft_count: uintSchema,
+    tps_count: uintSchema,
+    at: uintSchema.nullable(),
+  })
+  .strict();
+
 export const snapshotRankingSchema = z
   .object({
     v: uintSchema,
@@ -264,10 +317,13 @@ export const snapshotRankingSchema = z
           failures: z.array(z.tuple([uintSchema, z.string()])).optional(),
           last_observed: uintSchema.nullable(),
           trial: z.object({ window_started: uintSchema.nullable(), samples: uintSchema, failures: uintSchema, stable_windows: uintSchema, graduated: z.boolean() }).strict(),
+          circuit: z.object({ open: z.boolean(), until: uintSchema.nullable(), probe: z.boolean() }).strict().optional(),
         })
         .strict(),
     ),
     removed: z.array(z.string()),
+    records: z.array(z.object({ root: z.string(), summary: recordSummarySchema }).strict()).optional(),
+    removed_records: z.array(z.string()).optional(),
   })
   .strict();
 export type SnapshotRankingDto = z.infer<typeof snapshotRankingSchema>;
@@ -323,14 +379,46 @@ function feedText(value: unknown, field: string): string {
   return value;
 }
 
+function feedAmount(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new BridgeWireError("invalid_document", field, `ranking ${field} is a finite number of at least 0`);
+  return value;
+}
+
+/** A root's summary as the wire writes it (r17), or a throw naming the field. */
+function recordSummaryDtoOf(value: unknown, field: string): z.infer<typeof recordSummarySchema> {
+  const r = feedObject(value, field);
+  const quantile = (v: unknown, name: string) => (v === null ? null : feedAmount(v, `${field}.${name}`));
+  return {
+    s: feedAmount(r.s, `${field}.s`),
+    f: feedAmount(r.f, `${field}.f`),
+    tokens: feedAmount(r.tokens, `${field}.tokens`),
+    decode_ms: feedAmount(r.decodeMs, `${field}.decodeMs`),
+    ttft_p50: quantile(r.ttftP50, "ttftP50"),
+    ttft_p90: quantile(r.ttftP90, "ttftP90"),
+    ttft_p99: quantile(r.ttftP99, "ttftP99"),
+    ttft_count: feedCount(r.ttftCount, `${field}.ttftCount`),
+    tps_count: feedCount(r.tpsCount, `${field}.tpsCount`),
+    at: r.at === null ? null : feedCount(r.at, `${field}.at`),
+  };
+}
+
+/** A key's circuit as the wire writes it (r17), or a throw naming the field. */
+function circuitDtoOf(value: unknown, field: string): { open: boolean; until: bigint | null; probe: boolean } {
+  const c = feedObject(value, field);
+  return { open: feedFlag(c.open, `${field}.open`), until: c.until === null ? null : feedCount(c.until, `${field}.until`), probe: feedFlag(c.probe, `${field}.probe`) };
+}
+
 /**
  * The wire form of a replica's feed answer, as the bridge writes it. Only its shape is checked here (the types the wire
  * carries, the epoch's characters); what the values mean (the columns' lengths, the run numbers' order, a failure's
  * kind, the feed's bounds) is the lane's ranking base's to check, as the main gateway's base checks a replica's answer.
- * A value of another shape throws: the bridge then leaves `ranking` out.
+ * A value of another shape throws: the bridge then leaves `ranking` out. `options.records` (a read that asked,
+ * `ranking_records`, r17): the roots' records, the roots whose record went and each key's circuit go too, when the answer
+ * has them; otherwise none of them, which a lane of r16 (strict) would refuse.
  */
-export function snapshotRankingDtoOf(value: unknown): SnapshotRankingDto {
+export function snapshotRankingDtoOf(value: unknown, options: SnapshotRankingOptions = {}): SnapshotRankingDto {
   const a = feedObject(value, "answer");
+  const records = options.records === true;
   const epoch = feedText(a.epoch, "epoch");
   if (!RANKING_EPOCH_PATTERN.test(epoch)) throw new BridgeWireError("invalid_document", "epoch", "ranking epoch is 1 to 128 URL-unreserved characters");
   if (!Array.isArray(a.keys)) throw new BridgeWireError("invalid_document", "keys", "ranking keys is an array");
@@ -376,10 +464,26 @@ export function snapshotRankingDtoOf(value: unknown): SnapshotRankingDto {
           stable_windows: feedCount(trial.stableWindows, `keys.${i}.trial.stableWindows`),
           graduated: feedFlag(trial.graduated, `keys.${i}.trial.graduated`),
         },
+        ...(records && k.circuit !== undefined ? { circuit: circuitDtoOf(k.circuit, `keys.${i}.circuit`) } : {}),
       };
     }),
     removed: (a.removed as unknown[]).map((key, i) => feedText(key, `removed.${i}`)),
+    ...(records && a.records !== undefined ? { records: recordsDtoOf(a.records) } : {}),
+    ...(records && a.removedRecords !== undefined ? { removed_records: textsOf(a.removedRecords, "removedRecords") } : {}),
   };
+}
+
+function recordsDtoOf(value: unknown): z.infer<typeof snapshotRankingSchema>["records"] {
+  if (!Array.isArray(value)) throw new BridgeWireError("invalid_document", "records", "ranking records is an array");
+  return (value as unknown[]).map((entry, i) => {
+    const r = feedObject(entry, `records.${i}`);
+    return { root: feedText(r.root, `records.${i}.root`), summary: recordSummaryDtoOf(r.summary, `records.${i}.summary`) };
+  });
+}
+
+function textsOf(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw new BridgeWireError("invalid_document", field, `ranking ${field} is an array`);
+  return (value as unknown[]).map((text, i) => feedText(text, `${field}.${i}`));
 }
 
 const UTF8 = new TextEncoder();
@@ -394,29 +498,47 @@ const KEY_FIXED_BYTES = toJsonString({
   whole: true,
 } as unknown as Json).length;
 
+/** What a key's circuit adds at the least (r17): its member, the shortest values, the comma before it. */
+const CIRCUIT_FIXED_BYTES = toJsonString({ circuit: { open: true, probe: true, until: 0n } } as unknown as Json).length - 1;
+
+/** What a root's record adds at the least (r17): its members, the shortest values (`0.0` a float, `0` an integer), a comma. */
+const RECORD_FIXED_BYTES =
+  toJsonString({ root: "", summary: { at: 0n, decode_ms: 0, f: 0, s: 0, tokens: 0, tps_count: 0n, ttft_count: 0n, ttft_p50: 0, ttft_p90: 0, ttft_p99: 0 } } as unknown as Json).length + 1;
+
 /**
  * A lower bound of the bytes a replica's feed answer comes to once written (`snapshotRankingDtoOf`, then `toJsonString`),
  * from its typed arrays' lengths and its texts alone, nothing encoded: @gray/routing `feedAnswerBytes`' accounting of a
  * key (its columns' bytes and its text), each column as base64 (4 characters per 3 bytes), each key's fixed members
  * (`KEY_FIXED_BYTES`), and each removed key's text. A ranking part past RANKING_ANSWER_MAX_BYTES by it is past it
  * written, so the bridge leaves it out without building its strings (r16); one within it is written and measured
- * (`snapshotAnswerBytes`). 0 for a value of no feed answer's shape, which the writer refuses.
+ * (`snapshotAnswerBytes`). 0 for a value of no feed answer's shape, which the writer refuses. `options.records`: what
+ * the records, the roots whose record went and the circuits add (r17), as the writer writes them for a read that asked.
  */
-export function snapshotRankingBytesAtLeast(value: unknown): number {
+export function snapshotRankingBytesAtLeast(value: unknown, options: SnapshotRankingOptions = {}): number {
   if (typeof value !== "object" || value === null) return 0;
-  const { keys, removed } = value as { readonly keys?: unknown; readonly removed?: unknown };
+  const { keys, removed, records, removedRecords } = value as { readonly keys?: unknown; readonly removed?: unknown; readonly records?: unknown; readonly removedRecords?: unknown };
   let bytes = 0;
   if (Array.isArray(keys)) {
     for (const entry of keys as unknown[]) {
       if (typeof entry !== "object" || entry === null) continue;
-      const { key, samples } = entry as { readonly key?: unknown; readonly samples?: unknown };
+      const { key, samples, circuit } = entry as { readonly key?: unknown; readonly samples?: unknown; readonly circuit?: unknown };
       bytes += KEY_FIXED_BYTES + (typeof key === "string" ? UTF8.encode(key).length : 0);
+      if (options.records === true && circuit !== undefined) bytes += CIRCUIT_FIXED_BYTES;
       if (typeof samples !== "object" || samples === null) continue;
       const { nAt, measures, flags } = samples as { readonly nAt?: unknown; readonly measures?: unknown; readonly flags?: unknown };
       for (const column of [nAt, measures, flags]) if (ArrayBuffer.isView(column)) bytes += 4 * Math.ceil(column.byteLength / 3);
     }
   }
   if (Array.isArray(removed)) for (const key of removed as unknown[]) if (typeof key === "string") bytes += UTF8.encode(key).length + 2;
+  if (options.records === true) {
+    if (Array.isArray(records)) {
+      for (const entry of records as unknown[]) {
+        const root = typeof entry === "object" && entry !== null ? (entry as { readonly root?: unknown }).root : undefined;
+        bytes += RECORD_FIXED_BYTES + (typeof root === "string" ? UTF8.encode(root).length : 0);
+      }
+    }
+    if (Array.isArray(removedRecords)) for (const root of removedRecords as unknown[]) if (typeof root === "string") bytes += UTF8.encode(root).length + 2;
+  }
   return bytes;
 }
 
@@ -449,9 +571,30 @@ export function snapshotRankingOf(dto: SnapshotRankingDto): SnapshotRanking {
           stableWindows: asNumber(k.trial.stable_windows, "stable_windows"),
           graduated: k.trial.graduated,
         },
+        ...(k.circuit === undefined ? {} : { circuit: { open: k.circuit.open, until: k.circuit.until === null ? null : asNumber(k.circuit.until, "circuit.until"), probe: k.circuit.probe } }),
       };
     }),
     removed: [...dto.removed],
+    ...(dto.records === undefined
+      ? {}
+      : {
+          records: dto.records.map((r) => ({
+            root: r.root,
+            summary: {
+              s: r.summary.s,
+              f: r.summary.f,
+              tokens: r.summary.tokens,
+              decodeMs: r.summary.decode_ms,
+              ttftP50: r.summary.ttft_p50,
+              ttftP90: r.summary.ttft_p90,
+              ttftP99: r.summary.ttft_p99,
+              ttftCount: asNumber(r.summary.ttft_count, "ttft_count"),
+              tpsCount: asNumber(r.summary.tps_count, "tps_count"),
+              at: r.summary.at === null ? null : asNumber(r.summary.at, "at"),
+            },
+          })),
+        }),
+    ...(dto.removed_records === undefined ? {} : { removedRecords: [...dto.removed_records] }),
   };
 }
 
@@ -555,13 +698,13 @@ function rankingOfWire(value: unknown): Pick<RawSnapshotAnswer, "ranking" | "ran
 }
 
 /** The wire answer of a DO-facing answer: integers to bigints, the snapshot to a JSON value, the ranking members only when given. */
-export function snapshotAnswerDtoOf(answer: RawSnapshotAnswer): SnapshotAnswerDto {
+export function snapshotAnswerDtoOf(answer: RawSnapshotAnswer, options: SnapshotRankingOptions = {}): SnapshotAnswerDto {
   return {
     version: asBigint(answer.version, "version"),
     refreshed_at: asBigint(answer.refreshedAt, "refreshedAt"),
     confirmed_at: answer.confirmedAt === undefined ? null : asBigint(answer.confirmedAt, "confirmedAt"),
     snapshot: answer.snapshot === null ? null : integersOfJson(answer.snapshot, "snapshot"),
-    ...(answer.ranking === undefined ? {} : { ranking: snapshotRankingDtoOf(answer.ranking) }),
+    ...(answer.ranking === undefined ? {} : { ranking: snapshotRankingDtoOf(answer.ranking, options) }),
     ...(answer.rankingFailingSince === undefined ? {} : { ranking_failing_since: answer.rankingFailingSince === null ? null : asBigint(answer.rankingFailingSince, "rankingFailingSince") }),
   };
 }

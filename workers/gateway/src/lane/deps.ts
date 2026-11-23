@@ -50,8 +50,7 @@ import type { LaneProcessState } from "./state.ts";
  * | `region` | `request.cf` | the CVM's region from configuration (workerd has no `request.cf`) |
  *
  * Everything else is the same code as the main lane: `cfg`, `gate`, `shardCounts`, `endpointCounts`,
- * `shardRests` and `dispatchBudgets` (r16: the rests the shards said they hold, which ranking reads, and the
- * exploration budget each attempt reserves its dispatch in), `clock`, `service`, `policy`, `load`, `degraded`,
+ * `shardRests` (r16: the rests the shards said they hold, which ranking reads), `clock`, `service`, `load`, `degraded`,
  * `content`, `fingerprintKey`, `meter`. The tables, the load and the content state are the lane process's
  * singletons (the gateway's `index.ts` keeps its own private, and moving them would change the main lane's code;
  * the lane's behaviour is identical because they are the same classes with the same bounds).
@@ -271,13 +270,12 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     accounts: remoteShardLocator(state.bridge, cfg.laneBridgeAnswerMarginMs),
     shardCounts: learned.shardCounts,
     // The endpoint ops over the bridge, and the roots a failure's rest is filed at (r16), on the isolate's one latch for a
-    // bridge that predates their members (remote/legacy.ts); the rests the shards said they hold, which ranking reads, and
-    // the exploration budget, as the main gateway's index.ts wires them.
+    // bridge that predates their members (remote/legacy.ts); the rests the shards said they hold, which ranking reads, as
+    // the main gateway's index.ts wires them.
     endpoints: remoteEndpointLocator(state.bridge, { legacy: isolate.legacy.endpoint, now: state.state.now }),
     endpointCounts: learned.endpointCounts,
     endpointRoots: remoteEndpointRootLocator(state.bridge, { legacy: isolate.legacy.endpoint, now: state.state.now }),
     shardRests: learned.shardRests,
-    dispatchBudgets: learned.dispatchBudgets,
     continuation: laneContinuation(),
     // Off: the lane refuses a body carrying a `gtc1_` handle (documents not resolved, M25).
     toolCallIds: undefined,
@@ -291,7 +289,6 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     master: async () => null,
     region,
     service: { env: cfg.deployEnv, ...isolate.identity },
-    policy: "balanced",
     load: isolate.load,
     degraded: learned.degraded,
     content: isolate.content(cfg.contentIsolateMaxBytes),

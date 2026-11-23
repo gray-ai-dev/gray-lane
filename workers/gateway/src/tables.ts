@@ -1,5 +1,4 @@
 import type { Region, ShardCountTable } from "@gray/account";
-import { DispatchBudgets } from "@gray/routing";
 import { LRUCache } from "lru-cache";
 import { DegradedAdmissions } from "./admission.ts";
 import { EndpointCounts } from "./endpoints.ts";
@@ -51,11 +50,6 @@ export class IsolateTables {
   readonly endpointCounts: EndpointCounts;
   readonly shardRests: ShardRests;
   readonly degraded: DegradedAdmissions;
-  /**
-   * The isolate's exploration budget (`reserve_dispatch`): bounded by its own group count, the server's
-   * `RankingConfig::max_endpoints` (4,096; ranking.rs:91), not by ISOLATE_TABLE_ENTRIES.
-   */
-  readonly dispatchBudgets: DispatchBudgets;
 
   constructor(max: number) {
     this.max = max;
@@ -63,6 +57,5 @@ export class IsolateTables {
     this.endpointCounts = new EndpointCounts(max);
     this.shardRests = new ShardRests(max);
     this.degraded = new DegradedAdmissions(max);
-    this.dispatchBudgets = new DispatchBudgets();
   }
 }

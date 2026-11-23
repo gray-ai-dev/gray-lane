@@ -20,7 +20,7 @@ import {
   type BridgeRequestOf,
   type BridgeResponseOf,
 } from "@gray/lane-wire";
-import type { AcquireInput, AcquireResult, NoteInput, PermitToken, ReleaseInput, ReleaseResult, RestInput, RetryReleaseInput, RetryReserveInput, RetryReserveResult, WarmResult } from "@gray/endpoint";
+import type { AcquireInput, AcquireResult, NoteInput, OutcomeMeasure, PermitToken, ReleaseInput, ReleaseResult, RestInput, RetryReleaseInput, RetryReserveInput, RetryReserveResult, WarmResult } from "@gray/endpoint";
 import type { LocationHint } from "@gray/config";
 import type { EndpointLocator, EndpointShardRpc } from "../../endpoints.ts";
 import type { EndpointRootLocator, EndpointRootRests } from "../../rests.ts";
@@ -48,6 +48,12 @@ import { LegacyLatch } from "./legacy.ts";
  * shard holds. A bridge of an earlier release refuses a document with any of them (400, its strict schemas): the call
  * goes again as that release's document, and the endpoint ops' latch (`LaneIsolate.legacy.endpoint`, remote/legacy.ts)
  * keeps every endpoint op to those documents for LANE_BRIDGE_LEGACY_RETRY_MS: the lane routes as before r16 meanwhile.
+ *
+ * Since r17 a measure has a fifth member, whether the attempt was in its session (docs/utility-routing.md "The long
+ * record"). A bridge of r16 refuses it (400): the release or note goes again with the four members of r16, its rank key
+ * and measure kept, and the measures' latch (`RemoteEndpointOptions.measures`) keeps the measures to four for
+ * LANE_BRIDGE_LEGACY_RETRY_MS. The shard then counts a 429 of the lane's as outside a session: its availability loses
+ * nothing else. A bridge before r16 refuses the four members too, and the call ends at the document of before.
  */
 
 /** What the remote endpoint clients share: the endpoint ops' latch and its clock. */
@@ -56,15 +62,31 @@ export interface RemoteEndpointOptions {
   readonly legacy?: LegacyLatch;
   /** The latch's clock; the bridge client's (`BridgeClientOptions.now`, `Date.now`) by default. */
   readonly now?: () => number;
+  /** Whether the bridge refused a measure of five members lately (r17); the process's own (`MEASURES`) by default. */
+  readonly measures?: LegacyLatch;
 }
+
+/**
+ * The process's measures latch (r17): a bridge of r16 refused five members within LANE_BRIDGE_LEGACY_RETRY_MS. One a
+ * process, as the endpoint ops' latch is, so every request of the isolate keeps to four members while it holds.
+ */
+const MEASURES = new LegacyLatch();
 
 interface Legacy {
   readonly latch: LegacyLatch;
+  readonly measures: LegacyLatch;
   readonly now: () => number;
 }
 
 function legacyOf(options: BridgeClientOptions, endpoint: RemoteEndpointOptions): Legacy {
-  return { latch: endpoint.legacy ?? new LegacyLatch("endpoint"), now: endpoint.now ?? options.now ?? Date.now };
+  return { latch: endpoint.legacy ?? new LegacyLatch("endpoint"), measures: endpoint.measures ?? MEASURES, now: endpoint.now ?? options.now ?? Date.now };
+}
+
+/** The measure of r16: the four members before the fifth (`inSession`) of r17. */
+function fourMembers<I extends { readonly measure?: OutcomeMeasure }>(input: I): I | null {
+  const m = input.measure;
+  if (m === undefined || m.length === 4) return null;
+  return { ...input, measure: [m[0], m[1], m[2], m[3]] } as I;
 }
 
 /** The input as a lane before r16 sent it: without the rank key, the rests it ended and the snapshot's version. */
@@ -130,12 +152,32 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
     }
   }
 
+  /**
+   * A release's or a note's call with its measure of five members (r17), or with the four of r16 (`four`) when the
+   * measures' latch holds or the bridge refuses five (400): then as `#send` sends a document of r16. No `four` (a measure
+   * of four, or none): `#send` as it is.
+   */
+  async #sendMeasured<I, O extends BridgeOp>(op: O, call: BridgeCall, input: I, four: I | null, before: I | null, dto: (input: I) => BridgeRequestOf<O>): Promise<BridgeResponseOf<O>> {
+    if (four === null) return this.#send(op, call, input, before, dto);
+    const { latch, measures, now } = this.#legacy;
+    if (latch.legacy(now()) || measures.legacy(now())) return this.#send(op, call, four, before, dto);
+    try {
+      return await this.call(op, call, dto(input));
+    } catch (error) {
+      if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
+      const answer = await this.#send(op, call, four, before, dto);
+      if (!measures.legacy(now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "endpoint_measure", window_ms: measures.retryMs }));
+      measures.refused(now());
+      return answer;
+    }
+  }
+
   async acquire(input: AcquireInput): Promise<AcquireResult> {
     return acquireResultOf(await this.#send("endpoint.acquire", bridgeCall("endpoint.acquire", this.#target()), input, acquireBefore(input), acquireInputDtoOf));
   }
 
   async release(input: ReleaseInput): Promise<ReleaseResult> {
-    return endpointReleaseResultOf(await this.#send("endpoint.release", bridgeCall("endpoint.release", this.#target()), input, releaseBefore(input), endpointReleaseInputDtoOf));
+    return endpointReleaseResultOf(await this.#sendMeasured("endpoint.release", bridgeCall("endpoint.release", this.#target()), input, fourMembers(input), releaseBefore(input), endpointReleaseInputDtoOf));
   }
 
   async reserveRetry(input: RetryReserveInput): Promise<RetryReserveResult> {
@@ -143,7 +185,7 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   }
 
   async note(input: NoteInput): Promise<void> {
-    await this.#send("endpoint.note", bridgeCall("endpoint.note", this.#target()), input, noteBefore(input), noteInputDtoOf);
+    await this.#sendMeasured("endpoint.note", bridgeCall("endpoint.note", this.#target()), input, fourMembers(input), noteBefore(input), noteInputDtoOf);
   }
 
   async releaseRetry(input: RetryReleaseInput): Promise<void> {

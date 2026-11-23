@@ -18,28 +18,48 @@ import { feedAnswerBytes, feedColumnsCount, type FeedAnswer } from "@gray/routin
  * full answer was of the epoch the isolate already held (1: a replica's restart, a fallback, or a reader behind the
  * replica's removal log; 0: the first, a new collector epoch, or a delta), 11 the samples of the keys it carried whole (a
  * new run of a key's samples, sent again in full; all of a full answer's): the rest of a delta's samples are new to the
- * isolate (criterion (d1)).
+ * isolate (criterion (d1)); since r17 (docs/utility-routing.md "The feed"), 12 the answer's roots' records and 13 its
+ * keys that carried a circuit, 14 the base's records and 15 its keys' circuits after the check (criterion (c): each takes
+ * memory beside the keys; a base of an earlier answer's shape holds none).
  */
 export function rankingCheckPoint(
   answer: FeedAnswer | undefined,
-  base: { readonly keys: number; readonly samples: number; readonly failures: number; readonly ageMs: number | null },
+  base: { readonly keys: number; readonly samples: number; readonly failures: number; readonly records?: number; readonly circuits?: number; readonly ageMs: number | null },
   instance: string,
   from: { readonly source: string; readonly sameEpoch: boolean } = { source: "", sameEpoch: false },
 ): AnalyticsEngineDataPoint {
   let samples = 0;
   let failures = 0;
   let whole = 0;
+  let circuits = 0;
   for (const k of answer?.keys ?? []) {
     const count = feedColumnsCount(k.samples);
     samples += count;
     if (k.whole) whole += count;
     failures += k.failures?.length ?? 0;
+    if (k.circuit !== undefined) circuits += 1;
   }
   const kind = answer === undefined ? "none" : answer.full ? "full" : "delta";
   return {
     indexes: ["ranking_check"],
     blobs: ["ranking_check", kind, instance, from.source],
-    doubles: [1, answer?.keys.length ?? 0, samples, answer === undefined ? 0 : feedAnswerBytes(answer), base.keys, base.samples, base.ageMs ?? -1, failures, base.failures, answer?.full === true && from.sameEpoch ? 1 : 0, whole],
+    doubles: [
+      1,
+      answer?.keys.length ?? 0,
+      samples,
+      answer === undefined ? 0 : feedAnswerBytes(answer),
+      base.keys,
+      base.samples,
+      base.ageMs ?? -1,
+      failures,
+      base.failures,
+      answer?.full === true && from.sameEpoch ? 1 : 0,
+      whole,
+      answer?.records?.length ?? 0,
+      circuits,
+      base.records ?? 0,
+      base.circuits ?? 0,
+    ],
   };
 }
 

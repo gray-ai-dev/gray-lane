@@ -17,9 +17,10 @@ export function takesTraffic(route: { readonly expiresAt: number; readonly traff
 }
 import { gatewayNow } from "./clock.ts";
 import type { GatewayEnv } from "./env.ts";
-import type { FeedAnswer, FeedHave, RankingConfig, RouteTag } from "@gray/routing";
+import type { FeedAnswer, FeedHave, GatewayRouting, RankingConfig, RouteTag } from "@gray/routing";
 import { endpointSettings, rankingConfigOf } from "@gray/endpoint";
 import { RankingBase } from "./ranking-base.ts";
+import { gatewayRoutingOf } from "./routing-policy.ts";
 import { rankingCheckPoint } from "./ranking-points.ts";
 
 /**
@@ -258,6 +259,12 @@ export interface GatewaySnapshot {
   readonly translation?: string;
   /** `off` when the confidential entry does not translate (@gray/snapshot `Snapshot.entryTranslation`, ConfigDO's ENTRY_TRANSLATION); absent while it does. */
   readonly entryTranslation?: "off";
+  /**
+   * The operator's routing policy and the routed models' reference prices (r17, docs/utility-routing.md
+   * "Configuration"), parsed once per snapshot version; unset: the code's defaults (@gray/routing
+   * `DEFAULT_ROUTING_POLICY`) and no reference prices.
+   */
+  readonly routing?: GatewayRouting;
   /**
    * The control database's replay key, sealed under the master key (@gray/snapshot
    * `Snapshot.replayKey`): the tool-call id keys derive from it (tool-ids.ts). Unset: no handle can be
@@ -509,6 +516,9 @@ export function gatewaySnapshotOf(snapshot: Snapshot, mode: GatewayMode = "main"
     registered: new Set(view.registered),
     published: view.published,
     ...(view.handles === undefined ? {} : { handles: view.handles }),
+    // The operator's routing policy, parsed here once per version, and the routed models' reference prices (r17); a
+    // snapshot without them (an earlier gray-jobs) routes by the code's defaults.
+    ...(view.routing === undefined ? {} : { routing: gatewayRoutingOf(view.routing, view.version) }),
     ...(Object.keys(view.laneServed).length === 0 ? {} : { laneServed: view.laneServed }),
     ...(view.laneOffers === undefined ? {} : { laneOffers: view.laneOffers }),
     // The model-check tickets' keys, the main gateway's and the lane entry's alike (both map through here).
@@ -961,6 +971,13 @@ export class SnapshotCache {
   private confirmedAt = 0;
   private checkedAt = -Infinity;
   private checking: Promise<void> | null = null;
+  /** The check under way asks for the ranking (`readRanked` waits for such a check, never for one of the snapshot alone). */
+  private checkingRanks = false;
+  /**
+   * What the last answer of a check said of the ranking: its source keeps a copy of the collector (it says how its syncs
+   * go, `SnapshotAnswer.rankingFailingSince`), or keeps none; null before an answer.
+   */
+  private keepsFeed: boolean | null = null;
   /** The confirmation in flight (`confirm`), and when the last one started. */
   private confirming: Promise<void> | null = null;
   private confirmStartedAt = -Infinity;
@@ -1021,6 +1038,50 @@ export class SnapshotCache {
     }
     await this.awaitCopy(source, timing, now, background, run, Math.max(0, waitMs));
     return withGap(this.result(timing, now));
+  }
+
+  /**
+   * What a routing read reads at `now` (docs/utility-routing-reads.md "The route reads"): the snapshot as a request reads
+   * it and, when the isolate has no ranking base it can use (only the background checks bring it, and an isolate that
+   * takes entrypoint calls alone may have none), the ranking, waited for at most `waitMs`: the check under way when it
+   * asks for the ranking (a cold isolate's first check brings the snapshot alone, the one after it the ranking, D7),
+   * else one of its own. A replica answers its copy of the collector as it is and refreshes an empty or old one in the
+   * background (gray-jobs ConfigReplicaDO `ranking`), so while the source keeps such a copy the read asks again every
+   * RANKED_RETRY_MS until a base it can use comes or the wait ends; a source that keeps none has none to give, and the
+   * read answers at once. A base that does not come leaves the read without a feed, as requests are.
+   */
+  async readRanked(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, waitMs: number): Promise<SnapshotRead> {
+    const read = await this.read(source, timing, now, background);
+    if (!read.ok || this.fed(now)) return read;
+    const deadline = sleep(waitMs, timing.timers);
+    try {
+      while (!this.fed(now) && !deadline.fired()) {
+        const underWay = this.pending(timing, now);
+        if (underWay !== null && this.checkingRanks) {
+          await Promise.race([underWay, deadline.done]);
+          continue;
+        }
+        const asked = this.check(source, now, timing, undefined, undefined, true, background);
+        background(asked);
+        await Promise.race([asked, deadline.done]);
+        if (this.fed(now) || deadline.fired() || this.keepsFeed !== true) break;
+        const pause = sleep(RANKED_RETRY_MS, timing.timers);
+        try {
+          await Promise.race([pause.done, deadline.done]);
+        } finally {
+          pause.cancel();
+        }
+      }
+    } finally {
+      deadline.cancel();
+    }
+    return this.result(timing, now);
+  }
+
+  /** The copy's ranking can serve a read: a base it took current with the roots' records, or a checkpoint of its own. */
+  private fed(now: number): boolean {
+    if (this.copy !== null && this.copy.ranking !== this.base) return this.copy.ranking !== null;
+    return this.base.current(now) !== null && this.base.recordsSupported();
   }
 
   /**
@@ -1272,6 +1333,7 @@ export class SnapshotCache {
         await null;
         const answer = await source.current(this.copy?.version ?? 0, via, confirmedAfter, judge, asked);
         feedKept = answer.rankingFailingSince !== undefined;
+        if (generation === this.generation) this.keepsFeed = feedKept;
         const took = this.take(answer, generation, timing);
         if (asked !== undefined && generation === this.generation) {
           const at = gatewayNow();
@@ -1297,7 +1359,10 @@ export class SnapshotCache {
       if (first && this.copy !== null && feedKept && background !== undefined && generation === this.generation) background(this.check(source, now, timing, via, undefined, true));
     })();
     if (confirming) this.confirming = run;
-    else this.checking = run;
+    else {
+      this.checking = run;
+      this.checkingRanks = asked !== undefined;
+    }
     return run;
   }
 
@@ -1361,6 +1426,8 @@ export class SnapshotCache {
     this.confirmedAt = 0;
     this.checkedAt = -Infinity;
     this.checking = null;
+    this.checkingRanks = false;
+    this.keepsFeed = null;
     this.confirming = null;
     this.confirmStartedAt = -Infinity;
     this.storing = null;
@@ -1371,6 +1438,12 @@ export class SnapshotCache {
 
 /** A promise that never settles: a race's arm that must not end it. */
 const NEVER = new Promise<never>(() => {});
+
+/**
+ * How long a routing read waits before it asks again a source that keeps a copy of the collector, after an answer that
+ * brought no base it can use (`readRanked`): the replica refreshes its copy in the background meanwhile.
+ */
+const RANKED_RETRY_MS = 150;
 
 /** A wait of `ms` on `timers` (the platform's when absent): `done` resolves then, unless `cancel` came first. */
 function sleep(ms: number, timers?: CheckTimers): { readonly done: Promise<void>; fired(): boolean; cancel(): void } {

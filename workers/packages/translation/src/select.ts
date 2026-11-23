@@ -204,7 +204,13 @@ export type Verdict<T> =
   /** The customer's own filter left the target no route. */
   | { readonly kind: "excluded" }
   /** The target cannot serve the request for this reason (region, pricing). */
-  | { readonly kind: "failed"; readonly error: ApiError };
+  | { readonly kind: "failed"; readonly error: ApiError }
+  /**
+   * The target passes every check above, but the request's routing constraints and price cap exclude each of its routes
+   * (docs/utility-routing.md "Constraints and the price cap"): a later target is tried, and this one serves only when no
+   * later one does, so that admission's formula refuses the model as before.
+   */
+  | { readonly kind: "constrained"; readonly value: T };
 
 export interface SelectOptions<R, T> {
   /** The protocol the client spoke. */
@@ -231,7 +237,8 @@ export interface SelectOptions<R, T> {
   /**
    * The gateway's checks of one target, in Rust's order: keep the routes capable of
    * `translation.contract` (none: `skip`); then the customer's filter, when it is not the default
-   * (none left: `excluded`); then the caller's region and the prices (an error: `failed`).
+   * (none left: `excluded`); then the caller's region and the prices (an error: `failed`); then the request's routing
+   * constraints and price cap (none passes: `constrained`).
    */
   judge(translation: Translation, routes: readonly R[]): Verdict<T> | Promise<Verdict<T>>;
   /** The answer when no target had a route at all (`model_resolution::unrouted`). */
@@ -248,8 +255,9 @@ export type Selection<T> = { readonly ok: true; readonly translation: Translatio
  * a body the upstream's parser refuses (400 `translation_invalid_request`) or a body larger than its API takes (413)
  * is kept as the target's failure; then `judge`. How many tools a request declares is its provider's to decide
  * (main's 2dcdb334): Gray cannot know what a relay's route takes, so the count is not checked. When no target serves:
- * the first refusal, else the first failure, else 400 `routing_filter_excluded_all` when the customer's filter
- * emptied a target, else `unrouted()`. Under the implied rule (decision (b) of 2026-10-23) a refusal of the
+ * the first target the request's routing constraints and price cap left no route of (`constrained`), whose ranking
+ * then refuses the model as it did when it was served; else the first refusal, else the first failure, else 400
+ * `routing_filter_excluded_all` when the customer's filter emptied a target, else `unrouted()`. Under the implied rule (decision (b) of 2026-10-23) a refusal of the
  * translation is no answer: one of the request itself (`checkRequest`) answers `unrouted()` at once, one of a target
  * (`translateRequest`) skips that target as if it had no capable route; the answer is then the first failure, the
  * filter's, or `unrouted()`, as without the rule, so the rule never turns today's answer into a translation refusal.
@@ -265,6 +273,8 @@ export async function selectTranslation<R, T>(o: SelectOptions<R, T>): Promise<S
   let refused: Refusal | undefined;
   let failed: ApiError | undefined;
   let excluded = false;
+  // The first target whose routes the request's constraints all exclude: it serves when no later target does.
+  let constrained: { readonly translation: Translation; readonly value: T } | undefined;
   for (const upstream of o.upstreams) {
     const routes = o.routes(upstream);
     if (routes.length === 0) continue;
@@ -308,8 +318,12 @@ export async function selectTranslation<R, T>(o: SelectOptions<R, T>): Promise<S
       case "failed":
         failed ??= verdict.error;
         continue;
+      case "constrained":
+        constrained ??= { translation, value: verdict.value };
+        continue;
     }
   }
+  if (constrained !== undefined) return { ok: true, ...constrained };
   if (refused !== undefined) return { ok: false, error: refusalError(refused) };
   if (failed !== undefined) return { ok: false, error: failed };
   if (excluded) return { ok: false, error: new ApiError(400, "routing_filter_excluded_all") };

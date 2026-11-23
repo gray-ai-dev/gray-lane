@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { continuationReferences } from "@gray/continuation";
 import { get, isObject, parsePlain, readSerdeBytes, toJsonString, type Json, type JsonObject } from "@gray/json";
 import { ApiError } from "@gray/errors";
+import { confidentialRouting, ROUTING_PARAMS_HEADER, type RequestRoutingRecord } from "@gray/routing";
 import {
   applyDeclaredChanges,
   checkOfficialUpstream,
@@ -187,6 +188,18 @@ export function laneContinuationUnrecorded(): ApiError {
 export function laneRoutingInBody(): ApiError {
   return new ApiError(400, "routing_invalid").withMessage(
     "The confidential lane sends a Gemini request body as received and cannot take `provider` out of it: send the routing preference in the `x-gray-routing` header instead.",
+  );
+}
+
+/**
+ * 400 for routing parameters in the body in lane mode (r17, docs/utility-routing.md "Request parameters"), on every API:
+ * none of the lane's declared rewrites takes a `routing` member out (it removes `provider` only, `remove_member
+ * /provider`), so the upstream would get it. The `x-gray-routing-params` header carries the same parameters and is never
+ * forwarded.
+ */
+export function laneRoutingParamsInBody(): ApiError {
+  return new ApiError(400, "routing_invalid").withMessage(
+    `The confidential lane sends the request body as received and cannot take \`routing\` out of it: send the routing parameters in the \`${ROUTING_PARAMS_HEADER}\` header instead.`,
   );
 }
 
@@ -619,14 +632,17 @@ export function laneUsage(usage: Readonly<Record<string, number>> | null): { rea
 }
 
 /** How `laneSafeRecord` handles each field of `RequestRecord`. */
-export type LaneRecordFieldPolicy = "keep" | "null" | "empty_array";
+export type LaneRecordFieldPolicy = "keep" | "null" | "empty_array" | "confidential_routing";
 
 /**
  * Compile-time exhaustive policy for every field of `RequestRecord` (`sinks.ts`): adding a new
  * field to `RequestRecord` fails typechecking until explicitly classified here.
  *
  * Client fingerprint fields (`"null"`) and answer tool names (`"empty_array"`) never leave the
- * lane CVM; any runtime property not present in `LANE_RECORD_POLICY` is dropped fail-closed.
+ * lane CVM; the routing record leaves as the confidential entry's projection (`"confidential_routing"`: @gray/routing
+ * `confidentialRouting`, docs/utility-routing-reads.md "The confidential entry's record"), so no candidate's figures,
+ * requirements, preference, workload or reference leave the CVM through it; any runtime property not present in
+ * `LANE_RECORD_POLICY` is dropped fail-closed.
  */
 export const LANE_RECORD_POLICY = Object.freeze({
   requestId: "keep",
@@ -703,6 +719,9 @@ export const LANE_RECORD_POLICY = Object.freeze({
   routeRefusals: "keep",
   freeReason: "keep",
   routingCandidates: "keep",
+  eligibleRoutes: "keep",
+  routingEvidence: "keep",
+  routing: "confidential_routing",
   preference: "keep",
   relayAccountId: "keep",
   stackTrace: "keep",
@@ -724,8 +743,9 @@ export const LANE_RECORD_EMPTY_ARRAYS = Object.freeze(
 
 /**
  * `value` sanitized by `LANE_RECORD_POLICY`: `"null"` fields become `null`, `"empty_array"` fields
- * become `[]` when array-valued (`null` otherwise), `"keep"` fields are preserved, and any key not
- * listed in `LANE_RECORD_POLICY` is dropped fail-closed.
+ * become `[]` when array-valued (`null` otherwise), the `"confidential_routing"` field becomes the confidential
+ * entry's projection, `"keep"` fields are preserved, and any key not listed in `LANE_RECORD_POLICY` is dropped
+ * fail-closed.
  */
 export function laneSafeRecord<T extends object>(value: T): T {
   const out: Record<string, unknown> = {};
@@ -734,6 +754,7 @@ export function laneSafeRecord<T extends object>(value: T): T {
     const policy = LANE_RECORD_POLICY[name as keyof RequestRecord];
     if (policy === "null") out[name] = null;
     else if (policy === "empty_array") out[name] = Array.isArray(fieldValue) ? [] : null;
+    else if (policy === "confidential_routing") out[name] = fieldValue === null || fieldValue === undefined ? fieldValue : confidentialRouting(fieldValue as RequestRoutingRecord);
     else out[name] = fieldValue;
   }
   return out as T;

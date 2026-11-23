@@ -697,13 +697,17 @@ export const SETTINGS: readonly SettingSpec[] = [
     min: 1,
     max: 512,
     source:
-      "The isolate's cache affinity map (gateway preference.ts `isolateAffinity`) frees entries only when a workspace's shard or the map is " +
-      "full, so it grows to its bounds over an isolate's life. Measured by the release 4 routing-preference check (Node on the 5090 box, " +
-      "2026-10-23, 64-hex keys): about 200 bytes an entry, 100 workspaces of 512 entries 10 MiB, 4,096 of them 409 MiB, past the isolate's " +
-      "128 MB (C1). With AFFINITY_WORKSPACES the default holds 40,960 entries, about 8 MB. Maximum: the server's own bound (routing.rs " +
-      "`Affinity::default`, 512); the two together are bounded by a cross check. An Anthropic turn writes at most four entries " +
-      "(ANTHROPIC_MAX_BREAKPOINTS), so 128 hold the latest 32 conversations or more of a workspace in one isolate for their five minutes.",
-    doc: "The most cache affinity entries the gateway's isolate keeps for one workspace; past it the entry closest to expiry goes.",
+      "The isolate's session store (gateway preference.ts `isolateSessions`; since r17 sessions replace the cache affinity map, whose " +
+      "names these settings keep) frees entries only when a workspace's shard or the store is full, so it grows to its bounds over an " +
+      "isolate's life. Measured for the affinity map by the release 4 routing-preference check (Node on the 5090 box, 2026-10-23, 64-hex " +
+      "keys): about 200 bytes an entry, 100 workspaces of 512 entries 10 MiB, 4,096 of them 409 MiB, past the isolate's 128 MB (C1); a " +
+      "session's entry also holds its prices and a second time (not measured again). With AFFINITY_WORKSPACES the default holds 40,960 " +
+      "entries, about 8 MB at that size. Maximum: the server's own bound (session.rs `SessionStore::default`, 512); the two together are " +
+      "bounded by a cross check. A session is one entry (a client session id, a stated cache key, or an API key and a model), an " +
+      "Anthropic conversation one for each cache breakpoint its turn writes, at most four (ANTHROPIC_MAX_BREAKPOINTS), so 128 hold the " +
+      "latest 32 sessions or more of a workspace in one isolate for their idle time (the routing policy's `session_idle_ms`, 10 minutes by " +
+      "default).",
+    doc: "The most session entries the gateway's isolate keeps for one workspace; past it the idle ones go, then the one idle longest.",
   },
   {
     name: "AFFINITY_WORKSPACES",
@@ -715,8 +719,10 @@ export const SETTINGS: readonly SettingSpec[] = [
     max: 4096,
     source:
       "AFFINITY_ENTRIES_PER_WORKSPACE source: 320 workspaces of 128 entries are about 8 MB of the isolate's 128 MB. Maximum: the server's own " +
-      "bound (routing.rs `Affinity::default`, 4096).",
-    doc: "The most workspaces the gateway's isolate keeps cache affinity entries for; a new one waits until a workspace's entries all expired.",
+      "bound (session.rs `SessionStore::default`, 4096).",
+    doc:
+      "The most workspaces the gateway's isolate keeps sessions for; a new one's sessions are not kept until a workspace has had no " +
+      "request for the session idle time.",
   },
   {
     name: "ANSWER_HELD_MAX_BYTES",
@@ -5341,8 +5347,9 @@ export const CROSS_CHECKS: readonly CrossCheck[] = [
     names: ["AFFINITY_ENTRIES_PER_WORKSPACE", "AFFINITY_WORKSPACES"],
     check: (a, b) => (a * b <= 163_840 ? null : `${a} entries for each of AFFINITY_WORKSPACES (${b}) are more than 163,840, a quarter of the isolate's memory`),
     source:
-      "The isolate's affinity map at about 200 bytes an entry (AFFINITY_ENTRIES_PER_WORKSPACE source) takes at most a quarter of the isolate's " +
-      "128 MB (C1): 163,840 entries, about 32 MB, beside the bodies a request holds (BODY_PARSE_MAX_BYTES, BODY_RAW_MAX_BYTES sources).",
+      "The isolate's session store at about 200 bytes an entry (the affinity map's, AFFINITY_ENTRIES_PER_WORKSPACE source) takes at most a " +
+      "quarter of the isolate's 128 MB (C1): 163,840 entries, about 32 MB, beside the bodies a request holds (BODY_PARSE_MAX_BYTES, " +
+      "BODY_RAW_MAX_BYTES sources).",
   },
   {
     workers: ["gateway"],
@@ -5645,7 +5652,7 @@ export interface GatewayConfig {
   readonly streamTotalSeconds: number;
   readonly bodyParseMaxBytes: number;
   readonly bodyRawMaxBytes: number;
-  /** AFFINITY_ENTRIES_PER_WORKSPACE, AFFINITY_WORKSPACES: the bounds of the isolate's cache affinity map. */
+  /** AFFINITY_ENTRIES_PER_WORKSPACE, AFFINITY_WORKSPACES: the bounds of the isolate's session store (named for the cache affinity it replaced). */
   readonly affinityEntriesPerWorkspace: number;
   readonly affinityWorkspaces: number;
   readonly answerHeldMaxBytes: number;

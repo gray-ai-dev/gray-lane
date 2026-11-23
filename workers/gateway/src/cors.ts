@@ -9,9 +9,12 @@
 
 /** The methods the Media Playground calls with: a request, then the polls of a video job. */
 const METHODS = "GET, POST";
-/** The headers browsers and SDKs send beyond the CORS-safelisted ones. */
+/**
+ * The headers browsers and SDKs send beyond the CORS-safelisted ones, and the routing parameters, which the
+ * confidential entry takes from this header alone (docs/utility-routing.md "Request parameters").
+ */
 const HEADERS =
-  "authorization, content-type, idempotency-key, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-retry-count, x-stainless-runtime, x-stainless-runtime-version, x-stainless-timeout, x-goog-api-key, x-gray-routing";
+  "authorization, content-type, idempotency-key, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-retry-count, x-stainless-runtime, x-stainless-runtime-version, x-stainless-timeout, x-goog-api-key, x-gray-routing, x-gray-routing-params";
 /** The answer headers it reads: the request's ids, and when a key's limit opens again (frontend error-categories.ts). */
 export const EXPOSED = "x-request-id, request-id, x-gray-key-limit-reset";
 /**

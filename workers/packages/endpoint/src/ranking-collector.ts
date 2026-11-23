@@ -12,10 +12,10 @@
  * copy is no worse.
  *
  * A root the sweep could not reach is asked again, the first time ENDPOINT_REPORT_MS later, then twice as long each
- * time, at most CONFIG_ALERT_AGE_MS apart, while the collector is younger than the stale window (a root whose route
- * serves pushes its keys itself; one that has not within the stale window holds only keys gone stale since). A root that
- * answers with no keys leaves the list, and comes back with its next push. The retries go with the calls into the object
- * (no timer): it is called every few seconds while any route serves.
+ * time, at most CONFIG_ALERT_AGE_MS apart, until it answers: its long record (r17) never goes stale, and an idle route's
+ * comes back only from its root. A root that answers with no keys and no record leaves the list, and comes back with its
+ * next push. The retries go with the calls into the object (no timer): it is called every few seconds while any route
+ * serves.
  *
  * Pure: the caller supplies the times, the epoch, the store and the roots' answers.
  */
@@ -38,8 +38,6 @@ export interface RankingCollectorSettings {
   readonly sweepRetryMs: number;
   /** The longest wait between two asks of such a root (CONFIG_ALERT_AGE_MS). */
   readonly sweepRetryMaxMs: number;
-  /** How long after its start the collector asks such a root again at all (the stale window, ENDPOINT_BREAKER_STALE_SECONDS). */
-  readonly sweepForMs: number;
   /** ALERT_GROUP_MS: the push-rate alert is said again at most every half of it while the rate lasts. */
   readonly alertGroupMs: number;
   /** The call rate (per second, averaged over a minute) past which the collector says `ranking_push_rate`. */
@@ -60,12 +58,11 @@ export const PUSH_RATE_ALERT_PER_SECOND = 250;
 export const PUSH_RATE_WINDOW_MS = 60_000;
 
 /** The collector's settings from the gateway's configuration (each one's source is in @gray/config). */
-export function collectorSettings(cfg: Pick<GatewayConfig, "configAlertAgeMs" | "endpointReportMs" | "endpointBreakerStaleSeconds" | "alertGroupMs">): RankingCollectorSettings {
+export function collectorSettings(cfg: Pick<GatewayConfig, "configAlertAgeMs" | "endpointReportMs" | "alertGroupMs">): RankingCollectorSettings {
   return {
     readyAfterMs: cfg.configAlertAgeMs,
     sweepRetryMs: cfg.endpointReportMs,
     sweepRetryMaxMs: cfg.configAlertAgeMs,
-    sweepForMs: cfg.endpointBreakerStaleSeconds * 1000,
     alertGroupMs: cfg.alertGroupMs,
     pushRateAlertPerSecond: PUSH_RATE_ALERT_PER_SECOND,
   };
@@ -137,19 +134,29 @@ export class RankingCollectorCore {
   swept(root: string, answer: RankingPush | null, nowMs: number): void {
     const p = this.pending.get(root);
     if (answer === null) {
-      const failures = (p?.failures ?? 0) + 1;
-      if (nowMs - this.startedAt >= this.settings.sweepForMs) this.pending.delete(root);
-      else this.pending.set(root, { failures, dueAt: nowMs + Math.min(this.settings.sweepRetryMs * 2 ** (failures - 1), this.settings.sweepRetryMaxMs) });
+      const failures = Math.min((p?.failures ?? 0) + 1, 32);
+      this.pending.set(root, { failures, dueAt: nowMs + Math.min(this.settings.sweepRetryMs * 2 ** (failures - 1), this.settings.sweepRetryMaxMs) });
       return;
     }
     this.pending.delete(root);
-    if (Array.isArray(answer.keys) && answer.keys.length === 0) {
-      // Nothing to rank: the root leaves the list until it pushes again.
+    if (Array.isArray(answer.keys) && answer.keys.length === 0 && (answer.record === undefined || answer.record === null) && !this.feed.hasRecord(root)) {
+      // Nothing to rank and no record (or a root of an earlier release), and none of it held (an export answered after
+      // the root's push holds an older state): the root leaves the list until it pushes again.
       this.roots.delete(root);
       this.store.remove(root);
       return;
     }
     this.push(answer, nowMs);
+  }
+
+  /**
+   * The alert line to say when the feed's bound of records (`RECORDS_BOUND`) moved roots' records out since the last call
+   * (`ranking_records_full`): a route whose record went ranks on start values until its root pushes again. Null otherwise.
+   */
+  recordsAlert(): Record<string, unknown> | null {
+    const evicted = this.feed.takeEvictedRecords();
+    if (evicted.length === 0) return null;
+    return { level: "alert", event: "ranking_records_full", alert_key: "ranking_records_full", evicted: evicted.length, first: evicted[0], records: this.feed.recordCount };
   }
 
   /** The round asked every root it took. */

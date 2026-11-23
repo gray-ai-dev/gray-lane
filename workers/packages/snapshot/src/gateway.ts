@@ -5,7 +5,7 @@ import { ENTRY_ENDPOINT_PROTOCOLS, entryEndpointRoute } from "./endpoint-route.t
 import { trafficEnds } from "./expiry.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
 import type { RouteTag } from "./offers.ts";
-import { snapshotRoutes, stackRouteNamesOnly, type Snapshot, type SnapshotRoute } from "./snapshot.ts";
+import { snapshotRoutes, stackRouteNamesOnly, type Snapshot, type SnapshotRoute, type SnapshotRouting } from "./snapshot.ts";
 
 /** A recipient record as the gateway reads it (@gray/content `RecipientRecord`). */
 export interface GatewayRecipient {
@@ -301,6 +301,11 @@ export interface GatewayView {
   /** Every registered public handle with its supplier workspace id (`SnapshotContent.handles`). Absent: none registered. */
   readonly handles?: Readonly<Record<string, string>>;
   /**
+   * The operator's routing policy as stored and the routed models' reference prices (`SnapshotContent.routing`), in both
+   * modes: the lane entry ranks by the same policy as the main gateway. Absent: a snapshot without it (the defaults).
+   */
+  readonly routing?: SnapshotRouting;
+  /**
    * Every route of the snapshot in this view's mode as its (route, supplier) references, with `true` third when
    * it has a tier, priced or not and whatever its expiry (inference.rs `layered_over` reads `snapshot.routes`
    * so): what tells a name in a customer's order that still orders something from one whose routes left or
@@ -573,6 +578,8 @@ export function gatewayView(snapshot: Snapshot, mode: GatewayMode = "main"): Gat
     registered: snapshot.registered ?? [],
     published,
     ...(snapshot.handles === undefined ? {} : { handles: snapshot.handles }),
+    // A snapshot stored before the policy travelled with it has none: the defaults.
+    ...(snapshot.routing === undefined ? {} : { routing: snapshot.routing }),
     laneServed: mode === "main" ? laneServedOf(snapshot) : {},
     ...((offers) => (offers.length === 0 ? {} : { laneOffers: offers }))(mode === "main" ? laneOffersOf(snapshot) : []),
   };

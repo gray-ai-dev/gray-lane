@@ -1,7 +1,7 @@
 import { ApiError } from "@gray/errors";
 import { LANE_PROTOCOLS } from "@gray/lane";
 import type { Protocol } from "@gray/protocol";
-import { Affinity, Preference, parseTagPattern, type RequestedSort, type RouteTag, type Tags } from "@gray/routing";
+import { Preference, SessionStore, parseTagPattern, type Constraint, type RequestedSort, type RouteTag, type Tags, type TtftPercentile, type UtilityResult } from "@gray/routing";
 import { laneServedKey, providerRef, routeServes, supplierRef } from "@gray/snapshot";
 import type { PlanPreference } from "./plan-order.ts";
 import type { GatewaySnapshot, RouteRecord } from "./snapshot.ts";
@@ -71,9 +71,15 @@ export function takeTags(
   return { ok: true, model: own.model, models: bare, tags: models.length === 0 ? [own.tag] : tags };
 }
 
-/** Whether `route` is a candidate under the opt-in rule of a route with a tier (`tier_admitted`, `Preference.optsIn`); a route without one always is. */
-export function tierAdmitted(preference: Preference, route: { readonly operator: string; readonly endpointId: string; readonly tag?: RouteTag }): boolean {
-  return (route.tag?.tier ?? null) === null || preference.optsIn(providerRef(route.operator, route.endpointId));
+/**
+ * Whether `route` is a candidate under the opt-in rule of a route with a tier (`tier_admitted`, `Preference.optsIn`); a
+ * route without one always is. A request whose routing parameters are explicit opts every tiered route in: the caller
+ * must mark the request's preference with `Preference.withRoutingExplicit` before it is layered (`layeredOver`), which
+ * is also what keeps an order naming only tiered routes. `routingExplicit` is only there so the callers compile until
+ * they do; it goes after r17's merge.
+ */
+export function tierAdmitted(preference: Preference, route: { readonly operator: string; readonly endpointId: string; readonly tag?: RouteTag }, routingExplicit = false): boolean {
+  return (route.tag?.tier ?? null) === null || routingExplicit || preference.optsIn(providerRef(route.operator, route.endpointId));
 }
 
 /** A route's two references, (route, supplier). */
@@ -103,6 +109,24 @@ function publishedOf(snapshot: PreferenceSnapshot): readonly (readonly [string, 
   return snapshot.published ?? snapshot.routes.map((r) => [...refsOf(r), (r.tag?.tier ?? null) !== null] as const);
 }
 
+/** What a level's tag patterns are resolved against for `model` (inference.rs `tags_of`): the model's tagged routes, each by its `providerRef`, and every registered handle. */
+export function tagsOf(snapshot: PreferenceSnapshot, model: string | null): Tags {
+  return {
+    routes: snapshot.routes.flatMap((r) => (r.model === model && r.tag !== undefined ? [[providerRef(r.operator, r.endpointId), r.tag] as const] : [])),
+    handles: snapshot.handles ?? {},
+  };
+}
+
+/**
+ * What a tag pattern names against `tags`, as `layeredOver` resolves a level holding it alone (`preference_levels`'s
+ * `resolved`): the references the routing record tells a level's list leaving a route out by. None for what is no
+ * pattern.
+ */
+export function patternRefs(tags: Tags, pattern: string): readonly string[] {
+  const level = Preference.parseDefault(JSON.stringify({ only: [pattern] }));
+  return typeof level === "string" ? [] : level.resolved(null, tags).only;
+}
+
 /** A request's layered preference and the levels that stated one, or the refusal of a default it cannot read. */
 export type Layered = { readonly ok: true; readonly preference: Preference; readonly sources: readonly PreferenceSource[] } | { readonly ok: false; readonly code: "routing_default_invalid" };
 
@@ -117,18 +141,17 @@ export type Layered = { readonly ok: true; readonly preference: Preference; read
  * level's tag patterns are resolved against that model's routes before the levels are layered.
  */
 export function layeredOver(snapshot: PreferenceSnapshot, keyDefault: string | null, workspaceId: string, preference: Preference, model: string | null = null, tag: string | null = null): Layered {
-  let key = keyDefault === null ? null : Preference.parseDefault(keyDefault);
-  if (key === "routing_default_invalid") return { ok: false, code: key };
+  // A key's default also carries its routing mode (`mode`), which the parameters' resolution reads, not layering.
+  const keyRead = keyDefault === null ? null : Preference.parseKeyDefault(keyDefault);
+  if (keyRead === "routing_default_invalid") return { ok: false, code: keyRead };
+  let key = keyRead?.preference ?? null;
   const stored = snapshot.routingDefaults?.[workspaceId];
   let workspace = stored === undefined ? null : Preference.parseDefault(stored);
   if (workspace === "routing_default_invalid") return { ok: false, code: workspace };
   // Tag patterns become references before anything below reads the lists; a request that states none, the
   // usual one, pays for none of this.
   if (tag !== null || [preference, key, workspace].some((level) => level !== null && level.statesPattern())) {
-    const tags: Tags = {
-      routes: snapshot.routes.flatMap((r) => (r.model === model && r.tag !== undefined ? [[providerRef(r.operator, r.endpointId), r.tag] as const] : [])),
-      handles: snapshot.handles ?? {},
-    };
+    const tags = tagsOf(snapshot, model);
     preference = preference.resolved(tag, tags);
     key = key?.resolved(null, tags) ?? null;
     workspace = workspace?.resolved(null, tags) ?? null;
@@ -308,6 +331,115 @@ export function unreadablePreference(code: "routing_invalid" | "routing_ambiguou
 }
 
 /**
+ * 400 for a request whose routing parameters `takeRouting` refused: `routing_invalid` or `routing_ambiguous`, with its
+ * message naming the member (public_errors.rs `routing_refused`, docs/utility-routing.md "Request parameters").
+ */
+export function routingRefused(code: "routing_invalid" | "routing_ambiguous", message: string): ApiError {
+  return new ApiError(400, code).withMessage(message);
+}
+
+/** From this value on a best value is written with its power of ten (public_errors.rs `SCIENTIFIC_FROM`). */
+const SCIENTIFIC_FROM = 1e9;
+
+/**
+ * `x` written with `places` decimals, rounded down, or up with `up`: a best value shown so still fails the constraint it
+ * failed (public_errors.rs `shown`). From 1e9 on it is four significant digits and the power of ten (`1.235e20`),
+ * written by hand: Rust's `{:e}` and `toExponential` differ. The power is found by multiplying by ten and the digits
+ * rounded the same way, with only the arithmetic both runtimes do alike. Null for a value no message can show (not
+ * finite, negative).
+ */
+function shown(x: number, places: 0 | 1 | 4, up: boolean): string | null {
+  if (!Number.isFinite(x) || x < 0) return null;
+  const round = (value: number) => (up ? Math.ceil(value) : Math.floor(value));
+  if (x >= SCIENTIFIC_FROM) {
+    let power = 1;
+    let exponent = 0;
+    while (power * 10 <= x) {
+      power *= 10;
+      exponent += 1;
+    }
+    let digits = round((x / power) * 1_000);
+    if (digits >= 10_000) {
+      digits = 1_000;
+      exponent += 1;
+    }
+    return `${Math.floor(digits / 1_000)}.${String(digits % 1_000).padStart(3, "0")}e${exponent}`;
+  }
+  const whole = round(x * [1, 10, 100, 1_000, 10_000][places]!);
+  if (places === 0) return BigInt(whole).toString();
+  const unit = 10n ** BigInt(places);
+  const n = BigInt(whole);
+  return `${n / unit}.${(n % unit).toString().padStart(places, "0")}`;
+}
+
+/**
+ * 400 for a request every candidate of whose model failed `constraint` (public_errors.rs `constraint_excluded_all`,
+ * docs/utility-routing.md "Constraints and the price cap"): the price cap `routing_max_price_excluded_all`, the others
+ * `routing_filter_excluded_all`, as the customer's own filters answer. The message names the constraint (for
+ * `max_ttft_ms`, `percentile`, the one whose check emptied the set) and `best`, the best value among the routes that
+ * constraint saw (for `min_context_tokens`, the model's window; null when unknown). Like those filters it is the model's
+ * lack of an eligible provider: a model the customer listed next may still serve the request.
+ */
+export function constraintsExcludedAll(constraint: Constraint, best: number | null, percentile: TtftPercentile | null = null): ApiError {
+  const value = (places: 0 | 1 | 4, up: boolean) => (best === null ? null : shown(best, places, up));
+  if (constraint === "max_price_multiple") {
+    const multiple = value(4, true);
+    return new ApiError(400, "routing_max_price_excluded_all").withMessage(
+      multiple === null
+        ? "No provider of this model is priced within `max_price_multiple` of the model's reference price."
+        : `No provider of this model is priced within \`max_price_multiple\` of the model's reference price: the lowest multiple among them is ${multiple}.`,
+    );
+  }
+  let said: string | null = null;
+  let name: string = constraint;
+  switch (constraint) {
+    case "min_availability": {
+      const v = value(4, false);
+      said = v === null ? null : `the highest availability among them is ${v}`;
+      break;
+    }
+    case "max_ttft_ms": {
+      const v = value(0, true);
+      if (percentile !== null) name = `max_ttft_ms.${percentile}`;
+      said = v === null ? null : percentile === null ? `the lowest time to first token among them is ${v} ms` : `the lowest ${percentile} time to first token among them is ${v} ms`;
+      break;
+    }
+    case "min_tps": {
+      const v = value(1, false);
+      said = v === null ? null : `the highest throughput among them is ${v} tokens per second`;
+      break;
+    }
+    case "min_context_tokens": {
+      const v = value(0, false);
+      said = v === null ? "the model's context window is not known" : `the model's context window is ${v} tokens`;
+      break;
+    }
+  }
+  return new ApiError(400, "routing_filter_excluded_all").withMessage(
+    said === null ? `No provider of this model meets the routing constraint \`${name}\`.` : `No provider of this model meets the routing constraint \`${name}\`: ${said}.`,
+  );
+}
+
+/**
+ * 400 `routing_reference_price_unavailable` for a request that sets `max_price_multiple` on a model without a reference
+ * price (public_errors.rs `reference_price_unavailable`, docs/utility-routing.md "Constraints and the price cap"): that
+ * model alone is refused, before any filter runs, and the next model of a `models` list may still serve the request;
+ * this is the answer when none can.
+ */
+export function referencePriceUnavailable(model: string): ApiError {
+  return new ApiError(400, "routing_reference_price_unavailable").withMessage(
+    `The model \`${model}\` has no reference price yet, so \`max_price_multiple\` cannot be applied to it. Remove \`max_price_multiple\`, or choose another model.`,
+  );
+}
+
+/** The answer to a request of `model` that `rankByUtility` left no route for (`constraintsExcludedAll`, `referencePriceUnavailable`; public_errors.rs `utility_refusal`); null for an order. */
+export function utilityRefusal(result: UtilityResult, model: string): ApiError | null {
+  if (result.ok) return null;
+  if (result.constraint === "reference_price_unavailable") return referencePriceUnavailable(model);
+  return constraintsExcludedAll(result.constraint, result.best, result.percentile ?? null);
+}
+
+/**
  * The answer to a request whose key's or workspace's stored default `layeredOver` cannot read
  * (`routing_default_invalid`, `unreadable_default`): 503, since the request is not at fault and an
  * organization's constraint is never dropped.
@@ -375,20 +507,20 @@ export function planPreference<R extends { readonly record: { readonly operator:
   };
 }
 
-let isolateMap: { readonly map: Affinity; readonly perWorkspace: number; readonly workspaces: number } | null = null;
+let isolateStore: { readonly store: SessionStore; readonly perWorkspace: number; readonly workspaces: number } | null = null;
 
 /**
- * The isolate's cache affinity map (inference.rs `InferenceRuntime.affinity`, process-local there). It is a
- * latency optimization, never a routing authority: an isolate that starts empty, or a conversation whose
- * next request another isolate serves, only costs that request its cache hit. Bounded by
- * AFFINITY_ENTRIES_PER_WORKSPACE and AFFINITY_WORKSPACES, sized from the isolate's memory: the server's bounds
- * (`Affinity::default`, @gray/routing AFFINITY_PER_WORKSPACE, AFFINITY_WORKSPACES) fill some 400 MB, and the map
- * frees entries only when it is full. One map per isolate; a configuration with other bounds starts a new one.
+ * The isolate's session store (docs/utility-routing.md "Sessions"; the server's `InferenceRuntime` holds one per
+ * process), which replaces its cache affinity map. A session lives only here: an isolate that starts empty, or a
+ * session whose next request another isolate serves, is not established there, and the session key as the seed of
+ * the draw makes that isolate draw the same provider in most cases. Bounded as the affinity map was, by
+ * AFFINITY_ENTRIES_PER_WORKSPACE and AFFINITY_WORKSPACES (the names kept). One store per isolate; a configuration with
+ * other bounds starts a new one.
  */
-export function isolateAffinity(cfg: { readonly affinityEntriesPerWorkspace: number; readonly affinityWorkspaces: number }): Affinity {
-  const held = isolateMap;
-  if (held !== null && held.perWorkspace === cfg.affinityEntriesPerWorkspace && held.workspaces === cfg.affinityWorkspaces) return held.map;
-  const map = new Affinity(cfg.affinityEntriesPerWorkspace, cfg.affinityWorkspaces);
-  isolateMap = { map, perWorkspace: cfg.affinityEntriesPerWorkspace, workspaces: cfg.affinityWorkspaces };
-  return map;
+export function isolateSessions(cfg: { readonly affinityEntriesPerWorkspace: number; readonly affinityWorkspaces: number }): SessionStore {
+  const held = isolateStore;
+  if (held !== null && held.perWorkspace === cfg.affinityEntriesPerWorkspace && held.workspaces === cfg.affinityWorkspaces) return held.store;
+  const store = new SessionStore(cfg.affinityEntriesPerWorkspace, cfg.affinityWorkspaces);
+  isolateStore = { store, perWorkspace: cfg.affinityEntriesPerWorkspace, workspaces: cfg.affinityWorkspaces };
+  return store;
 }

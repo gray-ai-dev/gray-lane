@@ -1,4 +1,5 @@
 import type { RestCause, RestScope } from "@gray/errors";
+import type { RecordDelta, RecordParams } from "@gray/routing";
 import type { CircuitView, KeyOutcomes, OutcomeMeasure } from "./circuit.ts";
 
 /**
@@ -122,6 +123,11 @@ export interface RootView {
    * interval at most). Absent: no window. A shard of a Worker version before it ignores it.
    */
   readonly rebuildingUntil?: number;
+  /**
+   * The long record's rate cap (tok/s) the shards floor each throughput sample's decode time with (r17,
+   * docs/utility-routing.md "The long record"). Absent: 5000.
+   */
+  readonly maxRateTps?: number;
 }
 
 /** A shard's identity: its Durable Object name is `shardName(endpointId, region, index)`. */
@@ -407,6 +413,18 @@ export function answeredFailure(code: string | null | undefined): boolean {
   return code !== null && code !== undefined && ANSWERED_FAILURE_CODES.includes(code);
 }
 
+/**
+ * What an attempt's outcome tells its route's long record (`@gray/routing` `addAttempt`'s `success`; docs/utility-routing.md
+ * "The long record"): what it tells the circuit (`circuitSuccess`), but nothing for a `rate_limited` failure without a
+ * measure: an attempt without one is outside every session, where a 429 counts against no one's availability (the measure,
+ * when there is one, says so itself). The circuit counts that 429 all the same.
+ */
+export function recordSuccess(outcome: Outcome, measure: OutcomeMeasure | undefined): boolean | null {
+  if (outcome.kind === "not_counted") return null;
+  if (outcome.kind === "success") return true;
+  return outcome.reason === "rate_limited" && measure === undefined ? null : false;
+}
+
 /** An attempt's account-block outcome as its release reports it (`ReleaseInput.accountBlock`). */
 export type AccountBlockNote =
   | { readonly kind: "refused"; readonly block: "flagged" | "third_party_apps"; readonly model: string; readonly pattern: { readonly client: string; readonly tools: boolean } }
@@ -535,6 +553,17 @@ export interface ShardReport extends ShardIdentity {
   readonly abandonedProbes: readonly ProbeKey[];
   /** Operations figures of the shard's retries and refusals (absent from a shard of an earlier build). */
   readonly retryStats?: RetryStats;
+  /**
+   * The long record's increments since the last report (r17, docs/utility-routing.md "The long record"): merged once,
+   * when the root applies this report. Absent: none, or a shard of an earlier release.
+   */
+  readonly record?: RecordDelta;
+  /**
+   * When the shard built this report, on its clock (r17), the same in every resend: a root merges no record from a report
+   * built more than idleReturnMs ago (a copy delayed in flight past its idle lease's removal would be taken as new).
+   * Absent from a shard of an earlier release; a root of an earlier release ignores it.
+   */
+  readonly builtAt?: number;
 }
 
 /** A probe claim's identity: the claiming shard is the reporter. */
@@ -640,6 +669,11 @@ export interface ConfigureInput {
    * storage takes it as nothing.
    */
   readonly published?: boolean;
+  /**
+   * The long record's parameters (r17, docs/utility-routing.md "Parameters at the root"): the root keeps the highest
+   * version it has seen. Absent: a publisher of an earlier release; the root keeps what it has (the code's defaults).
+   */
+  readonly recordParams?: RecordParams;
 }
 
 /** A rest the gateway files at a root its scope covers, after a failure (gateway inference.ts `restRoute`). */

@@ -166,7 +166,20 @@ export interface RequestIndexRow {
    * indexed and counts in no error rate. One this consumer cannot read is left out, never refusing the row.
    */
   readonly routeAttempts?: readonly RouteAttempt[];
+  /**
+   * The column `routing` (workers/db/migrations/0101; docs/utility-routing-reads.md "Request routing evidence"), not in
+   * `COLUMNS`, whose kinds have no JSON: how the request was routed, the JSON object the gateway builds (@gray/routing
+   * `RequestRoutingRecord`, its format `v` 1), which gray-jobs writes as it came. Absent from a row of a request that did
+   * not reach routing, and of a gateway before it; one this consumer cannot read is left out, never refusing the row.
+   */
+  readonly routing?: RoutingColumn;
 }
+
+/** A routing record as a row carries it: a JSON object of format 1 (`v`), read for its format alone. */
+export type RoutingColumn = object;
+
+/** The routing record's format this consumer writes (@gray/routing `REQUEST_ROUTING_VERSION`). */
+const ROUTING_COLUMN_FORMAT = 1;
 
 /**
  * The class of an attempt's failure (record.rs Attempt `retry_class`, main's retry::Class; docs/api-errors.md,
@@ -500,7 +513,45 @@ export function parseRow(v: unknown): RequestIndexRow {
       if (!(err instanceof InvalidRow)) throw err;
     }
   }
+  // How the request was routed, not the row: a value that is no record of the format this consumer writes, or whose
+  // reading throws, is left out.
+  let routing: RoutingColumn | null = null;
+  try {
+    routing = o.routing === undefined || o.routing === null ? null : routingOf(o.routing);
+  } catch {
+    routing = null;
+  }
+  if (routing !== null) out.routing = routing;
   return out as unknown as RequestIndexRow;
+}
+
+/** `value` with every string as PostgreSQL's jsonb takes it (`pgText`): NUL and lone surrogates replaced. */
+function jsonText(value: unknown): unknown {
+  if (typeof value === "string") return pgText(value);
+  if (Array.isArray(value)) return value.map(jsonText);
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [pgText(k), jsonText(v)]));
+  return value;
+}
+
+/**
+ * A row's routing record when it is a JSON object of `ROUTING_COLUMN_FORMAT`, its text as jsonb takes it; else null. It
+ * is serialized once here, where its row is read alone: one that will not serialize (a bigint) throws here, and its row
+ * goes without it, rather than when gray-jobs serializes the batch it is written in, which every row of it would fail.
+ */
+function routingOf(value: unknown): RoutingColumn | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  if ((value as { readonly v?: unknown }).v !== ROUTING_COLUMN_FORMAT) return null;
+  const routing = jsonText(value) as RoutingColumn;
+  JSON.stringify(routing);
+  return routing;
+}
+
+/**
+ * A row's routing record as `request_logs.routing` keeps it (workers/db/migrations/0101): as the row carries it, null for
+ * a row without one. gray-jobs writes it.
+ */
+export function routingColumn(row: Pick<RequestIndexRow, "routing">): RoutingColumn | null {
+  return row.routing ?? null;
 }
 
 const object = (v: unknown, field: string): Record<string, unknown> => {

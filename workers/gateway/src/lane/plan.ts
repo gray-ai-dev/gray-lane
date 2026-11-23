@@ -68,6 +68,11 @@ export interface DecisionInput {
    * (`laneRoutingInBody`): its rewrite policy has no op that removes it.
    */
   readonly stripProvider?: boolean;
+  /**
+   * The body named `routing`, the customer's routing parameters (r17, docs/utility-routing.md "Request parameters"): left
+   * out of every upstream body as `provider` is. Never in the lane, which refuses such a body (`laneRoutingParamsInBody`).
+   */
+  readonly stripRouting?: boolean;
   /** Tier B/C: members whose nested keys collapsed (`parsed.collapsed`). */
   readonly collapsed: ReadonlyMap<string, Json>;
 }
@@ -85,6 +90,7 @@ export function rewriteDecisions(input: DecisionInput): RewriteDecisions {
   // `planOps` drops the removal for a received body that does not carry it.
   if (input.stripModels) removals.push({ path: "/models" });
   if (input.stripProvider === true) removals.push({ path: "/provider" });
+  if (input.stripRouting === true) removals.push({ path: "/routing" });
   if (input.protocol === "anthropic_messages") {
     const metadata = get(input.body, "metadata");
     if (isObject(metadata) && Object.hasOwn(metadata, "user_id")) removals.push({ path: "/metadata/user_id" });
@@ -103,14 +109,15 @@ export function rewriteDecisions(input: DecisionInput): RewriteDecisions {
 
 /**
  * The request's own overlay from its decisions, exactly as `admit` built it: the collapsed members,
- * the customer's `models` list and routing preference, then the cap. The end-user removals are per attempt (`planOverlay`),
- * as they are for the main lane.
+ * the customer's `models` list, routing preference and routing parameters, then the cap. The end-user removals are per
+ * attempt (`planOverlay`), as they are for the main lane.
  */
 export function decisionOverlay(decisions: RewriteDecisions, base?: Overlay): Overlay {
   const overlay = base?.clone() ?? new Overlay();
   for (const { member, value } of decisions.collapsed) overlay.set(member, value);
   if (decisions.removals.some((removal) => removal.path === "/models")) overlay.remove("models");
   if (decisions.removals.some((removal) => removal.path === "/provider")) overlay.remove("provider");
+  if (decisions.removals.some((removal) => removal.path === "/routing")) overlay.remove("routing");
   if (decisions.cap !== null) overlay.set(decisions.cap.field, decisions.cap.value);
   return overlay;
 }

@@ -190,7 +190,6 @@ export const STOPS = [
   "circuit",
   "capacity",
   "quota",
-  "dispatch_budget",
   "price",
   "should_retry_false",
   "retry_after_too_long",

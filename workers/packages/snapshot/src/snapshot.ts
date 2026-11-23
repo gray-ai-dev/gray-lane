@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import type { Protocol } from "@gray/protocol";
 import { parsePlain } from "@gray/json";
+import { DEFAULT_ROUTING_POLICY, referencePricesOf, routingPolicyOfText, type ReferencePrice, type ReferencePriceValues, type RoutingPolicy } from "@gray/routing";
 // The subpath, not the package: the gateway bundles this package, and @gray/control's other modules bring zod.
 import { binds, kept, recordFromRow, type CodingAgentRecord, type CodingAgentRow, type OpencodeThinking } from "@gray/control/coding-agent";
 import { streamsMedia } from "@gray/control";
@@ -324,6 +325,27 @@ export interface SnapshotContent {
    * snapshot is the bytes it was.
    */
   readonly names?: Readonly<Record<string, string>>;
+  /**
+   * The operator's routing policy and the routed models' reference prices (r17, docs/utility-routing.md "Configuration",
+   * `snapshotRouting`): the stored row's version and document, which each gateway reads once per snapshot version, and
+   * each routed model's reference price. Absent in a snapshot stored before it travelled with it (an earlier gray-jobs)
+   * and from a reader without the row's read: the code's defaults at version 0, and no reference prices.
+   */
+  readonly routing?: SnapshotRouting;
+}
+
+/** `SnapshotContent.routing`. */
+export interface SnapshotRouting {
+  /** The stored row's update time in ms; 0: none is stored, the code's defaults. */
+  readonly version: number;
+  /** The stored document's text, as `translation` travels; null: none is stored. */
+  readonly document: string | null;
+  /**
+   * Each routed model's reference price, micro-USD per million tokens without the platform fee, by model in byte order:
+   * the policy's override (`source: override`), else the reference catalog's (`source: catalog`); a model with neither
+   * is absent. Conditional catalog prices are not read.
+   */
+  readonly referencePrices: readonly ReferencePrice[];
 }
 
 /** A published snapshot: the content, its version and when the rebuild that first produced it ran. */
@@ -506,6 +528,11 @@ export interface SnapshotReader {
   stackDeployments?(relayIds: readonly string[]): Promise<ReadonlyMap<string, StackDeploymentStanding>>;
   /** Every registered public handle and its workspace (control_provider_handles); a reader without it reads none. */
   handles?(): Promise<readonly { readonly handle: string; readonly workspace_id: string; readonly show_name?: boolean }[]>;
+  /**
+   * The stored routing policy's row (`routing_policy`, id 1, crates/gray-gateway/src/routing_policy/store.rs `load`), or
+   * null when none is stored; a reader without it reads none, and the snapshot carries no `routing`.
+   */
+  routingPolicy?(): Promise<RoutingPolicyRow | null>;
 }
 
 /** modeltrace.rs `PROFILE_ID`: the profile prefix of ModelTrace's records. */
@@ -556,10 +583,49 @@ export interface ModelReference {
   readonly facts: ReferenceFacts;
   readonly largestWindow: number | null;
   /**
+   * The reference price the catalog states for a model, micro-USD per million tokens (model_metadata.rs
+   * `reference_price`: @gray/routing `catalogReferencePrice` of its `pricing_raw`), null for none. Absent: no
+   * catalog prices; a routed model's reference is then the routing policy's override alone.
+   */
+  readonly prices?: (model: string) => ReferencePriceValues | null;
+  /**
    * The capability words (`capabilityWords`) the catalog states of a model by its Gray id, null when it does not list
    * it: a relay stack's routes serve these (`laneRouteCapabilities`). Absent: none stated of any model.
    */
   readonly capabilities?: (model: string) => ReadonlySet<string> | null;
+}
+
+/** The stored routing policy's row as the snapshot's reader reads it (`routing_policy`, id 1). */
+export interface RoutingPolicyRow {
+  readonly document: string;
+  /** Milliseconds: the policy's version. */
+  readonly updated_at: number;
+}
+
+/**
+ * The snapshot's `routing` (docs/utility-routing.md "Configuration"): the stored row (null: none, the defaults at
+ * version 0) as stored, and the reference prices of `models` (@gray/routing `referencePricesOf`): the policy's override,
+ * else what `prices` states: the publisher's facts, which every gateway uses as they are. A document this build does not
+ * read takes no override; it travels as stored, and the gateways and the roots run the defaults at the row's version
+ * (`routingPolicyOfSnapshot`; the gateways say `routing_policy_invalid`).
+ */
+export function snapshotRouting(row: RoutingPolicyRow | null, models: Iterable<string>, prices: ((model: string) => ReferencePriceValues | null) | undefined): SnapshotRouting {
+  const version = row?.updated_at ?? 0;
+  const document = row?.document ?? null;
+  const { policy } = routingPolicyOfSnapshot({ version, document, referencePrices: [] });
+  return { version, document, referencePrices: referencePricesOf(policy, models, prices ?? (() => null)) };
+}
+
+/**
+ * The policy a snapshot's `routing` runs (docs/utility-routing.md "Configuration"), the gateways' and the roots' alike: its
+ * document's at its version; the code's defaults at version 0 for none (a snapshot without `routing`, or no row); and
+ * for a document that does not read the code's defaults at the row's version, `invalid` then saying why: the roots take
+ * them too (`recordParams` of that version), and a valid document written later has a higher version.
+ */
+export function routingPolicyOfSnapshot(routing: SnapshotRouting | undefined): { readonly policy: RoutingPolicy; readonly invalid: string | null } {
+  if (routing === undefined) return { policy: DEFAULT_ROUTING_POLICY, invalid: null };
+  const read = routingPolicyOfText(routing.document, routing.version);
+  return read.ok ? { policy: read.policy, invalid: null } : { policy: { ...DEFAULT_ROUTING_POLICY, version: routing.version }, invalid: read.message };
 }
 
 /** A read the server's refresh would fail on: ConfigDO keeps the last snapshot and logs it. */
@@ -1303,6 +1369,8 @@ export async function buildSnapshot(
   const recipients = [...(await reader.contentRecipients(["anonymous", ...usable], recipientDays(nowMs)))].sort((a, b) => byText(a.scope, b.scope) || a.day - b.day || a.generation - b.generation);
 
   const models = await routedModels(reader, routes, reference);
+  // The routing policy as stored, and each routed model's reference price (lane routes' models among them).
+  const routing = reader.routingPolicy === undefined ? undefined : snapshotRouting(await reader.routingPolicy(), routes.map((r) => r.mapping.requested_model), reference?.prices);
   const sorted = routes.sort((a, b) => byText(a.capacityKey, b.capacityKey));
   const streamedOnly = sorted.filter((r) => r.capabilities.streamedOnly === true);
 
@@ -1328,6 +1396,7 @@ export async function buildSnapshot(
     ...((named) => (named.length === 0 ? {} : { names: Object.fromEntries(named.map((r) => [r.workspace_id, r.handle])) }))(
       handleRows.filter((r) => r.show_name === true).sort((a, b) => byText(a.workspace_id, b.workspace_id)),
     ),
+    ...(routing === undefined ? {} : { routing }),
   };
 }
 

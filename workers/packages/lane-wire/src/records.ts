@@ -17,9 +17,11 @@ import {
   type RequestIndexRow,
   type RouteAttempt,
 } from "@gray/request-index";
+import { SERVICE_REGIONS } from "@gray/snapshot";
 import { z } from "zod";
 import { BridgeWireError } from "./error.ts";
 import { MAX_SAFE_INTEGER, asBigint, asNumber, intSchema, uintSchema } from "./ints.ts";
+import { RANKING_EPOCH_PATTERN } from "./snapshot.ts";
 import { fitStackTrace, stackTraceDtoOf, stackTraceOf, stackTraceSchema, type StackTraceDto } from "./stack-trace.ts";
 
 /**
@@ -65,13 +67,14 @@ export const LANE_FORBIDDEN_EVENT_COLUMNS = Object.freeze(["client_app", "client
  * charge's input and output sides and the route's API of a translated request, workers/db/migrations/0076;
  * r14's `routeAttempts`, the route attempts with their two answer checks, workers/db/migrations/0079; r15's five
  * measures on each attempt are later still, docs/live-speed.md, and each attempt's `providerFailure` of 2026-11-23
- * later again, so it goes first when a bridge refuses a document, then the measures):
+ * later again; r18's `routing`, the routing record's confidential projection, workers/db/migrations/0101, is the
+ * latest, and goes first when a bridge refuses a row, then the provider failure, then the measures):
  * absent from the wire document when null, and taken absent. A bridge that predates one still takes
  * every row that does not carry it (every row but a stack relay's), and a bridge that knows it takes
  * the rows of a lane that predates it, so neither deploy order loses rows of the lanes that existed
  * before.
  */
-export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace", "chargedInputMicrousd", "chargedOutputMicrousd", "upstreamProtocol", "routeAttempts"] as const);
+export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace", "chargedInputMicrousd", "chargedOutputMicrousd", "upstreamProtocol", "routeAttempts", "routing"] as const);
 
 /**
  * A route's key on the lane's wire, an endpoint id or a model name: 1 to 256 printable ASCII characters without a space.
@@ -151,6 +154,187 @@ function routeAttemptsDtoOf(attempts: readonly RouteAttempt[]): LaneRouteAttempt
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * The routing record's closed words (@gray/routing request-routing.ts, docs/utility-routing-reads.md "The record"): the
+ * presets, the percentiles, the constraints, the heads' reasons, the session's states and re-draws, the preference's
+ * levels. A supplier reference is 64 lowercase hex digits; an offer's region is one of the service regions an offer may
+ * declare (@gray/snapshot `SERVICE_REGIONS`), as it declares it.
+ */
+const ROUTING_PRESETS = ["interactive", "autonomous", "standard", "flex"] as const;
+const ROUTING_MODE_SOURCES = ["request", "key"] as const;
+const ROUTING_PERCENTILES = ["p50", "p90", "p99"] as const;
+const ROUTING_CONSTRAINTS = ["min_availability", "max_ttft_ms", "min_tps", "min_context_tokens", "max_price_multiple"] as const;
+const ROUTING_HEAD_REASONS = ["ranking", "session", "order", "tool_call_issuer", "account_block", "unselected", "recovery_probe", "recovery_trial"] as const;
+const ROUTING_SESSION_STATES = ["new", "kept", "changed", "off"] as const;
+const ROUTING_REDRAWS = ["failed", "circuit", "rest", "blocked", "price", "preference", "constraint", "gone"] as const;
+const ROUTING_LEVELS = ["request", "key", "workspace"] as const;
+const SUPPLIER_REF = /^[0-9a-f]{64}$/;
+
+/**
+ * A requirement's exclusion, each of its own kind: the percentile on `max_ttft_ms` alone, every value finite and within
+ * the requirement's range (an availability within [0, 1], a context window a whole number of tokens), and null only
+ * where the route has no finite value (an unknown context window, a price cap against a reference that costs nothing).
+ * Each limit is within the range the routing parameters are read in (@gray/routing params.ts, routing_params.rs): an
+ * availability within [0, 1], a latency, a throughput and a price cap greater than 0, a context window from 1 to
+ * MAX_TOKENS.
+ */
+const share = z.number().finite().min(0).max(1);
+const measure = z.number().finite().min(0);
+const positive = z.number().finite().gt(0);
+const tokens = z.number().int().min(0);
+/** The most tokens a routing parameter may state (params.ts `MAX_TOKENS`). */
+const MAX_TOKENS = 1_000_000_000;
+const contextLimit = z.number().int().min(1).max(MAX_TOKENS);
+const requirementExclusion = <N extends (typeof ROUTING_CONSTRAINTS)[number], V extends z.ZodType, L extends z.ZodType>(name: N, value: V, limit: L) =>
+  z.object({ name: z.literal(name), value, limit, source: z.enum(["request", "preset"]) }).strict();
+
+/** What emptied a refused request's set: a requirement and the best value seen, a list's level, or the cheapest rate. */
+const routingExclusionSchema = z.union([
+  z.object({ name: z.literal("max_price"), rate: z.enum(["input", "output"]), value: uintSchema, limit: uintSchema, source: z.enum(ROUTING_LEVELS) }).strict(),
+  z.object({ name: z.enum(["only", "ignore"]), source: z.enum(ROUTING_LEVELS) }).strict(),
+  requirementExclusion("min_availability", share, share),
+  z.object({ name: z.literal("max_ttft_ms"), percentile: z.enum(ROUTING_PERCENTILES), value: measure, limit: positive, source: z.enum(["request", "preset"]) }).strict(),
+  requirementExclusion("min_tps", measure, positive),
+  requirementExclusion("min_context_tokens", tokens.nullable(), contextLimit),
+  requirementExclusion("max_price_multiple", measure.nullable(), positive),
+]);
+
+/**
+ * A lane row's routing record (docs/utility-routing-reads.md "The confidential entry's record", r18): the confidential
+ * entry's projection, exactly its members. The preset and where it came from (the request or its API key, r20), the
+ * policy version, the API, the percentile, the band and the thresholds; the head's reason, the session (never when it was established, which would tie a session's requests
+ * together as LANE_RECORD_NULLED keeps them apart; its change naming the session's provider, without costs), the counts,
+ * the route chosen (its supplier, its endpoint, its offer's region) and a refusal's exclusion, which names no route,
+ * endpoint or supplier; every other member null and `omitted` 0. The endpoint ids are those `route_attempts` already
+ * carry; the counts and the head's reason are in the event allow-list. The product owner let these, and nothing more,
+ * leave the CVM with the index row (requirement of 2026-11-19, P1).
+ */
+const laneRoutingSchema = z
+  .object({
+    v: z.literal(1n),
+    entry: z.literal("confidential"),
+    policy_version: uintSchema,
+    preset: z.enum(ROUTING_PRESETS),
+    preset_stated: z.null(),
+    // Where the preset came from: one of two fixed words, nothing of the request's content (r20). Optional: an entry
+    // before it sends none.
+    mode_source: z.enum(ROUTING_MODE_SOURCES).nullable().optional(),
+    explicit: z.null(),
+    api: z.enum(["generation", "other"]),
+    ttft_percentile: z.enum(ROUTING_PERCENTILES),
+    band: z.number(),
+    thresholds: z.object({ own: uintSchema, p99: uintSchema }).strict(),
+    requirements: z.null(),
+    preference: z.null(),
+    workload: z.null(),
+    reference: z.null(),
+    head_reason: z.enum(ROUTING_HEAD_REASONS).nullable(),
+    session: z
+      .object({
+        state: z.enum(ROUTING_SESSION_STATES),
+        since_ms: z.null(),
+        change: z.object({ reason: z.enum(ROUTING_REDRAWS), provider: z.string().regex(SUPPLIER_REF).nullable(), previous_cost_microusd: z.null(), cost_microusd: z.null() }).strict().nullable(),
+      })
+      .strict()
+      .nullable(),
+    eligible: uintSchema,
+    in_draw: uintSchema,
+    chosen: z.object({ supplier: z.string().regex(SUPPLIER_REF), endpoint_id: z.string().regex(LANE_ROUTE_NAME_PATTERN), region: z.enum(SERVICE_REGIONS).nullable() }).strict().nullable(),
+    candidates: z.null(),
+    omitted: z.literal(0n),
+    refusal: z.object({ exclusion: routingExclusionSchema }).strict().nullable(),
+  })
+  .strict()
+  // A refused request chose no route, kept no session, put no route first and drew from none.
+  .refine((r) => r.refusal === null || (r.chosen === null && r.session === null && r.head_reason === null && r.in_draw === 0n), {
+    message: "a refused request chose no route, kept no session, put no route first and drew from none",
+  });
+type LaneRoutingDto = z.infer<typeof laneRoutingSchema>;
+
+/** `v` when it is an object (not an array), else null. */
+const membersOf = (v: unknown): Record<string, unknown> | null => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+/** A safe integer as the wire's bigint; anything else as it is, for the schema to refuse. */
+const wireInt = (v: unknown): unknown => (typeof v === "number" && Number.isSafeInteger(v) ? BigInt(v) : v);
+
+/** A refusal's exclusion with its own members alone, each copied by name, its counts as bigints. */
+function exclusionDtoOf(e: Record<string, unknown> | null): unknown {
+  if (e === null) return null;
+  if (e.name === "max_price") return { name: e.name, rate: e.rate, value: wireInt(e.value), limit: wireInt(e.limit), source: e.source };
+  if (e.name === "only" || e.name === "ignore") return { name: e.name, source: e.source };
+  return { name: e.name, ...(e.percentile === undefined ? {} : { percentile: e.percentile }), value: e.value, limit: e.limit, source: e.source };
+}
+
+/**
+ * A row's routing record as the CVM sends it: its members copied by name (a member the record gains beside them, or one
+ * an exclusion gains, never leaves), its counts as bigints. Null when it would not pass `laneRoutingSchema` (a main
+ * entry's record, one with a member that may not leave the CVM, a word off its list): the row goes without it, as a row of
+ * a gateway before it; the row itself is never lost with it.
+ */
+function routingDtoOf(routing: object): LaneRoutingDto | null {
+  const r = routing as Record<string, unknown>;
+  const thresholds = membersOf(r.thresholds);
+  const session = membersOf(r.session);
+  const change = membersOf(session?.change);
+  const chosen = membersOf(r.chosen);
+  const refusal = membersOf(r.refusal);
+  const projected = {
+    v: wireInt(r.v),
+    entry: r.entry,
+    policy_version: wireInt(r.policy_version),
+    preset: r.preset,
+    preset_stated: r.preset_stated ?? null,
+    ...(r.mode_source === undefined ? {} : { mode_source: r.mode_source }),
+    explicit: r.explicit ?? null,
+    api: r.api,
+    ttft_percentile: r.ttft_percentile,
+    band: r.band,
+    thresholds: thresholds === null ? r.thresholds : { own: wireInt(thresholds.own), p99: wireInt(thresholds.p99) },
+    requirements: r.requirements ?? null,
+    preference: r.preference ?? null,
+    workload: r.workload ?? null,
+    reference: r.reference ?? null,
+    head_reason: r.head_reason ?? null,
+    session:
+      session === null
+        ? (r.session ?? null)
+        : {
+            state: session.state,
+            since_ms: session.since_ms ?? null,
+            change:
+              change === null
+                ? (session.change ?? null)
+                : { reason: change.reason, provider: change.provider ?? null, previous_cost_microusd: change.previous_cost_microusd ?? null, cost_microusd: change.cost_microusd ?? null },
+          },
+    eligible: wireInt(r.eligible),
+    in_draw: wireInt(r.in_draw),
+    chosen: chosen === null ? (r.chosen ?? null) : { supplier: chosen.supplier, endpoint_id: chosen.endpoint_id, region: chosen.region ?? null },
+    candidates: r.candidates ?? null,
+    omitted: wireInt(r.omitted),
+    refusal: refusal === null ? (r.refusal ?? null) : { exclusion: exclusionDtoOf(membersOf(refusal.exclusion)) },
+  };
+  const parsed = laneRoutingSchema.safeParse(projected);
+  if (parsed.success) return parsed.data;
+  // A line names why the record goes without its row, nothing it holds.
+  console.warn(JSON.stringify({ level: "warn", event: "routing_record_dropped", reason: "lane_schema" }));
+  return null;
+}
+
+/** A wire routing record as the row's: its counts back to safe numbers. */
+function routingOf(dto: LaneRoutingDto): object {
+  const n = (v: bigint) => asNumber(v, "routing");
+  const exclusion = dto.refusal?.exclusion;
+  return {
+    ...dto,
+    v: n(dto.v),
+    policy_version: n(dto.policy_version),
+    thresholds: { own: n(dto.thresholds.own), p99: n(dto.thresholds.p99) },
+    eligible: n(dto.eligible),
+    in_draw: n(dto.in_draw),
+    omitted: n(dto.omitted),
+    refusal: exclusion === undefined ? null : { exclusion: exclusion.name === "max_price" ? { ...exclusion, value: n(exclusion.value), limit: n(exclusion.limit) } : exclusion },
+  };
+}
+
 /** A wire route attempt as the row's: its counts back to safe numbers (within their bounds, so always safe). */
 function routeAttemptOf(dto: LaneRouteAttemptDto): RouteAttempt {
   const out: Record<string, unknown> = { ...dto };
@@ -200,6 +384,7 @@ const LANE_ROW_SHAPE: Record<string, z.ZodType> = {
   ...Object.fromEntries(COLUMNS.map((column) => [column.key, rowColumnSchema(column)])),
   stackTrace: stackTraceSchema.optional(),
   routeAttempts: routeAttemptsSchema.optional(),
+  routing: laneRoutingSchema.optional(),
 };
 export const laneIndexRowSchema = z.object(LANE_ROW_SHAPE).strict();
 export type LaneIndexRowDto = z.infer<typeof laneIndexRowSchema>;
@@ -248,6 +433,11 @@ export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
     const attempts = routeAttemptsDtoOf(row.routeAttempts);
     if (attempts !== null) out.routeAttempts = attempts;
   }
+  // A row's routing, when it has one: an explicit null is none, and never reaches the projection.
+  if (row.routing !== undefined && row.routing !== null) {
+    const routing = routingDtoOf(row.routing);
+    if (routing !== null) out.routing = routing;
+  }
   return out as LaneIndexRowDto;
 }
 
@@ -262,6 +452,7 @@ export function laneIndexRowOf(dto: LaneIndexRowDto): RequestIndexRow {
   if (dto.stackTrace !== undefined) out.stackTrace = stackTraceOf(dto.stackTrace as StackTraceDto);
   // The schema's members as they came, the measures' counts as numbers.
   if (dto.routeAttempts !== undefined) out.routeAttempts = (dto.routeAttempts as readonly LaneRouteAttemptDto[]).map(routeAttemptOf);
+  if (dto.routing !== undefined) out.routing = routingOf(dto.routing as LaneRoutingDto);
   return out as unknown as RequestIndexRow;
 }
 
@@ -284,7 +475,20 @@ interface EventColumn {
   readonly kind: EventKind;
   readonly required?: boolean;
   readonly values?: readonly string[];
+  /** A string column's fixed form: the TEE sends only identifiers, counts and booleans. */
+  readonly pattern?: RegExp;
 }
+
+/**
+ * `routing_policy` as the contract writes it (docs/utility-routing.md "Evidence"; sinks.ts `routingPolicyText`,
+ * request_log/evidence.rs `routing_policy_text`): the preset (@gray/routing `PRESETS`), the policy and snapshot
+ * versions, the feed (a collector epoch as a read names it, snapshot.ts `RANKING_EPOCH_PATTERN`, and its sequence number;
+ * `none`; the server's `local`), the window, the session (`SessionState`, a re-draw with its `SessionRedraw`) and the
+ * price multiple to four decimals (a whole number past 2^53 / 10^4).
+ */
+const ROUTING_POLICY = new RegExp(
+  `^utility;preset=(interactive|autonomous|standard|flex);policy=\\d{1,20};snapshot=\\d{1,20};feed=(${RANKING_EPOCH_PATTERN.source.slice(1, -1)}:\\d{1,20}|none|local);window=\\d{1,20};session=(hit|new|none|off|redraw:(failed|circuit|rest|blocked|price|preference|constraint|gone));multiple=(\\d{1,20}\\.\\d{4}|\\d{1,400}|-)$`,
+);
 
 /** Every column `wideEvent` writes, with its kind and whether it is always there (`sinks.ts`). */
 const EVENT_COLUMNS: readonly EventColumn[] = [
@@ -368,10 +572,17 @@ const EVENT_COLUMNS: readonly EventColumn[] = [
   { key: "trust_outcome", kind: "forbidden" },
   { key: "routing_translation", kind: "bool" },
   { key: "routing_upstream_protocol", kind: "string" },
+  // The routing evidence (r17, docs/utility-routing.md "Evidence"): the policy text (identifiers and counts), the routes
+  // entering the constraints, and the session's key, provider and hit; no content.
+  { key: "routing_policy", kind: "string", pattern: ROUTING_POLICY },
+  { key: "routing_eligible_routes", kind: "int" },
   { key: "routing_attempts_allowed", kind: "int" },
   { key: "routing_skipped", kind: "skipped" },
   { key: "routing_head_reason", kind: "string" },
   { key: "routing_recovery_probe_endpoint", kind: "string" },
+  { key: "routing_affinity_key_present", kind: "bool" },
+  { key: "routing_affinity_pinned_endpoint", kind: "string" },
+  { key: "routing_affinity_honoured", kind: "bool" },
   { key: "recovery_retry_after_s", kind: "int" },
   { key: "routing_candidates", kind: "candidates" },
 ];
@@ -398,7 +609,7 @@ function eventColumnSchema(column: EventColumn): z.ZodType {
   let base: z.ZodType;
   switch (column.kind) {
     case "string":
-      base = column.values === undefined ? z.string().max(8192) : z.enum(column.values as [string, ...string[]]);
+      base = column.values !== undefined ? z.enum(column.values as [string, ...string[]]) : column.pattern !== undefined ? z.string().max(8192).regex(column.pattern) : z.string().max(8192);
       break;
     case "int":
       base = uintSchema;

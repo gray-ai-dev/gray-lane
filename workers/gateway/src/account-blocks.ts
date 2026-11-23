@@ -69,16 +69,15 @@ export interface Steered<R extends PlanRoute = Route> {
 }
 
 /**
- * The steering (`admit`, D4): a stable partition that moves every route of a `blocked` supplier behind every
- * route that is not. With only blocked routes ranked, the supplier's refusal would send the request to one of
- * the routes ranking left out for want of samples after all: `unsampled` (those, not blocked, ranked without
- * exploration) go there first. A route left out for its circuit stays out. The pins skipped blocked routes
- * before, so a pinned head stays the head.
+ * The steering (`order_plan`, D4): a stable partition that moves every route of a `blocked` supplier behind every
+ * route that is not. The formula orders every candidate whose circuit lets it serve, so no route is left out for want
+ * of samples to bring forward; a route left out for its circuit stays out. The session and issuer targets and a due
+ * probe skipped blocked routes before, so a head they placed stays the head.
  */
-export function steer<R extends PlanRoute>(plan: readonly R[], blocked: ReadonlyMap<string, AccountBlock>, unsampled: readonly R[]): Steered<R> {
+export function steer<R extends PlanRoute>(plan: readonly R[], blocked: ReadonlyMap<string, AccountBlock>): Steered<R> {
   if (blocked.size === 0) return { plan: [...plan], head: false, moved: false };
   const away = (r: R) => blocked.has(r.record.operator);
-  const routes = plan.every(away) ? [...plan, ...unsampled.filter((r) => !away(r) && !plan.includes(r))] : [...plan];
+  const routes = [...plan];
   const headBefore = routes[0]?.record.endpointId;
   let seenAway = false;
   let moved = false;

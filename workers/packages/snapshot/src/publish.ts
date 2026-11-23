@@ -1,3 +1,4 @@
+import type { RecordParams } from "@gray/routing";
 import { accountKeyConfig, type SnapshotKey } from "./keys.ts";
 import type { RouteRestChecks } from "./rests.ts";
 import type { SnapshotCapacity, SnapshotWorkspace } from "./snapshot.ts";
@@ -37,6 +38,12 @@ export interface CapacityTerms {
   readonly withdrawn: boolean;
   /** The checks of the route that passed (`SnapshotCapacity.restChecks`); absent in a record published before them. */
   readonly restChecks?: RouteRestChecks;
+  /**
+   * The long record's parameters of the snapshot's routing policy (r17, @gray/routing `recordParamsOf`; @gray/endpoint
+   * ConfigureInput.recordParams), the same for every root, so a new policy reconfigures every serving root. Absent in a
+   * record published before them, which reads as a change.
+   */
+  readonly recordParams?: RecordParams;
 }
 
 /**
@@ -85,9 +92,26 @@ export function forgottenKeys(want: ReadonlyMap<string, KeyTerms>, published: Re
   return out;
 }
 
-/** The capacity terms the endpoint roots should have: enabled capacities serve, the rest are withdrawn. */
-export function capacityTerms(capacities: readonly SnapshotCapacity[]): Map<string, CapacityTerms> {
-  return new Map(capacities.map((c) => [c.capacityKey, { capacityKey: c.capacityKey, maxConcurrency: c.maxConcurrency, withdrawn: !c.enabled, ...(c.restChecks === undefined ? {} : { restChecks: c.restChecks }) }]));
+/**
+ * The capacity terms the endpoint roots should have: enabled capacities serve, the rest are withdrawn; every one with
+ * `recordParams` when given (the snapshot's routing policy's).
+ */
+export function capacityTerms(capacities: readonly SnapshotCapacity[], recordParams?: RecordParams): Map<string, CapacityTerms> {
+  return new Map(
+    capacities.map((c) => [
+      c.capacityKey,
+      { capacityKey: c.capacityKey, maxConcurrency: c.maxConcurrency, withdrawn: !c.enabled, ...(c.restChecks === undefined ? {} : { restChecks: c.restChecks }), ...(recordParams === undefined ? {} : { recordParams }) },
+    ]),
+  );
+}
+
+/**
+ * Whether a root told `prior` has `terms`. A newer pass of the route's checks is news (it ends the rests its root holds that
+ * began no later), and so are other record parameters for a root that serves; a withdrawn root takes them when it is
+ * configured again.
+ */
+function sameTerms(prior: CapacityTerms, terms: CapacityTerms): boolean {
+  return prior.maxConcurrency === terms.maxConcurrency && prior.withdrawn === terms.withdrawn && sameChecks(prior.restChecks, terms.restChecks) && (terms.withdrawn || sameRecordParams(prior.recordParams, terms.recordParams));
 }
 
 /** The capacity changes to send; a published capacity gone from the snapshot is withdrawn. */
@@ -95,8 +119,7 @@ export function capacityChanges(want: ReadonlyMap<string, CapacityTerms>, publis
   const out: CapacityTerms[] = [];
   for (const [key, terms] of want) {
     const prior = published.get(key);
-    // A newer pass of the route's checks is told too: it ends the rests its root holds that began no later.
-    if (!prior || prior.maxConcurrency !== terms.maxConcurrency || prior.withdrawn !== terms.withdrawn || !sameChecks(prior.restChecks, terms.restChecks)) out.push(terms);
+    if (!prior || !sameTerms(prior, terms)) out.push(terms);
   }
   for (const [key, prior] of published) if (!want.has(key) && !prior.withdrawn) out.push({ ...prior, withdrawn: true });
   return out;
@@ -138,7 +161,7 @@ export function capacityResends(want: ReadonlyMap<string, CapacityTerms>, publis
   const out: CapacityTerms[] = [];
   for (const [key, terms] of want) {
     const prior = published.get(key);
-    if (prior === undefined || prior.maxConcurrency !== terms.maxConcurrency || prior.withdrawn !== terms.withdrawn || !sameChecks(prior.restChecks, terms.restChecks)) continue;
+    if (prior === undefined || !sameTerms(prior, terms)) continue;
     if (prior.sentAtMs === undefined || nowMs - prior.sentAtMs >= resendMs) out.push(terms);
   }
   return out;
@@ -176,6 +199,12 @@ export function keyResends(want: ReadonlyMap<string, KeyTerms>, published: Reado
 function sameChecks(a: RouteRestChecks | undefined, b: RouteRestChecks | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
   return a.endpointMs === b.endpointMs && a.modelMs === b.modelMs && a.routeMs === b.routeMs;
+}
+
+/** Every member alike; a record without them (published before they travelled) is never alike one with them. */
+function sameRecordParams(a: RecordParams | undefined, b: RecordParams | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (Object.keys(b) as (keyof RecordParams)[]).every((k) => a[k] === b[k]) && Object.keys(a).length === Object.keys(b).length;
 }
 
 /**

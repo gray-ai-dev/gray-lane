@@ -130,8 +130,14 @@ export const filedRestOutSchema = z
 
 const filedRests = z.array(filedRestSchema).max(FILED_REST_KEYS_MAX);
 
-/** `OutcomeMeasure` (@gray/endpoint `validMeasure`): latency, time to first token, output tokens, failure kind. */
-export const outcomeMeasureSchema = z.tuple([uintSchema, uintSchema.nullable(), uintSchema, z.enum(measureFailures).nullable()]);
+/**
+ * `OutcomeMeasure` (@gray/endpoint `validMeasure`): latency, time to first token, output tokens, failure kind, and since
+ * r17 a fifth member, 1 when the attempt's route was its session's established provider (else 0), which the shard
+ * consumes for the long record. A bridge of an earlier release refuses five members (strict): the lane sends four then
+ * (gateway lane/remote/endpoint.ts).
+ */
+const measureMembers = [uintSchema, uintSchema.nullable(), uintSchema, z.enum(measureFailures).nullable()] as const;
+export const outcomeMeasureSchema = z.union([z.tuple(measureMembers), z.tuple([...measureMembers, z.union([z.literal(0n), z.literal(1n)])])]);
 export type OutcomeMeasureDto = z.infer<typeof outcomeMeasureSchema>;
 
 /** A rest an answer at the caller's isolate ended (`AcquireInput.ended`). */
@@ -390,7 +396,8 @@ export function filedRestDtoOf(rest: FiledRest): FiledRestDto {
 }
 
 export function outcomeMeasureOf(dto: OutcomeMeasureDto): OutcomeMeasure {
-  return [asNumber(dto[0], "measure.latency"), dto[1] === null ? null : asNumber(dto[1], "measure.ttft"), asNumber(dto[2], "measure.output_tokens"), dto[3]];
+  const four = [asNumber(dto[0], "measure.latency"), dto[1] === null ? null : asNumber(dto[1], "measure.ttft"), asNumber(dto[2], "measure.output_tokens"), dto[3]] as const;
+  return dto.length === 5 ? [...four, dto[4] === 1n ? 1 : 0] : four;
 }
 
 /**
@@ -399,8 +406,11 @@ export function outcomeMeasureOf(dto: OutcomeMeasureDto): OutcomeMeasure {
  */
 function measureMember(measure: OutcomeMeasure | undefined): { readonly measure?: OutcomeMeasureDto } {
   if (measure === undefined || !validMeasure(measure)) return {};
-  const [latency, ttft, tokens, failure] = measure;
-  return { measure: [BigInt(latency), ttft === null ? null : BigInt(ttft), BigInt(tokens), failure] };
+  const [latency, ttft, tokens, failure, inSession] = measure;
+  const l = BigInt(latency);
+  const t = ttft === null ? null : BigInt(ttft);
+  const o = BigInt(tokens);
+  return { measure: inSession === undefined ? [l, t, o, failure] : [l, t, o, failure, inSession === 1 ? 1n : 0n] };
 }
 
 export function acquireInputOf(dto: AcquireInputDto): AcquireInput {

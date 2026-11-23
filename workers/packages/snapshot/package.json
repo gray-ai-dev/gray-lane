@@ -15,6 +15,7 @@
     "@gray/control": "0.0.0",
     "@gray/json": "0.0.0",
     "@gray/protocol": "0.0.0",
+    "@gray/routing": "0.0.0",
     "@noble/hashes": "1.8.0",
     "jsonc-parser": "3.3.1"
   },

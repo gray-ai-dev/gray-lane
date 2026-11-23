@@ -20,10 +20,16 @@
  * `make_room`); with none idle it is not taken, and its routes rank as unobserved (design D10). Keys gone stale stay
  * until they are evicted (design G6): the server's ranker ranks a key observed long ago otherwise than one never seen.
  *
+ * r17 (docs/utility-routing.md "The feed"): each key carries its circuit as its root keeps it (`FeedKey.circuit`: open,
+ * the cooldown's end, a probe lease out), and the feed keeps each root's long-record summary (`RankingPush.record`) in a
+ * map of its own, each tagged with the change number it came at, so a reader gets the records changed since its have
+ * (`FeedAnswer.records`, all of them in a full answer) and the roots whose record went (`removedRecords`). A record is
+ * never evicted for being idle: past `maxRecords` (16,384) the least recently updated goes, and the collector says so.
+ *
  * Pure: the caller supplies the times and the epoch.
  */
 
-import { DEFAULT_RANKING_CONFIG, FEED_VERSION, feedColumnsCount, feedKeyValid, feedSampleValid, SampleColumns, type AttemptFailure, type FeedAnswer, type FeedColumns, type FeedHave, type FeedKey, type FeedSample, type FeedTrial, type RankingConfig } from "@gray/routing";
+import { DEFAULT_RANKING_CONFIG, FEED_VERSION, feedColumnsCount, feedKeyValid, feedRecordValid, feedSampleValid, RECORDS_BOUND, recordSummaryValid, SampleColumns, type AttemptFailure, type FeedAnswer, type FeedCircuit, type FeedColumns, type FeedHave, type FeedKey, type FeedRecord, type FeedSample, type FeedTrial, type RankingConfig, type RecordSummary } from "@gray/routing";
 import type { RootRankingKey } from "./circuit.ts";
 
 /** A root's push to the collector: its name, its epoch (each instance's own), and the keys that changed, each whole. */
@@ -31,6 +37,11 @@ export interface RankingPush {
   readonly root: string;
   readonly rootEpoch: string;
   readonly keys: readonly RootRankingKey[];
+  /**
+   * The root's long-record summary (r17, docs/utility-routing.md "The feed"): with every push once it changed, always
+   * in an export. Absent: unchanged, or a root of an earlier release; null: the root has no record.
+   */
+  readonly record?: RecordSummary | null;
 }
 
 /** The collector's answer to a push: its epoch, which a root that sees it change pushes every key again for. */
@@ -45,6 +56,11 @@ export interface RankingFeedLimits {
   readonly maxSamples: number;
   /** A key not observed for this long is idle (`stale_after_ms`, 600 s, ranking.rs:93). */
   readonly staleMs: number;
+  /**
+   * Roots' records kept at most (r17); absent: @gray/routing's `RECORDS_BOUND` (16,384, an isolate's ranker's too): past
+   * it the least recently updated goes, with the collector's alert.
+   */
+  readonly maxRecords?: number;
 }
 
 /** The removals kept for readers to be told of; a reader behind the oldest one gets everything (`full`). */
@@ -61,6 +77,9 @@ interface Entry {
   lastObserved: number | null;
   trial: FeedTrial;
   open: boolean;
+  /** Its circuit's cooldown end while open and whether a probe lease is out, as its root said (r17); null and false before. */
+  until: number | null;
+  probe: boolean;
   /** The change that last touched it, the one that took it whole, the one that changed its failures. */
   changedSeq: number;
   wholeSeq: number;
@@ -72,6 +91,9 @@ function rootKeyValid(k: unknown, limits: RankingFeedLimits): k is RootRankingKe
   if (k === null || typeof k !== "object") return false;
   const r = k as Record<string, unknown>;
   if (typeof r.open !== "boolean" || typeof r.gen !== "number" || !Number.isSafeInteger(r.gen) || r.gen < 0) return false;
+  // The circuit's members a root of r17 adds: absent from one of an earlier release.
+  if (r.until !== undefined && r.until !== null && !(typeof r.until === "number" && Number.isSafeInteger(r.until) && r.until >= 0)) return false;
+  if (r.probe !== undefined && typeof r.probe !== "boolean") return false;
   if (!Array.isArray(r.samples) || r.samples.length > limits.maxSamples || !r.samples.every(feedSampleValid)) return false;
   // Numbered in order within the run.
   for (let i = 1; i < r.samples.length; i++) if ((r.samples[i] as FeedSample)[0] <= (r.samples[i - 1] as FeedSample)[0]) return false;
@@ -110,6 +132,47 @@ function olderRun(k: RootRankingKey, entry: Entry): boolean {
 
 const sameFailures = (a: readonly (readonly [number, AttemptFailure])[], b: readonly (readonly [number, AttemptFailure])[]) => a.length === b.length && a.every((f, i) => f[0] === b[i]![0] && f[1] === b[i]![1]);
 
+/** The members of a record's summary (`RecordSummary`), in its order. */
+const SUMMARY_NAMES = ["s", "f", "tokens", "decodeMs", "ttftP50", "ttftP90", "ttftP99", "ttftCount", "tpsCount", "at"] as const;
+
+/** `v` as a record's summary, copied member by member, when it is one (@gray/routing `recordSummaryValid`); else null. */
+function summaryOf(v: unknown): RecordSummary | null {
+  if (!recordSummaryValid(v)) return null;
+  return Object.fromEntries(SUMMARY_NAMES.map((name) => [name, v[name]])) as unknown as RecordSummary;
+}
+
+const sameSummary = (a: RecordSummary, b: RecordSummary) => SUMMARY_NAMES.every((name) => a[name] === b[name]);
+
+/**
+ * Whether summary `s` is of an older state of its root's record than `held`, as `olderRun` reads a key's run: merged last
+ * before it (`at`), or at the same `at` not ahead of it in outcomes (S + F), then TTFT samples, then throughput samples
+ * (each merge at one time only adds; the counts never decay). Not older: newer, or another summary of the same state.
+ */
+function olderSummary(s: RecordSummary, held: RecordSummary): boolean {
+  const at = s.at ?? -1;
+  const heldAt = held.at ?? -1;
+  if (at !== heldAt) return at < heldAt;
+  if (s.s + s.f !== held.s + held.f) return s.s + s.f < held.s + held.f;
+  if (s.ttftCount !== held.ttftCount) return s.ttftCount < held.ttftCount;
+  return s.tpsCount <= held.tpsCount;
+}
+
+/** `v` as a key's circuit in a collector's answer (`FeedKey.circuit`), when it is one; else null. */
+function circuitOf(v: unknown): FeedCircuit | null {
+  if (v === null || typeof v !== "object") return null;
+  const c = v as Record<string, unknown>;
+  if (typeof c.open !== "boolean" || typeof c.probe !== "boolean") return null;
+  if (!(c.until === null || (typeof c.until === "number" && Number.isSafeInteger(c.until) && c.until >= 0))) return null;
+  return { open: c.open, until: c.until as number | null, probe: c.probe };
+}
+
+/** A root's record as the feed keeps it: the summary, the change it came at, when it was last pushed (or copied). */
+interface RecordEntry {
+  readonly summary: RecordSummary;
+  readonly seq: number;
+  readonly updatedAt: number;
+}
+
 export class RankingFeed {
   /** The collector's epoch whose sequence numbers this store keeps (a replica's: the collector's it copies). */
   epoch: string;
@@ -120,6 +183,11 @@ export class RankingFeed {
   private asOfMs = 0;
   private readonly entries = new Map<string, Entry>();
   private removed: { readonly key: string; readonly seq: number }[] = [];
+  /** The roots' long-record summaries (r17), by root, and the roots whose record went, with the change they went at. */
+  private readonly records = new Map<string, RecordEntry>();
+  private removedRecords: { readonly root: string; readonly seq: number }[] = [];
+  /** The roots whose record the bound moved out since the last `takeEvictedRecords`. */
+  private evictedRecords: string[] = [];
   private readonly limits: RankingFeedLimits;
   /**
    * This store numbers its epoch's changes itself (the collector), rather than copying another's numbers (a replica). A
@@ -142,6 +210,11 @@ export class RankingFeed {
   /** How many keys it keeps. */
   get size(): number {
     return this.entries.size;
+  }
+
+  /** How many roots' records it keeps (r17). */
+  get recordCount(): number {
+    return this.records.size;
   }
 
   /** When the collector last answered for this store (`asOf`); 0: never. */
@@ -171,6 +244,8 @@ export class RankingFeed {
           lastObserved: k.lastObserved,
           trial: k.trial,
           open: k.open,
+          until: k.until ?? null,
+          probe: k.probe ?? false,
           changedSeq: seq,
           wholeSeq: seq,
           failuresSeq: seq,
@@ -193,13 +268,70 @@ export class RankingFeed {
         entry.lastObserved = k.lastObserved;
         entry.trial = k.trial;
         entry.open = k.open;
+        entry.until = k.until ?? null;
+        entry.probe = k.probe ?? false;
         entry.changedSeq = seq;
       }
       taken += 1;
     }
-    if (taken > 0) this.seq = seq;
+    // The root's record (r17): with the push once it changed, null when the root has none; absent, as it was.
+    const recorded = push.record !== undefined && typeof push.root === "string" && this.takeRecord(push.root, push.record, nowMs, seq);
+    if (taken > 0 || recorded) this.seq = seq;
     this.asOfMs = nowMs;
     return taken;
+  }
+
+  /** The roots whose record the bound moved out since the last call (for the collector's alert). */
+  takeEvictedRecords(): string[] {
+    const out = this.evictedRecords;
+    this.evictedRecords = [];
+    return out;
+  }
+
+  /** Whether the feed holds a record of `root` (the collector keeps such a root on its list). */
+  hasRecord(root: string): boolean {
+    return this.records.has(root);
+  }
+
+  /**
+   * `root`'s record as its push or a sweep's export carries it, at change `seq`: a summary newer than the one held
+   * replaces it (a new root past the bound moves the least recently updated out); an older one, which a sweep's export
+   * answered after the root's push is, changes nothing (`olderSummary`), and nor does null (no record): a root whose record
+   * started over keeps its last summary until the new record's first merge. True when the feed changed.
+   */
+  private takeRecord(root: string, value: unknown, nowMs: number, seq: number): boolean {
+    if (value === null) return false;
+    const summary = summaryOf(value);
+    if (summary === null) return false;
+    const held = this.records.get(root);
+    if (held !== undefined && sameSummary(held.summary, summary)) {
+      this.records.set(root, { ...held, updatedAt: nowMs });
+      return false;
+    }
+    if (held !== undefined && olderSummary(summary, held.summary)) return false;
+    if (held === undefined) this.makeRecordRoom(seq);
+    this.records.set(root, { summary, seq, updatedAt: nowMs });
+    if (this.removedRecords.length > 0) this.removedRecords = this.removedRecords.filter((r) => r.root !== root);
+    return true;
+  }
+
+  private dropRecord(root: string, seq: number): boolean {
+    if (!this.records.delete(root)) return false;
+    this.removedRecords.push({ root, seq });
+    this.trimRemoved();
+    return true;
+  }
+
+  /** Room for a new root's record: past the bound the least recently updated goes (never for being idle alone). */
+  private makeRecordRoom(seq: number): void {
+    const bound = this.limits.maxRecords ?? RECORDS_BOUND;
+    while (this.records.size >= bound) {
+      let victim: { root: string; at: number } | undefined;
+      for (const [root, r] of this.records) if (victim === undefined || r.updatedAt < victim.at || (r.updatedAt === victim.at && root < victim.root)) victim = { root, at: r.updatedAt };
+      if (victim === undefined) return;
+      this.dropRecord(victim.root, seq);
+      this.evictedRecords.push(victim.root);
+    }
   }
 
   /**
@@ -219,6 +351,8 @@ export class RankingFeed {
     if (restart) {
       this.entries.clear();
       this.removed = [];
+      this.records.clear();
+      this.removedRecords = [];
       this.epoch = answer.epoch;
       // The new collector's numbering, whatever the old one had reached (its numbers mean nothing in this epoch).
       this.seq = seq;
@@ -228,13 +362,23 @@ export class RankingFeed {
     for (const key of answer.removed) {
       if (this.entries.delete(key)) this.removed.push({ key, seq });
     }
+    // The roots' records (r17), in the collector's numbers; absent from a collector of an earlier release: as they were.
+    for (const root of Array.isArray(answer.removedRecords) ? answer.removedRecords : []) if (typeof root === "string") this.dropRecord(root, seq);
+    for (const r of Array.isArray(answer.records) ? answer.records : []) {
+      // A record that is not one (@gray/routing `feedRecordValid`: a root's name of 1 to 512 bytes, a summary) alone is
+      // passed over, as an isolate's ranker passes it over.
+      if (!feedRecordValid(r)) continue;
+      const summary = summaryOf(r.summary)!;
+      if (!this.records.has(r.root)) this.makeRecordRoom(seq);
+      this.records.set(r.root, { summary, seq, updatedAt: answer.asOf });
+    }
     this.trimRemoved();
     for (const k of answer.keys) {
       if (!feedKeyValid(k, bounds(this.limits))) continue;
       let e = this.entries.get(k.key);
       if (e === undefined || k.whole) {
         if (e === undefined && !this.makeRoom(answer.asOf, seq)) continue;
-        e = { root: "", rootEpoch: "", gen: 0, samples: new SampleColumns({ tags: true }), failures: [], lastObserved: null, trial: k.trial, open: false, changedSeq: seq, wholeSeq: seq, failuresSeq: seq };
+        e = { root: "", rootEpoch: "", gen: 0, samples: new SampleColumns({ tags: true }), failures: [], lastObserved: null, trial: k.trial, open: false, until: null, probe: false, changedSeq: seq, wholeSeq: seq, failuresSeq: seq };
         this.entries.set(k.key, e);
         this.unremove(k.key);
       }
@@ -250,6 +394,11 @@ export class RankingFeed {
       }
       e.lastObserved = k.lastObserved;
       e.trial = k.trial;
+      // The key's circuit as the collector has it (r17); a collector of an earlier release carries none: closed.
+      const circuit = circuitOf(k.circuit);
+      e.open = circuit?.open ?? false;
+      e.until = circuit?.until ?? null;
+      e.probe = circuit?.probe ?? false;
       e.changedSeq = seq;
     }
     this.seq = Math.max(this.seq, seq);
@@ -281,11 +430,15 @@ export class RankingFeed {
         ...(whole || e.failuresSeq > from ? { failures: e.failures } : {}),
         lastObserved: e.lastObserved,
         trial: e.trial,
+        circuit: { open: e.open, until: e.until, probe: e.probe },
       });
     }
     const removed = full ? [] : this.removed.filter((r) => r.seq > from && !this.entries.has(r.key)).map((r) => r.key);
+    const records: FeedRecord[] = [];
+    for (const [root, r] of this.records) if (full || r.seq > from) records.push({ root, summary: r.summary });
+    const removedRecords = full ? [] : this.removedRecords.filter((r) => r.seq > from && !this.records.has(r.root)).map((r) => r.root);
     void nowMs;
-    return { v: FEED_VERSION, epoch: this.epoch, seq: full ? this.seq : Math.max(this.seq, from), asOf, full, keys, removed: [...new Set(removed)] };
+    return { v: FEED_VERSION, epoch: this.epoch, seq: full ? this.seq : Math.max(this.seq, from), asOf, full, keys, removed: [...new Set(removed)], records, removedRecords: [...new Set(removedRecords)] };
   }
 
   /** Room for a new key (ranking.rs `make_room`): an idle key goes, a closed one before an open one, the least recently observed first. */
@@ -311,5 +464,6 @@ export class RankingFeed {
 
   private trimRemoved(): void {
     while (this.removed.length > REMOVED_KEPT) this.floorSeq = Math.max(this.floorSeq, this.removed.shift()!.seq);
+    while (this.removedRecords.length > REMOVED_KEPT) this.floorSeq = Math.max(this.floorSeq, this.removedRecords.shift()!.seq);
   }
 }

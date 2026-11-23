@@ -2,9 +2,11 @@ import { DEFAULT_RANKING_CONFIG, feedAnswerValid, Ranker, type FeedHave, type Ra
 
 /**
  * The isolate's ranking base (r30 ranking design 2.6): one @gray/routing `Ranker` holding every rank key's samples as the
- * endpoint roots keep them, taken from the ranking feed with the snapshot check (snapshot.ts `SnapshotCache.take`,
- * `Ranker.applyFeed`), which ranking reads (routes.ts `rankerFor`). It outlives the snapshot's versions: the snapshot
- * says what may serve, the base what each route did.
+ * endpoint roots keep them, and since r17 each key's circuit and each root's long-record summary (docs/utility-routing.md
+ * "The feed": `Ranker.circuitOf`, `routeSummary`, which the request path builds its routes for the utility formula from),
+ * taken from the ranking feed with the snapshot check (snapshot.ts `SnapshotCache.take`, `Ranker.applyFeed`), which
+ * ranking reads (routes.ts `rankerFor`). It outlives the snapshot's versions: the snapshot says what may serve, the base
+ * what each route did.
  *
  * Its age is the collector's: `asOf`, the collector's clock when it last answered for the copy the isolate read. A base
  * not confirmed within CONFIG_ALERT_AGE_MS (60 s, the server's REFRESH_TTL) is not used (design G8, declared D4):
@@ -24,6 +26,10 @@ import { DEFAULT_RANKING_CONFIG, feedAnswerValid, Ranker, type FeedHave, type Ra
 export class RankingBase {
   private ranker: Ranker | null = null;
   private asOf = 0;
+  /** Whether the last answer the base took carried the roots' records (`recordsSupported`). */
+  private records = false;
+  /** The latest `asOf` a check found the base current at with the roots' records (`checked`); null before one (`asOfMs`). */
+  private recordsAsOf: number | null = null;
   private alertAgeMs = Number.POSITIVE_INFINITY;
   /** When `ranking_stale` was last said in the current spell. */
   private saidAt = Number.NEGATIVE_INFINITY;
@@ -39,6 +45,17 @@ export class RankingBase {
 
   constructor(log: (event: Record<string, unknown>) => void) {
     this.log = log;
+  }
+
+  /**
+   * Whether the base's producer carries the roots' records (r17, docs/utility-routing.md "The feed", its last item): the
+   * last answer the base took had a `records` member, which a collector of r17 (and a TEE bridge asked for them) always
+   * sends, an empty list too. Without it (none taken yet, or a collector, replica or bridge of an earlier release) the
+   * request path reads the feed as unavailable for the formula: the fixed values, evidence `fixed`. An answer behind the
+   * base or one it cannot read changes nothing.
+   */
+  recordsSupported(): boolean {
+    return this.records;
   }
 
   /** What the base holds of the feed (`FeedHave`), null before its first answer: what a check asks with. */
@@ -62,6 +79,7 @@ export class RankingBase {
       const ranker = this.ranker ?? new Ranker(config);
       ranker.applyFeed(answer, nowMs);
       this.ranker = ranker;
+      this.records = answer.records !== undefined;
       // A whole answer replaces the base, its age with it (another replica's older copy is that old); a delta adds to it.
       this.asOf = answer.full ? answer.asOf : Math.max(this.asOf, answer.asOf);
     } catch (err) {
@@ -75,10 +93,13 @@ export class RankingBase {
 
   /**
    * After a check that asked for the ranking, at `nowMs`: `replicaFailingSince` is the replica's word on its syncs with the
-   * collector (null: they work; undefined: it keeps no copy of the collector). Says `ranking_stale` as the class says.
+   * collector (null: they work; undefined: it keeps no copy of the collector). Says `ranking_stale` as the class says, and
+   * notes when the reads last had a feed (`asOfMs`).
    */
   checked(nowMs: number, timing: { readonly alertAgeMs: number; readonly alertGroupMs: number }, replicaFailingSince: number | null | undefined): void {
     this.alertAgeMs = timing.alertAgeMs;
+    // The reads have a feed now: a later one than they had, never an earlier (a lagging replica's older whole copy).
+    if (this.records && this.current(nowMs) !== null) this.recordsAsOf = Math.max(this.recordsAsOf ?? this.asOf, this.asOf);
     const since = [typeof replicaFailingSince === "number" ? replicaFailingSince : null, this.unreadableSince].reduce<number | null>((a, b) => (a === null ? b : b === null ? a : Math.min(a, b)), null);
     if (this.current(nowMs) !== null || since === null) {
       this.saidAt = Number.NEGATIVE_INFINITY;
@@ -107,6 +128,16 @@ export class RankingBase {
   }
 
   /**
+   * The last time the isolate had a feed the reads can use (`recordsSupported`, routes.ts `feedAvailable`), for a read
+   * that says since when it has none (docs/utility-routing-reads.md "The route reads"): the collector's word on the base
+   * at the latest check that found it current with the roots' records, never earlier than one said before; null before
+   * such a check.
+   */
+  asOfMs(): number | null {
+    return this.recordsAsOf;
+  }
+
+  /**
    * A check that started at `startedAt` brought a ranking answer from `source` (a replica's name; "" unknown) that the base
    * took (`apply` true): kept for `spanAt`, with the one before it when the same source answered both.
    */
@@ -128,15 +159,19 @@ export class RankingBase {
     return nowMs - this.answered[0]!.startedAt;
   }
 
-  /** How many keys, samples and failure-log entries the base holds (the soak's real size of the base, criterion (c)). */
-  size(): { readonly keys: number; readonly samples: number; readonly failures: number } {
+  /**
+   * How many keys, samples and failure-log entries the base holds, and since r17 how many roots' records and keys'
+   * circuits (the soak's real size of the base, criterion (c)).
+   */
+  size(): { readonly keys: number; readonly samples: number; readonly failures: number; readonly records: number; readonly circuits: number } {
     let samples = 0;
     let failures = 0;
     for (const state of this.ranker?.states.values() ?? []) {
       samples += state.samples.length;
       failures += state.failures.length;
     }
-    return { keys: this.ranker?.states.size ?? 0, samples, failures };
+    const held = this.ranker?.feedHeld() ?? { records: 0, circuits: 0 };
+    return { keys: this.ranker?.states.size ?? 0, samples, failures, records: held.records, circuits: held.circuits };
   }
 
   /** The ranker to rank with at `nowMs`: the base's while it is within CONFIG_ALERT_AGE_MS, else null (ranking reads no samples). */

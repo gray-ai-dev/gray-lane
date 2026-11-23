@@ -1,3 +1,4 @@
+import { addAttempt, DEFAULT_RECORD_PARAMS, deltaEmpty, emptyDelta, type RecordDelta } from "@gray/routing";
 import { shardName } from "./naming.ts";
 import { RetryBudgets, retryConcurrencyLimit, SecondOpinionGates, type GateLease } from "./retry.ts";
 import { AccountBlockGates } from "./account-blocks.ts";
@@ -39,6 +40,7 @@ import {
   type ShardMessage,
   type ShardReport,
   type SupplierFailure,
+  recordSuccess,
 } from "./types.ts";
 
 /**
@@ -338,6 +340,13 @@ export class EndpointShardCore {
   // Since the last report.
   private successes = 0;
   private failures = zeroFailures();
+  /**
+   * The long record's increments of the attempts released and noted since the last report (r17, docs/utility-routing.md
+   * "The long record"): the next report carries them (`ShardReport.record`), its resends the same within idleReturnMs of
+   * its first sending and none after (`pendingSentAt`). Memory only: a restart loses what was not reported, and nothing
+   * counts twice.
+   */
+  private record: RecordDelta = emptyDelta();
   private issued = 0;
   private denied = 0;
   private peak = 0;
@@ -386,6 +395,8 @@ export class EndpointShardCore {
   private lastActivityAt: number;
   private seq = 0;
   private pending: ShardReport | null = null;
+  /** When `pending` was first sent (the shard's clock): its resends carry its record only within idleReturnMs of it. */
+  private pendingSentAt = 0;
   /** The report on its way: true once the root answered it, false when its call failed. */
   private reporting: Promise<boolean> | null = null;
   private reportRequested = false;
@@ -737,7 +748,8 @@ export class EndpointShardCore {
     if (real && token.probeId !== null) {
       // Unanswered or failed: the probe lease runs out at the root on its own. The gateway's release (and a refit
       // waiting on it) is held at most ENDPOINT_ROOT_CALL_TIMEOUT_MS.
-      const measure = measureOf(input.measure);
+      // The root adds a probe's or a trial's attempt to the long record itself, never from this shard's increments.
+      const measure = fourMembers(measureOf(input.measure));
       await this.fromRoot(this.root.probeResult({ endpointId: this.identity!.endpointId, probeId: token.probeId, key: circuitKey(token.key), outcome: input.outcome, upstreamMayStillWork: input.upstreamMayStillWork, ...(measure === undefined ? {} : { measure }) }), this.settings.rootCallTimeoutMs);
     }
     // Holding more than it may use (a recall or a lower maximum capped it while its permits were in use): the permit this
@@ -1369,6 +1381,14 @@ export class EndpointShardCore {
     const now = this.clock();
     this.sweep(now);
     let payload = this.pending;
+    if (payload !== null && payload.record !== undefined && now - this.pendingSentAt > this.settings.idleReturnMs) {
+      // Unanswered for longer than idleReturnMs: the root may have applied it and dropped the idle lease that says so
+      // since (it keeps one twice that long after the shard's last report), and would take the resend as new. Without its
+      // record from here: the increments can be lost, never counted twice.
+      const { record: _record, ...rest } = payload;
+      payload = rest;
+      this.pending = rest;
+    }
     if (payload === null) {
       const used = this.used();
       const idle = now - this.lastActivityAt >= this.settings.idleReturnMs;
@@ -1421,10 +1441,14 @@ export class EndpointShardCore {
         viewVersion: this.view?.version ?? 0,
         abandonedProbes: this.abandoned,
         retryStats: this.retryStats(),
+        ...(deltaEmpty(this.record) ? {} : { record: this.record }),
+        // When it was built (`pendingSentAt`), the same in every resend: the root merges no record from an old one.
+        builtAt: now,
       };
       this.abandoned = [];
       this.successes = 0;
       this.failures = zeroFailures();
+      this.record = emptyDelta();
       this.issued = 0;
       this.denied = 0;
       this.peak = used;
@@ -1432,6 +1456,7 @@ export class EndpointShardCore {
       this.viewCheckedAt = now;
       this.viewCheckedSnapshot = this.snapshotSeen;
       this.pending = payload;
+      this.pendingSentAt = now;
     }
     // At most one report interval: a report still unanswered when the next is due counts as failed, so a root that
     // stalls holds no alarm and no later report behind it (the next joins none). Longer than a request's own wait for
@@ -1570,7 +1595,10 @@ export class EndpointShardCore {
       this.hwm > this.inUse + headroom(this.inUse, this.settings) ||
       this.holding > Math.max(this.used(), this.limit()) ||
       this.poolsDirty ||
-      this.abandoned.length > 0
+      this.abandoned.length > 0 ||
+      // The long record's increments (r17). Each attempt that adds to them adds to a key's runs too (`observe`), so this
+      // says nothing the runs do not today; it keeps the record from waiting on them.
+      !deltaEmpty(this.record)
     );
   }
 
@@ -1586,14 +1614,19 @@ export class EndpointShardCore {
     else this.notCounted[outcome.reason] += 1;
   }
 
-  /** An attempt's outcome at rank key `key`, for the key's circuit: a success or a supplier failure, a first call or a repeat. */
+  /**
+   * An attempt's outcome at rank key `key`, for the key's circuit: a success or a supplier failure, a first call or a repeat.
+   * Every one adds to the long record's increments too, repeats included (`addAttempt`, at the rate cap of the view).
+   */
   private observe(key: string, outcome: Outcome, repeat: boolean, measure: OutcomeMeasure | undefined): void {
+    this.record = addAttempt(this.record, recordSuccess(outcome, measure), measure, this.view?.maxRateTps ?? DEFAULT_RECORD_PARAMS.maxRateTps);
     const success = circuitSuccess(outcome);
     if (success === null) return;
     // A key's runs at the bound go to the root at once: past it the oldest would be dropped, a streak among them with
     // them (`CircuitRuns`). Not while a failed report waits out the slow-root window (`takeReportRequest`). The
-    // outcome's measures go beside it, for ranking.
-    if (this.runs.add(key, success, repeat, measure)) this.reportRequested = true;
+    // outcome's measures go beside it, for ranking, as the four members a root of every release reads: whether the
+    // attempt was in its session is the record's alone (above).
+    if (this.runs.add(key, success, repeat, fourMembers(measure))) this.reportRequested = true;
     // Any answer ends the key's streak (`record`: a repeat's success too); a repeat's failure adds nothing to it.
     if (success) {
       this.streaks.delete(key);
@@ -1711,7 +1744,21 @@ function minCap(a: number | null, b: number | null): number | null {
   return Math.min(a, b);
 }
 
-/** An attempt's measures as a release or note carries them, when they are measures (`validMeasure`); a gateway before ranking samples sends none. */
+/**
+ * An attempt's measures as a release or note carries them, when they are measures (`validMeasure`: four members, or five
+ * from a gateway of r17, whose fifth says whether the attempt was in its session); a gateway before ranking samples sends
+ * none.
+ */
 function measureOf(measure: unknown): OutcomeMeasure | undefined {
   return measure !== undefined && validMeasure(measure) ? measure : undefined;
+}
+
+/**
+ * `measure` without its fifth member (`inSession`): what goes to the root, in a report's outcomes and a probe's result. A
+ * root of an earlier release refuses a measure of five members (docs/utility-routing.md "Deployment"), and the session is
+ * the long record's alone, which this shard counts.
+ */
+function fourMembers(measure: OutcomeMeasure | undefined): OutcomeMeasure | undefined {
+  if (measure === undefined || measure.length === 4) return measure;
+  return [measure[0], measure[1], measure[2], measure[3]];
 }

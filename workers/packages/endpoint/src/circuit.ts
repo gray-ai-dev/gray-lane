@@ -9,15 +9,18 @@
  *
  * Each circuit keeps what the server's `EndpointState` keeps of a key: the samples of the stale window (when, whether it
  * succeeded, whether it repeated its request at an operator already called, and the attempt's measures: its latency,
- * time to first token and output tokens), the failures by kind, the trial (`TrialProgress`), the first-call failures in
- * a row, the quarantine (`quarantined_until`: the cooldown's end, kept once it passed while the key is in recovery), the
- * recovery lease, its passes and the spell's clock (`probing_since`, `probe_sent`, `answered`). The circuit reads the
- * samples' outcomes; ranking reads the rest, which the root exports (`rankingState`, the r30 ranking design 2.3).
+ * time to first token and output tokens), the failures by kind, the first-call failures in a row, the quarantine
+ * (`quarantined_until`: the cooldown's end, kept once it passed while the key is in recovery), the recovery lease, its
+ * passes and the spell's clock (`probing_since`, `probe_sent`, `answered`). The circuit reads the samples' outcomes;
+ * ranking reads the rest, which the root exports (`rankingState`, the r30 ranking design 2.3), and since r17 the circuit
+ * itself (`rankingKey`'s `open`, `until` and `probe`, docs/utility-routing.md "The feed"). There is no trial since r17
+ * (docs/utility-routing.md "Decisions": no trial gate); a circuit stored by a release before it keeps one, read and
+ * passed over.
  *
  * Pure: the root supplies the times and the probe ids, and stores `snapshot()`.
  */
 
-import { DEFAULT_RANKING_CONFIG, trialObserve, type AttemptFailure, type FeedSample, type FeedTrial, type RankingConfig, type TrialProgress } from "@gray/routing";
+import type { AttemptFailure, FeedSample, FeedTrial } from "@gray/routing";
 import type { Outcome } from "./types.ts";
 
 /** The key of the circuit an attempt that names no rank key is judged under (rank keys are hex digests). */
@@ -68,14 +71,19 @@ export interface CircuitSettings {
  * its start to its end), its time to first token (streams only; null when unmeasured), the committed answer's output
  * tokens (0 for a failure and a free answer), and a failure's kind (`AttemptFailure`; null for a success).
  */
-export type OutcomeMeasure = readonly [latencyMs: number, ttftMs: number | null, outputTokens: number, failure: AttemptFailure | null];
+export type OutcomeMeasure = readonly [latencyMs: number, ttftMs: number | null, outputTokens: number, failure: AttemptFailure | null, inSession?: 0 | 1];
 
-/** Whether `m` is an attempt's measures (`OutcomeMeasure`): what the root takes from a report or a probe's result. */
+/**
+ * Whether `m` is an attempt's measures (`OutcomeMeasure`): what the root takes from a report or a probe's result, and a
+ * shard from a release. The fifth member (r17, docs/utility-routing.md "The long record"): 1 when the attempt's route was
+ * its session's established provider on the gateway instance that sent it; the shard consumes it for the long record and
+ * never sends it on to the root, so a root of an earlier release only ever meets four members.
+ */
 export function validMeasure(m: unknown): m is OutcomeMeasure {
-  if (!Array.isArray(m) || m.length !== 4) return false;
-  const [latency, ttft, tokens, failure] = m as unknown[];
+  if (!Array.isArray(m) || (m.length !== 4 && m.length !== 5)) return false;
+  const [latency, ttft, tokens, failure, inSession] = m as unknown[];
   const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-  return count(latency) && (ttft === null || count(ttft)) && count(tokens) && (failure === null || (typeof failure === "string" && ATTEMPT_FAILURES.includes(failure as AttemptFailure)));
+  return count(latency) && (ttft === null || count(ttft)) && count(tokens) && (failure === null || (typeof failure === "string" && ATTEMPT_FAILURES.includes(failure as AttemptFailure))) && (m.length === 4 || inSession === 0 || inSession === 1);
 }
 
 const ATTEMPT_FAILURES: readonly string[] = ["timeout", "rate_limited", "transport", "rejected", "protocol"];
@@ -101,7 +109,10 @@ export interface ProbeLease {
   readonly leaseUntil: number;
 }
 
-/** A key's trial as the root stores it (`TrialProgress`). */
+/**
+ * A key's trial as a root of a release before r17 stored it (`TrialProgress`): passed over when read, never written (there
+ * is no trial since). The type goes after the r17 merge.
+ */
 export interface TrialDurable {
   readonly windowStarted: number | null;
   readonly samples: number;
@@ -112,13 +123,13 @@ export interface TrialDurable {
 
 /**
  * A key's state as the root stores it (`EndpointState`). Samples are `[at, success, retry]` with 0/1 flags, and a
- * measured one `[at, success, retry, latencyMs, ttftMs | null, outputTokens]`; version 2 wrote no measures, failures or
- * trial.
+ * measured one `[at, success, retry, latencyMs, ttftMs | null, outputTokens]`; version 2 wrote no measures or failures.
  */
 export interface CircuitDurable {
   readonly key: string;
   readonly samples: readonly (readonly [at: number, success: 0 | 1, retry: 0 | 1] | readonly [at: number, success: 0 | 1, retry: 0 | 1, latencyMs: number, ttftMs: number | null, outputTokens: number])[];
   readonly failures?: readonly (readonly [at: number, failure: AttemptFailure])[];
+  /** The key's trial, which a root of a release before r17 stored: passed over (there is none since). */
   readonly trial?: TrialDurable;
   readonly lastObserved: number | null;
   readonly consecutiveFailures: number;
@@ -131,9 +142,9 @@ export interface CircuitDurable {
 }
 
 /**
- * The root's circuits on disk: `version` 3 (the samples' measures, the failures and the trial; r30 ranking samples).
- * Version 2 is read as samples without measures, no failures and a trial not begun (a root's health row of the
- * statistical breaker had none and is read as no circuits).
+ * The root's circuits on disk: `version` 3 (the samples' measures and the failures; r30 ranking samples; a root of a
+ * release before r17 stored each key's trial too, which is passed over). Version 2 is read as samples without measures
+ * and no failures (a root's health row of the statistical breaker had none and is read as no circuits).
  */
 export interface CircuitsSnapshot {
   readonly version: 2 | 3;
@@ -141,9 +152,10 @@ export interface CircuitsSnapshot {
 }
 
 /**
- * A key's state as ranking reads it, in the server's checkpoint form (ranking.rs `EndpointState`'s `samples`, `failures`,
- * `last_observed` and `trial`, serde's names): what the root exports for ranking (`rankingState`), and what @gray/routing
- * `Ranker.restore` reads. Only measured samples are in it.
+ * A key's state as ranking reads it, in the server's checkpoint form (ranking.rs `EndpointState`'s `samples`, `failures`
+ * and `last_observed`, serde's names): what the root exports for ranking (`rankingState`), and what @gray/routing
+ * `Ranker.restore` reads. Only measured samples are in it. `trial` is always the trial never begun (`NO_TRIAL`): there is
+ * none since r17, and the member stays while readers outside this file still read it; it goes after the r17 merge.
  */
 export interface RankingStateJson {
   readonly samples: readonly { readonly at_ms: number; readonly success: boolean; readonly ttft_ms: number | null; readonly latency_ms: number; readonly output_tokens: number; readonly retry: boolean }[];
@@ -151,6 +163,16 @@ export interface RankingStateJson {
   readonly last_observed: number | null;
   readonly trial: { readonly window_started: number | null; readonly samples: number; readonly failures: number; readonly stable_windows: number; readonly graduated: boolean };
 }
+
+/** The trial never begun: `RankingStateJson.trial`, which nothing reads any more. */
+const NO_TRIAL: RankingStateJson["trial"] = { window_started: null, samples: 0, failures: 0, stable_windows: 0, graduated: false };
+
+/**
+ * Every key's trial as the root pushes it (`RootRankingKey.trial`, the feed's `FeedKey.trial`): graduated. There is no
+ * trial since r17; the member stays on the wire because a reader of an earlier release (an isolate, the TEE entry)
+ * requires it and ranks a key that has not graduated as unproven: read so, every key would be explored alone.
+ */
+const GRADUATED_TRIAL: FeedTrial = { windowStarted: null, samples: 0, failures: 0, stableWindows: 0, graduated: true };
 
 /** ranking.rs `operations_health`'s words. */
 export type CircuitState = "unobserved" | "closed" | "open" | "recovery_in_flight" | "recovery_due";
@@ -203,7 +225,6 @@ interface KeyState {
   sampleN: number;
   samples: Sample[];
   failures: [number, AttemptFailure][];
-  trial: TrialProgress;
   lastObserved: number | null;
   consecutiveFailures: number;
   quarantinedUntil: number | null;
@@ -214,14 +235,13 @@ interface KeyState {
   answered: boolean;
 }
 
-const freshTrial = (): TrialProgress => ({ windowStarted: undefined, samples: 0, failures: 0, stableWindows: 0, graduated: false });
-
-const fresh = (): KeyState => ({ gen: 0, sampleN: 0, samples: [], failures: [], trial: freshTrial(), lastObserved: null, consecutiveFailures: 0, quarantinedUntil: null, probe: null, recoveryPasses: 0, probingSince: null, probeSent: false, answered: false });
+const fresh = (): KeyState => ({ gen: 0, sampleN: 0, samples: [], failures: [], lastObserved: null, consecutiveFailures: 0, quarantinedUntil: null, probe: null, recoveryPasses: 0, probingSince: null, probeSent: false, answered: false });
 
 /**
  * A key's state as the root pushes it to the ranking collector (r30 ranking design 2.3): its run (`gen`) and its measured
- * samples numbered within it (`FeedSample`), its failures, its last observation, its trial, and whether its circuit is
- * open (the collector's eviction order: open ones last).
+ * samples numbered within it (`FeedSample`), its failures, its last observation, its trial (`GRADUATED_TRIAL`: there is
+ * none since r17), whether its circuit is open (the collector's eviction order: open ones last), and since r17 its
+ * cooldown's end while open and whether a probe lease is out (`until`, `probe`: the feed's `FeedKey.circuit`).
  */
 export interface RootRankingKey {
   readonly key: string;
@@ -231,6 +251,12 @@ export interface RootRankingKey {
   readonly lastObserved: number | null;
   readonly trial: FeedTrial;
   readonly open: boolean;
+  /**
+   * r17 (docs/utility-routing.md "The feed"): the cooldown's end while open, and whether a probe lease is out; the collector
+   * passes them to the feed as `FeedKey.circuit`. Absent from a root of an earlier release.
+   */
+  readonly until?: number | null;
+  readonly probe?: boolean;
 }
 
 /** The circuit closed, or its probe failed: the half-open spell is over (ranking.rs `EndpointState::end_spell`). */
@@ -254,8 +280,6 @@ const NO_CHANGE: CircuitChange = { flipped: false, durable: false };
 
 export class Circuits {
   private readonly settings: CircuitSettings;
-  /** The trial's numbers (`TrialProgress::observe`): the server's defaults, with the circuit's least samples. */
-  private readonly trialConfig: RankingConfig;
   private readonly keys = new Map<string, KeyState>();
 
   /**
@@ -264,10 +288,8 @@ export class Circuits {
    */
   constructor(settings: CircuitSettings, snapshot: CircuitsSnapshot | null = null, now: number = Number.POSITIVE_INFINITY) {
     this.settings = settings;
-    this.trialConfig = { ...DEFAULT_RANKING_CONFIG, minimumSamples: settings.minimumSamples };
     const live = (at: number) => now === Number.POSITIVE_INFINITY || (at <= now && now - at <= settings.staleMs);
     for (const c of snapshot?.circuits ?? []) {
-      const t = c.trial;
       const samples = c.samples
         .filter((x) => live(x[0]))
         .map((x, i) => ({ n: i + 1, at: x[0], success: x[1] === 1, retry: x[2] === 1, measure: x.length === 6 ? ([x[3], x[4], x[5]] as const) : null }));
@@ -278,7 +300,6 @@ export class Circuits {
         sampleN: samples.length,
         samples,
         failures: (c.failures ?? []).filter(([at]) => live(at)).map(([at, kind]) => [at, kind]),
-        trial: t === undefined ? freshTrial() : { windowStarted: t.windowStarted ?? undefined, samples: t.samples, failures: t.failures, stableWindows: t.stableWindows, graduated: t.graduated },
         lastObserved: c.lastObserved,
         consecutiveFailures: c.consecutiveFailures,
         quarantinedUntil: c.quarantinedUntil,
@@ -301,13 +322,11 @@ export class Circuits {
       s.quarantinedUntil = null;
       endSpell(s);
       s.consecutiveFailures = 0;
-      // The answers stay with their measures; the failures, and the trial's count of them, go. A new run of samples:
-      // the ranking feed takes the key whole.
+      // The answers stay with their measures; the failures go. A new run of samples: the ranking feed takes the key whole.
       s.samples = s.samples.filter((x) => x.success && x.at <= now && now - x.at <= this.settings.staleMs).map((x, i) => ({ ...x, n: i + 1 }));
       s.sampleN = s.samples.length;
       s.gen += 1;
       s.failures = [];
-      s.trial.failures = 0;
     }
     for (const key of this.keys.keys()) this.dirty.add(key);
   }
@@ -319,7 +338,6 @@ export class Circuits {
         key,
         samples: s.samples.map((x) => (x.measure === null ? ([x.at, x.success ? 1 : 0, x.retry ? 1 : 0] as const) : ([x.at, x.success ? 1 : 0, x.retry ? 1 : 0, x.measure[0], x.measure[1], x.measure[2]] as const))),
         failures: s.failures.map(([at, kind]) => [at, kind] as const),
-        trial: { windowStarted: s.trial.windowStarted ?? null, samples: s.trial.samples, failures: s.trial.failures, stableWindows: s.trial.stableWindows, graduated: s.trial.graduated },
         lastObserved: s.lastObserved,
         consecutiveFailures: s.consecutiveFailures,
         quarantinedUntil: s.quarantinedUntil,
@@ -419,8 +437,6 @@ export class Circuits {
       // with no other supply would otherwise open its circuit for everyone.
       s.consecutiveFailures += 1;
     }
-    // The trial counts every attempt, repeats too (`TrialProgress::observe`).
-    trialObserve(s.trial, at, obs.success, this.trialConfig);
     s.lastObserved = at;
     if (m !== undefined && m[3] !== null) s.failures.push([at, m[3]]);
     while (s.failures.length > this.settings.maxSamples) s.failures.shift();
@@ -437,8 +453,6 @@ export class Circuits {
       const { minimumSamples } = this.settings;
       if (s.consecutiveFailures >= this.settings.failureThreshold || (trip.count >= minimumSamples && trip.effective >= minimumSamples / 2 && failureRate >= this.settings.failureRate)) {
         s.quarantinedUntil = at + this.settings.cooldownMs;
-        // A key that trips starts its trial again.
-        s.trial = freshTrial();
         endSpell(s);
         durable = true;
       }
@@ -516,16 +530,21 @@ export class Circuits {
 
   /**
    * Marks `lease` as the key's one recovery lease (ranking.rs `lease`): the first lease after a cooldown begins the
-   * half-open spell; until a probe of the spell has been sent, each lease starts its clock afresh.
+   * half-open spell; until a probe of the spell has been sent, each lease starts its clock afresh. The key changed for the
+   * ranking feed (r17: a probe is out).
    */
   lease(key: string, lease: ProbeLease, now: number): void {
     const s = this.keys.get(key);
     if (s === undefined) return;
     s.probe = lease;
     s.probingSince = s.probeSent ? (s.probingSince ?? now) : now;
+    this.dirty.add(key);
   }
 
-  /** The probe holding the key's lease is being sent upstream (`probe_sent`): from here the spell's clock runs whatever becomes of the lease. */
+  /**
+   * The probe holding the key's lease is being sent upstream (`probe_sent`): from here the spell's clock runs whatever
+   * becomes of the lease. The key changed for the ranking feed when it changed anything.
+   */
   probeSent(key: string, probeId: string): boolean {
     return this.withLease(key, probeId, (s) => {
       if (s.probeSent) return false;
@@ -534,7 +553,10 @@ export class Circuits {
     });
   }
 
-  /** The probe holding the key's lease answered with a success status (`probe_answered`): its waiters, and later requests, go on as trials. */
+  /**
+   * The probe holding the key's lease answered with a success status (`probe_answered`): its waiters, and later requests,
+   * go on as trials. The key changed for the ranking feed when it changed anything.
+   */
   probeAnswered(key: string, probeId: string): boolean {
     return this.withLease(key, probeId, (s) => {
       if (s.answered && s.probeSent) return false;
@@ -547,7 +569,8 @@ export class Circuits {
 
   /**
    * The probe holding the key's lease gave it back (`abandon_recovery`): a probe that never went out leaves no clock
-   * behind; one that went out keeps it (`sent`: its result said it went out, which its `probeSent` may not have).
+   * behind; one that went out keeps it (`sent`: its result said it went out, which its `probeSent` may not have). The key
+   * changed for the ranking feed (r17: no probe is out).
    */
   abandon(key: string, probeId: string, sent: boolean): boolean {
     return this.withLease(key, probeId, (s) => {
@@ -581,21 +604,56 @@ export class Circuits {
 
   /**
    * The keys whose state changed since the ranking feed last took them (`takeDirty`), every key after a load or another
-   * build's restore. The route's own circuit (`ROUTE_CIRCUIT`, the attempts that name no rank key) is never pushed.
+   * build's restore: an attempt's outcome (the circuit opening and closing among them), and since r17 a lease taken,
+   * given back or run out, a probe sent and a probe's answer (docs/utility-routing.md "The feed": the circuit travels).
+   * The route's own circuit (`ROUTE_CIRCUIT`, the attempts that name no rank key) is never pushed.
    */
   private readonly dirty = new Set<string>();
+  /** Each key's lease end that ran out and was marked changed (`runOut`), so that one end marks it once. */
+  private readonly ranOut = new Map<string, number>();
 
-  /** Whether a key changed since the ranking feed last took them. */
-  hasDirty(): boolean {
+  /**
+   * Marks changed every key whose lease ran out by `now` (its end passed with no outcome, give-back or later lease), once
+   * a lease: the feed then shows no probe out, with no event of its own to say so.
+   */
+  private runOut(now: number): void {
+    for (const [key, s] of this.keys) {
+      if (s.probe === null || now <= s.probe.leaseUntil || this.ranOut.get(key) === s.probe.leaseUntil) continue;
+      this.ranOut.set(key, s.probe.leaseUntil);
+      this.dirty.add(key);
+    }
+  }
+
+  /** Whether a key changed since the ranking feed last took them, a lease run out by `now` among them. */
+  hasDirty(now: number): boolean {
+    this.runOut(now);
     for (const key of this.dirty) if (key !== ROUTE_CIRCUIT && this.keys.has(key)) return true;
     return false;
   }
 
-  /** The keys changed since the last call, and none kept (`Circuits.dirty`). */
-  takeDirty(): string[] {
+  /** The keys changed since the last call, a lease run out by `now` among them, and none kept (`Circuits.dirty`). */
+  takeDirty(now: number): string[] {
+    this.runOut(now);
     const out = [...this.dirty].filter((key) => key !== ROUTE_CIRCUIT && this.keys.has(key));
     this.dirty.clear();
     return out;
+  }
+
+  /**
+   * When a root with nothing else to push should look again at `now`, so that its feed stops showing a probe out once
+   * none is: the first moment one of the leases still out runs out, its end + 1 (a lease runs out once the clock passes
+   * its end, `now > leaseUntil`), or null when none is out. Every lease that has run out by `now` is first marked
+   * changed (`runOut`), so a look at that moment is what puts it in the next push.
+   */
+  nextLeaseEnd(now: number): number | null {
+    this.runOut(now);
+    let soonest: number | null = null;
+    for (const s of this.keys.values()) {
+      if (s.probe === null || now > s.probe.leaseUntil) continue;
+      const end = s.probe.leaseUntil + 1;
+      if (soonest === null || end < soonest) soonest = end;
+    }
+    return soonest;
   }
 
   /** Marks `keys` changed again (a push that did not go), or every key (`keys` absent: the collector started over). */
@@ -603,21 +661,26 @@ export class Circuits {
     for (const key of keys ?? this.keys.keys()) this.dirty.add(key);
   }
 
-  /** `key`'s state as the root pushes it to the ranking collector (`RootRankingKey`), or null for a key it does not keep. */
-  rankingKey(key: string): RootRankingKey | null {
+  /**
+   * `key`'s state as the root pushes it to the ranking collector (`RootRankingKey`), or null for a key it does not keep:
+   * since r17 its circuit too, the cooldown's end while open (`until`) and whether a probe lease is out (`probe`: one held,
+   * and not run out by `now`).
+   */
+  rankingKey(key: string, now: number): RootRankingKey | null {
     const s = this.keys.get(key);
     if (s === undefined) return null;
     const samples: FeedSample[] = [];
     for (const x of s.samples) if (x.measure !== null) samples.push([x.n, x.at, x.success ? 1 : 0, x.retry ? 1 : 0, x.measure[0], x.measure[1], x.measure[2]]);
-    const t = s.trial;
     return {
       key,
       gen: s.gen,
       samples,
       failures: s.failures.map(([at, kind]) => [at, kind] as const),
       lastObserved: s.lastObserved,
-      trial: { windowStarted: t.windowStarted ?? null, samples: t.samples, failures: t.failures, stableWindows: t.stableWindows, graduated: t.graduated },
+      trial: GRADUATED_TRIAL,
       open: s.quarantinedUntil !== null,
+      until: s.quarantinedUntil,
+      probe: s.probe !== null && now <= s.probe.leaseUntil,
     };
   }
 
@@ -628,19 +691,18 @@ export class Circuits {
 
   /**
    * `key`'s state as ranking reads it (`RankingStateJson`, the server's checkpoint form), or null for a key the root does
-   * not keep: its measured samples, its failures, its last observation and its trial.
+   * not keep: its measured samples, its failures and its last observation (its trial the one never begun).
    */
   rankingState(key: string): RankingStateJson | null {
     const s = this.keys.get(key);
     if (s === undefined) return null;
     const samples: RankingStateJson["samples"][number][] = [];
     for (const x of s.samples) if (x.measure !== null) samples.push({ at_ms: x.at, success: x.success, ttft_ms: x.measure[1], latency_ms: x.measure[0], output_tokens: x.measure[2], retry: x.retry });
-    const t = s.trial;
     return {
       samples,
       failures: s.failures.map(([at, kind]) => [at, kind] as const),
       last_observed: s.lastObserved,
-      trial: { window_started: t.windowStarted ?? null, samples: t.samples, failures: t.failures, stable_windows: t.stableWindows, graduated: t.graduated },
+      trial: NO_TRIAL,
     };
   }
 
@@ -654,11 +716,16 @@ export class Circuits {
     return s.quarantinedUntil !== null && (s.answered || (s.probingSince !== null && now >= s.probingSince + this.settings.recoveryWaitMs));
   }
 
-  /** Applies `change` to `key` when probe `probeId` holds its lease, and says whether it changed anything. */
+  /**
+   * Applies `change` to `key` when probe `probeId` holds its lease, and says whether it changed anything: when it did, the
+   * key changed for the ranking feed.
+   */
   private withLease(key: string, probeId: string, change: (s: KeyState) => boolean): boolean {
     const s = this.keys.get(key);
     if (s === undefined || s.probe === null || s.probe.id !== probeId) return false;
-    return change(s);
+    const changed = change(s);
+    if (changed) this.dirty.add(key);
+    return changed;
   }
 
   /** The samples of the stale window at `now`, all of them (ranking.rs `stats`): their count and weighted success rate. */
@@ -719,6 +786,7 @@ export class Circuits {
     }
     if (victim === undefined) return false;
     this.keys.delete(victim);
+    this.ranOut.delete(victim);
     return true;
   }
 }

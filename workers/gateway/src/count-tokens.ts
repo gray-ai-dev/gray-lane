@@ -39,7 +39,7 @@ import {
   type CanonicalRequest,
   type Protocol,
 } from "@gray/protocol";
-import { Preference, type RankingPolicy } from "@gray/routing";
+import { Preference } from "@gray/routing";
 import { providerRef, supplierRef } from "@gray/snapshot";
 import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import { workspaceHome } from "./account.ts";
@@ -112,7 +112,7 @@ import {
 import { noProvider, unrouted } from "./resolution.ts";
 import { REST_EGRESS_REGION, shardRestView } from "./rests.ts";
 import type { AnswerShare } from "./retained.ts";
-import { pinHolds, rankDetailed, regionMatches, releaseOutdated, withinMaxPrice, type Route } from "./routes.ts";
+import { rankDetailed, regionMatches, releaseOutdated, withinMaxPrice, type Route } from "./routes.ts";
 import {
   clientFields,
   emitRecord,
@@ -772,12 +772,12 @@ export class CountTokensRun {
   ): Promise<Route | null> {
     const remaining = routes.filter((r) => !attempted.has(r.record.endpointId) && (onlyOperator === null || r.record.operator === onlyOperator));
     if (remaining.length === 0) return null;
-    const policy: RankingPolicy = preference.orderingPolicy(this.deps.policy);
     const now = this.deps.clock();
-    const issued = issuedRoutes !== null && remaining.some((r) => issuedRoutes.has(r.record.endpointId));
-    const exploration = issued ? "suppressed" : preference.exploration();
     const rests = await shardRestView(this.deps.shardRests, remaining, false, now, this.deps.cfg.endpointReportMs, snapshot.version, this.rankRegionOf);
-    const ranking = await rankDetailed(snapshot, remaining, this.requestId, now, policy, exploration, rests, false, false, this.rankRegionOf);
+    // The routes as the ranker's circuits leave them (routes.ts `rankDetailed`): the ranking policies and exploration
+    // this ordered by are gone (r17, docs/utility-routing.md "The rankers"), and a count serves no completion for the
+    // utility formula to rank (open point in the r17 sync hand-in).
+    const ranking = await rankDetailed(snapshot, remaining, this.requestId, now, rests, false, false, this.rankRegionOf);
     const ordered = ranking.ordered;
     if (ordered.length === 0) return null;
     if (preference.order.length > 0) {
@@ -789,7 +789,9 @@ export class CountTokensRun {
       return sorted[0] ?? null;
     }
     if (issuedRoutes !== null) {
-      const pinned = ordered.find((r) => issuedRoutes.has(r.record.endpointId) && pinHolds(snapshot, remaining, r, now, false, this.rankRegionOf));
+      // The tool-call issuer takes the head among the routes the circuits left, as admission's plan gives it (plan-order.ts
+      // `issuerTarget`; r17 removed the reliability pin, `pinHolds`).
+      const pinned = ordered.find((r) => issuedRoutes.has(r.record.endpointId));
       if (pinned !== undefined) return pinned;
     }
     if (avoidOwner !== null) {

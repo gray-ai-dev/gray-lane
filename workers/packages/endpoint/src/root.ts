@@ -1,10 +1,13 @@
 import { LOCATION_HINTS } from "@gray/config";
+import { isGeneration, isProtocol } from "@gray/protocol";
+import { addAttempt, DEFAULT_RECORD_PARAMS, emptyDelta, emptyRecord, mergeDelta, recordFromJson, recordParamsWithinBounds, summaryOf, type LongRecord, type RecordDelta, type RecordParams, type RecordSummary } from "@gray/routing";
 import { mergeAccountBlockViews } from "./account-blocks.ts";
 import { Circuits, decodeRuns, ROUTE_CIRCUIT, validMeasure, type CircuitHealth, type CircuitsSnapshot, type ProbeLease, type RankingStateJson } from "./circuit.ts";
 import type { RankingPush, RankingPushAck } from "./ranking-feed.ts";
 import { retryConcurrencyLimit } from "./retry.ts";
 import { circuitSettings, inDoubtMs, type EndpointSettings } from "./settings.ts";
 import {
+  recordSuccess,
   SUPPLIER_FAILURES,
   type AnsweredInput,
   type Breaker,
@@ -66,6 +69,14 @@ import {
  *   the root's state on disk, written with every change, so a root that comes back keeps them; a root another
  *   build wrote drops them with the breaker's evidence (`restoreOtherBuild`), as the server's restore drops
  *   another build's rests.
+ * - The long record (r17, docs/utility-routing.md "The long record"). The route's TTFT, throughput and availability,
+ *   decayed by time with a floor (`@gray/routing` record.ts): each applied report's increments (`ShardReport.record`)
+ *   and each probe's and trial's result are merged at the root's clock, and the record goes to disk (row 4) with the
+ *   circuits and the leases' sequence numbers, so the record on disk never holds a report the leases on disk do not.
+ *   Another build's restart keeps it (outcome counts, which a release does not reinterpret). Its parameters come with
+ *   `configure` (`recordParams`, the highest version, on disk in the root's state); while it has fewer than `threshold`
+ *   TTFT samples the root grants at most `unmeasuredInflight` permits in all (`ceiling`), and its summary goes to the
+ *   ranking collector with the pushes.
  *
  * Pure: the Durable Object (workers/gateway/src/objects/endpoint-root.ts) supplies the storage and
  * the clock, and delivers the returned messages to the shards.
@@ -126,6 +137,16 @@ export interface RootDurable {
   readonly recoveryPasses?: number;
   readonly probe?: unknown;
   readonly probePermits?: readonly unknown[];
+  /**
+   * The long record's parameters last taken from a `configure` (r17, `ConfigureInput.recordParams`): the latest version
+   * the publisher sent. Absent: never taken, the code's defaults (version 0).
+   */
+  readonly recordParams?: RecordParams;
+  /**
+   * A `configure` brought record parameters, taken or refused (`recordParamsReceived`): absent with `recordParams` too,
+   * the root asks to be told again. Refused ones would come again just the same.
+   */
+  readonly recordParamsTold?: true;
 }
 
 export interface LeaseRow {
@@ -172,14 +193,20 @@ export interface Orphaned {
  * release-4 build before 2026-10-25 wrote its circuits there, which `EndpointRootCore` moves to their own place.
  */
 export interface RootStore {
-  /** `circuits`: as last written (`saveCircuits`). `health`: what the health window's place holds, unread except as above. */
-  load(): { readonly root: RootDurable | null; readonly leases: readonly LeaseRow[]; readonly circuits: CircuitsSnapshot | null; readonly health: unknown };
+  /**
+   * `circuits`: as last written (`saveCircuits`). `health`: what the health window's place holds, unread except as above.
+   * `record`: the long record's place (row 4 of the gateway's SqlRootStore) as last written (`saveRecord`), read by
+   * `recordFromJson`; absent or null: nothing there (a root of an earlier release, or a store without the place).
+   */
+  load(): { readonly root: RootDurable | null; readonly leases: readonly LeaseRow[]; readonly circuits: CircuitsSnapshot | null; readonly health: unknown; readonly record?: unknown };
   saveRoot(root: RootDurable): void;
   saveLease(lease: LeaseRow): void;
   deleteLease(shard: string): void;
   saveCircuits(circuits: CircuitsSnapshot): void;
   /** Empties the health window's place (only ever for circuits a release-4 build wrote there). */
   deleteHealth(): void;
+  /** Writes the long record's place. Absent from a store without it (an earlier test double): the record stays in memory. */
+  saveRecord?(record: LongRecord): void;
 }
 
 interface Lease {
@@ -326,6 +353,24 @@ export class EndpointRootCore {
   private trips = 0;
   /** Each shard's latest retry and refusal figures (memory only, for operations health). */
   private readonly shardStats = new Map<string, { readonly stats: RetryStats; readonly at: number }>();
+  /** The route's long record (r17), as merged so far; on disk (`saveRecord`) with the circuits. */
+  private record: LongRecord;
+  /** The record changed since it was last written (`saveHealth`). */
+  private recordUnsaved = false;
+  /** The record's place on disk holds something (a record, or one this build cannot read). */
+  private recordOnDisk: boolean;
+  /** The record changed since the last push to the ranking collector (`takeRankingPush`). */
+  private recordPushDue = false;
+  /** The disk held a record this build cannot read (another `v`, a bad shape): it started a new one. Said in the log. */
+  readonly recordDropped: boolean;
+
+  /**
+   * Whether a `configure` ever brought this root the long record's parameters, taken or refused: until one does, the
+   * root's object asks gray-jobs to tell it again (`askToBeTold`) rather than wait for the hourly re-tell.
+   */
+  get recordParamsReceived(): boolean {
+    return this.root.recordParams !== undefined || this.root.recordParamsTold === true;
+  }
 
   /**
    * `build`: the Worker version this root runs (its version metadata id), or null where none is bound
@@ -374,6 +419,25 @@ export class EndpointRootCore {
     }
     this.circuits = new Circuits(circuitSettings(settings), saved, now);
     this.healthSavedAt = now;
+    // The long record, before anything below writes the health turn. A record this build cannot read starts over.
+    const stored = loaded.record ?? null;
+    const record = stored === null ? null : recordFromJson(stored);
+    this.recordOnDisk = stored !== null;
+    this.recordDropped = stored !== null && record === null;
+    this.record = record ?? emptyRecord();
+    if (record === null && this.root.configured) {
+      // A configured root without a record it reads (one of an earlier release, or one whose record was dropped): the route
+      // starts on start values and its in-flight cap (docs/utility-routing.md "Deployment"), which reaches every shard
+      // holding permits in a new view, as a lower maximum does. The empty record goes to its place, so the next start of
+      // this root is not taken for that again.
+      if (this.ceiling() < this.root.maxConcurrency) {
+        this.capLeases(this.ceiling());
+        const version = this.root.version + 1;
+        this.root = { ...this.root, version, deliverVersion: version };
+        store.saveRoot(this.root);
+      }
+      this.writeRecordPlace();
+    }
     // A root this build wrote keeps its leases and their spells' clocks, unlike the server's restart of its own
     // checkpoint (ranking.rs `restore`, where the process took the probe's request with it): the platform takes an idle
     // root out of memory (about 10 s idle, endpoint.md section 6), not the gateway's requests, so the probe it granted
@@ -443,16 +507,23 @@ export class EndpointRootCore {
   takeRankingPush(root: string, now = false): RankingPush | null {
     const at = this.clock();
     if (!now && at - this.lastRankingPushAt < this.rankingPushInterval()) return null;
-    const changed = this.circuits.takeDirty();
-    if (changed.length === 0) return null;
+    // At the root's clock: a probe lease that ran out by now is a change, and the keys say no probe is out (r17).
+    const changed = this.circuits.takeDirty(at);
+    const record = this.recordPushDue;
+    if (changed.length === 0 && !record) return null;
     this.lastRankingPushAt = at;
-    return { root, rootEpoch: this.rankingEpoch, keys: changed.map((key) => this.circuits.rankingKey(key)).filter((k) => k !== null) };
+    this.recordPushDue = false;
+    // The long record's summary with the push once it changed (r17): absent, a collector keeps what it had.
+    return { root, rootEpoch: this.rankingEpoch, keys: changed.map((key) => this.circuits.rankingKey(key, at)).filter((k) => k !== null), ...(record ? { record: this.recordSummary() } : {}) };
   }
 
-  /** The collector took a push: a new epoch of its (it started over) has every key pushed again. */
+  /** The collector took a push: a new epoch of its (it started over) has every key, and the record, pushed again. */
   rankingPushed(ack: RankingPushAck): void {
     this.rankingPushFailures = 0;
-    if (this.collectorEpoch !== null && ack.epoch !== this.collectorEpoch) this.circuits.markDirty();
+    if (this.collectorEpoch !== null && ack.epoch !== this.collectorEpoch) {
+      this.circuits.markDirty();
+      this.recordPushDue = true;
+    }
     this.collectorEpoch = ack.epoch;
   }
 
@@ -465,6 +536,7 @@ export class EndpointRootCore {
   rankingPushFailed(push: RankingPush): void {
     this.rankingPushFailures = Math.min(this.rankingPushFailures + 1, 32);
     this.circuits.markDirty(push.keys.map((k) => k.key));
+    if (push.record !== undefined) this.recordPushDue = true;
   }
 
   /** How long after the last push the next may go: ENDPOINT_REPORT_MS, backing off after failed ones (`rankingPushFailed`). */
@@ -475,12 +547,20 @@ export class EndpointRootCore {
 
   /** Every key's ranking state, whole (`root`: this root's name): what the collector asks a root for when it starts over. */
   rankingExport(root: string): RankingPush {
-    return { root, rootEpoch: this.rankingEpoch, keys: this.circuits.rankingKeys().map((key) => this.circuits.rankingKey(key)).filter((k) => k !== null) };
+    const at = this.clock();
+    return { root, rootEpoch: this.rankingEpoch, keys: this.circuits.rankingKeys().map((key) => this.circuits.rankingKey(key, at)).filter((k) => k !== null), record: this.recordSummary() };
   }
 
-  /** When the next push may go, while keys wait for one; null when none waits (`nextWakeAt`). */
-  private rankingPushDue(): number | null {
-    return this.rankingPushes && this.circuits.hasDirty() ? this.lastRankingPushAt + this.rankingPushInterval() : null;
+  /**
+   * When the next push may go, while keys or the record wait for one (a probe lease run out by `now` among them), or the
+   * first moment a probe lease still out runs out (`nextLeaseEnd`), which is a change the feed shows with no event of its
+   * own; null when nothing waits (`nextWakeAt`).
+   */
+  private rankingPushDue(now: number): number | null {
+    if (!this.rankingPushes) return null;
+    const due = this.circuits.hasDirty(now) || this.recordPushDue ? this.lastRankingPushAt + this.rankingPushInterval() : null;
+    const lease = this.circuits.nextLeaseEnd(now);
+    return due === null ? lease : lease === null ? due : Math.min(due, lease);
   }
 
   view(): RootView {
@@ -491,17 +571,21 @@ export class EndpointRootCore {
     // A shard of a Worker version before per-key circuits reads `breaker` alone: the route's circuit, which the attempts
     // such a shard reports (without keys) and asks probes for are judged under.
     const breaker: Breaker = route === undefined ? CLOSED : { state: "open", openedAt: null, cooldownUntil: route.cooldownUntil };
+    const maxRateTps = this.recordParams().maxRateTps;
     return {
       endpointId: r.endpointId,
       version: r.version,
       configured: r.configured,
-      maxConcurrency: r.maxConcurrency,
+      // The in-flight cap of a route without enough TTFT samples is the shards' maximum too (`ceiling`).
+      maxConcurrency: this.ceiling(),
       withdrawn: r.withdrawn,
       breaker,
       circuits,
       shardsPerRegion: r.shardsPerRegion,
       ...(rests.length > 0 ? { rests } : {}),
       ...(r.rebuildingUntil === undefined ? {} : { rebuildingUntil: r.rebuildingUntil }),
+      // Absent: the default every shard takes.
+      ...(maxRateTps === DEFAULT_RECORD_PARAMS.maxRateTps ? {} : { maxRateTps }),
     };
   }
 
@@ -538,11 +622,87 @@ export class EndpointRootCore {
    */
   private knownMax: number | null = null;
 
-  /** The most this root may grant in all at `now`: the maximum, and while the window runs what its known shards held. */
+  /** The most this root may grant in all at `now`: its ceiling, and while the window runs what its known shards held. */
   private limit(now: number): number {
-    if (!this.rebuilding(now)) return this.root.maxConcurrency;
+    if (!this.rebuilding(now)) return this.ceiling();
     if (this.knownMax === null) this.knownMax = this.grantedTotal();
-    return Math.min(this.root.maxConcurrency, this.knownMax);
+    return Math.min(this.ceiling(), this.knownMax);
+  }
+
+  /** The long record's parameters the root holds: the latest it was configured with, else the code's defaults. */
+  private recordParams(): RecordParams {
+    return this.root.recordParams ?? DEFAULT_RECORD_PARAMS;
+  }
+
+  /**
+   * The most this root grants in all, the window aside (`limit`): the offer's maximum, and for a generation protocol's
+   * route while the long record has fewer than `threshold` TTFT samples no more than `unmeasuredInflight`
+   * (docs/utility-routing.md "In-flight cap"): a route without enough data enters ranking on start values, its requests
+   * in flight capped. A non-generative API's route has no time to first token and is never capped (decisions T29). The
+   * view says it as its maximum.
+   */
+  private ceiling(): number {
+    const p = this.recordParams();
+    if (!generationRoute(this.root.endpointId) || this.record.ttftCount >= p.threshold) return this.root.maxConcurrency;
+    return Math.min(this.root.maxConcurrency, p.unmeasuredInflight);
+  }
+
+  /**
+   * Every shard's cap once the most this root grants in all became `room`: when the grants pass it, each may issue only its
+   * share until its reports bring the holdings down; otherwise none (each holds no more than the root counts for it).
+   */
+  private capLeases(room: number): void {
+    const total = this.grantedTotal();
+    for (const lease of this.leases.values()) {
+      const cap = total > room ? Math.floor((room * lease.granted) / total) : null;
+      if (cap !== lease.cap) {
+        lease.cap = cap;
+        this.saveLease(lease);
+      }
+    }
+  }
+
+  /** The record as the gateways read it (`RankingPush.record`): its summary, or null before its first merge. */
+  private recordSummary(): RecordSummary | null {
+    const r = this.record;
+    return r.avail.at === null && r.tps.at === null && r.ttft.at === null ? null : summaryOf(r);
+  }
+
+  /**
+   * `delta` merged into the record at `now` (`mergeDelta`, under the parameters held now), to be written with the next
+   * health write: the caller marks the reporter's lease. True when it lifted the in-flight cap (or set it again): the
+   * caller then sends every shard the new view, which carries the new maximum (as a raise or a lowering does).
+   */
+  private mergeRecord(delta: RecordDelta, now: number): boolean {
+    const before = this.ceiling();
+    const merged = mergeDelta(this.record, delta, now, this.recordParams());
+    if (merged === this.record) return false;
+    this.record = merged;
+    this.recordUnsaved = true;
+    this.recordPushDue = true;
+    if (this.ceiling() === before) return false;
+    this.capLeases(this.ceiling());
+    const version = this.root.version + 1;
+    this.root = { ...this.root, version, deliverVersion: version };
+    this.store.saveRoot(this.root);
+    return true;
+  }
+
+  /**
+   * Writes the record's place now (a start that found none it reads, a first configure): alone while every lease's
+   * sequence number is on disk, else in a health write with the leases whose reports it holds.
+   */
+  private writeRecordPlace(): void {
+    this.recordUnsaved = true;
+    if (this.unsavedSeq.size > 0) {
+      this.saveHealth();
+      return;
+    }
+    if (this.store.saveRecord !== undefined) {
+      this.store.saveRecord(this.record);
+      this.recordOnDisk = true;
+    }
+    this.recordUnsaved = false;
   }
 
   /** The window after this root's storage started over begins, or begins again: every address is asked anew. */
@@ -640,28 +800,34 @@ export class EndpointRootCore {
    * Sets the maximum concurrency from the approved offer. A lower maximum caps every shard at once. The checks
    * that passed (`restChecks`) end the rests they prove over.
    */
-  configure(input: ConfigureInput): { readonly view: RootView; readonly deliveries: readonly Delivery[] } {
+  configure(input: ConfigureInput): { readonly view: RootView; readonly deliveries: readonly Delivery[]; readonly recordParamsRefused?: true } {
     const max = input.maxConcurrency;
     if (!Number.isSafeInteger(max) || max < 1 || max > MAX_CONCURRENCY) throw new RangeError(`maxConcurrency must be an integer in 1..${MAX_CONCURRENCY}, got ${max}`);
     if (input.restChecks !== undefined) checkRestChecks(input.restChecks);
     this.checkEndpoint(input.endpointId, true);
     const ended = input.restChecks === undefined ? false : this.takeChecks(input.restChecks);
+    // The long record's parameters first, whatever else the call changes (a policy change reconfigures every root with its
+    // maximum as it was). Ones this root cannot take are said in the log and change nothing else: the call applies.
+    const taken = this.takeRecordParams(input.recordParams);
+    const refused = taken === "refused" ? ({ recordParamsRefused: true } as const) : {};
     const r = this.root;
-    if (r.configured && r.maxConcurrency === max) return { view: this.view(), deliveries: ended ? this.deliveriesForAll() : [] };
-    const total = this.grantedTotal();
-    // Room for the shards: the new maximum (a probe's and a trial's permits are the shards' too).
-    const room = max;
-    for (const lease of this.leases.values()) {
-      // The shards may hold more than the new maximum leaves them: after a lowering, and also after
-      // a raise that follows a lowering before the holdings came down. Each may then issue only its
-      // share until its reports bring the holdings down. Otherwise every cap is lifted: each shard
-      // holds no more than the root counts for it (granted), and those counts fit.
-      const cap = total > room ? Math.floor((room * lease.granted) / total) : null;
-      if (cap !== lease.cap) {
-        lease.cap = cap;
-        this.saveLease(lease);
-      }
+    if (r.configured && r.maxConcurrency === max) {
+      if (taken !== "view") return { view: this.view(), deliveries: ended ? this.deliveriesForAll() : [], ...refused };
+      // The ceiling or the rate cap moved: every shard holding permits hears the new view, as a new maximum is heard.
+      this.capLeases(this.ceiling());
+      const version = r.version + 1;
+      this.root = { ...r, version, deliverVersion: version };
+      this.store.saveRoot(this.root);
+      return { view: this.view(), deliveries: this.deliveriesForAll(), ...refused };
     }
+    // Room for the shards: the new maximum (a probe's and a trial's permits are the shards' too), the in-flight cap within
+    // it. The shards may hold more than it leaves them: after a lowering, and also after a raise that follows a lowering
+    // before the holdings came down. Each may then issue only its share until its reports bring the holdings down.
+    // Otherwise every cap is lifted: each shard holds no more than the root counts for it (granted), and those counts fit.
+    // The route's name too: a first configure (a root whose storage started over has shards holding permits) learns from
+    // it whether the in-flight cap holds (`generationRoute`), which the caps below are worked out from.
+    this.root = { ...r, endpointId: input.endpointId, maxConcurrency: max };
+    this.capLeases(this.ceiling());
     const version = r.version + 1;
     // ConfigDO configured this capacity before, and this root has never been configured: its storage started over (M12,
     // A7). It no longer knows what it granted, so for a while it grants no more than the shards it knows held (`limit`).
@@ -678,7 +844,10 @@ export class EndpointRootCore {
       ...(startedOver ? { rebuildingUntil: Math.max(r.rebuildingUntil ?? 0, this.clock() + this.rebuildMs()), startedOverAt: this.clock() } : {}),
     };
     this.store.saveRoot(this.root);
-    return { view: this.view(), deliveries: r.configured || startedOver ? this.deliveriesForAll() : [] };
+    // A root configured for the first time has its record's place written: a start of it never takes it for a root of an
+    // earlier release (the constructor).
+    if (!this.recordOnDisk) this.writeRecordPlace();
+    return { view: this.view(), deliveries: r.configured || startedOver ? this.deliveriesForAll() : [], ...refused };
   }
 
   /**
@@ -766,12 +935,19 @@ export class EndpointRootCore {
     readonly tripped: readonly CircuitTrip[];
     readonly startedOver: StartedOver | null;
     readonly behind: Behind | null;
+    /** The report's long-record increments were not ones (`recordDeltaValid`): applied without them. Said in the log. */
+    readonly recordRefused: boolean;
+    /**
+     * The report was built more than idleReturnMs ago (`ShardReport.builtAt`): applied without its long-record
+     * increments, which a copy delayed past its idle lease's removal would count again. Said in the log.
+     */
+    readonly recordLate: boolean;
   } {
     this.checkEndpoint(input.endpointId, false);
     checkReport(input);
     const now = this.clock();
     let lease = this.leases.get(input.shard);
-    const stale = (held: Lease) => ({ reply: { stale: true, view: this.view(), allowance: held.granted }, deliveries: [], tripped: [], startedOver: null, behind: null });
+    const stale = (held: Lease) => ({ reply: { stale: true, view: this.view(), allowance: held.granted }, deliveries: [], tripped: [], startedOver: null, behind: null, recordRefused: false, recordLate: false });
     let startedOver: StartedOver | null = null;
     const another = lease !== undefined && input.incarnation !== undefined && lease.incarnation !== undefined && input.incarnation !== lease.incarnation;
     // A report of a storage made before the lease's: one that was replaced, its report still on its way (an instance
@@ -797,6 +973,9 @@ export class EndpointRootCore {
       lease.epoch = 0;
       lease.seq = 0;
     } else if (lease && (input.epoch < lease.epoch || (input.epoch === lease.epoch && input.seq <= lease.seq))) {
+      // The shard of this storage is there, sending again a report whose answer it missed: its lease is not idle, so a
+      // later resend of that report still finds the lease that says it was taken, and its record counts once.
+      lease.lastSeenAt = now;
       return stale(lease);
     }
     const fresh = !lease;
@@ -876,12 +1055,27 @@ export class EndpointRootCore {
       this.windowStarts();
       deliveries.push(...this.deliveriesForAll().filter((d) => d.shard !== input.shard));
     }
-    if (this.root.configured && input.outcomes !== undefined && input.outcomes.length > 0) {
+    // The report's long-record increments, merged once: this report is applied (a stale one returned above). They go to
+    // disk in the health write that writes its outcomes' circuits (below), with this lease's sequence number before them;
+    // a merge that moves the in-flight cap writes at once, with the view that says it, which every other shard holding
+    // permits hears.
+    const recordRefused = input.record !== undefined && !recordDeltaValid(input.record);
+    // A report built more than idleReturnMs ago (the shard's clock, `builtAt`) merges no record: it may be a copy delayed
+    // in flight past the removal of the idle lease that said it was taken, now taken as new (contract "How it reaches the
+    // root"; exact while the two clocks differ by less than idleReturnMs, as the incarnation's deadline already assumes).
+    // A `builtAt` that is not a time says nothing of its age: taken as late too, never a reason to refuse the report
+    // (its holdings and outcomes must reach the root), as a bad record's increments are not.
+    const built: unknown = input.builtAt;
+    const recordLate = input.record !== undefined && !recordRefused && built !== undefined && (!Number.isSafeInteger(built) || (built as number) < 0 || now - (built as number) > this.settings.idleReturnMs);
+    const merged = input.record !== undefined && !recordRefused && !recordLate;
+    const moved = merged && this.mergeRecord(input.record!, now);
+    const outcomes = this.root.configured && input.outcomes !== undefined && input.outcomes.length > 0;
+    let opened = false;
+    let durable = false;
+    if (outcomes) {
       // Each key's outcomes in the order the shard saw them, now: the shards' reports arrive one at a time, so the
       // root's clock orders them as the server's one process orders its observations.
-      let opened = false;
-      let durable = false;
-      for (const { key, runs, measures } of input.outcomes) {
+      for (const { key, runs, measures } of input.outcomes!) {
         // The last outcomes with their measures (`KeyOutcomes.measures`), the earlier ones as their runs.
         const change = this.circuits.recordOutcomes(key, decodeRuns(runs)!, measures ?? [], now);
         // A report's outcomes are never a probe's, so a key whose circuit flipped here opened.
@@ -894,16 +1088,15 @@ export class EndpointRootCore {
         const version = this.root.version + 1;
         this.root = { ...this.root, version, deliverVersion: version };
         this.store.saveRoot(this.root);
-        // The reporter has the view in its reply.
-        deliveries.push(...this.deliveriesForAll().filter((d) => d.shard !== input.shard));
       }
-      if (durable || now - this.healthSavedAt >= this.settings.healthCheckpointMs) {
-        this.unsavedSeq.add(lease.shard);
-        this.saveHealth();
-      } else {
-        // In memory only until the next write: the alarm writes them once the reports stop (`tick`).
-        this.healthUnsavedAt = now;
-      }
+    }
+    // The reporter has the view in its reply.
+    if (opened || moved) deliveries.push(...this.deliveriesForAll().filter((d) => d.shard !== input.shard));
+    if (outcomes || merged) {
+      this.unsavedSeq.add(lease.shard);
+      // In memory only until the next write: the alarm writes them once the reports stop (`tick`), a checkpoint at the latest.
+      if (durable || moved || now - this.healthSavedAt >= this.settings.healthCheckpointMs) this.saveHealth();
+      else this.healthUnsavedAt = now;
     }
     this.updateShards(now);
 
@@ -939,7 +1132,7 @@ export class EndpointRootCore {
     else this.unsavedSeq.add(lease.shard);
     // The reply carries the view too, but it may be lost: only an acknowledged message counts as
     // delivered (`delivered`), so a broadcast the shard missed is sent again.
-    return { reply: { stale: false, view: this.view(), allowance, ...(recalled > 0 ? { recalled } : {}) }, deliveries, tripped, startedOver, behind };
+    return { reply: { stale: false, view: this.view(), allowance, ...(recalled > 0 ? { recalled } : {}) }, deliveries, tripped, startedOver, behind, recordRefused, recordLate };
   }
 
   /**
@@ -1020,7 +1213,16 @@ export class EndpointRootCore {
       if (this.circuits.abandon(key, input.probeId, outcome.reason !== "not_dispatched")) this.saveHealth();
       return { view: this.view(), deliveries };
     }
-    if (!this.root.configured) return { view: this.view(), deliveries };
+    // The long record counts a probe's and a trial's attempt as any other, the root's own increment: a route in recovery is
+    // no session's provider, so its measure is taken outside a session (a 429 adds nothing), and without a measure a 429
+    // adds nothing either (`recordSuccess`). The circuit still reads every one below.
+    const measure = input.measure !== undefined && validMeasure(input.measure) ? ([input.measure[0], input.measure[1], input.measure[2], input.measure[3]] as const) : undefined;
+    const moved = this.mergeRecord(addAttempt(emptyDelta(), recordSuccess(outcome, measure), measure, this.recordParams().maxRateTps), now);
+    if (moved) deliveries = this.deliveriesForAll();
+    if (!this.root.configured) {
+      this.saveHealthByRule(moved, this.recordUnsaved, now);
+      return { view: this.view(), deliveries };
+    }
     const change = this.circuits.record(key, { at: now, success: outcome.kind === "success", retry: false, ...(input.measure === undefined ? {} : { measure: input.measure }) }, input.probeId);
     if (change.flipped) {
       // The circuit closed (a probe never opens one): every shard hears it.
@@ -1034,9 +1236,19 @@ export class EndpointRootCore {
       this.root = { ...this.root, version: this.root.version + 1 };
       this.store.saveRoot(this.root);
     }
-    if (change.durable) this.saveHealth();
-    else if (change.recorded) this.healthUnsavedAt = now;
+    this.saveHealthByRule(moved || change.durable, change.recorded || this.recordUnsaved, now);
     return { view: this.view(), deliveries };
+  }
+
+  /**
+   * The health write after a probe's or a trial's result, by a report's rule: at once when `atOnce` (a cooldown moved, the
+   * in-flight cap moved); for what is `unsaved` (a sample, the record) at the latest healthCheckpointMs after the last
+   * write, else once results have stopped for healthSaveMs (`tick`). Results closer together than healthSaveMs would
+   * otherwise never reach the disk.
+   */
+  private saveHealthByRule(atOnce: boolean, unsaved: boolean, now: number): void {
+    if (atOnce || (unsaved && now - this.healthSavedAt >= this.settings.healthCheckpointMs)) this.saveHealth();
+    else if (unsaved) this.healthUnsavedAt = now;
   }
 
   /** The Durable Object delivered `version` to `shard`. */
@@ -1089,7 +1301,7 @@ export class EndpointRootCore {
       else if (lease.granted === 0) times.push(lease.lastSeenAt + 2 * this.settings.idleReturnMs + 1);
     }
     if (this.healthUnsavedAt !== null) times.push(this.healthUnsavedAt + this.settings.healthSaveMs);
-    const push = this.rankingPushDue();
+    const push = this.rankingPushDue(now);
     if (push !== null) times.push(push);
     return times.length === 0 ? null : Math.max(now, Math.min(...times));
   }
@@ -1198,6 +1410,33 @@ export class EndpointRootCore {
     return true;
   }
 
+  /**
+   * The long record's parameters a `configure` brought (docs/utility-routing.md "Parameters at the root"): taken when their
+   * version is not lower than the one held (the same version too: a policy the publisher cannot read is the code's
+   * defaults at its row's version), and on disk at once. Ones outside the policy's bounds, or not parameters at all, are
+   * `refused`: the root keeps its own. `view`: taken, and the view they make differs (the ceiling or the rate cap).
+   */
+  private takeRecordParams(input: unknown): "none" | "refused" | "older" | "same" | "taken" | "view" {
+    if (input === undefined) return "none";
+    const params = recordParamsWithin(input);
+    if (params === null) {
+      // Told all the same: asking again would bring the same ones (`recordParamsReceived`).
+      if (!this.recordParamsReceived) {
+        this.root = { ...this.root, recordParamsTold: true };
+        this.store.saveRoot(this.root);
+      }
+      return "refused";
+    }
+    const held = this.root.recordParams;
+    if (held !== undefined && params.version < held.version) return "older";
+    if (held !== undefined && RECORD_PARAM_NAMES.every((name) => held[name] === params[name])) return "same";
+    const ceiling = this.ceiling();
+    const rate = this.recordParams().maxRateTps;
+    this.root = { ...this.root, recordParams: params };
+    this.store.saveRoot(this.root);
+    return this.ceiling() !== ceiling || params.maxRateTps !== rate ? "view" : "taken";
+  }
+
   private checkEndpoint(endpointId: string, configuring: boolean): void {
     if (this.root.endpointId === "" && configuring) return;
     if (this.root.endpointId !== "" && endpointId !== this.root.endpointId) throw new RangeError(`endpoint ${endpointId} sent to the root of ${this.root.endpointId}`);
@@ -1284,6 +1523,12 @@ export class EndpointRootCore {
       if (l) this.saveLease(l);
     }
     this.unsavedSeq.clear();
+    // The long record in the same turn, after the leases whose reports it holds (row 4).
+    if (this.recordUnsaved && this.store.saveRecord !== undefined) {
+      this.store.saveRecord(this.record);
+      this.recordOnDisk = true;
+    }
+    this.recordUnsaved = false;
     this.healthUnsavedAt = null;
     this.healthSavedAt = this.clock();
   }
@@ -1521,6 +1766,59 @@ function checkReport(input: ShardReport): void {
     }
   }
 }
+
+/**
+ * Whether the root named `name` is a generation protocol's route (chat, responses, messages, gemini: `isGeneration`),
+ * which the in-flight cap holds: its name is the route's capacity key, `endpoint:protocol:model hash` (@gray/snapshot
+ * `capacityKey`; no part holds a colon). A name of another shape names no protocol, and is not capped.
+ */
+function generationRoute(name: string): boolean {
+  const parts = name.split(":");
+  const protocol = parts.length === 3 ? parts[1] : undefined;
+  return protocol !== undefined && isProtocol(protocol) && isGeneration(protocol);
+}
+
+/** The members of `RecordParams`, in its order. */
+const RECORD_PARAM_NAMES = ["version", "halfLifeTtftMs", "halfLifeTpsMs", "halfLifeAvailMs", "floorTtft", "floorTps", "floorAvail", "maxRateTps", "unmeasuredInflight", "threshold"] as const;
+
+/**
+ * `input` as the long record's parameters when it is ones the routing policy allows: every member a number, copied member
+ * by member, within the policy's bounds (@gray/routing `recordParamsWithinBounds`, which gray-jobs applied before it sent
+ * them); else null.
+ */
+function recordParamsWithin(input: unknown): RecordParams | null {
+  if (input === null || typeof input !== "object") return null;
+  const p = input as Record<string, unknown>;
+  if (!RECORD_PARAM_NAMES.every((name) => typeof p[name] === "number" && Number.isFinite(p[name]))) return null;
+  const params = Object.fromEntries(RECORD_PARAM_NAMES.map((name) => [name, p[name]])) as unknown as RecordParams;
+  return recordParamsWithinBounds(params) ? params : null;
+}
+
+/**
+ * Whether `d` is a shard's record increments (`ShardReport.record`): whole counts, a decode time only with throughput
+ * samples, TTFT buckets as 32-bit whole numbers strictly ascending, each with a count. A report whose increments are not
+ * is applied without them (`report`'s `recordRefused`): its leases and circuits must not wait on a shard's bad record.
+ */
+function recordDeltaValid(d: unknown): d is RecordDelta {
+  if (d === null || typeof d !== "object") return false;
+  const r = d as Record<string, unknown>;
+  const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  if (!count(r.s) || !count(r.f) || !count(r.tokens) || !count(r.n)) return false;
+  if (typeof r.decodeMs !== "number" || !Number.isFinite(r.decodeMs) || r.decodeMs < 0) return false;
+  if (r.n === 0 && (r.tokens !== 0 || r.decodeMs !== 0)) return false;
+  if (!Array.isArray(r.ttft) || r.ttft.length > TTFT_BUCKETS_BOUND) return false;
+  let last = Number.NEGATIVE_INFINITY;
+  for (const entry of r.ttft as unknown[]) {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    const [bucket, n] = entry as unknown[];
+    if (typeof bucket !== "number" || !Number.isInteger(bucket) || bucket < -2147483648 || bucket > 2147483647 || bucket <= last || !count(n) || n === 0) return false;
+    last = bucket;
+  }
+  return true;
+}
+
+/** The TTFT buckets a delta may hold: every bucket of a whole number of milliseconds up to 2^53 − 1 is fewer (the zero one, 0 to 937). */
+const TTFT_BUCKETS_BOUND = 1024;
 
 function largestPowerOfTwoAtMost(n: number): number {
   let k = 1;

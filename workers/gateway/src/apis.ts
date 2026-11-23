@@ -35,7 +35,7 @@ import {
   type Stop,
 } from "@gray/errors";
 import { accountInDebt, includeRate, insufficientBalance, keySpendLimit, rateBound, requestCeiling, UNDECODED, type RateBound } from "@gray/holds";
-import { get } from "@gray/json";
+import { type Json, get, isObject } from "@gray/json";
 import { accrualId, customerRates, evidenceHash, newRequestId, requestKey as ledgerRequestKey, storedEvidence, usageCost } from "@gray/ledger-keys";
 import {
   type ApiRequest,
@@ -55,9 +55,20 @@ import { ZERO_COUNTERS } from "@gray/protocol";
 import type { CanonicalRequest, Protocol } from "@gray/protocol";
 import { FREE_DELIVERY, type AccountBlockGates, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type OutcomeMeasure, type Pattern, type PermitToken } from "@gray/endpoint";
 import { accountBlockIsolate, blockGates } from "./account-blocks.ts";
-import { headReason, orderPlan, settleHead, steering } from "./plan-order.ts";
-import { layeredOver, tierAdmitted, untagged, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, unreadableDefault, unreadablePreference, unverifiable, verifiableRoute, verifiableUpFront, type PreferenceFacts } from "./preference.ts";
-import { type DispatchPermit, Preference } from "@gray/routing";
+import { HeldProbe, NO_ISSUER, orderPlan, settleHead, steering, type ProbeLeases } from "./plan-order.ts";
+import { layeredOver, tierAdmitted, untagged, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, routingRefused, unreadableDefault, unreadablePreference, unverifiable, utilityRefusal, verifiableRoute, verifiableUpFront, type PreferenceFacts } from "./preference.ts";
+import {
+  DEFAULT_ROUTING_POLICY,
+  Preference,
+  ROUTING_PARAMS_HEADER,
+  keyDefaultPreset,
+  overKeyPreset,
+  resolveRoutingParams,
+  takeRouting,
+  type ModeSource,
+  type RoutingEvidence,
+  type RoutingParams,
+} from "@gray/routing";
 import { admitOnce } from "./admission.ts";
 import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { RequestBudget } from "./budget.ts";
@@ -67,9 +78,9 @@ import { Dispatcher, countedFailure, noRouteRetryAfter, servedLater, skipLabel, 
 import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releasePermit, releaseRetry, reserveRetry, settledWithin, shardFor, type ReleaseFacts, type ShardChoice } from "./endpoints.ts";
 import { judgeEvidence, mediaEvidence } from "./evidence.ts";
 import { originsOf } from "./hosts.ts";
-import type { GatewayDeps } from "./inference.ts";
+import { type GatewayDeps, planReasons } from "./inference.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
-import { type ResponseHash, bodyHashOf, egressCapacity, egressOwnAnswer, egressRefused, egressSentNothing, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
+import { type ResponseHash, bodyHashOf, egressCapacity, egressOwnAnswer, egressRefused, egressSentNothing, laneRoutingParamsInBody, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
 import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHash, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
@@ -80,11 +91,33 @@ import { chargeSidesMismatch, evidenceSides, pricedQuoteOf, recordedSides, safeA
 import { MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
 import { unrouted } from "./resolution.ts";
 import { type AnswerShare, Retained } from "./retained.ts";
-import { fileRest, rankKey, recoveryRefusal, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView } from "./rests.ts";
-import { dispatchExploratory, rank, rankDetailed, rankedWith, rankingBaseAge, rankKeyOf, regionMatches, releaseOutdated, routeProbeLeases, withinBound, withinMaxPrice, type Route } from "./routes.ts";
+import { fileRest, rankKey, recoveryRefusal, REST_EGRESS_REGION, restConfigOf, RestFilings, restInForce, restRoots, restScopeId, restUntil, shardRestView } from "./rests.ts";
+import {
+  orderedOf,
+  rankDetailed,
+  rankedFeed,
+  rankedWith,
+  rankingBaseAge,
+  rankKeyOf,
+  rankUtility,
+  regionMatches,
+  releaseOutdated,
+  routeProbeLeases,
+  screenConstraints,
+  unselectedOf,
+  utilityRoutesOf,
+  withinBound,
+  withinMaxPrice,
+  comparedRates,
+  feedAvailable,
+  type Route,
+  type UtilityAsk,
+  type UtilityRoutes,
+} from "./routes.ts";
+import { formulaRefusal, listFilter, preferenceLevels, preferenceRefusedFacts, recordOfFacts, routingFactsOf, sharesOf, statedOf, type PreferenceLevelFacts, type RoutingFacts, type StatedRouting } from "./request-routing.ts";
 import { notWritten } from "@gray/content";
 import { AttemptEvidence, RequestEvidence } from "./traffic-evidence.ts";
-import { attemptMeasures, clientFields, dispatchRecord, emitRecord, FREE_NO_USAGE, recordDelivery, type AdmissionStage, type AttemptRecord, type BillingOutcome, type FreeReason, type RequestOutcome, type RequestRecord, type RetryEvent } from "./sinks.ts";
+import { attemptMeasures, candidatesOf, clientFields, constraintSkips, dispatchRecord, unbudgeted, emitRecord, FREE_NO_USAGE, recordDelivery, utilityCandidates, type AdmissionStage, type AttemptRecord, type BillingOutcome, type CandidateRecord, type FreeReason, type RequestOutcome, type RequestRecord, type RetryEvent } from "./sinks.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
 import { type GatewaySnapshot, type KeyRecord, type RouteRecord, routeServes, snapshotTiming } from "./snapshot.ts";
 import { sendable, UPSTREAM_BODY_CHUNK_BYTES } from "./upstream.ts";
@@ -197,8 +230,8 @@ interface Attempt {
   providerFailure?: true;
   /** The failure rest in force on its route once its failure rested it (inference.ts `Attempt.rest`): the request log names it. */
   rest?: { readonly cause: string; readonly untilMs: number };
-  /** Its routing group's dispatch (inference.ts `Attempt.dispatch`): committed as it goes out, dropped if it never did. */
-  dispatch?: DispatchPermit;
+  /** What the ranking that chose its route read (routes.ts `rankedWith`), for its dispatch's point (inference.ts `Attempt.ranked`). */
+  ranked?: { readonly ageMs: number | null; readonly spanMs: number | null };
   /** When its dispatch went out (`send`), for its dispatch's point. */
   dispatchedAtMs?: number;
   /** The provider's key, and the attempt's own fetch through egress's `/route/` kind. */
@@ -218,7 +251,8 @@ type SendResult =
    */
   | { readonly kind: "connect" | "transport" | "timeout" | "unsent" }
   | { readonly kind: "refused"; readonly error: ApiError }
-  | { readonly kind: "left" };
+  /** The client left; `started`: the provider's fetch was made, else nothing was sent. */
+  | { readonly kind: "left"; readonly started: boolean };
 
 /** The retry settings (@gray/config RETRY_*), as @gray/errors reads them (inference.ts `retryConfig`). */
 function retryConfig(cfg: GatewayDeps["cfg"]): RetryConfig {
@@ -369,39 +403,64 @@ export class ModelApiRun {
   private attemptsAllowedCount: number | null = null;
   private retryStop: Stop | null = null;
   private readonly skippedRoutes: { endpointId: string; reason: string }[] = [];
+  /** The candidates the record names (inference.ts `routingCandidates`): the formula's, in the plan's order. */
+  private routingCandidates: CandidateRecord[] = [];
+  /** Why the plan's head is first (`routing_head_reason`): the plan's reason, as inference.ts records it. */
   private headReason: string | null = null;
-  /** The request was ranked (wide_event/request.rs `routed`): its record states its affinity facts. */
+  /** The probe the admission plan leased for its head (null: none), and whether every candidate was open with none. */
+  private planProbe: string | null = null;
+  private planAllOpen = false;
+  /** The request was ranked (wide_event/request.rs `routed`): its record states its routing evidence. */
   private ranked = false;
+  /** What the request ranked by (inference.ts `routingEvidence`); null before it was ranked. */
+  private routingEvidence: RoutingEvidence | null = null;
+  /** The routes entering the formula's constraints (`routing_eligible_routes`). */
+  private eligibleRoutes = 0;
+  /** The endpoints of the routes the formula kept (`rankUtility`): the only ones any attempt may go to. */
+  private kept: ReadonlySet<string> = new Set();
   /** The request's client and tool shape for account blocks (a model API request declares no tools). */
   private readonly pattern: Pattern;
-  /** The endpoint ranking explored (`exploration_id`): the head reason `exploration` when it leads the plan. */
-  private explored: string | null = null;
   /** The age of the ranking base its ranking read, null unmeasured, and its routes' shards' refusals (inference.ts). */
   private rankingBaseAgeMs: number | null = null;
-  private readonly routeRefusals: { endpointId: string; rankKey: string; group: string; reason: string; exploration: boolean; atMs: number; borrowing: boolean }[] = [];
-  /** What the latest ranking read (routes.ts `rankedWith`), and what the ranking that reserved each dispatch read (inference.ts `Acquired.ranked`). */
+  private readonly routeRefusals: { endpointId: string; rankKey: string; group: string; reason: string; atMs: number; borrowing: boolean }[] = [];
+  /** What the latest ranking read (routes.ts `rankedWith`), which an attempt it chose carries to its dispatch's point. */
   private rankedRead: { readonly ageMs: number | null; readonly spanMs: number | null } = { ageMs: null, spanMs: null };
-  private readonly rankedFor = new WeakMap<DispatchPermit, { readonly ageMs: number | null; readonly spanMs: number | null }>();
   /** The isolate's gap before this request (snapshot.ts `SnapshotRead.gapMs`); null at its first, undefined unread. */
   private isolateGapMs: number | null | undefined = undefined;
-  /** The exploration budget's routing group (inference.ts `routingGroup`). */
+  /** The ranking group its dispatches' and refusals' points name (inference.ts `routingGroup`). */
   private routingGroup = "";
-  /** A measured route is among the candidates: the exploration budget counts (inference.ts `matureAvailable`). */
-  private matureAvailable = false;
+  /** The recovery lease the plan's head took, until an attempt is sent (inference.ts, the server's `ProbeLease`). */
+  private readonly heldProbe = new HeldProbe();
+  /** The leases of the snapshot's ranker for the request's routes, by endpoint id (routes.ts `routeProbeLeases`). */
+  private planLeases: ProbeLeases | null = null;
   /**
    * The customer's routing preference, as the request stated it until it is layered over its key's and its
    * workspace's defaults (apis/mod.rs, `layered_preference`): it narrows, prices and orders the routes as it
    * does a generation request's.
    */
   private preference: Preference = Preference.DEFAULT;
+  /**
+   * The parameters the request routes by (`resolveRoutingParams`, as a generation request's, inference.ts): the body's
+   * `routing` or the `x-gray-routing-params` header over its preset and the snapshot's policy.
+   */
+  private routingParams: RoutingParams = resolveRoutingParams(null, DEFAULT_ROUTING_POLICY);
+  /** What the request stated itself of them, as its routing record tells it apart from its preset (`statedOf`). */
+  private routingStated: StatedRouting = statedOf(null);
+  /** Where its preset came from: the request, its API key's default (`overKeyPreset`), or neither. */
+  private routingModeSource: ModeSource | null = null;
+  /** The provider preference by level, as the request's routing record tells it (`preferenceLevels`). */
+  private preferenceLevels: readonly PreferenceLevelFacts[] = [];
+  /** The routing record's facts once the formula ranked or refused the model (request-routing.ts); null before. */
+  private routingFacts: RoutingFacts | null = null;
+  /** What the request ranks its routes by besides them (routes.ts `UtilityAsk`): admission's, which a failover's re-rank reads too. */
+  private utilityAsk: UtilityAsk | null = null;
   /** The tag pattern the request's model string carried (`model@pattern`, preference.ts `untagged`). */
   private modelTag: string | null = null;
   /** What the request log records of the layered preference (`preference_facts`); null until it was layered. */
   private preferenceRecord: PreferenceFacts | null = null;
-  /** Admission's steering moved another route to the head of the plan (`routing_head_reason` `account_block`). */
-  private steeredHead = false;
   /** The suppliers admission steered the request away from (`Plan::steered`). */
   private steeredAway: ReadonlyMap<string, AccountBlock> = new Map();
+  /** The probe the plan leased for its head, else the first attempt's when the shard granted it a probe permit. */
   private recoveryProbeEndpoint: string | null = null;
   /** What the request showed about the mappings that served it, carried to gray-jobs on its index message (inference.ts `traffic`). */
   private readonly traffic = new RequestEvidence(true);
@@ -577,6 +636,11 @@ export class ModelApiRun {
       retainedPeakBytes: this.retained.peak,
       ...(this.preferenceRecord === null ? {} : { preference: this.preferenceRecord }),
       ...(this.routingGroup === "" ? {} : { routingGroup: this.routingGroup, rankingBaseAgeMs: this.rankingBaseAgeMs }),
+      ...(this.routingEvidence === null ? {} : { routingEvidence: this.routingEvidence, eligibleRoutes: this.eligibleRoutes }),
+      routingCandidates: this.routingCandidates,
+      // How the request was routed (request_logs.routing): the record of the facts as they stand now; at the entry its
+      // projection, bounded as it leaves the CVM (inference.ts).
+      routing: recordOfFacts(this.routingFacts, this.preferenceLevels, this.preference.order, this.routingEvidence, this.headReason, this.lane !== null),
       ...(this.isolateGapMs === undefined ? {} : { isolateGapMs: this.isolateGapMs }),
       routeRefusals: [...this.routeRefusals],
       retry: {
@@ -585,9 +649,6 @@ export class ModelApiRun {
         skipped: [...this.skippedRoutes],
         headReason: this.headReason,
         recoveryProbeEndpoint: this.recoveryProbeEndpoint,
-        // These APIs carry no prompt prefix an upstream could have cached (apis/mod.rs `affinity_key: None`): a
-        // ranked request had no affinity key.
-        affinity: this.ranked ? { keyPresent: false, pinned: null } : null,
         recoveryRetryAfterS: this.recoveryRetryAfterS,
         // The model APIs take no list of fallback models (apis/mod.rs: `requested_model: None`, `fallback_models: vec![]`).
         requestedModel: null,
@@ -708,7 +769,6 @@ export class ModelApiRun {
     if (attempt.ended) return;
     attempt.ended = true;
     if (this.current === attempt) this.current = null;
-    attempt.dispatch?.drop();
     const record = attempt.candidate.record;
     // As inference.ts `endAttempt`: the supplier answered, so a block its gate remembered has lifted; a re-test
     // lease neither the answer nor a refusal settled goes back.
@@ -746,7 +806,7 @@ export class ModelApiRun {
       // A served attempt that followed a failure is where retries stopped (`retry_stop` `served`).
       ...(attempt.committed && this.retryStop === "served" ? { retryStop: "served" } : {}),
       ...(facts.rejected === true ? { rejected: true } : {}),
-      ...(attempt.dispatch?.committed === true ? { dispatch: dispatchRecord(attempt.dispatch, this.rankedFor.get(attempt.dispatch), attempt.dispatchedAtMs) } : {}),
+      ...(attempt.dispatchedAtMs === undefined ? {} : { dispatch: dispatchRecord(unbudgeted(this.routingGroup), attempt.ranked, attempt.dispatchedAtMs) }),
       // Whether it failed on its provider's answer, as its evidence noted (inference.ts `endAttempt`, 2026-11-23).
       providerFailure: attempt.providerFailure === true,
     });
@@ -764,6 +824,8 @@ export class ModelApiRun {
       null,
       charged ? (this.usage?.output_tokens ?? 0) : 0,
       released.kind === "supplier_failure" ? (failure ?? "protocol") : null,
+      // These APIs keep no session (inference.ts): never in one.
+      0,
     ];
     // Its record's route attempt carries the same measures (r15, docs/live-speed.md), in its rank key's mode.
     this.attempts[recordAt] = { ...this.attempts[recordAt]!, measures: attemptMeasures(released, measure, charged, this.stream) };
@@ -1005,16 +1067,36 @@ export class ModelApiRun {
   }
 
   /**
+   * Reads the request's routing parameters (`takeRouting`, inference.ts): the body's `routing` member, taken out of
+   * `body` (a JSON body, else null), or the `x-gray-routing-params` header, resolved over the snapshot's policy; a
+   * refusal is 400 naming the member (`routingRefused`). The preference `stated` is the request's, marked with
+   * whether they are explicit before it is layered (`withRoutingExplicit`). Null once read.
+   */
+  private takeRouting(snapshot: GatewaySnapshot, key: KeyRecord, body: Json | null, stated: Preference): Response | null {
+    const routed = takeRouting(body, this.request.headers.get(ROUTING_PARAMS_HEADER));
+    if (!routed.ok) return this.refuse(routingRefused(routed.code, routed.message), "preference");
+    // The key's default preset is the base of a request that names none (`overKeyPreset`).
+    const based = overKeyPreset(routed.request, keyDefaultPreset(key.routing ?? null));
+    this.routingParams = resolveRoutingParams(based.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
+    this.routingStated = statedOf(routed.request);
+    this.routingModeSource = based.modeSource;
+    this.preference = stated.withRoutingExplicit(this.routingParams.explicit);
+    return null;
+  }
+
+  /**
    * The request's preference layered over the defaults its key and its workspace set, as the generation APIs
    * layer it (`layered_preference`): a request narrows them and never widens them; a stored default this
    * gateway cannot read refuses the request (503). Null once layered.
    */
   private layer(snapshot: GatewaySnapshot, key: KeyRecord): Response | null {
     this.admission = "preference";
-    const layered = layeredOver(snapshot, key.routing ?? null, key.workspaceId, this.preference, this.model, this.modelTag);
+    const own = this.preference;
+    const layered = layeredOver(snapshot, key.routing ?? null, key.workspaceId, own, this.model, this.modelTag);
     if (!layered.ok) return this.refuse(unreadableDefault(layered.code), "preference");
     this.preference = layered.preference;
     this.preferenceRecord = preferenceFacts(layered.preference, layered.sources);
+    if (this.model !== null) this.preferenceLevels = preferenceLevels(snapshot, key.routing ?? null, key.workspaceId, own, this.model, this.protocol, this.modelTag);
     const models = this.model === null ? [] : [this.model];
     // A request that reached the confidential VM through Gray's API had its TLS ended at Cloudflare: nothing here
     // verifies it end to end (inference.ts, docs/design/one-address.md).
@@ -1058,15 +1140,23 @@ export class ModelApiRun {
     this.bodyReadMs = clock() - this.started;
 
     this.admission = "preference";
+    let preference: Preference;
     if (body.kind === "json") {
       const taken = Preference.take(body.value, this.request.headers);
       if (!taken.ok) return this.refuse(unreadablePreference(taken.code), "preference");
-      this.preference = taken.preference;
+      preference = taken.preference;
     } else {
       const read = Preference.fromHeader(this.request.headers);
       if (typeof read === "string") return this.refuse(unreadablePreference(read), "preference");
-      this.preference = read;
+      preference = read;
     }
+    // The routing parameters (r17) are the `x-gray-routing-params` header's alone here: the entry declares no op that takes
+    // a body's `routing` member out (`entryOps`), so a JSON body stating one, or a form with a part of that name, is 400
+    // naming the header, as on the entry's generation APIs (inference.ts; docs/utility-routing.md "Request parameters").
+    const routingInBody = body.kind === "json" ? isObject(body.value) && Object.hasOwn(body.value, "routing") : body.parts.some((part) => part.name === "routing");
+    if (routingInBody) return this.refuse(laneRoutingParamsInBody(), "preference");
+    const routed = this.takeRouting(snapshot, key, null, preference);
+    if (routed !== null) return routed;
 
     this.admission = "parse";
     const stated = statedModel(body);
@@ -1110,7 +1200,14 @@ export class ModelApiRun {
     // naming nothing registered, or a filter that leaves no route, refuses the request (400). No lane relay serves a
     // model API, so no verifiable route does: a `verifiable` request is told none serves it.
     const admitted = retainAdmitted(this.preference, registeredOf(snapshot), records, refsOf, verifiableRoute, unverifiable(true, false));
-    if (!admitted.ok) return this.refuse(new ApiError(400, admitted.code), "routes");
+    if (!admitted.ok) {
+      // The request's own lists left this model no route: its routing record says what they left out.
+      if (admitted.code === "routing_filter_excluded_all") {
+        const filtered = records.map((record) => ({ key: rankKeyOf(record, api.stream, this.rankRegion), record, by: listFilter(this.preference, ...refsOf(record)) }));
+        this.routingFacts = this.preferenceRefusedFactsOf(snapshot, api.model, filtered);
+      }
+      return this.refuse(new ApiError(400, admitted.code), "routes");
+    }
     const region = snapshot.workspaces[key.workspaceId]?.region ?? "any";
     const inRegion = admitted.routes.filter((r) => regionMatches(region, r.serviceRegion));
     if (inRegion.length === 0) return this.refuse(new ApiError(503, "region_unavailable"), "region");
@@ -1143,21 +1240,96 @@ export class ModelApiRun {
     this.admission = "pricing";
     const maxPrice = this.preference.maxPrice;
     const affordable = serviceable.filter((c) => withinMaxPrice(maxPrice, c.priced.rate, UNDECODED));
-    if (affordable.length === 0) return this.refuse(new ApiError(400, "routing_max_price_excluded_all"), "pricing");
+    if (affordable.length === 0) {
+      // The ceiling priced out every route the request had: its routing record says so, with the rates it compared.
+      const filtered = serviceable.map((c) => {
+        const { input, output } = comparedRates(c.priced.rate, UNDECODED);
+        return { key: rankKeyOf(c.record, api.stream, this.rankRegion), record: c.record, by: { by: "max_price" as const, input: Number(input), output: Number(output) } };
+      });
+      this.routingFacts = this.preferenceRefusedFactsOf(snapshot, api.model, filtered);
+      return this.refuse(new ApiError(400, "routing_max_price_excluded_all"), "pricing");
+    }
     return this.admit(snapshot, key, api, affordable);
   }
 
-  /** 6. The price bound, the reservation and admission; then dispatch. */
+  /**
+   * The routing record's facts of the model (request-routing.ts `routingFactsOf`; the server's `record_facts` through the
+   * shared `admit`): a model API's, compared on price, its routes as the formula read them (`u`) with their offers' regions.
+   */
+  private routingFactsOf(snapshot: GatewaySnapshot, model: string, routes: readonly Route[], u: UtilityRoutes, outcome: Pick<Parameters<typeof routingFactsOf>[0], "plan" | "shares" | "refused">): RoutingFacts {
+    return routingFactsOf({
+      api: "other",
+      params: this.routingParams,
+      stated: this.routingStated,
+      modeSource: this.routingModeSource,
+      policy: snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY,
+      reference: snapshot.routing?.referencePrices.get(model) ?? null,
+      contextTokens: snapshot.models[model]?.window ?? null,
+      routes: u.routes,
+      regionOf: (key) => routes.find((r) => rankKeyOf(r.record, this.stream, this.rankRegion) === key)?.record.serviceRegion ?? null,
+      eligible: routes.length,
+      feedAvailable: u.feedAvailable,
+      ...outcome,
+    });
+  }
+
+  /** The routing record's facts of a model the request's own provider preference left no route (`preferenceRefusedFacts`). */
+  private preferenceRefusedFactsOf(snapshot: GatewaySnapshot, model: string, filtered: Parameters<typeof preferenceRefusedFacts>[0]["filtered"]): RoutingFacts {
+    return preferenceRefusedFacts({
+      api: "other",
+      params: this.routingParams,
+      stated: this.routingStated,
+      modeSource: this.routingModeSource,
+      policy: snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY,
+      reference: snapshot.routing?.referencePrices.get(model) ?? null,
+      contextTokens: snapshot.models[model]?.window ?? null,
+      feedAvailable: feedAvailable(snapshot, this.deps.clock()),
+      filtered,
+    });
+  }
+
+  /**
+   * `admitPlanned`, after which a recovery lease the plan's head took goes back when no attempt was sent (inference.ts
+   * `admit`; the server's `ProbeLease`, dropped unsent).
+   */
   private async admit(snapshot: GatewaySnapshot, key: KeyRecord, api: ApiRequest, candidates: readonly MediaCandidate[]): Promise<Response> {
+    try {
+      return await this.admitPlanned(snapshot, key, api, candidates);
+    } finally {
+      await this.heldProbe.giveBack();
+    }
+  }
+
+  /** 6. The price bound, the reservation and admission; then dispatch. */
+  private async admitPlanned(snapshot: GatewaySnapshot, key: KeyRecord, api: ApiRequest, candidates: readonly MediaCandidate[]): Promise<Response> {
     const { cfg, clock } = this.deps;
     const requestKey = this.requestKey!;
     const accountKey = ledgerRequestKey(key.workspaceId, requestKey);
     this.accountKey = accountKey;
 
     this.admission = "pricing";
+    // The hold is sized over the routes the request's constraints and price cap pass, and the formula still ranks the
+    // others and names them, as on the generation APIs (inference.ts; review r17-gateway-5 finding 31).
+    const screened = screenConstraints(
+      snapshot,
+      candidates.map((c) => ({ record: c.record, rate: c.priced.rate })),
+      {
+        params: this.routingParams,
+        policy: snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY,
+        seed: requestKey,
+        sessionHit: false,
+        reference: snapshot.routing?.referencePrices.get(api.model) ?? null,
+        contextTokens: snapshot.models[api.model]?.window ?? null,
+        generative: false,
+      },
+      clock(),
+      api.stream,
+      this.rankRegionOf,
+    );
+    const sized = new Set(screened.passing.map((r) => r.record.endpointId));
     // The model APIs' bodies are not classified by what they can be billed at: every input-side rate counts (`UNDECODED`).
     let bound: RateBound = rateBound(UNDECODED);
-    for (const c of candidates) bound = includeRate(bound, c.priced.rate, c.record.cacheTtlAsRequested);
+    for (const c of candidates) if (sized.has(c.record.endpointId)) bound = includeRate(bound, c.priced.rate, c.record.cacheTtlAsRequested);
     const info = snapshot.models[api.model] ?? {};
     this.ceiling = requestCeiling(info.maxRequestMicrousd === undefined ? undefined : BigInt(info.maxRequestMicrousd), this.protocol);
     this.admission = "cost_ceiling";
@@ -1176,43 +1348,119 @@ export class ModelApiRun {
     // The route order, and the head's permit asked for beside admission: the plan a generation request's admission
     // makes (plan-order.ts `steering`, `orderPlan`, `settleHead`; apis/mod.rs admits through the same `admit`),
     // under the customer's preference. These APIs carry no prompt prefix an upstream could have cached and no
-    // tool-call ids, so there is no cache target and no issuer: a vendor's block on a supplier's upstream account
-    // steers the request away from that supplier unless the customer named an order, the order goes first and
-    // suppresses exploration, and its sort is the ranking policy.
+    // tool-call ids, so there is no session target and no issuer: a vendor's block on a supplier's upstream account
+    // steers the request away from that supplier unless the customer named an order, and the order goes first.
     this.admission = "ranking";
     const routes: Route[] = candidates.map((c) => ({ record: c.record, rate: c.priced.rate }));
     const preference = planPreference<Route>(this.preference);
-    const policy = this.preference.orderingPolicy(this.deps.policy);
-    const steered = steering(routes, preference, this.blockGates(api.model), () => null, null, () => false);
+    const steered = steering(routes, preference, this.blockGates(api.model), () => null, null, null);
     // Ranking passes over a route resting after a failure as its endpoint shard holds the rest, by the rank key of
     // the request's mode (apis/mod.rs admits through the shared `admit`, which ranks by `rank_key` with the ranker
     // that keeps the rests; inference.ts reads them the same way, rests.ts `shardRestView`).
     this.stream = api.stream;
     const rests = await shardRestView(this.deps.shardRests, routes, this.stream, clock(), cfg.endpointReportMs, snapshot.version, this.rankRegionOf);
     const rankedAt = clock();
-    const ranking = await rankDetailed(snapshot, routes, requestKey, rankedAt, policy, steered.exploration, rests, this.stream, true, this.rankRegionOf);
-    this.explored = ranking.explored?.record.endpointId ?? null;
+    // The formula orders them by price alone (docs/utility-routing.md "Score": α and β taken as 0 for these APIs, of the
+    // constraints only `min_availability` and `max_price_multiple` apply), drawn by the request key: no session.
+    const policy = snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY;
+    const utilityRoutes = utilityRoutesOf(snapshot, routes, rankedAt, this.stream, this.rankRegionOf);
+    this.utilityAsk = {
+      params: this.routingParams,
+      policy,
+      seed: requestKey,
+      sessionHit: false,
+      reference: snapshot.routing?.referencePrices.get(api.model) ?? null,
+      contextTokens: snapshot.models[api.model]?.window ?? null,
+      generative: false,
+    };
+    const ranking = await rankUtility(snapshot, routes, utilityRoutes, this.utilityAsk, requestKey, rankedAt, rests, this.stream, true, this.rankRegionOf);
+    const endpointOf = (rankKey: string) => utilityRoutes.routes.find((r) => r.key === rankKey)?.endpointId ?? rankKey;
+    if (!ranking.ok) {
+      // The record says what the request ranked by, the routes entering the constraints and each they excluded, as a
+      // generation request's does (inference.ts; review r17-gateway-5 finding 33).
+      this.routingEvidence = {
+        preset: this.routingParams.preset,
+        policyVersion: policy.version,
+        snapshotVersion: snapshot.version,
+        feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, rankedAt) : null,
+        session: { kind: this.preference.affinityAllowed() ? "none" : "off" },
+        sessionKeyPresent: false,
+        sessionEndpoint: null,
+        formulaFirst: null,
+        utility: ranking.utility.evidence,
+      };
+      this.eligibleRoutes = ranking.utility.evidence.candidates;
+      this.skippedRoutes.push(...constraintSkips(ranking.utility.evidence, endpointOf));
+      // The routing record's facts (request-routing.ts): what the formula refused the model for.
+      this.routingFacts = this.routingFactsOf(snapshot, api.model, routes, utilityRoutes, { refused: formulaRefusal(ranking.utility) });
+      return this.refuse(utilityRefusal(ranking.utility, api.model)!, "ranking");
+    }
+    this.kept = new Set(ranking.kept.map((r) => r.record.endpointId));
     this.rankingBaseAgeMs = rankingBaseAge(snapshot, rankedAt);
     this.rankedRead = rankedWith(snapshot, rankedAt);
-    // The exploration budget's routing group, and whether a measured route is among the candidates (inference.ts).
+    // The group the dispatches' points name (inference.ts).
     this.routingGroup = JSON.stringify([api.model, this.protocol, this.rankRegion, this.stream, this.deps.region]);
-    this.matureAvailable = ranking.result.evidence.some((e) => e.score !== undefined);
     this.ranked = true;
-    const ordering = await orderPlan(
-      ranking.result,
-      new Map(routes.map((r) => [r.record.endpointId, r])),
-      steered,
-      preference,
-      async (unranked) => (await rankDetailed(snapshot, unranked, requestKey, clock(), policy, "suppressed", rests, this.stream, false, this.rankRegionOf)).ordered.map((r) => r.record.endpointId),
-      (left, planned) => settleHead(routeProbeLeases(snapshot, clock(), [...left.values(), ...planned], this.stream, this.rankRegionOf), clock(), preference, ranking.result, left, planned, requestKey),
-    );
+    // A due recovery probe goes first for a request that could choose it (no customer order: these APIs have no
+    // session and no issuer), as on generation; the head the formula's unselected share moved first is named so (review
+    // r17-gateway-5 finding 34).
+    const order = { ...orderedOf(ranking.result), unselected: unselectedOf(ranking.utility, utilityRoutes) };
+    const leases = routeProbeLeases(snapshot, clock(), routes, this.stream, this.rankRegionOf);
+    const ordering = await orderPlan(order, new Map(routes.map((r) => [r.record.endpointId, r])), steered, preference, leases, clock(), requestKey);
+    this.planLeases = leases;
+    await this.heldProbe.hold(ordering.leased, leases, requestKey);
+    // Why the plan's head is first and the probe it leased, for the record (inference.ts), also for a request refused from
+    // here on.
+    this.headReason = ordering.headReason;
+    this.recoveryProbeEndpoint = ordering.leased;
+    this.planProbe = ordering.leased;
+    // Every candidate open: each route of the order is a recovery trial or the probe the ranking leased itself.
+    this.planAllOpen = ordering.leased === null && order.order.every((id) => order.trials.includes(id) || id === order.leased);
+    // What the request ranked by (inference.ts): these APIs carry no prompt prefix an upstream could have cached
+    // (apis/mod.rs `affinity_key: None`), so no session key.
+    const formula = ranking.utility?.ok === true ? ranking.utility : null;
+    const first = formula?.order[0];
+    this.routingEvidence = {
+      preset: this.routingParams.preset,
+      policyVersion: policy.version,
+      snapshotVersion: snapshot.version,
+      feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, rankedAt) : null,
+      session: { kind: this.preference.affinityAllowed() ? "none" : "off" },
+      sessionKeyPresent: false,
+      sessionEndpoint: null,
+      formulaFirst: formula === null ? (order.order[0] ?? null) : first === undefined ? null : (utilityRoutes.routes.find((r) => r.key === first)?.endpointId ?? first),
+      utility: formula?.evidence ?? null,
+    };
+    // The routes entering the constraints and those they excluded, as a generation request records them (inference.ts;
+    // review r17-gateway-5 blocker 29).
+    this.eligibleRoutes = formula?.evidence.candidates ?? routes.length;
+    if (formula !== null) this.skippedRoutes.push(...constraintSkips(formula.evidence, endpointOf));
     const plan = ordering.routes;
+    // The candidates the record names: the formula's, in the plan's order, each with the plan's reasons for it, as a
+    // generation request's record names them (inference.ts; the server's shared `admit`; review r17-gateway-5 finding
+    // 35); without the formula's evidence, the ranker's.
+    this.routingCandidates =
+      formula === null
+        ? candidatesOf(ranking.result, ordering.steeredRoutes)
+        : utilityCandidates(
+            formula.evidence,
+            plan.map((r) => rankKeyOf(r.record, this.stream, this.rankRegion)),
+            endpointOf,
+            (rankKey) => utilityRoutes.routes.find((r) => r.key === rankKey)?.summary?.ttftCount ?? 0,
+            this.routingParams.ttftPercentile,
+            (rankKey) => planReasons(rankKey, endpointOf(rankKey), { session: null, probe: ordering.leased, unselected: formula.evidence.unselected ? (formula.order[0] ?? null) : null, named: (id) => plan.some((r) => r.record.endpointId === id && preference.position(r) !== undefined), steered: ordering.steeredRoutes }),
+          );
+    // The routing record's facts (request-routing.ts): the plan and each formula candidate's first-choice share; these APIs
+    // keep no session.
+    this.routingFacts = this.routingFactsOf(snapshot, api.model, routes, utilityRoutes, {
+      plan: plan.map((r) => rankKeyOf(r.record, this.stream, this.rankRegion)),
+      shares: formula === null || this.utilityAsk === null ? new Map() : sharesOf(this.utilityAsk, utilityRoutes, formula.evidence),
+    });
     // Every route rests or cools down (ranking left them all out for it): the client is told the soonest one may serve,
     // before any hold or permit, as the server's admission tells it when ranking leaves no route (`recovery_refusal`).
     if (plan.length === 0 && (ranking.result.cooldownUntilMs !== undefined || ranking.result.awaitedProbeUntilMs !== undefined)) {
       return this.refuse(recoveryRefusal(ranking.result.cooldownUntilMs, ranking.result.awaitedProbeUntilMs, clock()), "ranking");
     }
-    this.steeredHead = ordering.steeredHead;
     this.steeredAway = steered.blocked;
     for (const block of ordering.steers) this.retryEvents.push({ kind: "account_block_steer", block });
     const byId = new Map(candidates.map((c) => [c.record.endpointId, c]));
@@ -1458,7 +1706,8 @@ export class ModelApiRun {
     const routeOf = (c: MediaCandidate): Route => routes.get(c.record.endpointId)!;
     const d = new Dispatcher({
       routes: plan.map(routeOf),
-      eligible: candidates.map(routeOf),
+      // Only the routes the formula kept (review r17-gateway-5 blocker 26; inference.ts, the server's `Plan::eligible`).
+      eligible: candidates.filter((c) => this.kept.has(c.record.endpointId)).map(routeOf),
       retry: retryConfig(this.deps.cfg),
       // The customer's layered preference: whether another operator may serve after a failure, and the order a
       // failover follows, as admission ordered the plan.
@@ -1495,12 +1744,12 @@ export class ModelApiRun {
       let next: Next;
       let backoffMs: number | null = null;
       let retest: BlockLease | null = null;
-      let dispatch: DispatchPermit | undefined;
+      let ranked = this.rankedRead;
       if (chosen.kind === "other_operator" || chosen.kind === "steered") {
         const got = await this.otherOperator(d, snapshot, api, head, held, bound, deadline, chosen.kind === "steered");
         if (got === "passed") continue;
         if (got.kind === "stop") return await this.stopped(d, got.stop);
-        ({ route, permit, retest, dispatch } = got);
+        ({ route, permit, retest, ranked } = got);
         next = d.tried.attempts === 0 ? "none" : "other_operator";
       } else {
         next = chosen.repeat.kind === "second_opinion" ? "second_opinion" : chosen.sameRoute ? "same_route" : "same_operator";
@@ -1525,7 +1774,6 @@ export class ModelApiRun {
         permit = got.permit;
         backoffMs = got.backoffMs;
         retest = got.retest;
-        dispatch = got.dispatch;
       }
       // The provider's key from the entry's memory, or one `endpoint.credential` call within the attempt's own bound
       // (`entryKey`); none in time passes the route over, and nothing is sent.
@@ -1533,7 +1781,6 @@ export class ModelApiRun {
       const fetchFor = this.lane.endpointFetch;
       if (credential === null || fetchFor === undefined) {
         if (retest !== null) this.gates.drop(retest);
-        dispatch?.drop();
         this.ctx.waitUntil(releasePermit(this.endpoints(), this.deps.region, permit, { kind: "not_counted", reason: "not_dispatched" }, false));
         this.passRoute(d, route, "route_inactive");
         continue;
@@ -1542,31 +1789,20 @@ export class ModelApiRun {
       const failure = d.last?.outcome.class;
       if (failure !== undefined && next !== "none") this.retryEvents.push({ kind: "retry", next, cls: failure });
       const index = d.tried.attempts;
-      // Why the head went first, for the record (`head_reason`, as inference.ts reads it): a recovery probe or a
-      // trial beside one, which the endpoint shard's permit says here, else how admission ordered it. A model API
-      // request has no tool-call issuer and no cache affinity to pin.
-      if (index === 0) {
-        // Rust logs the plan head's reason at admission (`order_plan`), before dispatch passes any route over (busy, or
-        // an exploration the budget refused): the facts admission knows are the plan head's, whichever route went.
-        const head = plan[0]?.record.endpointId;
-        this.headReason = headReason({
-          leased: permit.probeId !== null && permit.trial !== true,
-          trial: permit.probeId !== null && permit.trial === true,
-          steered: this.steeredHead,
-          issuerPinned: false,
-          affinity: false,
-          // The customer named an order (`!preference.order.is_empty()`), whichever route it put first.
-          ordered: this.preference.order.length > 0,
-          exploration: head !== undefined && this.explored === head,
-        });
+      // Without a probe the plan leased for its head (inference.ts, docs/utility-routing.md "Evidence"): a probe permit the
+      // shard grants the first attempt names the probe endpoint, and when every candidate was open and the plan put no
+      // probe first, the shard's permit says why the head went first. Never a failover's attempt.
+      if (index === 0 && this.planProbe === null) {
+        const probePermit = permit.probeId !== null && permit.trial !== true;
+        if (probePermit) this.recoveryProbeEndpoint = route.record.endpointId;
+        if (this.planAllOpen && permit.probeId !== null) this.headReason = probePermit ? "recovery_probe" : "recovery_trial";
       }
-      if (permit.probeId !== null && permit.trial !== true) this.recoveryProbeEndpoint = route.record.endpointId;
       d.sent(route, next);
       if (next !== "none") this.noteFollowed(next, backoffMs);
       const r = route.record;
       // A model API's answer is evidence of its base check alone (`answered`): no JSON output, no coding agent.
       const evidence = new AttemptEvidence({ endpointId: r.endpointId, credentialGeneration: r.credentialGeneration, configFingerprint: r.configFingerprint, model: r.model, protocol: r.protocol }, false, null);
-      const attempt: Attempt = { candidate: byId.get(route.record.endpointId)!, route, index, permit, startedAt: clock(), controller: new AbortController(), status: null, ended: false, next, committed: false, retest, evidence, entry, ...(dispatch === undefined ? {} : { dispatch }) };
+      const attempt: Attempt = { candidate: byId.get(route.record.endpointId)!, route, index, permit, startedAt: clock(), controller: new AbortController(), status: null, ended: false, next, committed: false, retest, evidence, ranked, entry };
       this.current = attempt;
       // The receipt id and forwarded draft this attempt may replace, kept so a failure of egress before it connected the
       // provider puts them back as they were (inference.ts, D72).
@@ -1597,7 +1833,10 @@ export class ModelApiRun {
           this.endAttempt(attempt, { kind: "not_counted", reason: permit.probeId !== null ? "not_dispatched" : "request_refused" }, false, result.error.code, { rejected: true });
           return this.fail(result.error, result.error.code, attempt, 0);
         case "left":
-          this.endAttempt(attempt, { kind: "not_counted", reason: "client_left" }, true, "client_left");
+          // The client is told 499 either way. An attempt whose fetch was never made sent the provider nothing: its permit
+          // goes back as not dispatched, freed at once (a probe's included), not held for work the upstream may still do.
+          if (result.started) this.endAttempt(attempt, { kind: "not_counted", reason: "client_left" }, true, "client_left");
+          else this.endAttempt(attempt, { kind: "not_counted", reason: "not_dispatched" }, false, "client_left");
           return await this.stopped(d, "client_left");
         case "connect":
           // Nothing of the body was taken: no request reached the upstream, which did no work for it.
@@ -1682,7 +1921,7 @@ export class ModelApiRun {
     bound: RateBound,
     deadline: number,
     lastResort: boolean,
-  ): Promise<{ readonly kind: "acquired"; readonly route: Route; readonly permit: PermitToken; readonly retest: BlockLease | null; readonly dispatch: DispatchPermit | undefined } | { readonly kind: "stop"; readonly stop: Stop } | "passed"> {
+  ): Promise<{ readonly kind: "acquired"; readonly route: Route; readonly permit: PermitToken; readonly retest: BlockLease | null; readonly ranked: { readonly ageMs: number | null; readonly spanMs: number | null } } | { readonly kind: "stop"; readonly stop: Stop } | "passed"> {
     const { cfg, clock } = this.deps;
     const first = d.tried.attempts === 0;
     let preferred = d.preferred(lastResort);
@@ -1708,7 +1947,7 @@ export class ModelApiRun {
     // its end and an open circuit's cooldown (the shard's `resting`, as inference.ts reads it).
     const breakerRefused = (route: Route, acquired: Extract<HeadPermit, { readonly ok: false }>): void => {
       // Every refusal of a first call's permit, by its own reason, for the soak's `route_refusal` points (inference.ts).
-      this.routeRefusals.push({ endpointId: route.record.endpointId, rankKey: rankKeyOf(route.record, this.stream, this.rankRegion), group: this.routingGroup, reason: acquired.reason, exploration: this.explored === route.record.endpointId, atMs: clock(), borrowing: acquired.borrowing });
+      this.routeRefusals.push({ endpointId: route.record.endpointId, rankKey: rankKeyOf(route.record, this.stream, this.rankRegion), group: this.routingGroup, reason: acquired.reason, atMs: clock(), borrowing: acquired.borrowing });
       if (acquired.reason === "busy" && acquired.retryAfterMs !== null) this.rebuildingEnds = Math.min(this.rebuildingEnds ?? Number.POSITIVE_INFINITY, clock() + acquired.retryAfterMs);
       if (acquired.reason !== "breaker_recovering" && acquired.reason !== "breaker_open" && acquired.reason !== "resting") return;
       const ends = acquired.awaitedMs ?? acquired.retryAfterMs;
@@ -1738,12 +1977,30 @@ export class ModelApiRun {
       } else {
         const remaining = d.otherCandidates().filter((r) => d.steered(r) === lastResort);
         if (remaining.length === 0) break;
-        // A failover re-ranks under the request's own ordering policy, as admission did, passing over the routes
-        // their shards said rest (inference.ts `rerank`).
+        // A failover re-ranks as admission did, passing over the routes their shards said rest, and its head is settled
+        // as admission's: under a customer order the routes it names go first, in its order, and with every route left
+        // open the due endpoint it names takes the probe the ranking leased for another (inference.ts `rerank`, the
+        // server's shared `Live::rerank` and `settle_head`). These APIs carry no tool-call issuer.
         const rests = await shardRestView(this.deps.shardRests, remaining, this.stream, clock(), cfg.endpointReportMs, snapshot.version, this.rankRegionOf);
         const rankedAt = clock();
-        const ranked = await rank(snapshot, remaining, this.requestKey!, rankedAt, this.preference.orderingPolicy(this.deps.policy), "suppressed", rests, this.stream, this.rankRegionOf);
+        const ask = this.utilityAsk;
+        const ranking =
+          ask === null
+            ? { ok: true as const, ...(await rankDetailed(snapshot, remaining, this.requestKey!, rankedAt, rests, this.stream, true, this.rankRegionOf)) }
+            : await rankUtility(snapshot, remaining, utilityRoutesOf(snapshot, remaining, rankedAt, this.stream, this.rankRegionOf), ask, this.requestKey!, rankedAt, rests, this.stream, true, this.rankRegionOf);
         this.rankedRead = rankedWith(snapshot, rankedAt);
+        if (!ranking.ok) {
+          // The formula excluded every route left: none is a candidate of this request any more.
+          for (const r of remaining) d.tried.passed.add(r.record.endpointId);
+          return "passed";
+        }
+        const ranked = [...ranking.ordered];
+        const left = new Map(remaining.filter((r) => !ranked.includes(r)).map((r) => [r.record.endpointId, r]));
+        const order = { ...orderedOf(ranking.result), unselected: "utility" in ranking ? unselectedOf(ranking.utility, ranking.routes) : null };
+        const leases = routeProbeLeases(snapshot, clock(), remaining, this.stream, this.rankRegionOf);
+        const leased = await settleHead(leases, planPreference<Route>(this.preference), order.leased, null, order.due, false, NO_ISSUER, left, ranked, this.requestKey!, clock());
+        // The re-ranked head's lease is the request's until its attempt goes, as the plan's head's (inference.ts).
+        await this.heldProbe.hold(leased, leases, this.requestKey!);
         route = ranked[0];
         if (route === undefined) {
           // Ranking left every candidate out: none is a candidate of this request any more.
@@ -1782,15 +2039,7 @@ export class ModelApiRun {
       // The first attempt at the plan's head takes the permit asked for beside admission; a cold pass's repeat asks the
       // shard its pass asked, where the borrow is on its way (`coldRepeat`).
       const acquired = await permit(route);
-      if (acquired.ok) {
-        // Then its routing group's dispatch (inference.ts `DispatchEnv.acquire`); a refusal passes the route over.
-        const dispatch = this.reserveDispatch(snapshot, route);
-        if (dispatch !== null) return { kind: "acquired", route, permit: acquired.permit, retest: gate.lease, dispatch };
-        if (gate.lease !== null) this.gates.drop(gate.lease);
-        this.ctx.waitUntil(releasePermit(this.endpoints(), this.deps.region, acquired.permit, { kind: "not_counted", reason: "not_dispatched" }, false));
-        this.passRoute(d, route, "dispatch_budget");
-        continue;
-      }
+      if (acquired.ok) return { kind: "acquired", route, permit: acquired.permit, retest: gate.lease, ranked: this.rankedRead };
       if (gate.lease !== null) this.gates.drop(gate.lease);
       breakerRefused(route, acquired);
       // Its circuit: the server's ranking would not have offered the route (inference.ts `DispatchEnv.acquire`).
@@ -1821,7 +2070,7 @@ export class ModelApiRun {
     choice: Extract<ReturnType<Dispatcher["choose"]>, { kind: "same_operator" }>,
     bound: RateBound,
     deadline: number,
-  ): Promise<{ readonly kind: "acquired"; readonly permit: PermitToken; readonly backoffMs: number; readonly retest: BlockLease | null; readonly dispatch: DispatchPermit | undefined } | { readonly kind: "stop"; readonly stop: Stop; readonly circuit?: true }> {
+  ): Promise<{ readonly kind: "acquired"; readonly permit: PermitToken; readonly backoffMs: number; readonly retest: BlockLease | null } | { readonly kind: "stop"; readonly stop: Stop; readonly circuit?: true }> {
     const { cfg, clock } = this.deps;
     const target = choice.target;
     const config = d.plan.retry;
@@ -1884,25 +2133,7 @@ export class ModelApiRun {
       this.passRoute(d, target, label);
       return { kind: "stop", stop: stopOfSkip(label) };
     }
-    const dispatch = this.reserveDispatch(this.snapshot!, target);
-    if (dispatch === null) {
-      if (gate.lease !== null) this.gates.drop(gate.lease);
-      this.ctx.waitUntil(releasePermit(this.endpoints(), this.deps.region, acquired.permit, { kind: "not_counted", reason: "not_dispatched" }, false));
-      this.passRoute(d, target, "dispatch_budget");
-      return { kind: "stop", stop: "dispatch_budget" };
-    }
-    return { kind: "acquired", permit: acquired.permit, backoffMs: waited.ms, retest: gate.lease, dispatch };
-  }
-
-  /** `route`'s routing group's dispatch in the isolate's exploration budget (inference.ts `reserveDispatch`): null when refused. */
-  private reserveDispatch(snapshot: GatewaySnapshot, route: Route): DispatchPermit | null | undefined {
-    const budgets = this.deps.dispatchBudgets;
-    if (budgets === undefined) return undefined;
-    const at = this.deps.clock();
-    const permit = budgets.reserve(this.routingGroup, dispatchExploratory(snapshot, route, at, this.stream, this.rankRegionOf), this.matureAvailable, at);
-    if (permit === undefined) return null;
-    this.rankedFor.set(permit, this.rankedRead);
-    return permit;
+    return { kind: "acquired", permit: acquired.permit, backoffMs: waited.ms, retest: gate.lease };
   }
 
   /** The isolate's account-block gates. */
@@ -1921,16 +2152,28 @@ export class ModelApiRun {
     if (lastResort) this.passRoute(d, route, "account_block");
   }
 
-  /** `route` is passed over without an attempt, for `label` (`pass`); the record lists it. */
+  /** `route` is passed over without an attempt, for `label` (`pass`); the record lists it, and a lease taken for it goes back. */
   private passRoute(d: Dispatcher, route: Route, label: string, facts?: PassFacts): void {
     d.pass(route, label, facts);
     this.skippedRoutes.push({ endpointId: route.record.endpointId, reason: label });
     this.passes += 1;
     if (label !== "circuit") this.recoveryOnly = false;
+    this.abandonLease(route);
+  }
+
+  /**
+   * A recovery lease the request took for `route` goes back (inference.ts `abandonLease`, the server's `skipped`): the
+   * one its plan's head holds, and any its ranking took at the route's rank key.
+   */
+  private abandonLease(route: Route): void {
+    this.ctx.waitUntil(this.heldProbe.passed(route.record.endpointId));
+    const leases = this.planLeases;
+    if (leases !== null) this.ctx.waitUntil(leases.abandonRecovery(route.record.endpointId, this.requestKey!));
   }
 
   /** `route` is left out for its circuit, as the server's ranking leaves it out (`Dispatcher.leaveOut`): the record lists no skip, and it counts as a route refused by its breaker. */
   private leaveOut(d: Dispatcher, route: Route): void {
+    this.abandonLease(route);
     d.leaveOut(route);
     this.passes += 1;
   }
@@ -2036,7 +2279,7 @@ export class ModelApiRun {
     if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, failure: failure.reason };
     // Its sample's measures: the refusing attempt's latency, the failure it counts as (inference.ts `settleHeld`); its
     // record's route attempt takes them (r15, docs/live-speed.md).
-    const measure: OutcomeMeasure = [at === undefined ? 0 : this.attempts[at]!.durationMs, null, 0, later.failure];
+    const measure: OutcomeMeasure = [at === undefined ? 0 : this.attempts[at]!.durationMs, null, 0, later.failure, 0];
     if (at !== undefined) this.attempts[at] = { ...this.attempts[at]!, measures: attemptMeasures(failure, measure, false, this.stream) };
     const deferred = this.deferred.get(key);
     if (deferred !== undefined) {
@@ -2197,12 +2440,13 @@ export class ModelApiRun {
       // The host the bytes go to (`upstream_name`): the provider's, whose API is not a TEE.
       upstream: laneUpstreamOf(record),
     });
+    // A recovery probe goes out from here, as the server's attempt sends it (`probe_sent`, `ProbeLease::sent`): its spell's
+    // clock runs, the dispatch's point records when it went, and the attempt owns the recovery lease the plan's head took
+    // for its route.
     const permit = attempt.permit;
     if (permit.probeId !== null && permit.trial !== true) this.ctx.waitUntil(probeSent(this.endpoints(), this.deps.region, permit));
-    if (attempt.dispatch !== undefined) {
-      attempt.dispatch.commit();
-      attempt.dispatchedAtMs = clock();
-    }
+    attempt.dispatchedAtMs = this.deps.clock();
+    await this.heldProbe.sent(attempt.route.record.endpointId);
     let timedOut = false;
     const timer = setTimeout(
       () => {
@@ -2229,7 +2473,10 @@ export class ModelApiRun {
       return { kind: "status", response };
     } catch {
       stream?.cancel().catch(() => {});
-      if (this.presence.gone) return { kind: "left" };
+      // An attempt whose call was never made never left the entry: the recovery lease it took over from the plan's head
+      // goes back (inference.ts `send`, the server's `close_attempt`).
+      if (!started) this.abandonLease(attempt.route);
+      if (this.presence.gone) return { kind: "left", started };
       if (timedOut) return { kind: started ? "timeout" : "unsent" };
       return { kind: taken ? "transport" : "connect" };
     } finally {
