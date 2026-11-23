@@ -44,8 +44,12 @@ export {
   type Position,
 } from "./protocol.ts";
 export {
+  GRAY_LANE_TRANSLATION,
+  GRAY_LANE_TRANSLATION_ID,
   GRAY_LANE_TRANSLATION_V1,
   GRAY_LANE_TRANSLATION_V1_ID,
+  GRAY_LANE_TRANSLATION_V2,
+  GRAY_LANE_TRANSLATION_V2_ID,
   HEADER_DROPPED,
   geminiPathOf,
   isTranslatedApi,

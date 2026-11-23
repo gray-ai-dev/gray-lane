@@ -97,9 +97,13 @@ export type TranslatedApi = (typeof TRANSLATED_APIS)[number];
 
 /**
  * The published translations a `request.translated` may name (`declared_in`): the translation code and the ops it allows
- * on a translated body (@gray/lane `GRAY_LANE_TRANSLATION_V1`). A verifier replays only the ones it carries.
+ * on a translated body (@gray/lane `GRAY_LANE_TRANSLATION_V1`, `GRAY_LANE_TRANSLATION_V2`). Each id is one translation's
+ * output, which never changes: the entry signs the newest, and a verifier replays a receipt with the one it names and
+ * fails one that names an id it does not carry.
  */
-export const TRANSLATION_POLICIES = Object.freeze(["gray-lane-translation-v1"] as const);
+export const TRANSLATION_POLICIES = Object.freeze(["gray-lane-translation-v1", "gray-lane-translation-v2"] as const);
+
+export type TranslationPolicyId = (typeof TRANSLATION_POLICIES)[number];
 
 /** The most names one `request.translated` lists as dropped. */
 export const TRANSLATED_DROPPED_MAX = 64;
@@ -115,7 +119,7 @@ export interface RequestTranslatedEvent {
   readonly dropped: readonly string[];
   /** The output cap Gray wrote into the translated body (@gray/protocol `applyOutputCap`), when it wrote one. */
   readonly output_cap?: bigint;
-  readonly declared_in: (typeof TRANSLATION_POLICIES)[number];
+  readonly declared_in: TranslationPolicyId;
 }
 
 /** The ops on a JSON body: a member named by an RFC 6901 pointer (`/model`, `/stream_options/include_usage`). */
@@ -375,7 +379,7 @@ export function requestTranslatedEvent(input: {
   readonly to: TranslatedApi;
   readonly dropped: readonly string[];
   readonly outputCap?: bigint;
-  readonly declaredIn: (typeof TRANSLATION_POLICIES)[number];
+  readonly declaredIn: TranslationPolicyId;
 }): JsonObject {
   const event: JsonObject = {
     type: EVENT_REQUEST_TRANSLATED,

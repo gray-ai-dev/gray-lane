@@ -1,3 +1,4 @@
+import { ApiError } from "@gray/errors";
 import { billsUnits, customerRate, includeRate, rateBound, reserveOutput, tokenRates, within, type BilledInput, type CustomerRate, type RateBound } from "@gray/holds";
 import { parseStrict } from "@gray/json";
 import {
@@ -6,6 +7,7 @@ import {
   type CanonicalRequest,
   type Protocol,
   type RequestedPricingFeatures,
+  type ServiceTierName,
   reasoningRequested,
   structured,
 } from "@gray/protocol";
@@ -29,7 +31,7 @@ import {
   type UtilityRoute,
 } from "@gray/routing";
 import { imageUsageKnown as imageGate, trafficEnded } from "@gray/snapshot";
-import { holdGenerationPriceOf, quoteLongContextThreshold, toolPricesOf } from "./money.ts";
+import { holdGenerationPriceOf, quoteLongContextThreshold } from "./money.ts";
 import { rankKeyLeases, type Ordered, type ProbeLeases } from "./plan-order.ts";
 import { RankingBase } from "./ranking-base.ts";
 import { REST_EGRESS_REGION } from "@gray/endpoint";
@@ -119,7 +121,29 @@ export interface PricingOptions {
 
 export type Priced =
   | { readonly ok: true; readonly routes: Route[]; readonly bound: RateBound; readonly toolReserve: bigint }
-  | { readonly ok: false; readonly status: 400 | 503; readonly code: PricingRefusalCode; readonly pricedOut?: readonly PricedOut<RouteRecord>[] };
+  | { readonly ok: false; readonly status: 400 | 503; readonly code: PricingRefusalCode; readonly serviceTier?: ServiceTierName; readonly pricedOut?: readonly PricedOut<RouteRecord>[] };
+
+/** Turns a `priceRoutes` refusal into a public `ApiError`, naming the requested service tier when `unsupported_service_tier`. */
+export function pricingRefusalError(priced: Extract<Priced, { readonly ok: false }>): ApiError {
+  const err = new ApiError(priced.status, priced.code);
+  if (priced.code === "unsupported_service_tier") {
+    if (priced.serviceTier === "fast") {
+      return err
+        .withParam("speed")
+        .withMessage(
+          'No verified provider of this model currently supports fast mode (`speed: "fast"`). Turn off fast mode (for example `/fast` in Claude Code) and send the request again without it, or choose another model.',
+        );
+    }
+    if (priced.serviceTier === "priority") {
+      return err
+        .withParam("service_tier")
+        .withMessage(
+          'No verified provider of this model currently supports the `priority` service tier (`service_tier: "priority"`). Send the request again without `service_tier: "priority"` to use standard routing, or choose another model.',
+        );
+    }
+  }
+  return err;
+}
 
 /**
  * Whether a route may serve under its quote (`image_gate`, then `image_usage_known`, @gray/snapshot
@@ -257,25 +281,27 @@ export function routeToolReserveMicrousd(route: Route, features: RequestedPricin
  */
 export function priceRoutes(records: readonly RouteRecord[], billed: BilledInput, feeBps: number, maxPrice: MaxPrice | null, options: PricingOptions = {}): Priced {
   const features = options.features ?? NO_PRICING_FEATURES;
-  const requestedToolNames = features.hostedTools.map((t) => t.tool);
   let pool = records;
   if (features.serviceTier !== null && pool.length > 0) {
     pool = pool.filter((r) => r.quote.serviceTiers?.[features.serviceTier!] !== undefined);
-    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_service_tier" };
+    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_service_tier", serviceTier: features.serviceTier };
   }
-  if (requestedToolNames.length > 0 && pool.length > 0) {
-    pool = pool.filter((r) => toolPricesOf(r.quote, feeBps, requestedToolNames) !== undefined);
-    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_hosted_tool" };
-  }
+  // Offers without `tool_prices` (or without a price for a given hosted tool) remain eligible and include
+  // hosted tool calls in their token price with no per-call reserve or surcharge; providers that want
+  // per-call billing set `tool_prices`, and providers that do not want to serve hosted tools decline them
+  // in their own software.
   const modelThreshold = options.modelLongContextThreshold;
   const inputUpper = options.inputUpperBound;
+  // A route whose quote carries no long_context threshold is flat-priced (legacy/subscription) and never dropped here;
+  // its hold and charge use base rates regardless of inputUpperBound (including undefined). Routes that do declare a
+  // long_context threshold above the catalog threshold are excluded once input may cross the catalog threshold.
   if (modelThreshold !== undefined && (inputUpper === undefined || inputUpper > BigInt(modelThreshold)) && pool.length > 0) {
     pool = pool.filter((r) => {
       const th = quoteLongContextThreshold(r.quote, features.serviceTier);
-      if (th === undefined || th > modelThreshold) return false;
+      if (th !== undefined && th > modelThreshold) return false;
       if (features.serviceTier !== null) {
         const baseTh = quoteLongContextThreshold(r.quote, null);
-        if (baseTh === undefined || baseTh > modelThreshold) return false;
+        if (baseTh !== undefined && baseTh > modelThreshold) return false;
       }
       return true;
     });

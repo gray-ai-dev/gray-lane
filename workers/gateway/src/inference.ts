@@ -198,6 +198,7 @@ import {
   RELEASE_OUTDATED,
   releaseOutdated,
   priceRoutes,
+  pricingRefusalError,
   probeLeases,
   promptOverhead,
   rankDetailed,
@@ -326,7 +327,7 @@ import {
 import { completedResponse, keptWeight } from "./lane/codex.ts";
 import type { LaneAttempt, LaneDeps, LanePolicyOutcome, LaneReceiptDraft, RewritePlan } from "./lane/types.ts";
 import type { AppendedText, GrayRewriteOp, LaneProtocol } from "@gray/lane";
-import { applyDeclaredChanges, checkOfficialUpstream, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_TRANSLATION_V1, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
+import { applyDeclaredChanges, checkOfficialUpstream, DEFAULT_MAX_TOTAL_BYTES, GRAY_LANE_TRANSLATION, GRAY_LANE_TRANSLATION_ID, StackEventDigester, stackBodyDigest, translatedForwarded, type LaneStackVendor, type OfficialVendor } from "@gray/lane";
 import { StackEventsChain } from "@gray/attest";
 import {
   addStackReceipt,
@@ -3480,7 +3481,7 @@ export class InferenceRun {
             preference.maxPrice,
             this.pricingOptionsFor(snapshot, canonical.model, inRegion, tUnits, tFeatures, tCompacts, t.upstream),
           );
-          if (!priced.ok) return { kind: "failed", error: new ApiError(priced.status, priced.code) };
+          if (!priced.ok) return { kind: "failed", error: pricingRefusalError(priced) };
           const value = { routes: priced.routes, bound: priced.bound, toolReserve: priced.toolReserve, features: tFeatures };
           // A target whose every route the request's constraints and price cap exclude is tried after the later ones:
           // its ranking would refuse the model while another API's routes pass (docs/utility-routing.md "Constraints and
@@ -3610,7 +3611,7 @@ export class InferenceRun {
           const filtered = priced.pricedOut.map(({ route, input, output }) => ({ key: rankKeyOf(route, canonical.stream === true, this.rankRegion(route)), record: route, by: { by: "max_price" as const, input: Number(input), output: Number(output) } }));
           this.routingFacts = this.preferenceRefusedFactsOf(snapshot, canonical.model, filtered);
         }
-        return this.unserved(new ApiError(priced.status, priced.code), "pricing");
+        return this.unserved(pricingRefusalError(priced), "pricing");
       }
       initialRoutes = priced.routes;
       initialBound = priced.bound;
@@ -3650,7 +3651,7 @@ export class InferenceRun {
         this.preference.maxPrice,
         this.pricingOptionsFor(snapshot, canonical.model, passingRecords, units, features, compacts, upstreamProto),
       );
-      if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
+      if (!repriced.ok) return this.unserved(pricingRefusalError(repriced), "pricing");
       initialRoutes = repriced.routes;
       initialBound = repriced.bound;
       initialToolReserve = repriced.toolReserve;
@@ -3709,7 +3710,7 @@ export class InferenceRun {
               this.preference.maxPrice,
               this.pricingOptionsFor(snapshot, canonical.model, directRecords, units, features, compacts, upstreamProto),
             );
-            if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
+            if (!repriced.ok) return this.unserved(pricingRefusalError(repriced), "pricing");
             sized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, repriced.toolReserve, room, keySpend, units, billed, compacts, upstreamProto);
           }
         }
@@ -3741,7 +3742,7 @@ export class InferenceRun {
           this.preference.maxPrice,
           this.pricingOptionsFor(snapshot, canonical.model, directRecords, units, features, compacts, upstreamProto),
         );
-        if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
+        if (!repriced.ok) return this.unserved(pricingRefusalError(repriced), "pricing");
         const resized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, repriced.toolReserve, room, keySpend, units, billed, compacts, upstreamProto);
         if ("error" in resized) return resized.nextModel ? this.unserved(resized.error, "cost_ceiling") : final(this.refuse(resized.error, "cost_ceiling"));
         ({ sizing, routes, bound, toolReserve } = resized);
@@ -4337,7 +4338,7 @@ export class InferenceRun {
         this.pricingOptionsFor(snapshot, canonical.model, keptRecords, units, this.pricingFeatures, compacts, upstreamProto),
       );
       // No route of the model is left at a price the request can afford: the model's refusal.
-      if (!repriced.ok) return { error: new ApiError(repriced.status, repriced.code), nextModel: true };
+      if (!repriced.ok) return { error: pricingRefusalError(repriced), nextModel: true };
       routes = repriced.routes;
       bound = repriced.bound;
       toolReserve = repriced.toolReserve;
@@ -7609,7 +7610,8 @@ export class InferenceRun {
    * (docs/design/lane-provider-routes.md section 10; @gray/lane `translatedForwarded`, the function a verifier replays):
    * the client's bytes without the members the gateway took out of them (`remove_member /models`, `/provider`,
    * gray-lane-rewrites-v1), translated from the client's API to the route's with the cap Gray wrote, then the route's
-   * upstream model (`set_member /model`, gray-lane-translation-v1; a Gemini route names it in its URL). The bytes must
+   * upstream model (`set_member /model`, in the translation's own policy, gray-lane-translation-v2; a Gemini route names
+   * it in its URL). The receipt names that translation, the one this gateway's @gray/protocol code writes. The bytes must
    * be the translated body this request was inspected, priced and held for (`Translation.body`) with the same model:
    * otherwise the receipt could not prove what was sent, and the attempt is refused, never sent. Cached per upstream
    * model.
@@ -7630,9 +7632,9 @@ export class InferenceRun {
     if (o.parsed.strip && isObject(client) && Object.hasOwn(client, "models")) before.push({ op: "remove_member", path: "/models" });
     if (this.stripProvider && isObject(client) && Object.hasOwn(client, "provider")) before.push({ op: "remove_member", path: "/provider" });
     const after: GrayRewriteOp[] = t.upstream === "gemini" ? [] : [{ op: Object.hasOwn(t.body, "model") ? "set_member" : "insert_member", path: "/model", value: model }];
-    const spec = { endpoint: this.path, from: t.client as TranslatedApi, to: t.upstream as TranslatedApi, ...(this.translationCap === null ? {} : { outputCap: this.translationCap }) };
+    const spec = { endpoint: this.path, from: t.client as TranslatedApi, to: t.upstream as TranslatedApi, declaredIn: GRAY_LANE_TRANSLATION_ID, ...(this.translationCap === null ? {} : { outputCap: this.translationCap }) };
     const replayed = translatedForwarded(received, spec, before, after, t.dropped);
-    const own = after.length === 0 ? { ok: true as const, forwarded: t.upstreamBytes() } : applyDeclaredChanges(t.upstreamBytes(), t.upstream as LaneProtocol, { grayOps: after, appends: [], policy: GRAY_LANE_TRANSLATION_V1 });
+    const own = after.length === 0 ? { ok: true as const, forwarded: t.upstreamBytes() } : applyDeclaredChanges(t.upstreamBytes(), t.upstream as LaneProtocol, { grayOps: after, appends: [], policy: GRAY_LANE_TRANSLATION });
     let forwarded: Forwarded;
     if (replayed.ok && own.ok && bytesEqual(replayed.forwarded, own.forwarded)) {
       forwarded = { ok: true, bytes: replayed.forwarded, events: [...replayed.events.before, replayed.events.translated, ...replayed.events.after], applied: [] };
@@ -8155,14 +8157,14 @@ export class InferenceRun {
     if (pricesModalities(priced.supplierMedia)) return this.settleModalities(a, attempt, rawUsage ?? null, priced.supplierMedia, billingMeta);
     // Money arithmetic is exact on safe integers only (docs/cloudflare-native.md 6.2); the ledger's own
     // range is i64 (inference.rs `checked`: "a usage counter is above the ledger's range").
-    // Only bill hosted tools the client actually requested (matching resolveAppliedServiceTier: an upstream
-    // echoing unrequested tool metadata on an ordinary request must neither overcharge nor fail the answer).
+    // Only bill hosted tools the client actually requested and this route's offer explicitly prices per call.
+    // Routes without a per-call price for a hosted tool include it in their token price (no tool surcharge).
     const requestedTools = new Set(this.pricingFeatures.hostedTools.map((t) => t.tool));
     const observedTools = billingMeta?.toolCalls ?? {};
     const toolCalls: Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>> = {};
     for (const k of HOSTED_TOOL_NAMES) {
       const count = observedTools[k];
-      if (count !== undefined && count > 0n && requestedTools.has(k)) {
+      if (count !== undefined && count > 0n && requestedTools.has(k) && route.record.quote.toolPrices?.[k] !== undefined) {
         if (count > BigInt(Number.MAX_SAFE_INTEGER)) {
           return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `hosted tool call count for ${k} exceeds safe integer range`, rawUsage);
         }
@@ -8391,7 +8393,7 @@ export class InferenceRun {
     const toolCalls: Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>> = {};
     for (const k of HOSTED_TOOL_NAMES) {
       const count = observedTools[k];
-      if (count !== undefined && count > 0n && requestedTools.has(k)) {
+      if (count !== undefined && count > 0n && requestedTools.has(k) && route.record.quote.toolPrices?.[k] !== undefined) {
         if (count > BigInt(Number.MAX_SAFE_INTEGER)) {
           return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `hosted tool call count for ${k} exceeds safe integer range`, rawUsage);
         }

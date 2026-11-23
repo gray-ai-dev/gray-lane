@@ -134,7 +134,7 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   [["wrong_api_for_model"], "This model is not served through this API.", "models"],
   [["no_available_provider"], "No verified provider can serve this model right now. Retry later, or choose another model.", "models"],
   [["unsupported_capability"], "No verified provider of this model supports a feature this request uses.", "models"],
-  [["unsupported_service_tier"], "No verified provider of this model prices the requested service tier (`fast` or `priority`). Remove the service tier or choose another model.", "models"],
+  [["unsupported_service_tier"], "No verified provider of this model currently supports the requested service tier (`fast` or `priority`). Send the request again without that service tier to use standard routing, or choose another model.", "models"],
   [["unsupported_hosted_tool"], "No verified provider of this model prices a hosted tool this request uses. Remove the hosted tool or choose another model.", "models"],
   [["unsupported_long_context"], "No verified provider of this model prices long-context requests above this threshold yet. Shorten the prompt or choose another model.", "models"],
   [["supplier_quote_unavailable"], "No provider of this model has a current approved price. Retry later, or choose another model.", "models"],

@@ -68,7 +68,10 @@
  * whose request the entry translated onto another text API, Gemini included on either side. It replaces steps 1–3 with
  * the replay of @gray/lane `replayTranslated`, the code the gateway runs: the `request.modified` ops before the event
  * (gray-lane-rewrites-v1, on the customer's body in its API), the translation the event names, then the ops after it
- * (gray-lane-translation-v1, on the translated body). The forwarded hash must be that replay's, the event's `from` the
+ * (declared in that translation's own policy, on the translated body). The event names its translation by id
+ * (`declared_in`): `gray-lane-translation-v2`, the one the entry signs, or `gray-lane-translation-v1`, the one earlier
+ * entries signed, replayed with its frozen code. A receipt is replayed under the translation it names and no other.
+ * The forwarded hash must be that replay's, the event's `from` the
  * API the receipt's endpoint names, its `dropped` the replay's names plus at most the client headers the receipt cannot
  * show (`HEADER_DROPPED`), and every `upstream.verified` must name a provider's own API (`provider_api_not_tee`): Gray
  * translates for endpoint routes only. The answer's translation back is not replayed; `response.returned` hashes the
@@ -961,7 +964,7 @@ function translationChecks(input: {
     checks.push(fail("request_forwarded_hash", "a non-refused receipt must carry request.forwarded"));
     return;
   }
-  const replay = replayTranslated(options.receivedBody, { endpoint: document.endpoint, from, to, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
+  const replay = replayTranslated(options.receivedBody, { endpoint: document.endpoint, from, to, declaredIn: event.declared_in, ...(cap === null ? {} : { outputCap: cap }) }, before, after);
   const what = `${before.length} declared op(s), the translation from ${from} to ${to}${cap === null ? "" : ` with output cap ${cap.toString()}`}, ${after.length} declared op(s)`;
   if (!replay.ok) {
     checks.push(fail("forwarded_body_hash", `${forwardedHash} is not checked: the received body does not replay (${replay.reason})`));

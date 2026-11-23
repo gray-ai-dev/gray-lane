@@ -186,6 +186,7 @@ export {
   translateRequest,
   translateResponse,
 } from "./translate/index.ts";
+export { applyOutputCapV1, translateRequestV1, type TranslatedRequestV1 } from "./translate-v1/index.ts";
 export { jsonSchema as normalizeGeminiSchema } from "./translate/decode.ts";
 export { SCRUB_SPAN_HELD_BYTES, ScrubScan, ScrubSpansTooMany, type ScrubSpan, withoutSpans } from "./translate/scrub-scan.ts";
 export {
