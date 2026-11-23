@@ -18,7 +18,7 @@ import { toolCallIdShards } from "../tool-call-id-shards.ts";
 import { trustGate } from "../trust.ts";
 import { BridgeCallError, type BridgeClientOptions } from "./remote/client.ts";
 import { remoteEndpointLocator, remoteEndpointRootLocator } from "./remote/endpoint.ts";
-import { remoteShardLocator } from "./remote/account.ts";
+import { remoteKeyRevoked, remoteShardLocator } from "./remote/account.ts";
 import { remoteSinks } from "./remote/sinks.ts";
 import { RemoteSnapshotSource } from "./remote/snapshot.ts";
 import { LegacyLatch } from "./remote/legacy.ts";
@@ -268,6 +268,7 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     sinks,
     gate: trustGate(cfg),
     accounts: remoteShardLocator(state.bridge, cfg.laneBridgeAnswerMarginMs),
+    keyRevoked: remoteKeyRevoked({ ...state.bridge, now: state.state.now }),
     shardCounts: learned.shardCounts,
     // The endpoint ops over the bridge, and the roots a failure's rest is filed at (r16), on the isolate's one latch for a
     // bridge that predates their members (remote/legacy.ts); the rests the shards said they hold, which ranking reads, as

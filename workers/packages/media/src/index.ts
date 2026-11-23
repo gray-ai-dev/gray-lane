@@ -45,7 +45,7 @@ export {
 export { type EmbeddingShape, type EmbeddingsShape, embeddingShape, embeddingsAnswer, embeddingsShapeOf, widthOfShape } from "./apis/embeddings.ts";
 export { entryRerankAnswer } from "./apis/rerank.ts";
 export { systemOneAnswer } from "./apis/systemone.ts";
-export { audioContentType, speechCharacters, transcriptAnswer, transcriptionBilled } from "./apis/audio.ts";
+export { audioContentType, audioTokenUsage, speechCharacters, transcriptAnswer, transcriptionBilled } from "./apis/audio.ts";
 export { entryImagesBilled, entryImagesStreamBilled, isImageLink } from "./apis/images.ts";
 export { type EgressPolicy, type Fetcher, isImage, isInlineImage, vetUrl } from "./apis/egress.ts";
 export { MAX_PARTS, MAX_PART_LABEL, formBoundary, receiveForm } from "./apis/form.ts";

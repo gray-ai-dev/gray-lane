@@ -4,7 +4,7 @@ import { capabilityWords, type Capabilities } from "./capabilities.ts";
 import { ENTRY_ENDPOINT_PROTOCOLS, entryEndpointRoute } from "./endpoint-route.ts";
 import { trafficEnds } from "./expiry.ts";
 import type { ModelFacts, ModelLimits } from "./facts.ts";
-import type { RouteTag } from "./offers.ts";
+import { HOSTED_TOOL_NAMES, SERVICE_TIER_NAMES, type HostedToolName, type OfferLongContextTerms, type OfferServiceTierTerms, type RouteTag, type ServiceTierName } from "./offers.ts";
 import { snapshotRoutes, stackRouteNamesOnly, type Snapshot, type SnapshotRoute, type SnapshotRouting } from "./snapshot.ts";
 
 /** A recipient record as the gateway reads it (@gray/content `RecipientRecord`). */
@@ -81,6 +81,24 @@ export interface GatewayMediaTerms {
   readonly unitPrices: Readonly<Record<string, number>>;
 }
 
+export interface GatewayLongContextQuote {
+  readonly thresholdInputTokens: number;
+  readonly input: number;
+  readonly output: number;
+  readonly cacheRead: number | null;
+  readonly cacheWrite: number | null;
+  readonly cacheWrite1h: number | null;
+}
+
+export interface GatewayServiceTierQuote {
+  readonly input: number;
+  readonly output: number;
+  readonly cacheRead: number | null;
+  readonly cacheWrite: number | null;
+  readonly cacheWrite1h: number | null;
+  readonly longContext?: GatewayLongContextQuote;
+}
+
 export interface GatewayQuote {
   readonly offerId: string;
   readonly version: number;
@@ -91,6 +109,12 @@ export interface GatewayQuote {
   readonly cacheWrite: number | null;
   readonly cacheWrite1h: number | null;
   readonly media: GatewayMediaTerms;
+  /** Optional long-context tiered token rates; omitted when not configured on the offer. */
+  readonly longContext?: GatewayLongContextQuote;
+  /** Optional accelerated service-tier rate tables (`fast`, `priority`); omitted when not configured. */
+  readonly serviceTiers?: Readonly<Partial<Record<ServiceTierName, GatewayServiceTierQuote>>>;
+  /** Optional per-call hosted tool prices (micro-USD per call); omitted when not configured. */
+  readonly toolPrices?: Readonly<Partial<Record<HostedToolName, number>>>;
 }
 
 /**
@@ -245,6 +269,7 @@ export interface GatewayModelLimits {
   readonly window?: number;
   readonly maxOutput?: number;
   readonly longestOutput?: number;
+  readonly longContextThreshold?: number;
 }
 
 /** `limits` as the gateway reads them: the stated ones, nothing for the rest. */
@@ -253,6 +278,7 @@ export function gatewayModelLimits(limits: ModelLimits): GatewayModelLimits {
     ...(limits.window === null ? {} : { window: limits.window }),
     ...(limits.maxOutput === null ? {} : { maxOutput: limits.maxOutput }),
     ...(limits.longestOutput === null ? {} : { longestOutput: limits.longestOutput }),
+    ...(limits.longContextThreshold == null ? {} : { longContextThreshold: limits.longContextThreshold }),
   };
 }
 
@@ -348,6 +374,47 @@ export interface GatewayLaneOffer {
   readonly outputOverheadTokens: number | null;
 }
 
+function gatewayLongContext(lc: OfferLongContextTerms | null | undefined): GatewayLongContextQuote | undefined {
+  if (lc == null) return undefined;
+  return {
+    thresholdInputTokens: lc.threshold_input_tokens,
+    input: lc.input_microusd_per_million,
+    output: lc.output_microusd_per_million,
+    cacheRead: lc.cache_read_microusd_per_million,
+    cacheWrite: lc.cache_write_microusd_per_million,
+    cacheWrite1h: lc.cache_write_1h_microusd_per_million,
+  };
+}
+
+function gatewayServiceTiers(tiers: Readonly<Partial<Record<ServiceTierName, OfferServiceTierTerms>>> | null | undefined): Readonly<Partial<Record<ServiceTierName, GatewayServiceTierQuote>>> | undefined {
+  if (tiers == null) return undefined;
+  const out: Partial<Record<ServiceTierName, GatewayServiceTierQuote>> = {};
+  for (const name of SERVICE_TIER_NAMES) {
+    const t = tiers[name];
+    if (t == null) continue;
+    const lc = gatewayLongContext(t.long_context);
+    out[name] = {
+      input: t.input_microusd_per_million,
+      output: t.output_microusd_per_million,
+      cacheRead: t.cache_read_microusd_per_million,
+      cacheWrite: t.cache_write_microusd_per_million,
+      cacheWrite1h: t.cache_write_1h_microusd_per_million,
+      ...(lc === undefined ? {} : { longContext: lc }),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function gatewayToolPrices(prices: Readonly<Partial<Record<HostedToolName, number>>> | null | undefined): Readonly<Partial<Record<HostedToolName, number>>> | undefined {
+  if (prices == null) return undefined;
+  const out: Partial<Record<HostedToolName, number>> = {};
+  for (const name of HOSTED_TOOL_NAMES) {
+    const p = prices[name];
+    if (p != null) out[name] = p;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
   // A route without an approved price serves only non-production fixtures in the server
   // (inference.rs UNQUOTED_CONCURRENCY); the gateway prices every route from its quote.
@@ -395,6 +462,9 @@ function routeRecord(r: SnapshotRoute): GatewayRouteRecord | null {
         audioOutput: t.media.audio_output_microusd_per_million,
         unitPrices: { ...t.media.unit_prices },
       },
+      ...((lc) => (lc === undefined ? {} : { longContext: lc }))(gatewayLongContext(t.long_context)),
+      ...((st) => (st === undefined ? {} : { serviceTiers: st }))(gatewayServiceTiers(t.service_tiers)),
+      ...((tp) => (tp === undefined ? {} : { toolPrices: tp }))(gatewayToolPrices(t.tool_prices)),
     },
     serviceRegion: t.service_region,
     // The server drops a quote past its eligibility (inference.rs `quote`: eligible_until > now).

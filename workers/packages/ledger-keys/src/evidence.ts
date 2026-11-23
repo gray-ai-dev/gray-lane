@@ -29,6 +29,14 @@ export const MAX_PLATFORM_FEE_BPS = 10_000n;
 export const BILLING_UNITS = ["images", "videos", "seconds", "characters", "requests"] as const;
 /** supply.rs GEMINI_MODALITIES. */
 export const GEMINI_MODALITIES = ["TEXT", "IMAGE", "AUDIO", "VIDEO", "DOCUMENT"] as const;
+/** Accelerated service tiers that may appear in evidence when non-standard pricing applied. */
+export const EVIDENCE_SERVICE_TIERS = ["fast", "priority"] as const;
+export type EvidenceServiceTier = (typeof EVIDENCE_SERVICE_TIERS)[number];
+/** Per-call billable hosted tool names that may appear in evidence usage and prices. */
+export const EVIDENCE_HOSTED_TOOLS = ["web_search", "google_search", "code_execution", "file_search"] as const;
+export type EvidenceHostedTool = (typeof EVIDENCE_HOSTED_TOOLS)[number];
+export type HostedToolCounts = Readonly<Partial<Record<EvidenceHostedTool, bigint>>>;
+export type HostedToolPrices = Readonly<Partial<Record<EvidenceHostedTool, bigint>>>;
 
 /** Why the ledger refuses: its Error::Transition, Error::Amount or Error::Conflict. */
 export type RefusalKind = "transition" | "amount" | "conflict";
@@ -56,6 +64,8 @@ export interface UsageCounters {
   readonly image_output_tokens: bigint;
   readonly audio_output_tokens: bigint;
   readonly units: bigint;
+  /** Per-call billable hosted tool invocations; absent when none occurred. */
+  readonly tool_calls?: HostedToolCounts;
 }
 
 /** The counters after the two required ones, in declaration order (all `#[serde(default, skip_serializing_if = "is_zero")]`). */
@@ -131,6 +141,8 @@ export interface SupplierQuote {
   readonly cache_write_microusd_per_million: bigint | null;
   readonly cache_write_1h_microusd_per_million: bigint | null;
   readonly media: MediaRates;
+  /** Per-call supplier prices for billable hosted tools (micro-USD per call); absent when unset. */
+  readonly tool_prices?: HostedToolPrices;
 }
 
 export interface FinalizationEvidence {
@@ -151,6 +163,12 @@ export interface FinalizationEvidence {
   readonly quote: SupplierQuote | null;
   readonly platform_fee_bps: bigint | null;
   readonly client_protocol: string | null;
+  /** Accelerated service tier billed (`fast` or `priority`); absent/null for standard pricing. */
+  readonly service_tier?: EvidenceServiceTier | null;
+  /** True when the offer's long-context tier applied to this request; absent/false otherwise. */
+  readonly long_context?: boolean;
+  /** Per-call customer prices for billable hosted tools (micro-USD per call); absent when unset. */
+  readonly customer_tool_prices?: HostedToolPrices;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -184,13 +202,42 @@ function struct(v: Json, what: string): JsonObject {
   return isObject(v) ? v : bad(`${what} is not an object`);
 }
 
+function readToolMap(o: JsonObject, key: string): HostedToolCounts | undefined {
+  const v = get(o, key);
+  if (v === undefined || v === null) return undefined;
+  const m = struct(v, key);
+  const out: Partial<Record<EvidenceHostedTool, bigint>> = {};
+  for (const k of Object.keys(m)) {
+    if (!(EVIDENCE_HOSTED_TOOLS as readonly string[]).includes(k)) bad(`unknown field ${k} in ${key}`);
+    out[k as EvidenceHostedTool] = u64(m[k]!, `${key}.${k}`);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readServiceTier(o: JsonObject, key: string): EvidenceServiceTier | null {
+  const v = get(o, key);
+  if (v === undefined || v === null) return null;
+  const s = str(v, key);
+  if (!(EVIDENCE_SERVICE_TIERS as readonly string[]).includes(s)) bad(`invalid ${key}`);
+  return s as EvidenceServiceTier;
+}
+
+function readOptionalBool(o: JsonObject, key: string): boolean {
+  const v = get(o, key);
+  if (v === undefined || v === null) return false;
+  if (typeof v !== "boolean") return bad(`${key} is not a boolean`);
+  return v;
+}
+
 function readUsage(v: Json): UsageCounters {
   const o = struct(v, "usage");
-  const out: Record<string, bigint> = { input_tokens: u64(required(o, "input_tokens"), "input_tokens"), output_tokens: u64(required(o, "output_tokens"), "output_tokens") };
+  const out: Record<string, unknown> = { input_tokens: u64(required(o, "input_tokens"), "input_tokens"), output_tokens: u64(required(o, "output_tokens"), "output_tokens") };
   for (const k of OPTIONAL_COUNTERS) {
     const m = get(o, k);
     out[k] = m === undefined ? 0n : u64(m, k);
   }
+  const toolCalls = readToolMap(o, "tool_calls");
+  if (toolCalls !== undefined) out.tool_calls = toolCalls;
   return out as unknown as UsageCounters;
 }
 
@@ -207,6 +254,7 @@ function readMedia(o: JsonObject, key: string): MediaRates {
 
 function readQuote(v: Json): SupplierQuote {
   const o = struct(v, "quote");
+  const toolPrices = readToolMap(o, "tool_prices");
   return {
     offer_id: str(required(o, "offer_id"), "offer_id"),
     offer_version: u64(required(o, "offer_version"), "offer_version"),
@@ -220,6 +268,7 @@ function readQuote(v: Json): SupplierQuote {
     cache_write_microusd_per_million: option(o, "cache_write_microusd_per_million", u64),
     cache_write_1h_microusd_per_million: option(o, "cache_write_1h_microusd_per_million", u64),
     media: readMedia(o, "media"),
+    ...(toolPrices === undefined ? {} : { tool_prices: toolPrices }),
   };
 }
 
@@ -231,6 +280,9 @@ function readQuote(v: Json): SupplierQuote {
 export function parseEvidence(text: string): FinalizationEvidence | null {
   try {
     const o = struct(parseSerde(text), "evidence");
+    const serviceTier = readServiceTier(o, "service_tier");
+    const longContext = readOptionalBool(o, "long_context");
+    const customerToolPrices = readToolMap(o, "customer_tool_prices");
     return {
       model: str(required(o, "model"), "model"),
       protocol: str(required(o, "protocol"), "protocol"),
@@ -252,6 +304,9 @@ export function parseEvidence(text: string): FinalizationEvidence | null {
         return n <= U32_MAX ? n : bad(`${what} is not a u32`);
       }),
       client_protocol: option(o, "client_protocol", str),
+      ...(serviceTier === null ? {} : { service_tier: serviceTier }),
+      ...(longContext ? { long_context: true } : {}),
+      ...(customerToolPrices === undefined ? {} : { customer_tool_prices: customerToolPrices }),
     };
   } catch (err) {
     if (err instanceof NotEvidence || err instanceof JsonError) return null;
@@ -272,11 +327,23 @@ function structJson(members: readonly (readonly [string, string | undefined])[])
 }
 const opt = (v: SerdeValue | null): string | undefined => (v === null ? undefined : toJsonString(v));
 
+function toolMapJson(m: HostedToolCounts | HostedToolPrices | undefined, skipZero: boolean): string | undefined {
+  if (m === undefined) return undefined;
+  const members: (readonly [string, string | undefined])[] = [];
+  for (const k of EVIDENCE_HOSTED_TOOLS) {
+    const v = m[k];
+    if (v === undefined || (skipZero && v === 0n)) continue;
+    members.push([k, toJsonString(v)]);
+  }
+  return members.length === 0 ? undefined : structJson(members);
+}
+
 function usageJson(u: UsageCounters): string {
   return structJson([
     ["input_tokens", toJsonString(u.input_tokens)],
     ["output_tokens", toJsonString(u.output_tokens)],
     ...OPTIONAL_COUNTERS.map((k) => [k, u[k] === 0n ? undefined : toJsonString(u[k])] as const),
+    ["tool_calls", toolMapJson(u.tool_calls, true)],
   ]);
 }
 
@@ -298,6 +365,7 @@ function quoteJson(q: SupplierQuote): string {
     ["cache_write_microusd_per_million", opt(q.cache_write_microusd_per_million)],
     ["cache_write_1h_microusd_per_million", opt(q.cache_write_1h_microusd_per_million)],
     ["media", mediaJson(q.media)],
+    ["tool_prices", toolMapJson(q.tool_prices, false)],
   ]);
 }
 
@@ -321,6 +389,9 @@ export function storedEvidence(e: FinalizationEvidence): string {
     ["quote", e.quote === null ? "null" : quoteJson(e.quote)],
     ["platform_fee_bps", opt(e.platform_fee_bps)],
     ["client_protocol", opt(e.client_protocol)],
+    ["service_tier", e.service_tier == null ? undefined : toJsonString(e.service_tier)],
+    ["long_context", e.long_context === true ? "true" : undefined],
+    ["customer_tool_prices", toolMapJson(e.customer_tool_prices, false)],
   ]);
 }
 
@@ -400,7 +471,24 @@ function weighted(parts: readonly (readonly [bigint, bigint])[]): bigint {
 
 const sub = (a: bigint, b: bigint) => (a >= b ? a - b : refuse("amount"));
 
-function usageCostOrThrow(u: UsageCounters, r: TokenRates): bigint {
+function toolChargeOrThrow(calls: HostedToolCounts | undefined, prices: HostedToolPrices | undefined): bigint {
+  if (calls === undefined) return 0n;
+  let total = 0n;
+  for (const k of EVIDENCE_HOSTED_TOOLS) {
+    const count = calls[k];
+    if (count === undefined || count === 0n) continue;
+    if (count > I64_MAX) refuse("amount");
+    const rate = prices?.[k];
+    if (rate === undefined) return refuse("transition");
+    const charge = count * rate;
+    if (charge > I64_MAX) refuse("amount");
+    total += charge;
+    if (total > I64_MAX) refuse("amount");
+  }
+  return total;
+}
+
+function usageCostOrThrow(u: UsageCounters, r: TokenRates, toolPrices?: HostedToolPrices): bigint {
   const uncached = sub(sub(u.input_tokens, u.cache_read_input_tokens), u.cache_write_input_tokens);
   const textInput = sub(sub(uncached, u.image_input_tokens), u.audio_input_tokens);
   const textOutput = sub(sub(u.output_tokens, u.image_output_tokens), u.audio_output_tokens);
@@ -420,14 +508,15 @@ function usageCostOrThrow(u: UsageCounters, r: TokenRates): bigint {
   ]);
   // price_tokens (crates/gray-ledger/src/lib.rs): ceil(units x rate / 1e6), within i64.
   const units = whole(u.units * r.unit);
-  const sum = whole(input) + whole(output) + units;
+  const tools = toolChargeOrThrow(u.tool_calls, toolPrices);
+  const sum = whole(input) + whole(output) + units + tools;
   return sum > I64_MAX ? refuse("amount") : sum;
 }
 
 /** `usage_cost`: the charge in micro-USD, or "amount" where the ledger refuses it. */
-export function usageCost(u: UsageCounters, r: TokenRates): bigint | "amount" {
+export function usageCost(u: UsageCounters, r: TokenRates, toolPrices?: HostedToolPrices): bigint | "amount" {
   try {
-    return usageCostOrThrow(u, r);
+    return usageCostOrThrow(u, r, toolPrices);
   } catch (err) {
     if (err instanceof Refusal) return "amount";
     throw err;
@@ -470,9 +559,14 @@ const SAFE_NESTED: readonly (readonly [string, readonly string[]])[] = [
   ["input_token_details", ["audio_tokens", "text_tokens"]],
   ["output_tokens_details", ["reasoning_tokens", "thinking_tokens", "audio_tokens", "image_tokens", "text_tokens"]],
   ["cache_creation", ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]],
-  ["server_tool_use", ["web_search_requests", "web_fetch_requests"]],
+  ["server_tool_use", ["web_search_requests", "web_fetch_requests", "code_execution_requests"]],
+  ["hosted_tool_calls", ["web_search", "google_search", "code_execution", "file_search"]],
 ];
 const SAFE_MODALITY_LISTS = ["promptTokensDetails", "candidatesTokensDetails", "cacheTokensDetails", "toolUsePromptTokensDetails"];
+const MAX_USAGE_ITERATIONS = 32;
+const ITERATION_TYPES = ["compaction", "message"] as const;
+const ITERATION_COUNTERS = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] as const;
+const ITERATION_CACHE_CREATION_FIELDS = ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] as const;
 
 function project(raw: Json, fields: readonly string[]): JsonObject {
   const out: JsonObject = {};
@@ -492,6 +586,24 @@ export function safeUsageCounters(raw: Json): JsonObject {
       const p = project(v, fields);
       if (Object.keys(p).length > 0) out[key] = p;
     }
+  }
+  const iterations = asArray(get(raw, "iterations"));
+  if (iterations !== undefined && iterations.length > 0) {
+    const kept: JsonObject[] = [];
+    for (const entry of iterations) {
+      if (kept.length >= MAX_USAGE_ITERATIONS) break;
+      if (!isObject(entry)) continue;
+      const item = project(entry, ITERATION_COUNTERS);
+      const typ = asStr(get(entry, "type"));
+      if (typ !== undefined && (ITERATION_TYPES as readonly string[]).includes(typ)) item.type = typ;
+      const split = get(entry, "cache_creation");
+      if (isObject(split)) {
+        const projectedSplit = project(split, ITERATION_CACHE_CREATION_FIELDS);
+        if (Object.keys(projectedSplit).length > 0) item.cache_creation = projectedSplit;
+      }
+      if (Object.keys(item).length > 0) kept.push(item);
+    }
+    if (kept.length > 0) out.iterations = kept;
   }
   for (const key of SAFE_MODALITY_LISTS) {
     const entries = asArray(get(raw, key));
@@ -556,7 +668,7 @@ function responses(raw: Json): UsageCounters {
   });
 }
 
-function anthropic(raw: Json): UsageCounters {
+function anthropicPass(raw: Json): UsageCounters {
   const cacheRead = optionalCount(raw, "cache_read_input_tokens") ?? 0n;
   const total = optionalCount(raw, "cache_creation_input_tokens");
   const input = requiredCount(raw, "input_tokens");
@@ -595,15 +707,53 @@ function anthropic(raw: Json): UsageCounters {
   });
 }
 
+function anthropic(raw: Json): UsageCounters {
+  const top = anthropicPass(raw);
+  const iterations = get(raw, "iterations");
+  if (iterations === undefined || iterations === null) return top;
+  const entries = asArray(iterations);
+  if (entries === undefined || entries.length > MAX_USAGE_ITERATIONS) refuse("transition");
+  if (entries!.length === 0) return top;
+  let sumInput = 0n;
+  let sumOutput = 0n;
+  let sumCacheRead = 0n;
+  let sumCacheWrite = 0n;
+  let sumCacheWrite1h = 0n;
+  for (const entry of entries!) {
+    if (!isObject(entry)) refuse("transition");
+    const pass = anthropicPass(entry);
+    sumInput = add(sumInput, pass.input_tokens);
+    sumOutput = add(sumOutput, pass.output_tokens);
+    sumCacheRead = add(sumCacheRead, pass.cache_read_input_tokens);
+    sumCacheWrite = add(sumCacheWrite, pass.cache_write_input_tokens);
+    sumCacheWrite1h = add(sumCacheWrite1h, pass.cache_write_1h_input_tokens);
+  }
+  const chosenOutput = sumOutput > top.output_tokens ? sumOutput : top.output_tokens;
+  if (sumInput > top.input_tokens) {
+    return counters({
+      input_tokens: sumInput,
+      output_tokens: chosenOutput,
+      cache_read_input_tokens: sumCacheRead,
+      cache_write_input_tokens: sumCacheWrite,
+      cache_write_1h_input_tokens: sumCacheWrite1h,
+    });
+  }
+  return { ...top, output_tokens: chosenOutput };
+}
+
 function gemini(raw: Json): UsageCounters {
+  const prompt = requiredCount(raw, "promptTokenCount");
+  const cacheRead = optionalCount(raw, "cachedContentTokenCount") ?? 0n;
+  if (cacheRead > prompt) refuse("transition");
+  const toolUsePrompt = optionalCount(raw, "toolUsePromptTokenCount") ?? 0n;
   const a = optionalCount(raw, "thoughtsTokenCount");
   const b = optionalCount(raw, "thinkingTokenCount");
   if (a !== null && b !== null && a !== b) refuse("transition");
   const thoughts = a ?? b ?? 0n;
   return counters({
-    input_tokens: requiredCount(raw, "promptTokenCount"),
+    input_tokens: add(prompt, toolUsePrompt),
     output_tokens: add(optionalCount(raw, "candidatesTokenCount") ?? 0n, thoughts),
-    cache_read_input_tokens: optionalCount(raw, "cachedContentTokenCount") ?? 0n,
+    cache_read_input_tokens: cacheRead,
   });
 }
 
@@ -726,13 +876,38 @@ function validateOrThrow(e: FinalizationEvidence, amount: bigint): bigint | null
     if (native instanceof Refusal) throw native;
     if (native !== undefined && !sameCounters(native, withoutMedia(e.usage))) refuse("transition");
   }
+  if (e.usage.tool_calls !== undefined) {
+    for (const k of EVIDENCE_HOSTED_TOOLS) {
+      const count = e.usage.tool_calls[k];
+      if (count === undefined || count === 0n) continue;
+      if (count > I64_MAX) refuse("amount");
+      let rawCount: bigint | undefined;
+      if (e.protocol === "anthropic_messages") {
+        const stu = get(raw, "server_tool_use");
+        if (k === "web_search") rawCount = asU64(get(stu, "web_search_requests"));
+        else if (k === "code_execution") rawCount = asU64(get(stu, "code_execution_requests"));
+      }
+      if (rawCount === undefined) {
+        rawCount = asU64(get(get(raw, "hosted_tool_calls"), k));
+      }
+      if (rawCount !== count) refuse("transition");
+    }
+  }
   for (const k of COUNTERS) if (e.usage[k] > I64_MAX) refuse("amount");
-  if (amount < 0n || usageCostOrThrow(e.usage, customerRates(e)) !== amount) refuse("amount");
+  if (amount < 0n || usageCostOrThrow(e.usage, customerRates(e), e.customer_tool_prices) !== amount) refuse("amount");
   if (e.platform_fee_bps !== null) {
     if (e.quote === null) refuse("conflict");
     const q = quoteRates(e.quote!);
     const c = customerRates(e);
     for (const k of RATE_FIELDS) if (customerRate(q[k], e.platform_fee_bps) !== c[k]) refuse("conflict");
+    const qt = e.quote!.tool_prices ?? {};
+    const ct = e.customer_tool_prices ?? {};
+    for (const k of EVIDENCE_HOSTED_TOOLS) {
+      const qp = qt[k];
+      const cp = ct[k];
+      if ((qp === undefined) !== (cp === undefined)) refuse("conflict");
+      if (qp !== undefined && customerRate(qp, e.platform_fee_bps) !== cp) refuse("conflict");
+    }
   }
   let payable: bigint | null = null;
   if (e.quote !== null) {
@@ -747,7 +922,7 @@ function validateOrThrow(e: FinalizationEvidence, amount: bigint): bigint | null
     ) {
       refuse("conflict");
     }
-    payable = usageCostOrThrow(e.usage, quoteRates(q));
+    payable = usageCostOrThrow(e.usage, quoteRates(q), q.tool_prices);
   }
   if (payable !== null && payable > amount) refuse("amount");
   return payable;

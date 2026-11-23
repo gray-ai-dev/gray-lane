@@ -240,6 +240,10 @@ export const CONTINUATION_ERRORS = {
   lookupUnavailable: () => new ApiError(503, "continuation_lookup_unavailable"),
   endpointConflict: () => new ApiError(409, "continuation_endpoint_conflict"),
   endpointUnavailable: () => new ApiError(409, "continuation_endpoint_unavailable"),
+  stateTooLarge: () =>
+    new ApiError(413, "request_body_limit").withMessage(
+      "The referenced zero-retention continuation state exceeds the request size limit. Send the conversation directly or start a new turn.",
+    ),
 } as const;
 
 export interface PinOptions {
@@ -263,6 +267,8 @@ export interface PinOptions {
    * absent: no copy.
    */
   readonly background?: (work: Promise<unknown>) => void;
+  /** Maximum cumulative UTF-8 bytes of sealed zero-retention state returned by one `pinReferences` call. */
+  readonly maxSealedBytes?: number;
 }
 
 /** One reference's live encrypted zero-retention continuation state returned by a pin lookup. */
@@ -302,18 +308,41 @@ export async function pinContinuation(o: PinOptions & { readonly protocol: Proto
  * When any matched reference carries live sealed zero-retention state, `sealed` lists each hit in `refs` order.
  */
 export async function pinReferences(o: PinOptions, refs: readonly Reference[]): Promise<PinResult> {
-  const answers = await mapConcurrent(refs, REFERENCE_BATCH_CONCURRENCY, (ref) => resolve(o, ref));
+  let cumulativeSealedBytes = 0;
+  let sealedOverflow = false;
+  const maxSealedBytes = o.maxSealedBytes;
+  const answers = await mapConcurrent(refs, REFERENCE_BATCH_CONCURRENCY, async (ref): Promise<{ readonly res: Resolution; readonly sealedBytes: number } | null> => {
+    if (sealedOverflow) return null;
+    const res = await resolve(o, ref);
+    let sealedBytes = 0;
+    if (res.kind === "found" && res.sealed !== undefined && maxSealedBytes !== undefined) {
+      sealedBytes = ENCODER.encode(res.sealed).byteLength;
+      cumulativeSealedBytes += sealedBytes;
+      if (cumulativeSealedBytes > maxSealedBytes) sealedOverflow = true;
+    }
+    return { res, sealedBytes };
+  });
   let pinned: string | null = null;
   const sealed: SealedContinuationHit[] = [];
+  let checkedSealedBytes = 0;
   for (let i = 0; i < answers.length; i++) {
-    const answer = answers[i]!;
+    const entry = answers[i];
+    if (entry === undefined || entry === null) return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge(), unanswered: [] };
+    const answer = entry.res;
     const ref = refs[i]!;
     if (answer.kind === "unavailable") return { ok: false, error: CONTINUATION_ERRORS.lookupUnavailable(), unanswered: answer.unanswered };
     if (answer.kind === "missing") return { ok: false, error: CONTINUATION_ERRORS.notFound(), unanswered: [] };
     if (pinned !== null && pinned !== answer.endpoint) return { ok: false, error: CONTINUATION_ERRORS.endpointConflict(), unanswered: [] };
     pinned = answer.endpoint;
-    if (answer.sealed !== undefined) sealed.push({ kind: ref.kind, reference: ref.reference, sealed: answer.sealed });
+    if (answer.sealed !== undefined) {
+      if (maxSealedBytes !== undefined) {
+        checkedSealedBytes += entry.sealedBytes;
+        if (checkedSealedBytes > maxSealedBytes) return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge(), unanswered: [] };
+      }
+      sealed.push({ kind: ref.kind, reference: ref.reference, sealed: answer.sealed });
+    }
   }
+  if (sealedOverflow) return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge(), unanswered: [] };
   return sealed.length === 0 ? { ok: true, pinned } : { ok: true, pinned, sealed };
 }
 

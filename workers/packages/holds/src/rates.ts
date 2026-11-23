@@ -235,3 +235,29 @@ export function within(rate: CustomerRate, bound: RateBound, ttlAsRequested: boo
     tokenRates(rate).unit <= bound.unit
   );
 }
+
+/** Component-wise maximum of two customer rates (used when a hold must cover both standard and long-context tiers). */
+export function maxCustomerRate(a: CustomerRate, b: CustomerRate): CustomerRate {
+  const ra = tokenRates(a);
+  const rb = tokenRates(b);
+  const optMax = (x: bigint | undefined, y: bigint | undefined): bigint | undefined => {
+    if (x === undefined) return y;
+    if (y === undefined) return x;
+    return max(x, y);
+  };
+  return {
+    input: max(ra.input, rb.input),
+    output: max(ra.output, rb.output),
+    cacheRead: max(ra.cacheRead, rb.cacheRead),
+    cacheWrite: max(ra.cacheWrite, rb.cacheWrite),
+    cacheWrite1h: max(ra.cacheWrite1h, rb.cacheWrite1h),
+    feeBps: a.feeBps ?? b.feeBps,
+    media: {
+      imageInput: optMax(a.media.imageInput, b.media.imageInput),
+      audioInput: optMax(a.media.audioInput, b.media.audioInput),
+      imageOutput: optMax(a.media.imageOutput, b.media.imageOutput),
+      audioOutput: optMax(a.media.audioOutput, b.media.audioOutput),
+      unit: optMax(a.media.unit, b.media.unit),
+    },
+  };
+}

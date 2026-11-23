@@ -2,7 +2,7 @@
  * Usage counters and finish reasons between the four protocols
  * (crates/gray-protocol/src/translate/usage.rs). Counters are u64 (`bigint`).
  */
-import { type Json, type JsonObject, asU64, pointer } from "@gray/json";
+import { type Json, type JsonObject, asStr, asU64, pointer } from "@gray/json";
 import type { Protocol } from "../types.ts";
 import { type Finish, type Usage, saturatingAdd, saturatingSub } from "./ir.ts";
 
@@ -140,11 +140,21 @@ export function geminiFinish(reason: string): Finish {
     case "PROHIBITED_CONTENT":
     case "SPII":
     case "IMAGE_SAFETY":
+    case "IMAGE_PROHIBITED_CONTENT":
+    case "IMAGE_RECITATION":
+    case "ESCALATION":
+    case "PUP_LIMITED_DISABLED":
     case "LANGUAGE":
       return "content_filter";
     default:
       return "other";
   }
+}
+
+/** True when Gemini `promptFeedback.blockReason` names an actual block reason (not null, empty, or unspecified). */
+export function hasGeminiBlockReason(body: Json): boolean {
+  const reason = asStr(pointer(body, "/promptFeedback/blockReason"));
+  return reason !== undefined && reason !== "" && reason !== "BLOCK_REASON_UNSPECIFIED";
 }
 
 /** A Responses terminal status and its `incomplete_details.reason`. */

@@ -46,6 +46,25 @@ export { geminiBlockFinish, mapFinish } from "./finish.ts";
 export { GeminiRefusal, geminiBlockReason, isGeminiRefusal } from "./refusal.ts";
 export { AnswerEnd, type AnswerEndFailure, type AnswerEndReason, GEMINI_ACCOUNT_LIMITED, UNFINISHED_EMPTY, unfinished } from "./answer-end.ts";
 export {
+  DEFAULT_UNBOUNDED_TOOL_USES,
+  HOSTED_TOOL_NAMES,
+  NO_PRICING_FEATURES,
+  SERVICE_TIER_NAMES,
+  StreamBillingObserver,
+  attachHostedToolCallsToRawUsage,
+  extractBufferedBillingMeta,
+  extractPricingFeatures,
+  isHostedToolName,
+  isServiceTierName,
+  resolveAppliedServiceTier,
+  type HostedToolCalls,
+  type HostedToolName,
+  type RequestedHostedTool,
+  type RequestedPricingFeatures,
+  type ResponseBillingMeta,
+  type ServiceTierName,
+} from "./pricing-features.ts";
+export {
   type BilledTokens,
   type BilledUsage,
   type CounterNames,
@@ -134,6 +153,7 @@ export {
   PromptUnits,
   RESERVED_PROMPT_OVERHEAD_TOKENS,
   Unbounded,
+  requestCompacts,
 } from "./reservation.ts";
 export {
   CLAUDE_MAX_VISUAL_TOKENS,
@@ -166,6 +186,7 @@ export {
   translateRequest,
   translateResponse,
 } from "./translate/index.ts";
+export { jsonSchema as normalizeGeminiSchema } from "./translate/decode.ts";
 export { SCRUB_SPAN_HELD_BYTES, ScrubScan, ScrubSpansTooMany, type ScrubSpan, withoutSpans } from "./translate/scrub-scan.ts";
 export {
   type GeminiModel,

@@ -842,13 +842,17 @@ const USAGE_NESTED_COUNTER_FIELDS: readonly (readonly [string, readonly string[]
   ["input_token_details", ["audio_tokens", "text_tokens"]],
   ["output_tokens_details", ["reasoning_tokens", "thinking_tokens", "audio_tokens", "image_tokens", "text_tokens"]],
   ["cache_creation", ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]],
-  ["server_tool_use", ["web_search_requests", "web_fetch_requests"]],
+  ["server_tool_use", ["web_search_requests", "web_fetch_requests", "code_execution_requests"]],
+  ["hosted_tool_calls", ["web_search", "google_search", "code_execution", "file_search"]],
 ];
 
 /** The Gemini per-modality lists `safe_usage_counters` keeps. */
 const USAGE_MODALITY_LIST_FIELDS: readonly string[] = ["promptTokensDetails", "candidatesTokensDetails", "cacheTokensDetails", "toolUsePromptTokensDetails"];
 /** `GEMINI_MODALITIES` (`@gray/ledger-keys`). */
 const USAGE_MODALITIES = Object.freeze(["TEXT", "IMAGE", "AUDIO", "VIDEO", "DOCUMENT"] as const);
+const MAX_USAGE_ITERATIONS = 32;
+const USAGE_ITERATION_TYPES = Object.freeze(["compaction", "message"] as const);
+const USAGE_ITERATION_COUNTER_FIELDS = Object.freeze(["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] as const);
 
 /** The largest u64 a reported usage counter can be (`safe_usage_counters`' u64 fields). */
 export const USAGE_COUNTER_MAX = 2n ** 64n - 1n;
@@ -866,22 +870,31 @@ function countersShape(names: readonly string[], nullable: readonly string[]): R
   return shape;
 }
 
+const laneIterationUsageSchema = z
+  .object({
+    ...countersShape(USAGE_ITERATION_COUNTER_FIELDS, USAGE_NULLABLE_COUNTER_FIELDS),
+    ...Object.fromEntries([
+      ["type", z.enum(USAGE_ITERATION_TYPES).optional()],
+      ["cache_creation", z.object(countersShape(["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"], [])).strict().optional()],
+    ]),
+  })
+  .strict();
+
 /** The counters an event may report: `reported_usage`, closed, every integer a bigint. */
 export const laneReportedUsageSchema = z
   .object({
     ...countersShape(USAGE_COUNTER_FIELDS, USAGE_NULLABLE_COUNTER_FIELDS),
-    ...Object.fromEntries(
-      USAGE_NESTED_COUNTER_FIELDS.map(([name, fields]) => [name, z.object(countersShape(fields, [])).strict().optional()]),
-    ),
-    ...Object.fromEntries(
-      USAGE_MODALITY_LIST_FIELDS.map((name) => [
+    ...Object.fromEntries([
+      ...USAGE_NESTED_COUNTER_FIELDS.map(([name, fields]) => [name, z.object(countersShape(fields, [])).strict().optional()] as const),
+      ["iterations", z.array(laneIterationUsageSchema).min(1).max(MAX_USAGE_ITERATIONS).optional()] as const,
+      ...USAGE_MODALITY_LIST_FIELDS.map((name) => [
         name,
         z
           .array(z.object({ modality: z.enum(USAGE_MODALITIES), tokenCount: uintSchema }).strict())
           .max(USAGE_MODALITIES.length)
           .optional(),
-      ]),
-    ),
+      ] as const),
+    ]),
   })
   .strict();
 export type LaneReportedUsageDto = z.infer<typeof laneReportedUsageSchema>;
@@ -971,6 +984,36 @@ function reportedUsageDtoOf(value: unknown): LaneReportedUsageDto {
       return { modality: eventText(record, "modality"), tokenCount: counterDtoOf(record["tokenCount"], `reported_usage.${name}.tokenCount`) };
     });
   }
+  const iterations = raw["iterations"];
+  if (iterations !== undefined) {
+    if (!Array.isArray(iterations)) throw new BridgeWireError("invalid_document", "reported_usage.iterations", "reported_usage.iterations is an array");
+    const mapped: Record<string, unknown>[] = [];
+    for (let i = 0; i < iterations.length; i++) {
+      const item = iterations[i];
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        throw new BridgeWireError("invalid_document", `reported_usage.iterations[${i}]`, "an iteration entry is an object");
+      }
+      const rec = item as Record<string, unknown>;
+      const entryOut: Record<string, unknown> = {};
+      if (rec["type"] !== undefined) entryOut["type"] = eventText(rec, "type");
+      for (const field of USAGE_ITERATION_COUNTER_FIELDS) {
+        if (Object.hasOwn(rec, field)) entryOut[field] = counterDtoOf(rec[field], `reported_usage.iterations[${i}].${field}`);
+      }
+      const cc = rec["cache_creation"];
+      if (cc !== undefined) {
+        if (typeof cc !== "object" || cc === null || Array.isArray(cc)) {
+          throw new BridgeWireError("invalid_document", `reported_usage.iterations[${i}].cache_creation`, "iteration cache_creation is an object");
+        }
+        const ccOut: Record<string, unknown> = {};
+        for (const f of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
+          if (Object.hasOwn(cc, f)) ccOut[f] = counterDtoOf((cc as Record<string, unknown>)[f], `reported_usage.iterations[${i}].cache_creation.${f}`);
+        }
+        if (Object.keys(ccOut).length > 0) entryOut["cache_creation"] = ccOut;
+      }
+      if (Object.keys(entryOut).length > 0) mapped.push(entryOut);
+    }
+    if (mapped.length > 0) out["iterations"] = mapped;
+  }
   return out as LaneReportedUsageDto;
 }
 
@@ -1034,6 +1077,25 @@ export function laneServiceEventOf(dto: LaneServiceEventDto): Record<string, unk
     const entries = raw[name];
     if (entries === undefined) continue;
     reportedUsage[name] = (entries as readonly { readonly modality: string; readonly tokenCount: bigint }[]).map((entry) => ({ modality: entry.modality, tokenCount: counterOf(entry.tokenCount) }));
+  }
+  const iterations = raw["iterations"] as readonly Record<string, unknown>[] | undefined;
+  if (iterations !== undefined) {
+    reportedUsage["iterations"] = iterations.map((iter) => {
+      const outIter: Record<string, unknown> = {};
+      if (typeof iter["type"] === "string") outIter["type"] = iter["type"];
+      for (const field of USAGE_ITERATION_COUNTER_FIELDS) {
+        if (Object.hasOwn(iter, field)) outIter[field] = counterOf(iter[field] as bigint | null);
+      }
+      const cc = iter["cache_creation"] as Record<string, unknown> | undefined;
+      if (cc !== undefined) {
+        const ccOut: Record<string, unknown> = {};
+        for (const f of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
+          if (Object.hasOwn(cc, f)) ccOut[f] = counterOf(cc[f] as bigint);
+        }
+        outIter["cache_creation"] = ccOut;
+      }
+      return outIter;
+    });
   }
   return {
     event_id: dto.event_id,

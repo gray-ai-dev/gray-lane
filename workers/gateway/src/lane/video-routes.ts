@@ -1,13 +1,13 @@
-import { isLocationHint } from "@gray/config";
 import { ApiError, shapeOf, type Origins } from "@gray/errors";
 import { VIDEO_JOB_ID_PATTERN, videoJobClosed, type LaneVideoJob } from "@gray/lane-wire";
 import { type ContentLimits, streamMedia } from "@gray/media";
 import { newRequestId } from "@gray/ledger-keys";
-import { keyHash, presentedKey } from "../auth.ts";
+import { workspaceHome } from "../account.ts";
+import { hasQueryCredentials, keyHash, presentedKey } from "../auth.ts";
 import { originsOf } from "../hosts.ts";
 import type { GatewayDeps } from "../inference.ts";
-import { lookUpKey } from "../key-lookup.ts";
-import { countKeyRate } from "../key-rate.ts";
+import { checkStaleKey, lookUpKey, type KeyLookup } from "../key-lookup.ts";
+import { countLiveKeyRate } from "../key-rate.ts";
 import { Outbound } from "../outbound.ts";
 import type { GatewaySnapshot, RouteRecord } from "../snapshot.ts";
 import { bodyHashOf, egressOwnAnswer, egressSentNothing, laneUpstreamOf, receiptDraft, responseHash, type ResponseHash } from "./hooks.ts";
@@ -170,7 +170,7 @@ async function serve(o: EntryVideoRequest, run: VideoRouteRun): Promise<Response
   const { cfg, clock } = deps;
   const url = new URL(request.url);
   // Query credentials leak through URL logs (`preflight`).
-  if (url.searchParams.has("key")) throw new ApiError(400, "query_credentials_unsupported");
+  if (hasQueryCredentials(url)) throw new ApiError(400, "query_credentials_unsupported");
   let variant: string | null = null;
   if (route.kind === "content") {
     for (const [name, value] of url.searchParams) if (name === "variant") variant = value;
@@ -179,9 +179,11 @@ async function serve(o: EntryVideoRequest, run: VideoRouteRun): Promise<Response
   const io = videoJobIo(deps, deps.lane);
   if (io === null) throw new ApiError(404, "unsupported_protocol");
 
-  // 1. The key, then the job's record.
+  // 1. The key (including live revocation check when the snapshot is stale), then the job's record.
   const outbound = new Outbound();
-  const read = await lookUpKey(request.headers, { cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => o.ctx.waitUntil(p), outbound }, false);
+  const lookup: KeyLookup = { cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => o.ctx.waitUntil(p), outbound, lane: true };
+  const read = await lookUpKey(request.headers, lookup, false);
+  if (deps.keyRevoked !== undefined) await checkStaleKey(read, deps.keyRevoked, lookup, "video_key_check_failed");
   const key = read.key!;
   const snapshot = read.snapshot!;
   let job: LaneVideoJob | null;
@@ -192,25 +194,22 @@ async function serve(o: EntryVideoRequest, run: VideoRouteRun): Promise<Response
   }
   if (job === null || !videoJobVisible(job, key)) throw notFound();
 
-  // 2. The key's minute, counted once after the key and before the route (apis/video.rs `job_caller`). A view without
-  // the workspace's home has no shard to count at: the route is served uncounted.
-  const home = snapshot.workspaces[key.workspaceId]?.home;
-  if (isLocationHint(home)) {
-    const over = await countKeyRate({
-      locate: outbound.accounts(deps.accounts),
-      counts: deps.shardCounts,
-      workspace: key.workspaceId,
-      region: deps.region,
-      home,
-      keyId: key.keyId,
-      requestId: run.requestId,
-      waitMs: cfg.accountAdmitAttemptMs,
-      clock,
-      ...(deps.admissionTimers === undefined ? {} : { timers: deps.admissionTimers }),
-      lane: true,
-    });
-    if (over !== null) throw over;
-  }
+  // 2. The key's minute and live revocation at its account shard (fail-closed before reaching upstream).
+  const home = workspaceHome(snapshot, key.workspaceId);
+  const over = await countLiveKeyRate({
+    locate: outbound.accounts(deps.accounts),
+    counts: deps.shardCounts,
+    workspace: key.workspaceId,
+    region: deps.region,
+    home,
+    keyId: key.keyId,
+    requestId: run.requestId,
+    waitMs: cfg.accountAdmitAttemptMs,
+    clock,
+    ...(deps.admissionTimers === undefined ? {} : { timers: deps.admissionTimers }),
+    lane: true,
+  });
+  if (over !== null) throw over;
   const presented = presentedKey(request.headers);
   const owner = presented instanceof ApiError ? "" : await keyHash(presented.token);
   return route.kind === "get" ? retrieve(io, run, snapshot, job, owner, request.headers) : content(o, io, run, snapshot, job, owner, variant);

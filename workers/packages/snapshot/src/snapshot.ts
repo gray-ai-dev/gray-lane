@@ -593,6 +593,8 @@ export interface ModelReference {
    * it: a relay stack's routes serve these (`laneRouteCapabilities`). Absent: none stated of any model.
    */
   readonly capabilities?: (model: string) => ReadonlySet<string> | null;
+  /** Input token threshold above which the vendor applies long-context tiered pricing; null when flat. */
+  readonly longContextThreshold?: (model: string) => number | null;
 }
 
 /** The stored routing policy's row as the snapshot's reader reads it (`routing_policy`, id 1). */
@@ -1539,7 +1541,10 @@ async function routedModels(
     const known = modelFacts(stated, record?.metadata ?? null);
     if (known !== null) facts.push({ model, ...known });
     const bounds = modelLimits(stated, record);
-    if (!noLimits(bounds)) limits.push({ model, ...bounds });
+    const threshold = reference?.longContextThreshold?.(model) ?? null;
+    if (!noLimits(bounds) || threshold !== null) {
+      limits.push({ model, ...bounds, ...(threshold === null ? {} : { longContextThreshold: threshold }) });
+    }
   }
   return { facts, limits };
 }

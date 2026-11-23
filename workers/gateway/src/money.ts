@@ -1,6 +1,6 @@
-import { customerRate, type CustomerRate, type MediaRates } from "@gray/holds";
-import { customerRates, type FinalizationEvidence } from "@gray/ledger-keys";
-import { tokenSides, usageCostParts as counterCostParts, type BilledTokens } from "@gray/protocol";
+import { customerRate, maxCustomerRate, type CustomerRate, type MediaRates } from "@gray/holds";
+import { customerRates, EVIDENCE_HOSTED_TOOLS, type FinalizationEvidence, type HostedToolCounts, type HostedToolPrices } from "@gray/ledger-keys";
+import { tokenSides, usageCostParts as counterCostParts, type BilledTokens, type HostedToolName, type ServiceTierName } from "@gray/protocol";
 import type { SupplierQuote } from "./snapshot.ts";
 
 /**
@@ -151,6 +151,142 @@ export function pricesModalities(media: MediaRates): boolean {
   return media.imageInput !== undefined || media.audioInput !== undefined || media.imageOutput !== undefined || media.audioOutput !== undefined;
 }
 
+/**
+ * Resolves the effective supplier token quote for `(serviceTier, longContext)`.
+ * Returns `undefined` when the requested service tier or long-context tier is not configured on the offer.
+ */
+export function effectiveSupplierQuote(quote: SupplierQuote, serviceTier: ServiceTierName | null, longContext: boolean): SupplierQuote | undefined {
+  if (serviceTier === null) {
+    if (!longContext) return quote;
+    const lc = quote.longContext;
+    if (lc === undefined) return undefined;
+    return {
+      ...quote,
+      input: lc.input,
+      output: lc.output,
+      cacheRead: lc.cacheRead,
+      cacheWrite: lc.cacheWrite,
+      cacheWrite1h: lc.cacheWrite1h,
+    };
+  }
+  const tier = quote.serviceTiers?.[serviceTier];
+  if (tier === undefined) return undefined;
+  if (!longContext) {
+    return {
+      ...quote,
+      input: tier.input,
+      output: tier.output,
+      cacheRead: tier.cacheRead,
+      cacheWrite: tier.cacheWrite,
+      cacheWrite1h: tier.cacheWrite1h,
+    };
+  }
+  const lc = tier.longContext;
+  if (lc === undefined) return undefined;
+  return {
+    ...quote,
+    input: lc.input,
+    output: lc.output,
+    cacheRead: lc.cacheRead,
+    cacheWrite: lc.cacheWrite,
+    cacheWrite1h: lc.cacheWrite1h,
+  };
+}
+
+/**
+ * The long-context threshold configured on `quote` for `serviceTier` (or base when null), or `undefined` if none.
+ */
+export function quoteLongContextThreshold(quote: SupplierQuote, serviceTier: ServiceTierName | null): number | undefined {
+  if (serviceTier === null) return quote.longContext?.thresholdInputTokens;
+  return quote.serviceTiers?.[serviceTier]?.longContext?.thresholdInputTokens;
+}
+
+/**
+ * Resolves the hold-sizing generation price of `quote` for `(serviceTier, mayHitLongContext)`:
+ * when the request may cross the long-context threshold, returns the component-wise maximum of base
+ * and long-context rates so the hold covers either outcome while settlement still bills actual tier.
+ * When `serviceTier !== null`, also merges the standard (base) tier envelope (and base long-context
+ * when `baseMayHitLongContext`) so a silent upstream downgrade to standard/default can never exceed
+ * the admitted hold even if a standard component rate exceeds the accelerated tier's rate.
+ */
+export function holdGenerationPriceOf(
+  quote: SupplierQuote,
+  feeBps: number,
+  serviceTier: ServiceTierName | null,
+  mayHitLongContext: boolean,
+  baseMayHitLongContext: boolean = mayHitLongContext,
+): PricedQuote | undefined {
+  const baseQuote = effectiveSupplierQuote(quote, serviceTier, false);
+  if (baseQuote === undefined) return undefined;
+  const basePriced = generationPriceOf(baseQuote, feeBps);
+  if (basePriced === undefined) return undefined;
+  let rate = basePriced.rate;
+  if (mayHitLongContext) {
+    const lcQuote = effectiveSupplierQuote(quote, serviceTier, true);
+    if (lcQuote === undefined) return undefined;
+    const lcPriced = generationPriceOf(lcQuote, feeBps);
+    if (lcPriced === undefined) return undefined;
+    rate = maxCustomerRate(rate, lcPriced.rate);
+  }
+  if (serviceTier !== null) {
+    const stdQuote = effectiveSupplierQuote(quote, null, false);
+    if (stdQuote !== undefined) {
+      const stdPriced = generationPriceOf(stdQuote, feeBps);
+      if (stdPriced === undefined) return undefined;
+      rate = maxCustomerRate(rate, stdPriced.rate);
+    }
+    if (baseMayHitLongContext) {
+      const stdLcQuote = effectiveSupplierQuote(quote, null, true);
+      if (stdLcQuote !== undefined) {
+        const stdLcPriced = generationPriceOf(stdLcQuote, feeBps);
+        if (stdLcPriced === undefined) return undefined;
+        rate = maxCustomerRate(rate, stdLcPriced.rate);
+      }
+    }
+  }
+  return { rate, supplierMedia: basePriced.supplierMedia };
+}
+
+/**
+ * Supplier and customer per-call prices (micro-USD per call) for the requested hosted tools.
+ * Returns `undefined` if any requested tool is unpriced or invalid on `quote`.
+ */
+export function toolPricesOf(
+  quote: SupplierQuote,
+  feeBps: number,
+  tools: readonly HostedToolName[],
+): { readonly supplier: HostedToolPrices; readonly customer: HostedToolPrices } | undefined {
+  if (tools.length === 0) return { supplier: {}, customer: {} };
+  const supplier: Partial<Record<HostedToolName, bigint>> = {};
+  const customer: Partial<Record<HostedToolName, bigint>> = {};
+  for (const tool of tools) {
+    const raw = quote.toolPrices?.[tool];
+    if (raw === undefined) return undefined;
+    const sp = price(raw);
+    if (sp === undefined) return undefined;
+    const cp = customerRate(sp, feeBps);
+    if (cp === undefined) return undefined;
+    supplier[tool] = sp;
+    customer[tool] = cp;
+  }
+  return { supplier, customer };
+}
+
+/** Total micro-USD charge for per-call hosted tool counts at `prices`; undefined on missing price or overflow. */
+export function toolChargeOf(calls: HostedToolCounts, prices: HostedToolPrices): bigint | undefined {
+  let total = 0n;
+  for (const tool of EVIDENCE_HOSTED_TOOLS) {
+    const count = calls[tool];
+    if (count === undefined || count === 0n) continue;
+    const rate = prices[tool];
+    if (rate === undefined) return undefined;
+    const part = count * rate;
+    if (part > I64_MAX || total + part > I64_MAX) return undefined;
+    total += part;
+  }
+  return total;
+}
+
 const I64_MAX = 0x7fff_ffff_ffff_ffffn;
 
 /**
@@ -187,11 +323,12 @@ export interface SettledSides {
  * shard settles the amount it is sent (@gray/account rules.ts) and a token charge is priced as its two sides, so a
  * mismatch is a fault of Gray's own to look into, not a state to expect.
  */
-export function recordedSides(sides: TokenSides | null, amount: number, unit: string | null): SettledSides {
+export function recordedSides(sides: TokenSides | null, amount: number, unit: string | null, extraMicrousd = 0n): SettledSides {
   if (sides === null) return { sides: null, mismatch: unit === null };
   const input = safeAmount(sides.input);
   const output = safeAmount(sides.output);
-  return input === undefined || output === undefined || input + output !== amount ? { sides: null, mismatch: true } : { sides: { input, output }, mismatch: false };
+  const extra = safeAmount(extraMicrousd);
+  return input === undefined || output === undefined || extra === undefined || input + output + extra !== amount ? { sides: null, mismatch: true } : { sides: { input, output }, mismatch: false };
 }
 
 /**

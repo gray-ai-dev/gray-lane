@@ -1,6 +1,14 @@
-import { billsUnits, includeRate, rateBound, reserveOutput, tokenRates, within, type BilledInput, type CustomerRate, type RateBound } from "@gray/holds";
+import { billsUnits, customerRate, includeRate, rateBound, reserveOutput, tokenRates, within, type BilledInput, type CustomerRate, type RateBound } from "@gray/holds";
 import { parseStrict } from "@gray/json";
-import { type CanonicalRequest, type Protocol, reasoningRequested, structured } from "@gray/protocol";
+import {
+  DEFAULT_UNBOUNDED_TOOL_USES,
+  NO_PRICING_FEATURES,
+  type CanonicalRequest,
+  type Protocol,
+  type RequestedPricingFeatures,
+  reasoningRequested,
+  structured,
+} from "@gray/protocol";
 import {
   effectiveMetrics,
   excludesEveryRankedCandidate,
@@ -21,7 +29,7 @@ import {
   type UtilityRoute,
 } from "@gray/routing";
 import { imageUsageKnown as imageGate, trafficEnded } from "@gray/snapshot";
-import { generationPriceOf } from "./money.ts";
+import { holdGenerationPriceOf, quoteLongContextThreshold, toolPricesOf } from "./money.ts";
 import { rankKeyLeases, type Ordered, type ProbeLeases } from "./plan-order.ts";
 import { RankingBase } from "./ranking-base.ts";
 import { REST_EGRESS_REGION } from "@gray/endpoint";
@@ -94,9 +102,24 @@ export function regionMatches(preference: string, serviceRegion: string | null):
   return serviceRegion === preference;
 }
 
+export type PricingRefusalCode =
+  | "routing_max_price_excluded_all"
+  | "supplier_quote_unavailable"
+  | "unsupported_service_tier"
+  | "unsupported_hosted_tool"
+  | "unsupported_long_context";
+
+export interface PricingOptions {
+  readonly features?: RequestedPricingFeatures;
+  /** Conservative upper bound on input tokens (`bodyBound + promptOverhead`), or undefined when unbounded. */
+  readonly inputUpperBound?: bigint;
+  /** Vendor long-context input token threshold for this model (from reference catalog), when tiered. */
+  readonly modelLongContextThreshold?: number;
+}
+
 export type Priced =
-  | { readonly ok: true; readonly routes: Route[]; readonly bound: RateBound }
-  | { readonly ok: false; readonly status: 400 | 503; readonly code: "routing_max_price_excluded_all" | "supplier_quote_unavailable"; readonly pricedOut?: readonly PricedOut<RouteRecord>[] };
+  | { readonly ok: true; readonly routes: Route[]; readonly bound: RateBound; readonly toolReserve: bigint }
+  | { readonly ok: false; readonly status: 400 | 503; readonly code: PricingRefusalCode; readonly pricedOut?: readonly PricedOut<RouteRecord>[] };
 
 /**
  * Whether a route may serve under its quote (`image_gate`, then `image_usage_known`, @gray/snapshot
@@ -187,25 +210,94 @@ export function boundRoutes<T>(
   return { ok: true, kept, bound };
 }
 
+const I64_MAX = 0x7fff_ffff_ffff_ffffn;
+
+/**
+ * Conservative micro-USD reserve covering per-call hosted tool surcharges across `routes`
+ * (using explicit `max_uses` when declared by the request, or `DEFAULT_UNBOUNDED_TOOL_USES`).
+ */
+export function toolReserveMicrousd(routes: readonly Route[], features: RequestedPricingFeatures, feeBps: number): bigint {
+  if (features.hostedTools.length === 0 || routes.length === 0) return 0n;
+  let total = 0n;
+  for (const reqTool of features.hostedTools) {
+    let maxRate = 0n;
+    for (const r of routes) {
+      const raw = r.record.quote.toolPrices?.[reqTool.tool];
+      if (raw === undefined || !Number.isSafeInteger(raw) || raw < 0) continue;
+      const c = customerRate(BigInt(raw), feeBps);
+      if (c !== undefined && c > maxRate) maxRate = c;
+    }
+    const uses = reqTool.maxUses !== null ? BigInt(reqTool.maxUses) : DEFAULT_UNBOUNDED_TOOL_USES;
+    const part = uses * maxRate;
+    total = total + part > I64_MAX ? I64_MAX : total + part;
+  }
+  return total;
+}
+
+/** Per-route worst-case hosted tool reserve (micro-USD) across the request's requested hosted tools. */
+export function routeToolReserveMicrousd(route: Route, features: RequestedPricingFeatures, feeBps: number): bigint {
+  if (features.hostedTools.length === 0) return 0n;
+  let total = 0n;
+  for (const reqTool of features.hostedTools) {
+    const raw = route.record.quote.toolPrices?.[reqTool.tool];
+    if (raw === undefined || !Number.isSafeInteger(raw) || raw < 0) continue;
+    const c = customerRate(BigInt(raw), feeBps);
+    if (c === undefined) continue;
+    const uses = reqTool.maxUses !== null ? BigInt(reqTool.maxUses) : DEFAULT_UNBOUNDED_TOOL_USES;
+    const part = uses * c;
+    total = total + part > I64_MAX ? I64_MAX : total + part;
+  }
+  return total;
+}
+
 /**
  * `price_routes`: each route's customer rate from its approved quote and the platform fee (its image and
- * audio token prices included), through `boundRoutes`: the routes priced by image output tokens whose
- * split no check proved dropped (`imageUsageKnown`), those without a rate dropped, those above the
- * customer's `maxPrice` (the layered preference's, @gray/routing `Preference.maxPrice`) dropped, and the
- * component-wise dearest rate of the rest. The hold is sized at that bound, so it covers whichever route
- * serves the request, failover included.
+ * audio token prices included, plus optional service-tier, long-context and hosted-tool filtering and
+ * hold bounding), through `boundRoutes`.
  */
-export function priceRoutes(records: readonly RouteRecord[], billed: BilledInput, feeBps: number, maxPrice: MaxPrice | null): Priced {
+export function priceRoutes(records: readonly RouteRecord[], billed: BilledInput, feeBps: number, maxPrice: MaxPrice | null, options: PricingOptions = {}): Priced {
+  const features = options.features ?? NO_PRICING_FEATURES;
+  const requestedToolNames = features.hostedTools.map((t) => t.tool);
+  let pool = records;
+  if (features.serviceTier !== null && pool.length > 0) {
+    pool = pool.filter((r) => r.quote.serviceTiers?.[features.serviceTier!] !== undefined);
+    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_service_tier" };
+  }
+  if (requestedToolNames.length > 0 && pool.length > 0) {
+    pool = pool.filter((r) => toolPricesOf(r.quote, feeBps, requestedToolNames) !== undefined);
+    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_hosted_tool" };
+  }
+  const modelThreshold = options.modelLongContextThreshold;
+  const inputUpper = options.inputUpperBound;
+  if (modelThreshold !== undefined && (inputUpper === undefined || inputUpper > BigInt(modelThreshold)) && pool.length > 0) {
+    pool = pool.filter((r) => {
+      const th = quoteLongContextThreshold(r.quote, features.serviceTier);
+      if (th === undefined || th > modelThreshold) return false;
+      if (features.serviceTier !== null) {
+        const baseTh = quoteLongContextThreshold(r.quote, null);
+        if (baseTh === undefined || baseTh > modelThreshold) return false;
+      }
+      return true;
+    });
+    if (pool.length === 0) return { ok: false, status: 400, code: "unsupported_long_context" };
+  }
   const bounded = boundRoutes(
-    records,
+    pool,
     (record) => ({ protocol: record.protocol, proved: (record.proved ?? []).includes("image_output"), pricesImageTokens: record.quote.media.imageOutput !== null }),
-    (record) => generationPriceOf(record.quote, feeBps)?.rate,
+    (record) => {
+      const th = quoteLongContextThreshold(record.quote, features.serviceTier);
+      const mayHitLongContext = th !== undefined && (inputUpper === undefined || inputUpper > BigInt(th));
+      const baseTh = features.serviceTier !== null ? quoteLongContextThreshold(record.quote, null) : undefined;
+      const baseMayHitLongContext = baseTh !== undefined && (inputUpper === undefined || inputUpper > BigInt(baseTh));
+      return holdGenerationPriceOf(record.quote, feeBps, features.serviceTier, mayHitLongContext, baseMayHitLongContext)?.rate;
+    },
     (record) => record.cacheTtlAsRequested,
     maxPrice,
     billed,
   );
   if (!bounded.ok) return bounded;
-  return { ok: true, routes: bounded.kept.map(({ route, rate }) => ({ record: route, rate })), bound: bounded.bound };
+  const routes = bounded.kept.map(({ route, rate }) => ({ record: route, rate }));
+  return { ok: true, routes, bound: bounded.bound, toolReserve: toolReserveMicrousd(routes, features, feeBps) };
 }
 
 /** A route still priced within the admitted bound (`CustomerRate::within`): failover never moves above it. */

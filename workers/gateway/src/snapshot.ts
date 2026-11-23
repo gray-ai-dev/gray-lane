@@ -1,7 +1,7 @@
 import type { GatewayConfig, LocationHint } from "@gray/config";
 import { REFERENCE_LARGEST_WINDOW } from "@gray/holds";
 import type { Protocol } from "@gray/protocol";
-import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneOffer, type GatewayLaneRelay, type GatewayMode, type GatewayRecipient, type ModelFacts, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, routeTakesTraffic, snapshotAlertKey, within } from "@gray/snapshot";
+import { type AgeJudgement, type CheckTimers, type CurrentAnswer, type GatewayLaneOffer, type GatewayLaneRelay, type GatewayLongContextQuote, type GatewayMode, type GatewayRecipient, type GatewayServiceTierQuote, type HostedToolName, type ModelFacts, type ServiceTierName, SNAPSHOT_SOURCES, STORED_SNAPSHOT_KEY, type Snapshot, type SnapshotAlert, WithinTimeout, confirmedAtOf, currentFor, gatewayView, readStoredSnapshot, replicaNames, routeServes, routeTakesTraffic, snapshotAlertKey, within } from "@gray/snapshot";
 
 // The age rule lives in `@gray/snapshot` so the bridge's `snapshot.current` and the CVM's sources
 // judge an answer by the same function (bridge-3); the gateway's own importers keep the old names.
@@ -85,6 +85,12 @@ export interface SupplierQuote {
   readonly cacheWrite: number | null;
   readonly cacheWrite1h: number | null;
   readonly media: MediaTerms;
+  /** Optional long-context tiered token rates; absent when unset on the offer. */
+  readonly longContext?: GatewayLongContextQuote;
+  /** Optional accelerated service-tier rates (`fast`, `priority`); absent when unset on the offer. */
+  readonly serviceTiers?: Readonly<Partial<Record<ServiceTierName, GatewayServiceTierQuote>>>;
+  /** Optional per-call hosted tool prices (micro-USD per call); absent when unset on the offer. */
+  readonly toolPrices?: Readonly<Partial<Record<HostedToolName, number>>>;
 }
 
 /** The chat capabilities a route proved in one mode (inference.rs `RouteCapabilities::chat_for`). */
@@ -222,6 +228,8 @@ export interface ModelInfo {
   readonly longestOutput?: number;
   /** An operator's per-request cap for the model, micro-USD (`max_request_microusd`). */
   readonly maxRequestMicrousd?: number;
+  /** Input token threshold above which the vendor applies long-context tiered pricing. */
+  readonly longContextThreshold?: number;
 }
 
 export interface GatewaySnapshot {

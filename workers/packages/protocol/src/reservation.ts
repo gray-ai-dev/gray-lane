@@ -60,11 +60,42 @@ function refersElsewhere(protocol: Protocol, body: Json): boolean {
     const value = get(body, key);
     return value !== undefined && value !== null;
   };
+  const hasItemReference =
+    protocol === "open_ai_responses" &&
+    (() => {
+      const input = get(body, "input");
+      return isArray(input) && input.some((entry) => isObject(entry) && asStr(get(entry, "type")) === "item_reference");
+    })();
   return (
     stated("previous_response_id") ||
     stated("conversation") ||
     (protocol === "open_ai_responses" && stated("prompt")) ||
+    hasItemReference ||
     (protocol === "gemini" && (stated("cachedContent") || stated("cached_content")))
+  );
+}
+
+/**
+ * Whether `body` asks for server-side compaction (OpenAI Responses `context_management` with
+ * `type: "compaction"`, or Anthropic Messages `context_management.edits[].type` starting with
+ * `"compact"` or top-level `compaction`), which can trigger an extra model pass (input + output).
+ * Purely inspects top-level fields so it works even on Tier B/C bodies where `PromptUnits` is null.
+ */
+export function requestCompacts(protocol: Protocol, body: Json): boolean {
+  if (!isObject(body)) return false;
+  const contextManagement = get(body, "context_management");
+  const anthropicEdits = isObject(contextManagement) ? get(contextManagement, "edits") : undefined;
+  return (
+    (protocol === "open_ai_responses" &&
+      isArray(contextManagement) &&
+      contextManagement.some((entry) => asStr(get(entry, "type")) === "compaction")) ||
+    (protocol === "anthropic_messages" &&
+      ((isArray(anthropicEdits) &&
+        anthropicEdits.some((entry) => {
+          const typ = asStr(get(entry, "type"));
+          return typ !== undefined && typ.startsWith("compact");
+        })) ||
+        (get(body, "compaction") !== undefined && get(body, "compaction") !== null)))
   );
 }
 
@@ -204,11 +235,7 @@ export class PromptUnits {
       hashSetting(shape, key, value, limit);
     }
     shape.update(new Uint8Array([images ? 1 : 0]));
-    const contextManagement = get(body, "context_management");
-    const compaction =
-      protocol === "open_ai_responses" &&
-      isArray(contextManagement) &&
-      contextManagement.some((entry) => asStr(get(entry, "type")) === "compaction");
+    const compaction = requestCompacts(protocol, body);
     return new PromptUnits({
       prefixHashes,
       suffix,

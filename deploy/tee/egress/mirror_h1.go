@@ -44,8 +44,22 @@ type mirrorH1Conn struct {
 	lr        *mirrorH1LimitReader
 	br        *bufio.Reader
 	bw        *bufio.Writer
+	written   *atomic.Int64
 	idleTimer *time.Timer
 	closed    bool
+}
+
+type mirrorH1CountWriter struct {
+	w io.Writer
+	n *atomic.Int64
+}
+
+func (w mirrorH1CountWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		w.n.Add(int64(n))
+	}
+	return n, err
 }
 
 // mirrorH1LimitReader limits what the response reader may take from the connection while a response head is read
@@ -158,10 +172,26 @@ func canReplayRequest(req *http.Request) bool {
 	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 }
 
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
 // RoundTrip sends req on an idle connection or a new one. A request that failed on a reused connection (the vendor
-// may have closed it while idle) is sent once more on a new connection when its body can be replayed.
+// may have closed it while idle) is sent once more on a new connection only when either zero bytes were written to the
+// socket, or the method is idempotent and the failure was not a response-header timeout.
 func (t *mirrorH1Client) RoundTrip(req *http.Request) (*http.Response, error) {
+	closeBody := func(r *http.Request) {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}
 	if t.dial == nil {
+		closeBody(req)
 		return nil, errMirrorNoDial
 	}
 	ctx := req.Context()
@@ -169,13 +199,12 @@ func (t *mirrorH1Client) RoundTrip(req *http.Request) (*http.Response, error) {
 	// connection: an idle one would otherwise get it while the context's end closes it. A relay call whose KMS lease
 	// ended after its last check comes here with such a context (stack_relay.go: lease.withContext).
 	if ctx.Err() != nil {
-		if req.Body != nil {
-			_ = req.Body.Close()
-		}
+		closeBody(req)
 		return nil, context.Cause(ctx)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 && req.GetBody != nil {
+			closeBody(req)
 			body, err := req.GetBody()
 			if err != nil {
 				return nil, err
@@ -195,14 +224,20 @@ func (t *mirrorH1Client) RoundTrip(req *http.Request) (*http.Response, error) {
 		if c == nil {
 			raw, err := t.dial(ctx)
 			if err != nil {
+				// errMirrorHTTP2 hands the same request (and its body) to the HTTP/2 transport.
+				if !errors.Is(err, errMirrorHTTP2) {
+					closeBody(req)
+				}
 				return nil, err
 			}
 			lr := &mirrorH1LimitReader{r: raw, remain: -1}
+			written := &atomic.Int64{}
 			c = &mirrorH1Conn{
-				conn: raw,
-				lr:   lr,
-				br:   bufio.NewReaderSize(lr, 16<<10),
-				bw:   bufio.NewWriterSize(raw, 16<<10),
+				conn:    raw,
+				lr:      lr,
+				br:      bufio.NewReaderSize(lr, 16<<10),
+				bw:      bufio.NewWriterSize(mirrorH1CountWriter{w: raw, n: written}, 16<<10),
+				written: written,
 			}
 		}
 
@@ -210,22 +245,28 @@ func (t *mirrorH1Client) RoundTrip(req *http.Request) (*http.Response, error) {
 			trace.GotConn(httptrace.GotConnInfo{Conn: c.conn, Reused: reused})
 		}
 
-		resp, err := t.roundTripConn(req, c)
+		resp, wroteBytes, timedOut, err := t.roundTripConn(req, c)
 		if err == nil {
 			return resp, nil
 		}
-		if !reused || ctx.Err() != nil || !canReplayRequest(req) {
+		if !reused || timedOut || ctx.Err() != nil || !canReplayRequest(req) || (wroteBytes && !isIdempotentMethod(req.Method)) {
+			closeBody(req)
 			return nil, err
 		}
 	}
+	closeBody(req)
 	return nil, errors.New("mirror h1: connection unavailable")
 }
 
-func (t *mirrorH1Client) roundTripConn(req *http.Request, c *mirrorH1Conn) (*http.Response, error) {
+func (t *mirrorH1Client) roundTripConn(req *http.Request, c *mirrorH1Conn) (*http.Response, bool, bool, error) {
 	ctx := req.Context()
 	stopCancel := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
+	if c.written != nil {
+		c.written.Store(0)
+	}
 
 	closeAfter, err := writeOrderedH1Request(req, c.bw)
+	wroteBytes := c.written == nil || c.written.Load() > 0
 	trace := httptrace.ContextClientTrace(ctx)
 	if trace != nil && trace.WroteRequest != nil {
 		trace.WroteRequest(httptrace.WroteRequestInfo{Err: err})
@@ -234,9 +275,9 @@ func (t *mirrorH1Client) roundTripConn(req *http.Request, c *mirrorH1Conn) (*htt
 		stopCancel()
 		_ = c.conn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, wroteBytes, false, ctxErr
 		}
-		return nil, err
+		return nil, wroteBytes, false, err
 	}
 
 	var timedOut atomic.Bool
@@ -248,29 +289,31 @@ func (t *mirrorH1Client) roundTripConn(req *http.Request, c *mirrorH1Conn) (*htt
 		})
 	}
 	resp, err := readMirrorH1Response(c, req, trace)
+	timerStopped := true
 	if respTimer != nil {
-		respTimer.Stop()
+		timerStopped = respTimer.Stop()
 	}
-	stopCancel()
+	cancelStopped := stopCancel()
 	if err != nil {
 		_ = c.conn.Close()
 		if timedOut.Load() {
-			return nil, context.DeadlineExceeded
+			return nil, wroteBytes, true, context.DeadlineExceeded
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, wroteBytes, false, ctxErr
 		}
-		return nil, err
+		return nil, wroteBytes, false, err
 	}
 
-	keepAlive := !resp.Close && !req.Close && !closeAfter && resp.ProtoAtLeast(1, 1)
+	// Never pool a connection whose timeout or cancel callback already started and may close c.conn asynchronously.
+	keepAlive := !resp.Close && !req.Close && !closeAfter && resp.ProtoAtLeast(1, 1) && timerStopped && cancelStopped && !timedOut.Load() && ctx.Err() == nil
 	if resp.Body == nil || resp.Body == http.NoBody {
 		if keepAlive {
 			t.putIdle(c)
 		} else {
 			_ = c.conn.Close()
 		}
-		return resp, nil
+		return resp, wroteBytes, false, nil
 	}
 
 	body := &mirrorH1Body{
@@ -284,7 +327,7 @@ func (t *mirrorH1Client) roundTripConn(req *http.Request, c *mirrorH1Conn) (*htt
 		_ = c.conn.Close()
 	})
 	resp.Body = body
-	return resp, nil
+	return resp, wroteBytes, false, nil
 }
 
 // readMirrorH1Response reads the final response to req, skipping informational (1xx) responses as net/http does,
@@ -426,11 +469,12 @@ func (b *mirrorH1Body) Close() error {
 
 func (b *mirrorH1Body) finish(sawEOF bool) {
 	b.once.Do(func() {
+		cancelStopped := true
 		if b.stopCtx != nil {
-			b.stopCtx()
+			cancelStopped = b.stopCtx()
 		}
 		_ = b.rc.Close()
-		if sawEOF && b.keepAlive && !b.canceled.Load() {
+		if sawEOF && b.keepAlive && cancelStopped && !b.canceled.Load() {
 			b.t.putIdle(b.c)
 		} else {
 			_ = b.c.conn.Close()

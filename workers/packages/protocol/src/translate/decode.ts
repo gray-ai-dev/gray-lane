@@ -171,9 +171,11 @@ function resolveNames(turns: Turn[]): void {
 
 function functionTool(f: JsonObject, param: string): Tool {
   for (const key of sortedKeys(f)) {
+    if (present(get(f, key)) === undefined) continue;
     if (!["name", "description", "parameters", "strict"].includes(key)) throw feature(`${param}.${key}`);
   }
   const name = text(get(f, "name"), `${param}.name`);
+  if (name.length === 0) throw invalid(`${param}.name`);
   const d = present(get(f, "description"));
   const description = d === undefined ? undefined : text(d, `${param}.description`);
   const parameters = present(get(f, "parameters")) ?? { type: "object" };
@@ -181,7 +183,11 @@ function functionTool(f: JsonObject, param: string): Tool {
   return { name, description, parameters, strict };
 }
 
-function jsonSchemaFormat(f: JsonObject, param: string): Format {
+function jsonSchemaFormat(f: JsonObject, param: string, allowedKeys: readonly string[]): Format {
+  for (const key of sortedKeys(f)) {
+    if (present(get(f, key)) === undefined) continue;
+    if (!allowedKeys.includes(key)) throw feature(`${param}.${key}`);
+  }
   const schema = present(get(f, "schema"));
   if (schema === undefined) throw invalid(`${param}.schema`);
   const n = present(get(f, "name"));
@@ -276,9 +282,22 @@ function chat(o: JsonObject, req: Request): void {
           else throw new Refusal(code.VALUE, k);
         } else if (isObject(v)) {
           const typ = get(v, "type");
-          if (typ === "function") req.toolChoice = { kind: "named", name: text(get(get(v, "function"), "name"), k) };
-          else if (typ === "custom") throw new Refusal(code.BUILTIN_TOOL, k);
-          else throw feature(k);
+          if (typ === "function") {
+            for (const key of sortedKeys(v)) {
+              if (present(get(v, key)) === undefined) continue;
+              if (key !== "type" && key !== "function") throw feature(`${k}.${key}`);
+            }
+            const fn = obj(get(v, "function"), k);
+            for (const key of sortedKeys(fn)) {
+              if (present(get(fn, key)) === undefined) continue;
+              if (key !== "name") throw feature(`${k}.function.${key}`);
+            }
+            req.toolChoice = { kind: "named", name: text(get(fn, "name"), k) };
+          } else if (typ === "custom") {
+            throw new Refusal(code.BUILTIN_TOOL, k);
+          } else {
+            throw feature(k);
+          }
         } else {
           throw invalid(k);
         }
@@ -292,12 +311,20 @@ function chat(o: JsonObject, req: Request): void {
         } else {
           const f = obj(v, k);
           const typ = get(f, "type");
-          if (typ === "text") req.format = { kind: "text" };
-          else if (typ === "json_object") req.format = { kind: "json_object" };
-          else if (typ === "json_schema") {
+          if (typ === "text" || typ === "json_object") {
+            for (const key of sortedKeys(f)) {
+              if (present(get(f, key)) === undefined) continue;
+              if (key !== "type") throw feature(`${k}.${key}`);
+            }
+            req.format = { kind: typ };
+          } else if (typ === "json_schema") {
+            for (const key of sortedKeys(f)) {
+              if (present(get(f, key)) === undefined) continue;
+              if (key !== "type" && key !== "json_schema") throw feature(`${k}.${key}`);
+            }
             const schema = get(f, "json_schema");
             if (schema === undefined) throw invalid("response_format.json_schema");
-            req.format = jsonSchemaFormat(obj(schema, "response_format.json_schema"), "response_format.json_schema");
+            req.format = jsonSchemaFormat(obj(schema, "response_format.json_schema"), "response_format.json_schema", ["name", "schema", "strict", "description"]);
           } else throw new Refusal(code.VALUE, k);
         }
         break;
@@ -390,6 +417,7 @@ function chat(o: JsonObject, req: Request): void {
           const r = present(get(m, key));
           if (r !== undefined) parts.push({ kind: "reasoning", thought: { text: text(r, `${p}.${key}`), carrier: undefined } });
         }
+        if (present(get(m, "reasoning_details")) !== undefined) req.dropped.add("reasoning_details");
         const content = present(get(m, "content"));
         if (content === undefined) {
           // nothing
@@ -543,9 +571,17 @@ function responses(o: JsonObject, req: Request): void {
           else throw new Refusal(code.VALUE, k);
         } else if (isObject(v)) {
           const typ = get(v, "type");
-          if (typ === "function") req.toolChoice = { kind: "named", name: text(get(v, "name"), k) };
-          else if (typ === "allowed_tools") throw feature(k);
-          else throw new Refusal(code.BUILTIN_TOOL, k);
+          if (typ === "function") {
+            for (const key of sortedKeys(v)) {
+              if (present(get(v, key)) === undefined) continue;
+              if (key !== "type" && key !== "name") throw feature(`${k}.${key}`);
+            }
+            req.toolChoice = { kind: "named", name: text(get(v, "name"), k) };
+          } else if (typ === "allowed_tools") {
+            throw feature(k);
+          } else {
+            throw new Refusal(code.BUILTIN_TOOL, k);
+          }
         } else {
           throw invalid(k);
         }
@@ -560,10 +596,15 @@ function responses(o: JsonObject, req: Request): void {
               } else {
                 const fo = obj(f, "text.format");
                 const typ = get(fo, "type");
-                if (typ === "text") req.format = { kind: "text" };
-                else if (typ === "json_object") req.format = { kind: "json_object" };
-                else if (typ === "json_schema") req.format = jsonSchemaFormat(fo, "text.format");
-                else throw new Refusal(code.VALUE, "text.format");
+                if (typ === "text" || typ === "json_object") {
+                  for (const key of sortedKeys(fo)) {
+                    if (present(get(fo, key)) === undefined) continue;
+                    if (key !== "type") throw feature(`text.format.${key}`);
+                  }
+                  req.format = { kind: typ };
+                } else if (typ === "json_schema") {
+                  req.format = jsonSchemaFormat(fo, "text.format", ["type", "name", "schema", "strict", "description"]);
+                } else throw new Refusal(code.VALUE, "text.format");
               }
             } else if (tk === "verbosity") {
               if (tv !== null) req.dropped.add("verbosity");
@@ -579,7 +620,9 @@ function responses(o: JsonObject, req: Request): void {
             if (rk === "effort") {
               const e = present(rv);
               req.reasoning = e === undefined ? undefined : effortValue(text(e, "reasoning.effort"), "reasoning.effort");
-            } else if (rk !== "summary" && rk !== "generate_summary") {
+            } else if (rk === "summary" || rk === "generate_summary") {
+              if (present(rv) !== undefined) req.dropped.add("reasoning_summary");
+            } else {
               throw feature(`reasoning.${rk}`);
             }
           }
@@ -691,7 +734,16 @@ function responses(o: JsonObject, req: Request): void {
         }
         case "reasoning": {
           const s = present(get(item, "summary"));
-          const summary = s === undefined ? "" : arr(s, `${p}.summary`).map((x) => text(get(x, "text"), `${p}.summary`)).join("\n\n");
+          let summary = s === undefined ? "" : arr(s, `${p}.summary`).map((x) => text(get(x, "text"), `${p}.summary`)).join("\n\n");
+          if (summary === "") {
+            const c = present(get(item, "content"));
+            if (c !== undefined) {
+              summary = arr(c, `${p}.content`)
+                .filter((x) => !isObject(x) || get(x, "type") === undefined || get(x, "type") === "reasoning_text")
+                .map((x) => text(get(x, "text"), `${p}.content`))
+                .join("\n\n");
+            }
+          }
           const encrypted = get(item, "encrypted_content");
           role = "assistant";
           part = {
@@ -835,6 +887,12 @@ function anthropic(o: JsonObject, req: Request): void {
         if (v !== undefined) {
           const c = obj(v, k);
           const typ = get(c, "type");
+          for (const key of sortedKeys(c)) {
+            if (present(get(c, key)) === undefined) continue;
+            if (key !== "type" && key !== "disable_parallel_tool_use" && !(typ === "tool" && key === "name")) {
+              throw feature(`${k}.${key}`);
+            }
+          }
           if (typ === "auto") req.toolChoice = { kind: "auto" };
           else if (typ === "any") req.toolChoice = { kind: "required" };
           else if (typ === "none") req.toolChoice = { kind: "none" };
@@ -872,6 +930,7 @@ function anthropic(o: JsonObject, req: Request): void {
             format = v;
           } else {
             for (const ck of sortedKeys(c)) {
+              if (present(get(c, ck)) === undefined) continue;
               if (ck !== "format" && ck !== "effort") throw feature(`${k}.${ck}`);
             }
             format = present(get(c, "format"));
@@ -879,11 +938,14 @@ function anthropic(o: JsonObject, req: Request): void {
           }
           if (format !== undefined) {
             const f = obj(format, k);
-            if (get(f, "type") === "json_schema") req.format = jsonSchemaFormat(f, k);
+            if (get(f, "type") === "json_schema") req.format = jsonSchemaFormat(f, k === "output_config" ? "output_config.format" : k, ["type", "name", "schema", "strict", "description"]);
             else throw new Refusal(code.VALUE, k);
           }
           if (effort !== undefined) effortHint = text(effort, "output_config.effort");
         }
+        break;
+      case "cache_control":
+        if (v !== undefined) req.dropped.add("cache_control");
         break;
       case "service_tier":
         if (v !== undefined) req.dropped.add("service_tier");
@@ -1074,14 +1136,32 @@ export function jsonSchema(schema: Json): Json {
   if (!isObject(schema)) return schema;
   const out: JsonObject = {};
   const nullable = get(schema, "nullable") === true;
+  let hasType = false;
   for (const [k, v] of members(schema)) {
     switch (k) {
       case "nullable":
       case "propertyOrdering":
         break;
       case "type": {
-        const t = typeof v === "string" ? v.toLowerCase() : v;
-        setMember(out, k, nullable ? [t, "null"] : t);
+        hasType = true;
+        if (typeof v === "string") {
+          const t = v.toLowerCase();
+          setMember(out, k, nullable && t !== "null" ? [t, "null"] : t);
+        } else if (isArray(v)) {
+          const types = v.map((entry) => (typeof entry === "string" ? entry.toLowerCase() : entry));
+          if (nullable && !types.includes("null")) types.push("null");
+          setMember(out, k, types);
+        } else {
+          setMember(out, k, v);
+        }
+        break;
+      }
+      case "enum": {
+        if (nullable && isArray(v) && !v.includes(null)) {
+          setMember(out, k, [...v, null]);
+        } else {
+          setMember(out, k, v);
+        }
         break;
       }
       case "properties":
@@ -1108,6 +1188,26 @@ export function jsonSchema(schema: Json): Json {
         break;
       default:
         setMember(out, k, v);
+    }
+  }
+  if (nullable && !hasType) {
+    const allowsNull = (b: Json): boolean => {
+      if (!isObject(b)) return false;
+      const t = get(b, "type");
+      if (t === "null" || (isArray(t) && t.includes("null"))) return true;
+      if (get(b, "const") === null) return true;
+      const en = get(b, "enum");
+      if (isArray(en) && en.includes(null)) return true;
+      const anyOf = get(b, "anyOf");
+      if (isArray(anyOf) && anyOf.some(allowsNull)) return true;
+      const oneOf = get(b, "oneOf");
+      if (isArray(oneOf) && oneOf.some(allowsNull)) return true;
+      return false;
+    };
+    if (isArray(out.anyOf) && !out.anyOf.some(allowsNull)) {
+      out.anyOf = [...out.anyOf, { type: "null" }];
+    } else if (isArray(out.oneOf) && !out.oneOf.some(allowsNull)) {
+      out.oneOf = [...out.oneOf, { type: "null" }];
     }
   }
   return out;
@@ -1256,7 +1356,7 @@ function gemini(body: JsonObject, req: Request): void {
         const name = text(get(f, "name"), `${pp}.functionCall.name`);
         const idValue = present(get(f, "id"));
         let id: string;
-        if (idValue !== undefined) {
+        if (idValue !== undefined && idValue !== "") {
           id = splitId(text(idValue, pp)).id;
         } else {
           generated += 1;
@@ -1275,7 +1375,7 @@ function gemini(body: JsonObject, req: Request): void {
         const name = text(get(f, "name"), `${pp}.functionResponse.name`);
         const idValue = present(get(f, "id"));
         let id: string;
-        if (idValue !== undefined) {
+        if (idValue !== undefined && idValue !== "") {
           id = splitId(text(idValue, pp)).id;
           const position = open.findIndex(([openId]) => openId === id);
           const known = position >= 0 ? (open.splice(position, 1)[0] as [string, string])[1] : answered.get(id);
@@ -1297,7 +1397,9 @@ function gemini(body: JsonObject, req: Request): void {
         let isError = false;
         const output = only("output");
         const error = only("error");
-        if (output !== undefined) {
+        if (typeof response === "string") {
+          textContent = response;
+        } else if (output !== undefined) {
           textContent = output;
         } else if (error !== undefined) {
           textContent = error;
@@ -1404,7 +1506,9 @@ function geminiGeneration(g: JsonObject, req: Request): void {
               else throw new Refusal(code.VALUE, `${p}.${tk}`);
             } else if (tk === "thinkingLevel") {
               req.reasoning = effortValue(text(tv, p).toLowerCase(), `${p}.${tk}`);
-            } else if (tk !== "includeThoughts") {
+            } else if (tk === "includeThoughts") {
+              if (present(tv) !== undefined) req.dropped.add("include_thoughts");
+            } else {
               throw feature(`${p}.${tk}`);
             }
           }

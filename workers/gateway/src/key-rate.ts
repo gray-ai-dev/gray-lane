@@ -85,6 +85,20 @@ export async function countModelCheck(o: KeyRateCount): Promise<ApiError | null>
   return admissionUnavailable();
 }
 
+/**
+ * Live fail-closed key rate and revocation check for routes that reach no billing admission (video retrieve/content,
+ * video idempotency replay). Rejects 429 `key_rate_limit`, 401 `api_key_revoked`, and 503
+ * `billing_admission_unavailable` when no shard confirms the key and minute count.
+ */
+export async function countLiveKeyRate(o: KeyRateCount): Promise<ApiError | null> {
+  const result = await countAtShard(o);
+  if (result.ok) return null;
+  if (result.code === "key_rate_limit") return keyRateRefusal(result.limit, result.retryAfterMs, o.clock());
+  if (result.code === "revoked") return new ApiError(401, "api_key_revoked");
+  countFailed(o, result.code);
+  return admissionUnavailable();
+}
+
 /** What a request no admission could take is told (`admitRefusal`'s, and the spent pre phase's): 503 billing_admission_unavailable, retry in a second. */
 export function admissionUnavailable(): ApiError {
   return new ApiError(503, "billing_admission_unavailable").withRetryAfter(1n);

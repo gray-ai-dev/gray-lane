@@ -85,7 +85,14 @@ export function geminiPathOf(endpoint: string): { readonly model: string; readon
   const path = endpoint.split(/[?#]/, 1)[0] ?? "";
   const match = /\/v1beta\/(?:models\/([^:]+)|([^:/]+\/[^:]+)):(generateContent|streamGenerateContent)$/.exec(path);
   if (match === null) return null;
-  return { model: match[1] ?? match[2]!, stream: match[3] === "streamGenerateContent" };
+  let model: string;
+  try {
+    model = decodeURIComponent(match[1] ?? match[2]!);
+  } catch {
+    return null;
+  }
+  if (model.length === 0) return null;
+  return { model, stream: match[3] === "streamGenerateContent" };
 }
 
 /** What the replay needs besides the received bytes: the receipt's endpoint and its translation. */

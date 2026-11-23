@@ -1,4 +1,5 @@
 import {
+  MAX_ITEM_REFERENCES,
   MAX_REFERENCE_BYTES,
   MAX_REPLY_ITEM_REFERENCES,
   MAX_SEALED_STATE_BYTES,
@@ -630,6 +631,15 @@ function sanitizeReplayedItem(
   return { item: copy, replayedEncrypted: false };
 }
 
+export class ExpandedBodyTooLargeError extends Error {
+  readonly limitBytes: number;
+  constructor(limitBytes: number) {
+    super(`Expanded zero-retention continuation body exceeds ${limitBytes} bytes`);
+    this.name = "ExpandedBodyTooLargeError";
+    this.limitBytes = limitBytes;
+  }
+}
+
 export interface ExpandZeroRetentionInput {
   readonly receivedBytes: Uint8Array;
   readonly parsedBody?: Json;
@@ -637,6 +647,8 @@ export interface ExpandZeroRetentionInput {
   readonly sealedItems?: ReadonlyMap<string, SealedItemState>;
   readonly addEncryptedReasoningInclude?: boolean;
   readonly stripReplayedEncryptedReasoning?: boolean;
+  /** Upper bound in UTF-8 bytes for the expanded JSON body; throws ExpandedBodyTooLargeError when exceeded. */
+  readonly maxExpandedBytes?: number;
 }
 
 export interface ExpandZeroRetentionResult {
@@ -673,6 +685,24 @@ export function expandZeroRetentionContinuation(input: ExpandZeroRetentionInput)
 
   const currentItems = normalizeResponsesInput(expanded);
   const assembledInput: Json[] = [];
+  const maxBytes = input.maxExpandedBytes;
+  let runningBytes = 0;
+  if (maxBytes !== undefined) {
+    const envelope: JsonObject = {};
+    for (const [k, v] of Object.entries(expanded)) {
+      if (k !== "input" && k !== "previous_response_id") envelope[k] = v;
+    }
+    // Account for `"input":[],` wrapper plus optional `reasoning.encrypted_content` include token.
+    runningBytes = utf8Length(toJsonString(envelope)) + 16;
+    if (runningBytes > maxBytes) throw new ExpandedBodyTooLargeError(maxBytes);
+  }
+  const pushBounded = (item: Json, precomputedBytes?: number): void => {
+    if (maxBytes !== undefined) {
+      runningBytes += (precomputedBytes ?? utf8Length(toJsonString(item))) + 1;
+      if (runningBytes > maxBytes) throw new ExpandedBodyTooLargeError(maxBytes);
+    }
+    assembledInput.push(item);
+  };
 
   // 1. Expand `previous_response_id` if its decrypted parent state is present.
   const prevId = get(expanded, "previous_response_id");
@@ -683,30 +713,49 @@ export function expandZeroRetentionContinuation(input: ExpandZeroRetentionInput)
     for (const parentItem of sealedParent.items) {
       const sanitized = sanitizeReplayedItem(parentItem, stripEncrypted);
       if (sanitized.replayedEncrypted) replayedEncryptedReasoning = true;
-      if (sanitized.item !== null) assembledInput.push(sanitized.item);
+      if (sanitized.item !== null) pushBounded(sanitized.item);
     }
     delete expanded.previous_response_id;
     const currentInstructions = get(expanded, "instructions");
     if ((currentInstructions === undefined || currentInstructions === null) && typeof sealedParent.instructions === "string") {
+      if (maxBytes !== undefined) {
+        runningBytes += utf8Length(toJsonString(sealedParent.instructions)) + 16;
+        if (runningBytes > maxBytes) throw new ExpandedBodyTooLargeError(maxBytes);
+      }
       expanded.instructions = sealedParent.instructions;
     }
   }
 
   // 2. Replace `input[].type === "item_reference"` entries in-place when decrypted item state is present.
+  // Cache sanitized byte sizes per item id so repeated references hit the cap before deep-cloning again.
+  const sealedItemByteSizes = new Map<string, number>();
   for (const entry of currentItems) {
     if (isObject(entry) && get(entry, "type") === "item_reference") {
       const refId = get(entry, "id");
       const sealedItem = typeof refId === "string" && refId.length > 0 ? input.sealedItems?.get(refId) : undefined;
       if (sealedItem !== undefined) {
         itemReferencesExpanded += 1;
+        if (itemReferencesExpanded > MAX_ITEM_REFERENCES) {
+          throw new ExpandedBodyTooLargeError(maxBytes ?? 0);
+        }
         inheritedAffinityId ??= sealedItem.affinityId;
+        const cachedSize = maxBytes !== undefined ? sealedItemByteSizes.get(refId as string) : undefined;
+        if (maxBytes !== undefined && cachedSize !== undefined && runningBytes + cachedSize + 1 > maxBytes) {
+          throw new ExpandedBodyTooLargeError(maxBytes);
+        }
         const sanitized = sanitizeReplayedItem(sealedItem.item, stripEncrypted);
         if (sanitized.replayedEncrypted) replayedEncryptedReasoning = true;
-        if (sanitized.item !== null) assembledInput.push(sanitized.item);
+        if (sanitized.item !== null) {
+          const itemBytes = cachedSize ?? (maxBytes !== undefined ? utf8Length(toJsonString(sanitized.item)) : undefined);
+          if (itemBytes !== undefined && cachedSize === undefined) sealedItemByteSizes.set(refId as string, itemBytes);
+          pushBounded(sanitized.item, itemBytes);
+        } else if (maxBytes !== undefined && cachedSize === undefined) {
+          sealedItemByteSizes.set(refId as string, 0);
+        }
         continue;
       }
     }
-    assembledInput.push(cloneJson(entry));
+    pushBounded(cloneJson(entry));
   }
 
   if (previousResponseIdExpanded || itemReferencesExpanded > 0) {
@@ -727,6 +776,9 @@ export function expandZeroRetentionContinuation(input: ExpandZeroRetentionInput)
 
   const changed = previousResponseIdExpanded || itemReferencesExpanded > 0 || includeEncryptedReasoningAdded;
   const expandedBytes = changed ? encoder.encode(toJsonString(expanded)) : input.receivedBytes;
+  if (maxBytes !== undefined && expandedBytes.length > maxBytes) {
+    throw new ExpandedBodyTooLargeError(maxBytes);
+  }
   const instructionsValue = get(expanded, "instructions");
 
   return {

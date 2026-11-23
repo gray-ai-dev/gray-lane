@@ -385,7 +385,10 @@ function tool(v: Json, p: Protocol): ToolDefinition {
   const f = orElse(get(v, "function"), () => v) as Json;
   object(f, p);
   const description = get(f, "description");
-  const parameters = orElse(orElse(get(f, "parameters"), () => get(f, "input_schema")), () => get(f, "parametersJsonSchema"));
+  const parameters = orElse(
+    orElse(orElse(get(f, "parameters"), () => get(f, "input_schema")), () => get(f, "parametersJsonSchema")),
+    () => get(f, "parameters_json_schema"),
+  );
   return {
     name: string(get(f, "name"), "tool.name", p),
     description: description === undefined ? null : string(description, "tool.description", p),
@@ -646,7 +649,7 @@ export function parseRequest(protocol: Protocol, modelPath: string | null, body:
       if (ts !== undefined && ts !== null) {
         for (const t of array(ts, "tools", p)) {
           const map = object(t, p);
-          const fs = get(t, "functionDeclarations");
+          const fs = geminiFieldOrRefuse(t, "functionDeclarations", p);
           if (fs !== undefined) for (const f of array(fs, "functionDeclarations", p)) tools.push(tool(f, p));
           if (Object.keys(map).some((k) => k !== "functionDeclarations" && k !== "function_declarations" && map[k] !== null)) {
             hasHostedTools = true;

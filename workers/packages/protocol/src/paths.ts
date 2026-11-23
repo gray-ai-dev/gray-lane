@@ -164,6 +164,7 @@ export function geminiCountModel(path: string): string | undefined {
 export function geminiWithoutModelsSegment(path: string, query: string | undefined): string | undefined {
   const rest = path.startsWith("/v1beta/") ? path.slice("/v1beta/".length) : "";
   if (!rest.includes("/") || !rest.includes(":")) return undefined;
+  if (rest.startsWith("models/") || rest.startsWith("v1beta/")) return undefined;
   return query === undefined ? `${MODELS_PREFIX}${rest}` : `${MODELS_PREFIX}${rest}?${query}`;
 }
 

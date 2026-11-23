@@ -132,8 +132,10 @@ function decodeChat(body: Json, r: Response): void {
   const m = get(choice, "message");
   if (m === undefined) throw upstream("message");
   for (const key of ["reasoning_content", "reasoning"]) {
-    const t = s(m, key);
-    if (t !== undefined && t !== "") r.output.push({ kind: "reasoning", thought: { text: t, carrier: Carrier.empty("open_ai_chat") } });
+    const raw = get(m, key);
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") throw upstream(`message.${key}`);
+    if (raw !== "") r.output.push({ kind: "reasoning", thought: { text: raw, carrier: Carrier.empty("open_ai_chat") } });
   }
   const content = get(m, "content");
   if (typeof content === "string") {
@@ -206,6 +208,15 @@ export function responsesThought(item: Json): Thought {
     const t = s(p, "text");
     if (t !== undefined) parts.push(t);
   }
+  if (parts.length === 0) {
+    const content = get(item, "content");
+    for (const p of isArray(content) ? content : []) {
+      const typ = s(p, "type");
+      if (typ !== undefined && typ !== "reasoning_text") continue;
+      const t = s(p, "text");
+      if (t !== undefined) parts.push(t);
+    }
+  }
   const text = parts.join("\n\n");
   const e = s(item, "encrypted_content");
   return { text: text === "" ? undefined : text, carrier: e === undefined ? undefined : new Carrier("open_ai_responses", { e }) };
@@ -235,6 +246,7 @@ function decodeAnthropic(body: Json, r: Response): void {
       case "tool_use": {
         const given = get(b, "input");
         const input = given === undefined ? {} : given;
+        if (!isObject(input)) throw upstream("content.input");
         const id = s(b, "id");
         if (id === undefined) throw upstream("content.id");
         const name = s(b, "name");

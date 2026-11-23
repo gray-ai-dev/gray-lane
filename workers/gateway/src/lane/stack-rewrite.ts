@@ -54,9 +54,9 @@ function memberOp(value: Json, member: string, to: Json): GrayRewriteOp {
 /**
  * The required changes of one attempt, as `RewriteSpec`'s `model`, `set` and `remove` state them (`stack.ts`
  * `stackRewriteSpec`), in the order egress reports ops (by top-level member name in UTF-16 order):
- * `/metadata` (OpenAI) or `/metadata/user_id` (Anthropic, cascading an emptied `/metadata`), `/model`, `/models`,
- * `/safety_identifier` (OpenAI), `store: false` on OpenAI routes, Codex's `stream: true`, Chat's `include_usage`,
- * and `/user` (OpenAI; `prompt_cache_key` stays untouched).
+ * `/metadata` (OpenAI), `/model`, `/models`, `/safety_identifier` (OpenAI), `store: false` on OpenAI routes, Codex's
+ * `stream: true`, Chat's `include_usage`, and `/user` (OpenAI; `prompt_cache_key` stays untouched). Anthropic's
+ * `metadata` is left as it came, `user_id` included (the entry's stand-in, `claude-code-user-id.ts`).
  * So a customer who replays the receipt's ops on the client's bytes (`@gray/lane-verify`) makes exactly the bytes the
  * entry sent, when the container forwarded them as they are.
  */
@@ -74,12 +74,12 @@ export function stackRequiredOps(input: {
   const { protocol, value } = input;
   const openAi = protocol === "open_ai_chat" || protocol === "open_ai_responses";
   const ops: GrayRewriteOp[] = [];
-  if (protocol === "anthropic_messages") {
-    const metadata = get(value, "metadata");
-    if (isObject(metadata) && Object.hasOwn(metadata, "user_id")) ops.push({ op: "remove_member", path: "/metadata/user_id" });
-  } else if (openAi && get(value, "metadata") !== undefined) {
-    ops.push({ op: "remove_member", path: "/metadata" });
-  }
+  // Anthropic's `metadata.user_id` is left as the entry sent it over the hop: the entry has already replaced a Claude
+  // Code user id with Gray's stand-in and removed any other (`claude-code-user-id.ts`, declared on the outer receipt's
+  // `peer.forwarded`), since a relay running CLIProxyAPI reads it to tell a Claude Code request and without it writes its
+  // own and adds its own cache marks (docs/relay-request-changes.md). A stack VM serving a client itself, which an
+  // outbound-only VM is never asked to, passes the client's.
+  if (openAi && get(value, "metadata") !== undefined) ops.push({ op: "remove_member", path: "/metadata" });
   ops.push(memberOp(value, "model", input.upstreamModel));
   if (input.stripModels === true || get(value, "models") !== undefined) ops.push({ op: "remove_member", path: "/models" });
   if (input.stripProvider === true) ops.push({ op: "remove_member", path: "/provider" });

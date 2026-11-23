@@ -7,6 +7,18 @@ import type { KeyRecord } from "./snapshot.ts";
  * `key_state`). The key itself is never stored or logged: the snapshot is keyed by its SHA-256.
  */
 
+/**
+ * Whether `url` carries a query-string API key credential (`?key=...` or `?api_key=...`, case-insensitive and percent-decoded).
+ * Query credentials leak through URL logs and proxies and are refused consistently across every API route.
+ */
+export function hasQueryCredentials(url: URL): boolean {
+  for (const name of url.searchParams.keys()) {
+    const lower = name.toLowerCase();
+    if (lower === "key" || lower === "api_key") return true;
+  }
+  return false;
+}
+
 /** How every Gray API key token starts (`gray_control::create_api_key`). */
 export const GRAY_KEY_PREFIX = "gray_key_";
 

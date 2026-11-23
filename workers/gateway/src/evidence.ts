@@ -1,10 +1,21 @@
 import type { CustomerRate, MediaRates as HoldMediaRates } from "@gray/holds";
 import { type Json, type SerdeObject, type SerdeValue, toJsonString } from "@gray/json";
-import { type FinalizationEvidence, type MediaRates, type UsageCounters, checkEvidence, safeUsageCounters, storedEvidence } from "@gray/ledger-keys";
+import {
+  EVIDENCE_HOSTED_TOOLS,
+  type EvidenceServiceTier,
+  type FinalizationEvidence,
+  type HostedToolCounts,
+  type HostedToolPrices,
+  type MediaRates,
+  type UsageCounters,
+  checkEvidence,
+  safeUsageCounters,
+  storedEvidence,
+} from "@gray/ledger-keys";
 import type { BilledTokens, Protocol } from "@gray/protocol";
 import { customerTextRates, hasMedia, type PricedQuote } from "./money.ts";
 import type { Route } from "./routes.ts";
-import type { RouteRecord } from "./snapshot.ts";
+import type { RouteRecord, SupplierQuote } from "./snapshot.ts";
 
 /**
  * A charge's evidence as the ledger stores and checks it (crates/gray-gateway/src/inference.rs
@@ -48,6 +59,15 @@ export interface EvidenceInput {
   readonly ceiling: bigint;
   readonly tokens: BilledTokens<bigint>;
   readonly rawUsage: Json;
+  /** Effective supplier quote when a service tier or long-context tier applied; defaults to `route.record.quote`. */
+  readonly quoteOverride?: SupplierQuote;
+  /** Effective customer rate when a service tier or long-context tier applied; defaults to `route.rate`. */
+  readonly rateOverride?: CustomerRate;
+  readonly serviceTier?: EvidenceServiceTier | null;
+  readonly longContext?: boolean;
+  readonly toolCalls?: HostedToolCounts;
+  readonly supplierToolPrices?: HostedToolPrices;
+  readonly customerToolPrices?: HostedToolPrices;
 }
 
 /** The ledger's `MediaRates` of a rate's media prices: null where unset. */
@@ -75,6 +95,7 @@ interface Basis {
   readonly protocol: Protocol;
   readonly clientProtocol: Protocol | null;
   readonly record: RouteRecord;
+  readonly quoteOverride?: SupplierQuote;
   readonly rate: CustomerRate;
   /** The supplier's image, audio and unit prices the customer's derive from (empty for a text route). */
   readonly supplierMedia: HoldMediaRates;
@@ -84,16 +105,37 @@ interface Basis {
   /** What `usage.units` counts; null for token usage. */
   readonly unit: string | null;
   readonly rawUsage: Json;
+  readonly serviceTier?: EvidenceServiceTier | null;
+  readonly longContext?: boolean;
+  readonly supplierToolPrices?: HostedToolPrices;
+  readonly customerToolPrices?: HostedToolPrices;
+}
+
+function nonEmptyToolPrices(prices: HostedToolPrices | undefined): HostedToolPrices | undefined {
+  if (prices === undefined) return undefined;
+  const out: Partial<Record<(typeof EVIDENCE_HOSTED_TOOLS)[number], bigint>> = {};
+  for (const k of EVIDENCE_HOSTED_TOOLS) {
+    if (prices[k] !== undefined) out[k] = prices[k]!;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function toolPriceBasis(prices: HostedToolPrices): SerdeObject {
+  const out: Record<string, SerdeValue> = {};
+  for (const k of EVIDENCE_HOSTED_TOOLS) {
+    if (prices[k] !== undefined) out[k] = prices[k]!;
+  }
+  return out;
 }
 
 /**
  * The price version: the SHA-256 of the rate basis as serde_json writes it (keys sorted, integers
- * as integers), `customer-price-v2` for a provider's offer plus Gray's fee. Image, audio and unit
- * prices join the basis only when the offer sets any, so text price versions are unchanged
- * (inference.rs `finalization_evidence`).
+ * as integers), `customer-price-v2` for a provider's offer plus Gray's fee. Image, audio, unit,
+ * tier and hosted-tool prices join the basis only when they apply, so standard text price versions
+ * are unchanged (inference.rs `finalization_evidence`).
  */
 async function priceVersion(b: Basis): Promise<string> {
-  const q = b.record.quote;
+  const q = b.quoteOverride ?? b.record.quote;
   const customer = customerTextRates(b.rate);
   const supplierInput = BigInt(q.input);
   const supplierCacheWrite = q.cacheWrite === null ? supplierInput : BigInt(q.cacheWrite);
@@ -121,15 +163,25 @@ async function priceVersion(b: Basis): Promise<string> {
     basis.supplier_media_microusd_per_million = mediaBasis(b.supplierMedia);
     basis.media_microusd_per_million = mediaBasis(b.rate.media);
   }
+  if (b.serviceTier != null) basis.service_tier = b.serviceTier;
+  if (b.longContext === true) basis.long_context = true;
+  const stp = nonEmptyToolPrices(b.supplierToolPrices);
+  const ctp = nonEmptyToolPrices(b.customerToolPrices);
+  if (stp !== undefined && ctp !== undefined) {
+    basis.supplier_tool_prices_microusd = toolPriceBasis(stp);
+    basis.tool_prices_microusd = toolPriceBasis(ctp);
+  }
   return sha256Hex(toJsonString(basis));
 }
 
 async function evidenceOf(b: Basis): Promise<FinalizationEvidence> {
-  const q = b.record.quote;
+  const q = b.quoteOverride ?? b.record.quote;
   const customer = customerTextRates(b.rate);
   const opt = (v: number | null) => (v === null ? null : BigInt(v));
   const endpoint = b.record.endpointId;
   const workspace = b.record.operator;
+  const stp = nonEmptyToolPrices(b.supplierToolPrices);
+  const ctp = nonEmptyToolPrices(b.customerToolPrices);
   return {
     model: b.model,
     protocol: b.protocol,
@@ -159,14 +211,19 @@ async function evidenceOf(b: Basis): Promise<FinalizationEvidence> {
       cache_write_microusd_per_million: opt(q.cacheWrite),
       cache_write_1h_microusd_per_million: opt(q.cacheWrite1h),
       media: hasMedia(b.supplierMedia) ? ledgerMedia(b.supplierMedia) : NO_MEDIA,
+      ...(stp === undefined ? {} : { tool_prices: stp }),
     },
     platform_fee_bps: BigInt(b.platformFeeBps),
     client_protocol: b.clientProtocol,
+    ...(b.serviceTier == null ? {} : { service_tier: b.serviceTier }),
+    ...(b.longContext === true ? { long_context: true } : {}),
+    ...(ctp === undefined ? {} : { customer_tool_prices: ctp }),
   };
 }
 
 /** The evidence of a generation answer: text tokens at the route's text rates. */
 export function finalizationEvidence(o: EvidenceInput): Promise<FinalizationEvidence> {
+  const hasToolCalls = o.toolCalls !== undefined && Object.values(o.toolCalls).some((v) => v !== undefined && v > 0n);
   const usage: UsageCounters = {
     input_tokens: o.tokens.input,
     output_tokens: o.tokens.output,
@@ -178,6 +235,7 @@ export function finalizationEvidence(o: EvidenceInput): Promise<FinalizationEvid
     image_output_tokens: 0n,
     audio_output_tokens: 0n,
     units: 0n,
+    ...(hasToolCalls ? { tool_calls: o.toolCalls } : {}),
   };
   // A text route's evidence states no media prices (money.ts: the generation path prices text tokens only).
   return evidenceOf({
@@ -185,13 +243,18 @@ export function finalizationEvidence(o: EvidenceInput): Promise<FinalizationEvid
     protocol: o.protocol,
     clientProtocol: o.clientProtocol,
     record: o.route.record,
-    rate: { ...o.route.rate, media: NO_HOLD_MEDIA },
+    quoteOverride: o.quoteOverride,
+    rate: { ...(o.rateOverride ?? o.route.rate), media: NO_HOLD_MEDIA },
     supplierMedia: NO_HOLD_MEDIA,
     platformFeeBps: o.platformFeeBps,
     ceiling: o.ceiling,
     usage,
     unit: null,
     rawUsage: o.rawUsage,
+    serviceTier: o.serviceTier,
+    longContext: o.longContext,
+    supplierToolPrices: o.supplierToolPrices,
+    customerToolPrices: o.customerToolPrices,
   });
 }
 
@@ -245,6 +308,12 @@ export interface GenerationMediaInput {
   /** The billed counters, image and audio subsets included (@gray/protocol `modalityUsage`). */
   readonly usage: UsageCounters;
   readonly rawUsage: Json;
+  readonly quoteOverride?: SupplierQuote;
+  readonly rateOverride?: CustomerRate;
+  readonly serviceTier?: EvidenceServiceTier | null;
+  readonly longContext?: boolean;
+  readonly supplierToolPrices?: HostedToolPrices;
+  readonly customerToolPrices?: HostedToolPrices;
 }
 
 /**
@@ -258,13 +327,18 @@ export function generationMediaEvidence(o: GenerationMediaInput): Promise<Finali
     protocol: o.protocol,
     clientProtocol: o.clientProtocol,
     record: o.route.record,
-    rate: o.route.rate,
+    quoteOverride: o.quoteOverride,
+    rate: o.rateOverride ?? o.route.rate,
     supplierMedia: o.supplierMedia,
     platformFeeBps: o.platformFeeBps,
     ceiling: o.ceiling,
     usage: o.usage,
     unit: null,
     rawUsage: o.rawUsage,
+    serviceTier: o.serviceTier,
+    longContext: o.longContext,
+    supplierToolPrices: o.supplierToolPrices,
+    customerToolPrices: o.customerToolPrices,
   });
 }
 

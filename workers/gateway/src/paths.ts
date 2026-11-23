@@ -27,8 +27,10 @@ export function servedProtocol(method: string, path: string): Served | null {
   if (path === "/v1/messages" || path === "/messages") return { protocol: "anthropic_messages", pathModel: null };
   const gemini = path.startsWith("/v1beta/models/") ? path : geminiWithoutModelsSegment(path, undefined);
   if (gemini === undefined || !(gemini.endsWith(":generateContent") || gemini.endsWith(":streamGenerateContent"))) return null;
-  const model = geminiPathModel(gemini);
-  return model === undefined ? null : { protocol: "gemini", pathModel: model };
+  const rawModel = geminiPathModel(gemini);
+  if (rawModel === undefined || rawModel.length === 0) return null;
+  const model = decodeSegment(rawModel);
+  return model.length === 0 ? null : { protocol: "gemini", pathModel: model };
 }
 
 /**

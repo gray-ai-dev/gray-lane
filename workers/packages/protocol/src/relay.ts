@@ -6,7 +6,7 @@
  * `relay` holds the decoding and billing half to Rust's output; the splitter is also held to the
  * gateway's own frame tests (test/relay.test.ts).
  */
-import { type Json, asStr, asU64, at, get } from "@gray/json";
+import { type Json, asStr, asU64, at, get, isArray, isObject } from "@gray/json";
 import { SSE_BUFFER_KEEP_BYTES } from "./sse.ts";
 import { isKeepAlive } from "./stream.ts";
 import type { CanonicalEvent, Protocol, Usage } from "./types.ts";
@@ -273,13 +273,29 @@ function outputBound(limit: OutputLimit): bigint | undefined {
  * from text then reads their subsets with `modalityUsage` (src/counters.ts), as Rust's
  * `modality_usage` does after `billable_usage`; the charge itself is `charge` / `usageCost` there.
  */
+function outputOverBound(protocol: Protocol, usage: Usage, rawUsage: Json, bound: bigint): bigint | undefined {
+  if (usage.output_tokens > bound) return usage.output_tokens;
+  if (protocol === "anthropic_messages") {
+    const iterations = get(rawUsage, "iterations");
+    if (isArray(iterations)) {
+      for (const entry of iterations) {
+        if (!isObject(entry)) continue;
+        const out = asU64(get(entry, "output_tokens"));
+        if (out !== undefined && out > bound) return out;
+      }
+    }
+  }
+  return undefined;
+}
+
 function finish(protocol: Protocol, stream: StreamObserver | undefined, usage: Usage, rawUsage: Json, limit: OutputLimit): Settlement {
   if (stream !== undefined && !stream.finalUsageSeen) return { kind: "missing", reason: finalUsageMissingReason(protocol, rawUsage) };
   const bound = outputBound(limit);
-  if (bound !== undefined && usage.output_tokens > bound) {
+  const over = bound === undefined ? undefined : outputOverBound(protocol, usage, rawUsage, bound);
+  if (over !== undefined && bound !== undefined) {
     return {
       kind: "output_over_limit",
-      reason: `${usage.output_tokens} output tokens reported, above the ${bound} the request allowed: ${limit.maxOutputTokens} per answer plus the route's output allowance of ${limit.allowance}, for ${limit.candidateCount} answer(s)`,
+      reason: `${over} output tokens reported, above the ${bound} the request allowed: ${limit.maxOutputTokens} per answer plus the route's output allowance of ${limit.allowance}, for ${limit.candidateCount} answer(s)`,
     };
   }
   const billed = billedTokens(protocol, rawUsage);

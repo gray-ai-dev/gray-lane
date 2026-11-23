@@ -2,11 +2,11 @@ import { bindsThinking, capabilitiesFromClaims, CODING_AGENT_SHAPE, opencodeThin
 import { asArray, asStr, get, isObject, parseSerde, pointer, toJsonString, type Json, type JsonObject } from "@gray/json";
 import { ProtocolStreamDecoder, SseDecoder, type CanonicalEvent, type FinishReason, type Protocol } from "@gray/protocol";
 import { compileSchema, type JsonSchema } from "json-schema-library";
-import anthropicMessages from "../../../../crates/gray-verifier/fixtures/opencode-2.0.27/anthropic_messages.json" with { type: "json" };
-import gemini from "../../../../crates/gray-verifier/fixtures/opencode-2.0.27/gemini.json" with { type: "json" };
-import manifestJson from "../../../../crates/gray-verifier/fixtures/opencode-2.0.27/manifest.json" with { type: "json" };
-import openAiChat from "../../../../crates/gray-verifier/fixtures/opencode-2.0.27/open_ai_chat.json" with { type: "json" };
-import openAiResponses from "../../../../crates/gray-verifier/fixtures/opencode-2.0.27/open_ai_responses.json" with { type: "json" };
+import anthropicMessages from "../fixtures/opencode-2.0.27/anthropic_messages.json" with { type: "json" };
+import gemini from "../fixtures/opencode-2.0.27/gemini.json" with { type: "json" };
+import manifestJson from "../fixtures/opencode-2.0.27/manifest.json" with { type: "json" };
+import openAiChat from "../fixtures/opencode-2.0.27/open_ai_chat.json" with { type: "json" };
+import openAiResponses from "../fixtures/opencode-2.0.27/open_ai_responses.json" with { type: "json" };
 import { billingRules, fail, inputBound, mergeUsage, NO_USAGE, REASONING_OUTPUT_LIMIT, Refusal, rustTrim, streamError, unclear, usage, type Challenge, type ProbeUsage, type Verdict } from "./native.ts";
 import type { CheckBound } from "./runner.ts";
 import type { CheckResult } from "./report.ts";

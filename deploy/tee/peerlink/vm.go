@@ -66,6 +66,7 @@ type wireEntries struct {
 type vmEntry struct {
 	relay, keyset, name string
 	spki                [sha256.Size]byte
+	ctx                 context.Context
 	cancel              context.CancelFunc
 
 	mu        sync.Mutex
@@ -73,6 +74,8 @@ type vmEntry struct {
 	notAfter  time.Time
 	addr      string // the table's direct address, or ""
 	pinned    bool
+	slotGen   []uint64
+	nextGen   uint64
 	sessions  int
 	direct    int // sessions over the direct address
 	lastError string
@@ -211,6 +214,17 @@ func (v *vm) apply(t wireEntries) {
 				old.mu.Unlock()
 				old.cancel()
 			} else {
+				// Respawn any slot whose keep goroutine exited (e.g. after notAfter elapsed before a renewal arrived).
+				if v.now().Before(notAfter) {
+					for slot := 0; slot < v.cfg.sessionsPerEntry; slot++ {
+						if slot < len(old.slotGen) && old.slotGen[slot] == 0 {
+							old.nextGen++
+							gen := old.nextGen
+							old.slotGen[slot] = gen
+							go v.keep(old.ctx, old, slot, gen)
+						}
+					}
+				}
 				old.mu.Unlock()
 				next[row.Entry] = old
 				delete(v.entries, row.Entry)
@@ -218,10 +232,16 @@ func (v *vm) apply(t wireEntries) {
 			}
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		e := &vmEntry{relay: t.Relay, keyset: t.Keyset, name: row.Entry, spki: spki, cancel: cancel, tokens: row.Attach, notAfter: notAfter, addr: row.Addr, pinned: true}
+		slotGen := make([]uint64, v.cfg.sessionsPerEntry)
+		var nextGen uint64
+		for slot := range slotGen {
+			nextGen++
+			slotGen[slot] = nextGen
+		}
+		e := &vmEntry{relay: t.Relay, keyset: t.Keyset, name: row.Entry, spki: spki, ctx: ctx, cancel: cancel, tokens: row.Attach, notAfter: notAfter, addr: row.Addr, pinned: true, slotGen: slotGen, nextGen: nextGen}
 		next[row.Entry] = e
 		for slot := 0; slot < v.cfg.sessionsPerEntry; slot++ {
-			go v.keep(ctx, e, slot)
+			go v.keep(ctx, e, slot, slotGen[slot])
 		}
 	}
 	for _, gone := range v.entries {
@@ -233,7 +253,14 @@ func (v *vm) apply(t wireEntries) {
 // keep holds one session slot of an entry (§3.6): slot i starts i × stagger late; a closed session is redialed
 // after up to jitter, then with backoff from backoffMin doubling to backoffMax, reset by a session that lived
 // backoffReset. A pin mismatch drops the pin and stops the slot until the lane pins the entry again.
-func (v *vm) keep(ctx context.Context, e *vmEntry, slot int) {
+func (v *vm) keep(ctx context.Context, e *vmEntry, slot int, gen uint64) {
+	defer func() {
+		e.mu.Lock()
+		if slot < len(e.slotGen) && e.slotGen[slot] == gen {
+			e.slotGen[slot] = 0
+		}
+		e.mu.Unlock()
+	}()
 	if !sleepCtx(ctx, time.Duration(slot)*v.cfg.stagger) {
 		return
 	}
@@ -244,6 +271,8 @@ func (v *vm) keep(ctx context.Context, e *vmEntry, slot int) {
 		var token attachToken
 		if live {
 			token = e.tokens[slot]
+		} else if slot < len(e.slotGen) && e.slotGen[slot] == gen {
+			e.slotGen[slot] = 0
 		}
 		e.mu.Unlock()
 		if !live {
@@ -261,6 +290,9 @@ func (v *vm) keep(ctx context.Context, e *vmEntry, slot int) {
 		if errors.Is(err, errEntryPinMismatch) {
 			// The entry rebooted (§3.3 step 4): the lane sees pinned false, attests it again and pushes a table.
 			e.pinned = false
+			if slot < len(e.slotGen) && e.slotGen[slot] == gen {
+				e.slotGen[slot] = 0
+			}
 			e.mu.Unlock()
 			return
 		}

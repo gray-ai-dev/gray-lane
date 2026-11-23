@@ -94,3 +94,24 @@ export function deriveAffinity(key: Uint8Array, relayId: string, workspaceId: st
   for (let index = 0; index < 16; index += 1) out += digest[index]!.toString(16).padStart(2, "0");
   return out;
 }
+
+/**
+ * The label of the device id in the stand-in for Claude Code's `metadata.user_id` (`claude-code-user-id.ts`).
+ */
+export const CLAUDE_CODE_DEVICE_DOMAIN = "gray-claude-code-device-v1";
+
+/**
+ * The device id Gray writes into the stand-in for a Claude Code `metadata.user_id` sent to `relayId` with the API key
+ * `keyId` of `workspaceId`: 64 lowercase hex, all of HMAC-SHA256 under `K_boot` over `LP(CLAUDE_CODE_DEVICE_DOMAIN) ||
+ * LP(workspace_id) || LP(key_id) || LP(relay_id)`. The same on every replica and boot of the entry's app (ER7), so it
+ * stays one device per customer key at one relay; another relay or key gets another, and nothing in it comes from the
+ * client's own device id. The key never leaves the entry's process, and the relay is sent the digest alone.
+ */
+export function deriveClaudeCodeDevice(key: Uint8Array, workspaceId: string, keyId: string, relayId: string): string {
+  if (key.length !== 32) throw new Error("the affinity key is 32 bytes");
+  const message = new Uint8Array([...lengthPrefixed(CLAUDE_CODE_DEVICE_DOMAIN), ...lengthPrefixed(workspaceId), ...lengthPrefixed(keyId), ...lengthPrefixed(relayId)]);
+  const digest = hmac(sha256, key, message);
+  let out = "";
+  for (const byte of digest) out += byte.toString(16).padStart(2, "0");
+  return out;
+}

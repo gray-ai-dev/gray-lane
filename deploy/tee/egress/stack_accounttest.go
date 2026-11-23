@@ -62,12 +62,18 @@ type accountTestAnswer struct {
 
 // stackTestCredentialForms are the credential headers each (vendor, credential type) sends (relay-connector
 // authHeaders): the names of the request's `credential` object, exactly.
-var stackTestCredentialForms = map[string][]string{
-	"anthropic/api_key":                {"x-api-key"},
-	"anthropic/oauth_access_token":     {"authorization"},
-	"openai/api_key":                   {"authorization"},
-	"chatgpt_codex/oauth_access_token": {"authorization", "chatgpt-account-id"},
-}
+var stackTestCredentialForms = func() map[string][]string {
+	m := map[string][]string{
+		"anthropic/api_key":                {"x-api-key"},
+		"anthropic/oauth_access_token":     {"authorization"},
+		"openai/api_key":                   {"authorization"},
+		"chatgpt_codex/oauth_access_token": {"authorization", "chatgpt-account-id"},
+	}
+	for _, v := range openAICompatibleVendors {
+		m[v.id+"/api_key"] = []string{"authorization"}
+	}
+	return m
+}()
 
 // validCredentialValue is a credential header's value: 1-16 KiB of printable ASCII, no space at either end.
 func validCredentialValue(value string) bool {

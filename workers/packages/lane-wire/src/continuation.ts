@@ -36,12 +36,14 @@ export const CONTINUATION_TARGET_PREFIX = "continuation/";
 export const CONTINUATION_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
 /** A hashed reference, as `@gray/continuation` `hashedReference` writes it (the gateway's tests hold the two equal). */
 export const CONTINUATION_REFERENCE_PATTERN = /^sha256:[0-9a-f]{64}$/;
-/** The most hashed references one `continuation.pin` or `continuation.bind` document may carry. */
-export const CONTINUATION_MAX_REFERENCES = 256;
+/** The most hashed references one `continuation.pin` or `continuation.bind` document may carry (`previous_response_id` + `conversation` + up to 256 `item_reference`s). */
+export const CONTINUATION_MAX_REFERENCES = 258;
 /** The longest model a binding stores (`@gray/continuation` MAX_MODEL_BYTES bounds it in bytes; this bounds the wire's string). */
 export const CONTINUATION_MODEL_MAX_LENGTH = 256;
 /** The longest encrypted zero-retention state blob a single reference may carry (matches `@gray/continuation` MAX_SEALED_STATE_BYTES). */
 export const CONTINUATION_STATE_MAX_LENGTH = 700_000;
+/** Maximum total sealed-state UTF-8 bytes returned by a single `continuation.pin` answer (safely below `BRIDGE_RESPONSE_MAX_BYTES`). */
+export const CONTINUATION_PIN_MAX_SEALED_BYTES = 6 * 1024 * 1024;
 /** The longest TTL in milliseconds for encrypted zero-retention continuation state (24 hours). */
 export const CONTINUATION_STATE_MAX_TTL_MS = 24 * 3600 * 1000;
 /** Request body limit for `continuation.bind` carrying sealed zero-retention state (2 MiB). */
@@ -74,7 +76,7 @@ export type ContinuationPinRequestDto = z.infer<typeof continuationPinRequestSch
 
 export const continuationPinAnswerSchema = z.union([
   z.object({ outcome: z.literal("pinned"), endpoint_id: id, sealed: z.array(sealedHitSchema).max(CONTINUATION_MAX_REFERENCES).optional() }).strict(),
-  z.object({ outcome: z.enum(["missing", "conflict", "unavailable"]) }).strict(),
+  z.object({ outcome: z.enum(["missing", "conflict", "unavailable", "too_large"]) }).strict(),
 ]);
 export type ContinuationPinAnswerDto = z.infer<typeof continuationPinAnswerSchema>;
 
@@ -108,7 +110,7 @@ export interface ContinuationSealedHit {
 /** What a pin found, as the lane and the bridge hold it. */
 export type ContinuationPin =
   | { readonly outcome: "pinned"; readonly endpointId: string; readonly sealed?: readonly ContinuationSealedHit[] }
-  | { readonly outcome: "missing" | "conflict" | "unavailable" };
+  | { readonly outcome: "missing" | "conflict" | "unavailable" | "too_large" };
 
 function checked<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);

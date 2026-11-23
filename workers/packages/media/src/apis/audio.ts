@@ -390,8 +390,12 @@ function billedSeconds(seconds: Json): Metered {
 
 const U64_MAX = 0xffff_ffff_ffff_ffffn;
 
-/** `audio_token_usage`: token usage of a transcription; `input_token_details.audio_tokens` is the audio subset of the input. */
-function audioTokenUsage(usage: Json): Metered {
+/**
+ * `audio_token_usage`: token usage of a transcription; `input_token_details.audio_tokens` is the audio subset of the input.
+ * When `input_token_details` omits `audio_tokens`, every non-text input token (all `input_tokens` when `text_tokens` is
+ * also absent) is billed as `audio_input_tokens` so unsplit audio usage never falls back to the cheaper text input rate.
+ */
+export function audioTokenUsage(usage: Json): Metered {
   let counters: UsageCounters = tokenUsage(usage, "input_tokens", "output_tokens");
   const nested = (key: string) => {
     try {
@@ -402,9 +406,21 @@ function audioTokenUsage(usage: Json): Metered {
   };
   const audio = nested("audio_tokens");
   const text = nested("text_tokens");
+  let pluralAudio: bigint | undefined;
+  try {
+    pluralAudio = nestedCounter(usage, "input_tokens_details", "audio_tokens");
+  } catch (error) {
+    throw new UsageError((error as Error).message);
+  }
   if (audio !== undefined) {
     if (counters.audio_input_tokens !== 0n && counters.audio_input_tokens !== audio) throw new UsageError("audio token counts disagree");
     counters = { ...counters, audio_input_tokens: audio };
+  } else if (pluralAudio === undefined) {
+    if (text === undefined) {
+      counters = { ...counters, audio_input_tokens: counters.input_tokens };
+    } else if (text <= counters.input_tokens) {
+      counters = { ...counters, audio_input_tokens: counters.input_tokens - text };
+    }
   }
   const detailed = counters.audio_input_tokens + (text ?? 0n);
   if (detailed > U64_MAX) throw new UsageError("token counts overflow");

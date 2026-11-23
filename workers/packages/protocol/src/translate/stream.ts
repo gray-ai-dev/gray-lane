@@ -32,6 +32,7 @@ import {
   anthropicFinish,
   chatFinish,
   geminiFinish,
+  hasGeminiBlockReason,
   readUsage,
   renderAnthropicFinish,
   renderChatFinish,
@@ -383,9 +384,11 @@ export class StreamTranslator {
             break;
           }
           case "response.reasoning_summary_text.delta":
-          case "response.reasoning_text.delta":
-            this.reasoningText.set(outputIndex(), true);
+          case "response.reasoning_text.delta": {
+            const delta = asStr(get(v, "delta"));
+            if (delta !== undefined && delta !== "") this.reasoningText.set(outputIndex(), true);
             break;
+          }
           case "response.reasoning_summary_part.added": {
             const i = outputIndex();
             if ((asU64(get(v, "summary_index")) ?? 0n) > 0n && this.reasoningText.get(i) === true) ops.push({ kind: "reasoning", text: "\n\n" });
@@ -403,7 +406,11 @@ export class StreamTranslator {
               this.reasoningEnded.add(id);
               this.kept += TRANSLATOR_OP_BYTES + stringHeap(id);
             }
-            ops.push({ kind: "reasoning_end", carrier: responsesThought(item).carrier });
+            const thought = responsesThought(item);
+            if (this.reasoningText.get(outputIndex()) !== true && thought.text !== undefined) {
+              ops.push({ kind: "reasoning", text: thought.text });
+            }
+            ops.push({ kind: "reasoning_end", carrier: thought.carrier });
             break;
           }
           case "response.completed":
@@ -424,8 +431,11 @@ export class StreamTranslator {
           case "content_block_start": {
             const block = get(v, "content_block") ?? null;
             const blockType = asStr(get(block, "type"));
-            if (blockType === "text" || blockType === "tool_use") {
+            if (blockType === "text") {
               // Carried by the canonical events.
+            } else if (blockType === "tool_use") {
+              const input = get(block, "input");
+              if (input !== undefined && !isObject(input)) throw upstream("content.input");
             } else if (blockType === "thinking") {
               const state: [string, string] = [asStr(get(block, "thinking")) ?? "", asStr(get(block, "signature")) ?? ""];
               const heap = TRANSLATOR_OP_BYTES + stringHeap(state[0]) + stringHeap(state[1]);
@@ -490,7 +500,7 @@ export class StreamTranslator {
         }
         const reason = asStr(pointer(v, "/candidates/0/finishReason"));
         if (reason !== undefined && reason !== "FINISH_REASON_UNSPECIFIED") this.finish = geminiFinish(reason);
-        if (pointer(v, "/promptFeedback/blockReason") !== undefined) this.finish = "content_filter";
+        if (hasGeminiBlockReason(v)) this.finish = "content_filter";
       }
     }
   }

@@ -495,11 +495,12 @@ function inlineMedia(object: JsonObject): "image" | "other" | undefined {
   }
 }
 
-/** `refers`: a file by id or URL, or a Chat assistant's earlier audio reply by id. */
+/** `refers`: a file by id or URL, a Responses `item_reference`, or a Chat assistant's earlier audio reply by id. */
 function refers(object: JsonObject): boolean {
   for (const key of ["file_id", "file_url", "fileUri", "file_uri"]) {
     if (typeof get(object, key) === "string") return true;
   }
+  if (get(object, "type") === "item_reference" && typeof get(object, "id") === "string") return true;
   return typeof get(get(object, "audio"), "id") === "string";
 }
 

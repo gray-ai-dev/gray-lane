@@ -22,7 +22,7 @@
  * Rust keeps as `raw_body`; `undefined` is Rust's `None`.
  */
 import { type Json, get, isObject, pointer, serializedLength, utf8Length } from "@gray/json";
-import { type CanonicalEvent, type CanonicalRequest, type FinishReason, type Protocol, ProtocolError, type ToolCallCheck, parseResponse } from "@gray/protocol";
+import { type CanonicalEvent, type CanonicalRequest, type FinishReason, type Protocol, ProtocolError, type ToolCallCheck, normalizeGeminiSchema, parseResponse } from "@gray/protocol";
 import { AnswerCallCheck } from "./answer.ts";
 import { type TrustMode, type TrustPolicyConfig, TrustConfigError, parseTestTrustMode, parseTrustPolicyConfig } from "./config.ts";
 import { inspectToolDeclarations, inspectToolSelection } from "./declarations.ts";
@@ -113,7 +113,8 @@ export class ToolSchemas {
     if (validator === undefined) {
       const tool = request.tools.find((t) => t.name === name);
       if (tool === undefined) return undefined;
-      validator = afterAdmission(() => schemaValidator(tool.parameters));
+      const schema = request.protocol === "gemini" ? normalizeGeminiSchema(tool.parameters) : tool.parameters;
+      validator = afterAdmission(() => schemaValidator(schema));
       if (validator === undefined) refuse("trust_invalid_tool_schema");
       this.compiled.set(name, validator);
     }
@@ -370,7 +371,8 @@ export class TrustPolicy {
       inspectToolSelection(request, body, undefined);
     }
     const compiles = options?.admitted === true ? (schema: Json) => afterAdmission(() => schemaCompiles(schema)) === true : schemaCompiles;
-    if (!withinCompileBudget(request.tools.map((tool) => tool.parameters))) {
+    const schemas = request.tools.map((tool) => (request.protocol === "gemini" ? normalizeGeminiSchema(tool.parameters) : tool.parameters));
+    if (!withinCompileBudget(schemas)) {
       // Rust checks each tool's name and then compiles its schema, tool by tool. Over the budget
       // nothing is compiled, so a name refusal anywhere comes first, as Rust gives it unless an
       // earlier tool's schema fails to compile (docs/cloudflare-native/trust.md section 5).
@@ -379,9 +381,10 @@ export class TrustPolicy {
       refuse("trust_tool_schemas_too_complex");
     }
     const names = new Set<string>();
-    for (const tool of request.tools) {
+    for (let i = 0; i < request.tools.length; i += 1) {
+      const tool = request.tools[i]!;
       this.checkToolName(tool.name, names);
-      if (!compiles(tool.parameters)) refuse("trust_invalid_tool_schema");
+      if (!compiles(schemas[i]!)) refuse("trust_invalid_tool_schema");
     }
   }
 

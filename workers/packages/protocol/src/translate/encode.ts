@@ -174,6 +174,7 @@ function chat(req: Request): JsonObject {
       }
     }
   }
+  validateToolNames(req, OPENAI_TOOL_NAME);
   const o: JsonObject = { model: req.model, messages };
   if (req.tools.length > 0) {
     o.tools = req.tools.map((t) => {
@@ -186,6 +187,7 @@ function chat(req: Request): JsonObject {
   }
   if (req.toolChoice !== undefined) {
     const c = req.toolChoice;
+    if (req.tools.length === 0 && (c.kind === "required" || c.kind === "named")) throw new Refusal(code.INVALID, "tool_choice");
     o.tool_choice = c.kind === "named" ? { type: "function", function: { name: c.name } } : c.kind;
   }
   if (req.tools.length > 0) put(o, "parallel_tool_calls", req.parallelToolCalls);
@@ -201,8 +203,12 @@ function chat(req: Request): JsonObject {
     }
   }
   if (req.reasoning !== undefined) {
-    if (req.reasoning.kind === "disabled") req.dropped.add("reasoning");
-    else o.reasoning_effort = reasoningEffort(req.reasoning) ?? null;
+    if (req.reasoning.kind === "disabled") {
+      if (supportsOpenAiReasoningNone(req.model)) o.reasoning_effort = "none";
+      else req.dropped.add("reasoning");
+    } else {
+      o.reasoning_effort = reasoningEffort(req.reasoning) ?? null;
+    }
   }
   putNumber(o, "temperature", req.temperature);
   putNumber(o, "top_p", req.topP);
@@ -221,6 +227,34 @@ function chat(req: Request): JsonObject {
   put(o, "prompt_cache_key", req.promptCacheKey);
   put(o, "prompt_cache_retention", req.promptCacheRetention);
   return o;
+}
+
+const OPENAI_TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+const ANTHROPIC_TOOL_NAME = /^[a-zA-Z0-9_-]{1,128}$/;
+const GEMINI_TOOL_NAME = /^[a-zA-Z_][a-zA-Z0-9_.\-:]{0,63}$/;
+
+function validateToolNames(req: Request, pattern: RegExp): void {
+  for (const t of req.tools) {
+    if (!pattern.test(t.name)) throw new Refusal(code.VALUE, "tools.name");
+  }
+  if (req.toolChoice?.kind === "named" && !pattern.test(req.toolChoice.name)) {
+    throw new Refusal(code.VALUE, "tool_choice");
+  }
+  for (const turn of req.turns) {
+    for (const part of turn.parts) {
+      if (part.kind === "call" && !pattern.test(part.call.name)) {
+        throw new Refusal(code.VALUE, "tools.name");
+      }
+      if (part.kind === "result" && part.result.name !== undefined && !pattern.test(part.result.name)) {
+        throw new Refusal(code.VALUE, "tools.name");
+      }
+    }
+  }
+}
+
+/** OpenAI models verified to accept `reasoning_effort: "none"` / `reasoning.effort: "none"` (CI-21). */
+function supportsOpenAiReasoningNone(model: string): boolean {
+  return /^(?:openai\/)?gpt-5\.(?:1|2|4)(?:-\d{4}-\d{2}-\d{2})?$/i.test(model);
 }
 
 function putNumber(o: JsonObject, key: string, v: JsonNumber | undefined): void {
@@ -298,6 +332,7 @@ function responses(req: Request): JsonObject {
         break;
     }
   }
+  validateToolNames(req, OPENAI_TOOL_NAME);
   o.input = input;
   if (req.tools.length > 0) {
     o.tools = req.tools.map((t) => {
@@ -312,6 +347,7 @@ function responses(req: Request): JsonObject {
   }
   if (req.toolChoice !== undefined) {
     const c = req.toolChoice;
+    if (req.tools.length === 0 && (c.kind === "required" || c.kind === "named")) throw new Refusal(code.INVALID, "tool_choice");
     o.tool_choice = c.kind === "named" ? { type: "function", name: c.name } : c.kind;
   }
   if (req.tools.length > 0) put(o, "parallel_tool_calls", req.parallelToolCalls);
@@ -328,7 +364,8 @@ function responses(req: Request): JsonObject {
   }
   if (req.reasoning !== undefined) {
     if (req.reasoning.kind === "disabled") {
-      req.dropped.add("reasoning");
+      if (supportsOpenAiReasoningNone(req.model)) o.reasoning = { effort: "none" };
+      else req.dropped.add("reasoning");
     } else {
       o.reasoning = { effort: reasoningEffort(req.reasoning) ?? null, summary: "auto" };
       o.include = ["reasoning.encrypted_content"];
@@ -430,9 +467,12 @@ function anthropic(req: Request): JsonObject {
   }
   const o: JsonObject = { model: req.model };
   if (req.system.length > 0) o.system = req.system.map((s) => ({ type: "text", text: s }));
-  o.messages = mergeRoles(messages).map(([role, content]) => ({ role, content }));
+  const merged = mergeRoles(messages);
+  if (merged.length === 0 || merged[0]![0] !== "user") throw new Refusal(code.INVALID, "messages");
+  o.messages = merged.map(([role, content]) => ({ role, content }));
   const maxTokens = req.maxTokens ?? DEFAULT_MAX_TOKENS;
   o.max_tokens = maxTokens;
+  validateToolNames(req, ANTHROPIC_TOOL_NAME);
   if (req.tools.length > 0) {
     if (req.tools.some((t) => t.strict === true)) req.dropped.add("tool_strict");
     o.tools = req.tools.map((t) => {
@@ -589,6 +629,7 @@ function gemini(req: Request): JsonObject {
   const o: JsonObject = {};
   if (req.system.length > 0) o.systemInstruction = { parts: req.system.map((s) => ({ text: s })) };
   o.contents = mergeRoles(contents).map(([role, parts]) => ({ role, parts }));
+  validateToolNames(req, GEMINI_TOOL_NAME);
   if (req.tools.length > 0) {
     if (req.tools.some((t) => t.strict === true)) req.dropped.add("tool_strict");
     const declarations = req.tools.map((t) => {

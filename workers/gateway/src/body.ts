@@ -68,6 +68,159 @@ export function bodyTooLarge(protocol: Protocol, limit: number, limitSource?: st
     .withMeta("limit_bytes", BigInt(limit));
 }
 
+type InboundCoding = "gzip" | "deflate";
+const MAX_INBOUND_CODINGS = 2;
+const DECODE_PIECE_BYTES = 4096;
+
+/** RFC 9110 §5.6.3 OWS trim. */
+function trimOws(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && (text[start] === " " || text[start] === "\t")) start += 1;
+  while (end > start && (text[end - 1] === " " || text[end - 1] === "\t")) end -= 1;
+  return text.slice(start, end);
+}
+
+/**
+ * Parses an inbound `Content-Encoding` header (RFC 9110 §8.4).
+ * Returns `[]` for uncompressed/identity, the list of codings (`gzip`/`deflate`) in application order,
+ * or `null` when an unsupported coding or more than {@link MAX_INBOUND_CODINGS} layers are listed.
+ */
+export function parseInboundCodings(header: string | null): readonly InboundCoding[] | null {
+  if (header === null) return [];
+  const codings: InboundCoding[] = [];
+  for (const part of header.split(",")) {
+    const token = trimOws(part).toLowerCase();
+    if (token === "" || token === "identity") continue;
+    if (token === "gzip" || token === "x-gzip") codings.push("gzip");
+    else if (token === "deflate") codings.push("deflate");
+    else return null;
+  }
+  return codings.length <= MAX_INBOUND_CODINGS ? codings : null;
+}
+
+/** RFC 1950 §2.2 zlib header check so `deflate` handles both zlib-wrapped and bare DEFLATE (`deflate-raw`). */
+function zlibHeader(cmf: number, flg: number): boolean {
+  return (cmf & 0x0f) === 8 && cmf >> 4 <= 7 && ((cmf << 8) | flg) % 31 === 0;
+}
+
+class WireLimitExceeded extends Error {}
+class InvalidEncodingStream extends Error {}
+
+function decodeInboundStream(
+  rawBody: ReadableStream<Uint8Array>,
+  codings: readonly InboundCoding[],
+  wireLimit: number,
+  onWireTooLarge: () => void,
+  onRawBroken: () => void,
+): ReadableStream<Uint8Array> {
+  const rawReader = rawBody.getReader();
+  let wireRead = 0;
+  let held: Uint8Array | null = null;
+  let stream: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        for (;;) {
+          if (held !== null && held.length > 0) {
+            const piece = held.subarray(0, DECODE_PIECE_BYTES);
+            held = held.subarray(piece.length);
+            controller.enqueue(piece);
+            return;
+          }
+          let next: ReadableStreamReadResult<Uint8Array>;
+          try {
+            next = await rawReader.read();
+          } catch (error) {
+            onRawBroken();
+            controller.error(error);
+            return;
+          }
+          if (next.done) {
+            controller.close();
+            return;
+          }
+          if (next.value.length === 0) continue;
+          wireRead += next.value.length;
+          if (wireRead > wireLimit) {
+            onWireTooLarge();
+            await rawReader.cancel().catch(() => {});
+            controller.error(new WireLimitExceeded());
+            return;
+          }
+          held = next.value;
+        }
+      },
+      cancel(reason) {
+        return rawReader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  // Undo codings in reverse order of application (RFC 9110 §8.4).
+  for (let i = codings.length - 1; i >= 0; i -= 1) {
+    const coding = codings[i]!;
+    const upstream = stream;
+    let openReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let decodedReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const open = async (): Promise<void> => {
+      const r = upstream.getReader();
+      openReader = r;
+      const head: Uint8Array[] = [];
+      const first: number[] = [];
+      const need = coding === "deflate" ? 2 : 1;
+      while (first.length < need) {
+        const res = await r.read();
+        if (res.done) {
+          await r.cancel().catch(() => {});
+          throw new InvalidEncodingStream();
+        }
+        if (res.value.length === 0) continue;
+        head.push(res.value);
+        for (const byte of res.value.subarray(0, need - first.length)) first.push(byte);
+      }
+      const format: "gzip" | "deflate" | "deflate-raw" = coding === "gzip" ? "gzip" : zlibHeader(first[0]!, first[1]!) ? "deflate" : "deflate-raw";
+      const feed = new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            const buffered = head.shift();
+            if (buffered !== undefined) {
+              controller.enqueue(buffered);
+              return;
+            }
+            const next = await r.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          },
+          cancel(reason) {
+            return r.cancel(reason);
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      decodedReader = feed.pipeThrough(new DecompressionStream(format)).getReader();
+      openReader = null;
+    };
+    stream = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          if (decodedReader === null) await open();
+          const res = await decodedReader!.read();
+          if (res.done) controller.close();
+          else controller.enqueue(res.value);
+        },
+        cancel(reason) {
+          if (decodedReader !== null) return decodedReader.cancel(reason);
+          if (openReader !== null) return openReader.cancel(reason);
+          return upstream.cancel(reason);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+  }
+  return stream;
+}
+
 /**
  * Reads `request`'s body within its limits; tier C needs `spool` (the content bucket). `held` hears
  * the bytes the read holds in memory as it goes: its buffer or chunks, the spool's part buffer.
@@ -75,22 +228,57 @@ export function bodyTooLarge(protocol: Protocol, limit: number, limitSource?: st
  * tier C body is never held whole to tell: @gray/tool-ids `HandleWatch`).
  */
 export async function readBody(request: Request, limits: BodyLimits, spool: ContentBucket | undefined, held?: (bytes: number) => void, watch?: (chunk: Uint8Array) => void): Promise<BodyRead> {
+  const codings = parseInboundCodings(request.headers.get("content-encoding"));
+  if (codings === null) {
+    await request.body?.cancel().catch(() => {});
+    return {
+      ok: false,
+      error: new ApiError(415, "unsupported_content_encoding").withMessage(
+        `Unsupported Content-Encoding ${JSON.stringify(request.headers.get("content-encoding") ?? "")}. Send an uncompressed body or compress with gzip or deflate.`,
+      ),
+    };
+  }
+  const encoded = codings.length > 0;
   const header = request.headers.get("content-length");
   const declared = header !== null && /^[0-9]+$/.test(header) ? Number(header) : null;
   if (declared !== null && declared > limits.limit) {
+    await request.body?.cancel().catch(() => {});
     return { ok: false, error: bodyTooLarge(limits.protocol, limits.limit, limits.limitSource) };
   }
   const activeSpool = isDisabledBucket(spool) ? undefined : spool;
-  if (request.body === null) return { ok: true, body: { tier: "A", bytes: new Uint8Array(0), length: 0 } };
-  if (declared !== null && declared > limits.rawMax && activeSpool === undefined) return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource) };
-  const reader = request.body.getReader();
-  const newSpool = (): Promise<Spool> => Spool.open(activeSpool!, `${SPOOL_PREFIX}${crypto.randomUUID()}`, spoolPartBytes(declared));
+  if (request.body === null) {
+    if (encoded) return { ok: false, error: new ApiError(400, "invalid_content_encoding") };
+    return { ok: true, body: { tier: "A", bytes: new Uint8Array(0), length: 0 } };
+  }
+  if (!encoded && declared !== null && declared > limits.rawMax && activeSpool === undefined) {
+    await request.body.cancel().catch(() => {});
+    return { ok: false, error: bodyTooLarge(limits.protocol, limits.rawMax, limits.limitSource) };
+  }
+  const wireLimit = activeSpool === undefined ? Math.min(limits.limit, limits.rawMax + 1024) : limits.limit;
+  const wireLimitReported = activeSpool === undefined && limits.rawMax < limits.limit ? limits.rawMax : limits.limit;
+  let wireTooLarge = false;
+  let rawBroken = false;
+  const sourceStream = encoded
+    ? decodeInboundStream(
+        request.body,
+        codings,
+        wireLimit,
+        () => {
+          wireTooLarge = true;
+        },
+        () => {
+          rawBroken = true;
+        },
+      )
+    : request.body;
+  const reader = sourceStream.getReader();
+  const newSpool = (): Promise<Spool> => Spool.open(activeSpool!, `${SPOOL_PREFIX}${crypto.randomUUID()}`, spoolPartBytes(encoded ? null : declared));
   // A stated length (tiers A and B): start with a modest buffer (at most 64 KiB) and grow as bytes arrive so an
   // unauthenticated request naming a 64 MiB Content-Length cannot pre-allocate 64 MiB before sending a byte.
   const INITIAL_DECLARED_BUFFER = 65_536;
-  let buffer: Uint8Array | null = declared !== null && declared <= limits.rawMax ? new Uint8Array(limits.whole === true ? declared : Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
+  let buffer: Uint8Array | null = !encoded && declared !== null && declared <= limits.rawMax ? new Uint8Array(limits.whole === true ? declared : Math.min(declared, INITIAL_DECLARED_BUFFER)) : null;
   let spooled: Spool | null = null;
-  if (declared !== null && declared > limits.rawMax) {
+  if (!encoded && declared !== null && declared > limits.rawMax) {
     try {
       spooled = await newSpool();
     } catch (error) {
@@ -121,7 +309,7 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
     }
   };
   const fail = async (error: ApiError): Promise<BodyRead> => {
-    reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => {});
     // A lifecycle rule on the spool prefix removes what an abort that did not answer leaves.
     if (spooled !== null) await store(() => spooled!.abort());
     return { ok: false, error };
@@ -137,13 +325,18 @@ export async function readBody(request: Request, limits: BodyLimits, spool: Cont
           : null;
   try {
     for (;;) {
-      let next: ReadableStreamReadResult<Uint8Array> | "timeout" | "broken";
+      let next: ReadableStreamReadResult<Uint8Array> | "timeout" | "broken" | "wire_limit" | "bad_encoding";
       try {
         next = await Promise.race([reader.read(), timeout]);
-      } catch {
-        next = "broken";
+      } catch (err) {
+        if (wireTooLarge || err instanceof WireLimitExceeded) next = "wire_limit";
+        else if (rawBroken) next = "broken";
+        else if (encoded) next = "bad_encoding";
+        else next = "broken";
       }
       if (next === "timeout") return await fail(new ApiError(408, "request_body_timeout"));
+      if (next === "wire_limit") return await fail(bodyTooLarge(limits.protocol, wireLimitReported, limits.limitSource));
+      if (next === "bad_encoding") return await fail(new ApiError(400, "invalid_content_encoding"));
       if (next === "broken") return await fail(new ApiError(400, "request_body_incomplete"));
       if (next.done) break;
       const chunk = next.value;

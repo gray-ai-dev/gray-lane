@@ -299,9 +299,12 @@ export function modalityUsage(protocol: Protocol, raw: Json, counters: UsageCoun
     case "gemini": {
       const uncached = (m: string): bigint => {
         const prompt = geminiModalityTokens(raw, "promptTokensDetails", m);
+        const toolUse = geminiModalityTokens(raw, "toolUsePromptTokensDetails", m);
         const cached = geminiModalityTokens(raw, "cacheTokensDetails", m);
         if (cached > prompt) throw new MeteringError("cached modality tokens exceed prompt modality tokens");
-        return prompt - cached;
+        const sum = prompt - cached + toolUse;
+        if (sum > U64_MAX) throw new MeteringError("usage overflow");
+        return sum;
       };
       parts = [
         uncached("IMAGE"),

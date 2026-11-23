@@ -7,8 +7,11 @@ import type { StoredReceipt } from "./state.ts";
  * The lane's receipts: the ACI headers (§7.1, §7.3), the document built from a request's bytes and
  * an attempt's draft, and the owner check of `GET /v1/aci/receipts/{id}` (§7.6).
  *
- * A receipt exists for an authenticated request whose body was read (M21). A refusal before the
- * body (401, a malformed header, the 413 of a body past the cap, 404) has no `request.received`, so
+ * A receipt exists for an authenticated request whose body was read (M21). Inbound `Content-Encoding`
+ * (`gzip` or `deflate`) is decoded by `readBody` within the body cap before JSON parsing, so
+ * `request.received` hashes the decoded request body bytes (the exact payload parsed and forwarded or
+ * rewritten). A refusal before the
+ * body (401, a malformed header, 415 unsupported content encoding, the 413 of a body past the cap, 404) has no `request.received`, so
  * it carries no receipt and no `X-Receipt-Id`. A request that committed an attempt but failed
  * before its response closed keeps its id (m11). The receipt is signed and stored as soon as the
  * answer has ended; until then (the answer still streaming, or ended a moment ago) the GET of an id

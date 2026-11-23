@@ -14,6 +14,14 @@ import type { ProbeCost } from "./evidence.ts";
 export const MAX_PRICE_MICROUSD_PER_MILLION = 1_000_000_000_000;
 /** A unit price may reach $100 a unit (MAX_UNIT_PRICE_MICROUSD_PER_MILLION). */
 export const MAX_UNIT_PRICE_MICROUSD_PER_MILLION = 100_000_000_000_000;
+/** A per-call hosted tool price may reach $100 per call (in micro-USD). */
+export const MAX_TOOL_PRICE_MICROUSD = 100_000_000;
+export const MIN_LONG_CONTEXT_THRESHOLD = 1_000;
+export const MAX_LONG_CONTEXT_THRESHOLD = 100_000_000;
+export const SERVICE_TIER_NAMES = ["fast", "priority"] as const;
+export type ServiceTierName = (typeof SERVICE_TIER_NAMES)[number];
+export const HOSTED_TOOL_NAMES = ["web_search", "google_search", "code_execution", "file_search"] as const;
+export type HostedToolName = (typeof HOSTED_TOOL_NAMES)[number];
 export const MAX_UNIT_PRICES = 32;
 export const MAX_CONCURRENCY = 100_000;
 /** 9999-12-31T23:59:59Z, the latest end date an offer may set (LATEST_END_DATE). */
@@ -104,6 +112,29 @@ export interface OfferMediaTerms {
   readonly unit_prices: Readonly<Record<string, number>>;
 }
 
+/** Long-context token rates applied to the whole request when billed input tokens exceed `threshold_input_tokens`. */
+export interface OfferLongContextTerms {
+  readonly threshold_input_tokens: number;
+  readonly input_microusd_per_million: number;
+  readonly output_microusd_per_million: number;
+  readonly cache_read_microusd_per_million: number | null;
+  readonly cache_write_microusd_per_million: number | null;
+  readonly cache_write_1h_microusd_per_million: number | null;
+}
+
+/** Explicit token rates for an accelerated service tier (`fast` or `priority`), with optional long-context rates. */
+export interface OfferServiceTierTerms {
+  readonly input_microusd_per_million: number;
+  readonly output_microusd_per_million: number;
+  readonly cache_read_microusd_per_million: number | null;
+  readonly cache_write_microusd_per_million: number | null;
+  readonly cache_write_1h_microusd_per_million: number | null;
+  readonly long_context?: OfferLongContextTerms | null;
+}
+
+export type OfferServiceTiers = Readonly<Partial<Record<ServiceTierName, OfferServiceTierTerms>>>;
+export type OfferToolPrices = Readonly<Partial<Record<HostedToolName, number>>>;
+
 export interface OfferTerms {
   readonly endpoint_id: string;
   readonly credential_generation: number;
@@ -127,6 +158,12 @@ export interface OfferTerms {
   readonly cache_write_microusd_per_million: number | null;
   readonly cache_write_1h_microusd_per_million: number | null;
   readonly media: OfferMediaTerms;
+  /** Optional long-context tiered token rates; absent when not set. */
+  readonly long_context?: OfferLongContextTerms | null;
+  /** Optional accelerated service-tier rate tables (`fast`, `priority`); absent when not set. */
+  readonly service_tiers?: OfferServiceTiers | null;
+  /** Optional per-call hosted tool prices (micro-USD per call); absent when not set. */
+  readonly tool_prices?: OfferToolPrices | null;
   readonly currency: string;
   readonly valid_until: number | null;
 }
@@ -221,6 +258,70 @@ function parseMedia(v: unknown): OfferMediaTerms {
   };
 }
 
+const LONG_CONTEXT_FIELDS = [
+  "threshold_input_tokens",
+  "input_microusd_per_million",
+  "output_microusd_per_million",
+  "cache_read_microusd_per_million",
+  "cache_write_microusd_per_million",
+  "cache_write_1h_microusd_per_million",
+];
+
+const SERVICE_TIER_FIELDS = [
+  "input_microusd_per_million",
+  "output_microusd_per_million",
+  "cache_read_microusd_per_million",
+  "cache_write_microusd_per_million",
+  "cache_write_1h_microusd_per_million",
+  "long_context",
+];
+
+function parseLongContext(v: unknown, what: string): OfferLongContextTerms | null {
+  if (v === undefined || v === null) return null;
+  const o = strict(v, what, LONG_CONTEXT_FIELDS);
+  return {
+    threshold_input_tokens: int(o.threshold_input_tokens, `${what}.threshold_input_tokens`, 0, I64_MAX),
+    input_microusd_per_million: int(o.input_microusd_per_million, `${what}.input`, I64_MIN, I64_MAX),
+    output_microusd_per_million: int(o.output_microusd_per_million, `${what}.output`, I64_MIN, I64_MAX),
+    cache_read_microusd_per_million: optInt(o.cache_read_microusd_per_million, `${what}.cache_read`, I64_MIN, I64_MAX),
+    cache_write_microusd_per_million: optInt(o.cache_write_microusd_per_million, `${what}.cache_write`, I64_MIN, I64_MAX),
+    cache_write_1h_microusd_per_million: optInt(o.cache_write_1h_microusd_per_million, `${what}.cache_write_1h`, I64_MIN, I64_MAX),
+  };
+}
+
+function parseServiceTiers(v: unknown): OfferServiceTiers | undefined {
+  if (v === undefined || v === null) return undefined;
+  const o = strict(v, "terms.service_tiers", SERVICE_TIER_NAMES);
+  const out: Partial<Record<ServiceTierName, OfferServiceTierTerms>> = {};
+  for (const name of SERVICE_TIER_NAMES) {
+    const raw = o[name];
+    if (raw === undefined || raw === null) continue;
+    const t = strict(raw, `terms.service_tiers.${name}`, SERVICE_TIER_FIELDS);
+    const lc = parseLongContext(t.long_context, `terms.service_tiers.${name}.long_context`);
+    out[name] = {
+      input_microusd_per_million: int(t.input_microusd_per_million, `terms.service_tiers.${name}.input`, I64_MIN, I64_MAX),
+      output_microusd_per_million: int(t.output_microusd_per_million, `terms.service_tiers.${name}.output`, I64_MIN, I64_MAX),
+      cache_read_microusd_per_million: optInt(t.cache_read_microusd_per_million, `terms.service_tiers.${name}.cache_read`, I64_MIN, I64_MAX),
+      cache_write_microusd_per_million: optInt(t.cache_write_microusd_per_million, `terms.service_tiers.${name}.cache_write`, I64_MIN, I64_MAX),
+      cache_write_1h_microusd_per_million: optInt(t.cache_write_1h_microusd_per_million, `terms.service_tiers.${name}.cache_write_1h`, I64_MIN, I64_MAX),
+      ...(lc === null ? {} : { long_context: lc }),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function parseToolPrices(v: unknown): OfferToolPrices | undefined {
+  if (v === undefined || v === null) return undefined;
+  const o = strict(v, "terms.tool_prices", HOSTED_TOOL_NAMES);
+  const out: Partial<Record<HostedToolName, number>> = {};
+  for (const name of HOSTED_TOOL_NAMES) {
+    const raw = o[name];
+    if (raw === undefined || raw === null) continue;
+    out[name] = int(raw, `terms.tool_prices.${name}`, I64_MIN, I64_MAX);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 const TERMS_FIELDS = [
   "endpoint_id",
   "credential_generation",
@@ -239,6 +340,9 @@ const TERMS_FIELDS = [
   "cache_write_microusd_per_million",
   "cache_write_1h_microusd_per_million",
   "media",
+  "long_context",
+  "service_tiers",
+  "tool_prices",
   "currency",
   "valid_until",
 ];
@@ -246,6 +350,9 @@ const TERMS_FIELDS = [
 export function parseTerms(v: unknown): OfferTerms {
   const o = strict(v, "terms", TERMS_FIELDS);
   if (!isProtocol(o.protocol)) throw new OfferError("terms.protocol is not a protocol");
+  const longContext = parseLongContext(o.long_context, "terms.long_context");
+  const serviceTiers = parseServiceTiers(o.service_tiers);
+  const toolPrices = parseToolPrices(o.tool_prices);
   return {
     endpoint_id: str(o.endpoint_id, "terms.endpoint_id"),
     credential_generation: int(o.credential_generation, "terms.credential_generation", 0, I64_MAX),
@@ -264,6 +371,9 @@ export function parseTerms(v: unknown): OfferTerms {
     cache_write_microusd_per_million: optInt(o.cache_write_microusd_per_million, "terms.cache_write", I64_MIN, I64_MAX),
     cache_write_1h_microusd_per_million: optInt(o.cache_write_1h_microusd_per_million, "terms.cache_write_1h", I64_MIN, I64_MAX),
     media: parseMedia(o.media),
+    ...(longContext === null ? {} : { long_context: longContext }),
+    ...(serviceTiers === undefined ? {} : { service_tiers: serviceTiers }),
+    ...(toolPrices === undefined ? {} : { tool_prices: toolPrices }),
     currency: str(o.currency, "terms.currency"),
     valid_until: optInt(o.valid_until, "terms.valid_until", I64_MIN, I64_MAX),
   };
@@ -349,6 +459,50 @@ const utf8Bytes = (s: string) => new TextEncoder().encode(s).byteLength;
 /** Rust's `str::trim` strips White_Space. */
 const trimmed = (s: string) => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
 
+export function longContextValid(lc: OfferLongContextTerms | null | undefined): boolean {
+  if (lc == null) return true;
+  const price = (r: number) => r >= 0 && r <= MAX_PRICE_MICROUSD_PER_MILLION;
+  return (
+    lc.threshold_input_tokens >= MIN_LONG_CONTEXT_THRESHOLD &&
+    lc.threshold_input_tokens <= MAX_LONG_CONTEXT_THRESHOLD &&
+    price(lc.input_microusd_per_million) &&
+    price(lc.output_microusd_per_million) &&
+    (lc.cache_read_microusd_per_million === null || (price(lc.cache_read_microusd_per_million) && lc.cache_read_microusd_per_million <= lc.input_microusd_per_million)) &&
+    (lc.cache_write_microusd_per_million === null || price(lc.cache_write_microusd_per_million)) &&
+    (lc.cache_write_1h_microusd_per_million === null || price(lc.cache_write_1h_microusd_per_million))
+  );
+}
+
+export function serviceTiersValid(tiers: OfferServiceTiers | null | undefined): boolean {
+  if (tiers == null) return true;
+  const price = (r: number) => r >= 0 && r <= MAX_PRICE_MICROUSD_PER_MILLION;
+  for (const [k, tier] of Object.entries(tiers)) {
+    if (!(SERVICE_TIER_NAMES as readonly string[]).includes(k)) return false;
+    if (tier == null) continue;
+    if (
+      !price(tier.input_microusd_per_million) ||
+      !price(tier.output_microusd_per_million) ||
+      (tier.cache_read_microusd_per_million !== null && (!price(tier.cache_read_microusd_per_million) || tier.cache_read_microusd_per_million > tier.input_microusd_per_million)) ||
+      (tier.cache_write_microusd_per_million !== null && !price(tier.cache_write_microusd_per_million)) ||
+      (tier.cache_write_1h_microusd_per_million !== null && !price(tier.cache_write_1h_microusd_per_million)) ||
+      !longContextValid(tier.long_context)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function toolPricesValid(prices: OfferToolPrices | null | undefined): boolean {
+  if (prices == null) return true;
+  for (const [k, p] of Object.entries(prices)) {
+    if (!(HOSTED_TOOL_NAMES as readonly string[]).includes(k)) return false;
+    if (p == null) continue;
+    if (!Number.isSafeInteger(p) || p < 0 || p > MAX_TOOL_PRICE_MICROUSD) return false;
+  }
+  return true;
+}
+
 /** `validate_terms`: whether an offer's terms are in range at `at` (Unix seconds). */
 export function validTerms(t: OfferTerms, at: number): boolean {
   const price = (r: number) => r >= 0 && r <= MAX_PRICE_MICROUSD_PER_MILLION;
@@ -372,6 +526,9 @@ export function validTerms(t: OfferTerms, at: number): boolean {
     (t.cache_write_microusd_per_million !== null && !price(t.cache_write_microusd_per_million)) ||
     (t.cache_write_1h_microusd_per_million !== null && !price(t.cache_write_1h_microusd_per_million)) ||
     !mediaValid(t.media, t.protocol) ||
+    !longContextValid(t.long_context) ||
+    !serviceTiersValid(t.service_tiers) ||
+    !toolPricesValid(t.tool_prices) ||
     (t.valid_until !== null && (t.valid_until <= at || t.valid_until > LATEST_END_DATE))
   );
 }

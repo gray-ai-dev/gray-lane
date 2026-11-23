@@ -1880,7 +1880,9 @@ async function readIntakeBody(request: Request, cfg: GatewayConfig, state: LaneP
     undefined,
   );
   if (!read.ok) {
-    return read.error.status === 413 ? refusal(413, "body_too_large", "the intake body is over the cap") : refusal(400, "invalid_body", "the body could not be read");
+    if (read.error.status === 413) return refusal(413, "body_too_large", "the intake body is over the cap");
+    if (read.error.status === 415) return refusal(415, "unsupported_content_encoding", "unsupported Content-Encoding");
+    return refusal(400, "invalid_body", "the body could not be read");
   }
   if (read.body.tier === "C") return refusal(400, "invalid_body", "the body could not be read");
   let text: string;

@@ -1,6 +1,7 @@
 import { releaseWithRetry, settleWithRetry, shardName, UNROUTED, type AdmitRefusal, type SettleInput, type HoldToken, type ShardCountTable, type ShardLocator } from "@gray/account";
 import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type LocationHint } from "@gray/config";
 import { workspaceHome } from "./account.ts";
+import type { KeyRevocationCheck } from "./key-lookup.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { endingWith, entryServesChain, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
@@ -96,25 +97,35 @@ import {
   type AnswerEndFailure,
   AnswerEnd,
   GeminiRefusal,
+  HOSTED_TOOL_NAMES,
+  NO_PRICING_FEATURES,
   Overlay,
   UNFINISHED_EMPTY,
   ProtocolError,
   PromptUnits,
   RESERVED_PROMPT_OVERHEAD_TOKENS,
+  StreamBillingObserver,
+  attachHostedToolCallsToRawUsage,
   attemptOverlay,
   bufferedSettlement,
   bufferedUsage,
   capOverlay,
+  extractBufferedBillingMeta,
+  extractPricingFeatures,
   missingUsageReason,
   geminiOperationUrl,
   locateMembers,
   outputCandidateCount,
   parseResponse,
   reasoningTokens,
+  requestCompacts,
+  resolveAppliedServiceTier,
   scrubNative,
   tokenSides,
   UNCOUNTED_CHECKS,
   unfinished,
+  type RequestedPricingFeatures,
+  type ResponseBillingMeta,
 } from "@gray/protocol";
 import {
   DEFAULT_ROUTING_POLICY,
@@ -140,9 +151,9 @@ import {
 import { type StreamStage, type Translation, TranslationFailure, admissionOutputCap, droppedHeaders, selectTranslation, translationTargets } from "@gray/translation";
 import { admitOnce, RateUnit, type DegradedAdmissions } from "./admission.ts";
 import { AnswerRelay, keepsAnswerText, wholeAnswerWeight } from "./answer.ts";
-import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
+import { hasQueryCredentials, keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { billedInputOf } from "./billed.ts";
-import { readBody, spoolReadBack, type Body } from "./body.ts";
+import { bodyTooLarge, readBody, spoolReadBack, type Body } from "./body.ts";
 import { RequestBudget, withinPhase } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, ClientStream, errorFrame, keepAliveFrame, platformTimers, type StreamTimers } from "./client.ts";
 import { logWithheld, resolveWithheld, settledBy, withheldBilling, type WithheldEnd } from "./withheld.ts";
@@ -169,7 +180,7 @@ import {
 } from "./image-usage.ts";
 import { AttemptEvidence, ProviderFailures, RequestEvidence, agentThinking, opencodeAgent, wantsJson, type FailedEnd } from "./traffic-evidence.ts";
 import { type FragmentUse, GateCapacity, PASS_THROUGH, type GateRequest, type GateVerdict, type StreamInspector, type ToolGate, refusedAnswerChecks } from "./gate.ts";
-import { chargeSidesMismatch, customerTextRates, generationPriceOf, pricesModalities, quoteTextRates, recordedSides, safeAmount, usageCost, usageCostParts, type RecordedSides, type TokenSides } from "./money.ts";
+import { chargeSidesMismatch, customerTextRates, effectiveSupplierQuote, generationPriceOf, pricesModalities, quoteLongContextThreshold, quoteTextRates, recordedSides, safeAmount, toolChargeOf, toolPricesOf, usageCost, usageCostParts, type RecordedSides, type TokenSides } from "./money.ts";
 import { type ContentBucket, MAX_WAITING_CONNECTIONS, Outbound } from "./outbound.ts";
 import { continuationBody, parseHeld, parseStored, type ParsedRequest } from "./parse.ts";
 import { redactedHeaders, redactedQuery } from "./redact.ts";
@@ -197,11 +208,13 @@ import {
   rankUtility,
   regionMatches,
   routeProbeLeases,
+  routeToolReserveMicrousd,
   screenConstraints,
   unselectedOf,
   utilityRoutesOf,
   withinBound,
   feedAvailable,
+  type PricingOptions,
   type Route,
   type UtilityAsk,
   type UtilityRoutes,
@@ -293,6 +306,7 @@ import { flushSinks } from "./lane/remote/sinks.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
 import { codexBackend, decisionOverlay, planOverlay, planRewrites, rewriteDecisions, storeOffBackend, type RewriteDecisions } from "./lane/plan.ts";
 import {
+  ExpandedBodyTooLargeError,
   ResponsesStateTap,
   expandZeroRetentionContinuation,
   extractReplyMetadata,
@@ -341,6 +355,7 @@ import {
 import type { StackRelayConfig, StackRelayRoute, StackVendor } from "./lane/stack-config.ts";
 import { stackCapOf } from "./lane/stack-document.ts";
 import { STACK_BODY_MAX_BYTES, stackRequestBody, stackStreamOptionsUnusable, type StackRequestBody } from "./lane/stack-rewrite.ts";
+import { peerHopBody as composePeerHop, type PeerHopBody } from "./lane/claude-code-user-id.ts";
 // The peer client as the request path sees it, types alone: its code and the peer check it runs are the lane entry's,
 // in no other bundle or program (`peer-model.ts`).
 import type { LanePeerCall, Peer } from "./lane/peer-model.ts";
@@ -426,6 +441,8 @@ export interface GatewayDeps {
   readonly gate: ToolGate;
   readonly accounts: ShardLocator;
   readonly shardCounts: ShardCountTable;
+  /** Real-time revocation check against a workspace's account root (direct DO binding or over the lane bridge). */
+  readonly keyRevoked?: KeyRevocationCheck;
   readonly endpoints: EndpointLocator;
   readonly endpointCounts: EndpointCounts;
   /**
@@ -1233,6 +1250,7 @@ export class InferenceRun {
   private withheld: Promise<void> | null = null;
   private boundM = 0n;
   private ceiling = 0n;
+  private pricingFeatures: RequestedPricingFeatures = NO_PRICING_FEATURES;
 
   // ---------------------------------------------------------------- the confidential lane
   /** The lane's per-request members; null on the main lane, and then every lane branch below is skipped. */
@@ -1250,22 +1268,25 @@ export class InferenceRun {
   /** The body the request was received with, exactly as it arrived: what every lane op and hash covers. */
   private laneReceived: Uint8Array | null = null;
   /**
-   * The body an entry sends over the peer hop when the client stated its routing preference in the body
-   * (docs/design/one-address.md): the client's bytes with `/provider` removed under the published rewrite policy, and
-   * the op's `request.modified` event, which the outer receipt's `peer.forwarded` declares. Made at the first peer
-   * attempt; null until then, and for a request whose body states none (the hop then carries the client's bytes).
+   * The body an entry sends over the peer hop to each relay's VM (`lane/claude-code-user-id.ts` `peerHopBody`): the
+   * client's bytes with Messages' `metadata.user_id` replaced by Gray's stand-in or removed, and `/provider` removed
+   * when the client stated its routing preference in the body (docs/design/one-address.md), under the published rewrite
+   * policy, and the ops' `request.modified` events. By relay id, since the stand-in is the relay's own; made at the
+   * first plan for that relay.
    */
-  private peerHop: { readonly base: Uint8Array; readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null = null;
+  private readonly peerHops = new Map<string, PeerHopBody & { readonly base: Uint8Array }>();
+  /** The ops each peer call's body carries, which its `peer.forwarded` declares. */
+  private readonly peerHopEvents = new Map<LanePeerCall, readonly JsonObject[]>();
   /** Decrypted zero-retention continuation response state for `previous_response_id`, keyed by plaintext id. */
   private readonly laneSealedResponses = new Map<string, SealedResponseState>();
   /** Decrypted zero-retention continuation item states for `item_reference`, keyed by plaintext item id. */
   private readonly laneSealedItems = new Map<string, SealedItemState>();
   /** Stable per-conversation affinity id used on zero-retention Responses routes when the client sent no session id. */
   private laneZdrAffinityId: string | null = null;
-  /** Zero-retention continuation expansion recorded on the active peer hop receipt, if any. */
-  private lanePeerExpansion: ExpandZeroRetentionResult | null = null;
-  /** Zero-retention continuation expansion recorded on the active direct stack receipt, if any. */
-  private laneStackExpansion: ExpandZeroRetentionResult | null = null;
+  /** Zero-retention continuation expansion recorded per peer hop call, if any. */
+  private readonly lanePeerExpansions = new Map<LanePeerCall, ExpandZeroRetentionResult | null>();
+  /** Zero-retention continuation expansion recorded per direct stack call, if any. */
+  private readonly laneStackExpansions = new Map<StackCall, ExpandZeroRetentionResult | null>();
   /** Parsed request body held for Turn 1 sealing on zero-retention Responses routes. */
   private laneZdrRequestBody: Json | null = null;
   /** At most one zero-retention fallback retry per request (unsupported `include` or `invalid_encrypted_content`). */
@@ -2022,7 +2043,12 @@ export class InferenceRun {
         ...(relayImage === null ? {} : { relayImage }),
         ...laneArrival(lane),
       });
-      const stackExpansion = this.laneStackExpansion;
+      let servedStackCall: StackCall | null = null;
+      for (const call of this.stackCalls) {
+        if (call.served !== null) servedStackCall = call;
+      }
+      const expansionCall = servedStackCall ?? this.stackCalls.at(-1) ?? null;
+      const stackExpansion = expansionCall === null ? null : (this.laneStackExpansions.get(expansionCall) ?? null);
       addStackReceipt(builder, {
         receivedHash: bodyHashOf(received),
         ...(stackExpansion !== null && stackExpansion.changed
@@ -2079,7 +2105,12 @@ export class InferenceRun {
         ...laneArrival(lane),
       });
       builder.addRequestReceivedHash(bodyHashOf(received));
-      const peerExpansion = this.lanePeerExpansion;
+      let servedPeerCall: LanePeerCall | null = null;
+      for (const call of this.peerCalls) {
+        if (call.envelopeSha256 !== null && call.head !== null && call.served) servedPeerCall = call;
+      }
+      const peerExpansionCall = servedPeerCall ?? this.peerCalls.at(-1) ?? null;
+      const peerExpansion = peerExpansionCall === null ? null : (this.lanePeerExpansions.get(peerExpansionCall) ?? null);
       if (peerExpansion !== null && peerExpansion.changed) {
         builder.addRequestContinuationExpanded({
           mode: "zero_retention",
@@ -2093,7 +2124,8 @@ export class InferenceRun {
       for (const call of this.peerCalls) {
         if (call.envelopeSha256 === null) continue;
         const n = BigInt(call.n);
-        builder.addPeerForwarded({ n, envelopeSha256: call.envelopeSha256, ...(this.peerHop === null ? {} : { modified: this.peerHop.events }) });
+        const modified = this.peerHopEvents.get(call) ?? [];
+        builder.addPeerForwarded({ n, envelopeSha256: call.envelopeSha256, ...(modified.length === 0 ? {} : { modified }) });
         if (call.head === null) {
           const failure = call.failure ?? { code: "peer_invalid" as const, sent: true };
           builder.addPeerFailed({ n, code: failure.code, sent: failure.sent, peer: call.commitment() });
@@ -2542,8 +2574,13 @@ export class InferenceRun {
         this.chargedSides = null;
         this.chargeSeq = null;
       }
-      this.abandon(error, "request_failed");
-      response = await this.closeRate(this.refuse(new ApiError(500, "internal_error"), this.admission));
+      if (error instanceof ApiError) {
+        this.cleanupInflight(error.code);
+        response = await this.closeRate(this.refuse(error, this.admission));
+      } else {
+        this.abandon(error, "request_failed");
+        response = await this.closeRate(this.refuse(new ApiError(500, "internal_error"), this.admission));
+      }
     }
     // The lane's receipt id goes on the response the client gets, whatever path built it (design v2
     // §C.9, M9; F2 D3): only when a receipt will be finalised for it — a committed attempt, a policy
@@ -2571,7 +2608,7 @@ export class InferenceRun {
     const { cfg, clock } = this.deps;
     const url = new URL(this.request.url);
     // Query credentials leak through URL logs (`preflight`).
-    if (url.searchParams.has("key")) {
+    if (hasQueryCredentials(url)) {
       await this.openContent({ kind: "anonymous" }, this.peekSnapshot());
       return this.refuse(new ApiError(400, "query_credentials_unsupported"), "query_credentials");
     }
@@ -3159,6 +3196,7 @@ export class InferenceRun {
     this.outputCapReason = null;
     this.boundM = 0n;
     this.ceiling = 0n;
+    this.pricingFeatures = NO_PRICING_FEATURES;
     this.billing = "none";
     this.releaseReason = null;
     this.admission = "routes";
@@ -3169,6 +3207,17 @@ export class InferenceRun {
     this.dispatcher = null;
     this.recoveryRetryAfterS = null;
     this.winningReceipt = null;
+    this.peerHops.clear();
+    this.peerHopEvents.clear();
+    this.laneSealedResponses.clear();
+    this.laneSealedItems.clear();
+    this.laneZdrAffinityId = null;
+    this.lanePeerExpansions.clear();
+    this.laneStackExpansions.clear();
+    this.laneZdrRequestBody = null;
+    this.zdrFallbackUsed = false;
+    this.zdrSuppressInclude = false;
+    this.zdrStripEncryptedReasoning = false;
     // F2 hooks-1: that model's error body is not the answer either, and it was hashed when it was
     // rendered (`errorResponse`). A model is replaced only before its headers go, so nothing the
     // client got is dropped: the lane's `response.returned` starts again with this model's bytes.
@@ -3385,7 +3434,7 @@ export class InferenceRun {
       }
       this.admission = "translation";
       const region = snapshot.workspaces[key.workspaceId]?.region ?? "any";
-      const selected = await selectTranslation<RouteRecord, { routes: Route[]; bound: RateBound }>({
+      const selected = await selectTranslation<RouteRecord, { routes: Route[]; bound: RateBound; toolReserve: bigint; features: RequestedPricingFeatures }>({
         client: protocol,
         // The translation reads what the client's composed ids carry: they are put back into a copy.
         body: this.toolIds?.forTranslation(protocol, parsed.value) ?? parsed.value,
@@ -3421,9 +3470,18 @@ export class InferenceRun {
           if (admitted.length === 0) return { kind: "excluded" };
           const inRegion = admitted.filter((r) => regionMatches(region, r.serviceRegion));
           if (inRegion.length === 0) return { kind: "failed", error: new ApiError(503, "region_unavailable") };
-          const priced = priceRoutes(inRegion, billedInputOf(t.contract, t.body), cfg.platformFeeBps, preference.maxPrice);
+          const tFeatures = extractPricingFeatures(t.contract.protocol, t.body, undefined);
+          const tUnits = promptUnits(t.upstream, t.body, canonical.model);
+          const tCompacts = tUnits?.compacts() ?? requestCompacts(t.upstream, t.body);
+          const priced = priceRoutes(
+            inRegion,
+            billedInputOf(t.contract, t.body),
+            cfg.platformFeeBps,
+            preference.maxPrice,
+            this.pricingOptionsFor(snapshot, canonical.model, inRegion, tUnits, tFeatures, tCompacts, t.upstream),
+          );
           if (!priced.ok) return { kind: "failed", error: new ApiError(priced.status, priced.code) };
-          const value = { routes: priced.routes, bound: priced.bound };
+          const value = { routes: priced.routes, bound: priced.bound, toolReserve: priced.toolReserve, features: tFeatures };
           // A target whose every route the request's constraints and price cap exclude is tried after the later ones:
           // its ranking would refuse the model while another API's routes pass (docs/utility-routing.md "Constraints and
           // the price cap"; the server's `LiveSelection::constrained`).
@@ -3450,7 +3508,7 @@ export class InferenceRun {
       this.translation = selected.translation;
       this.translation.noteClientHeaders(this.request.headers);
       // A translation was priced with its target (`select_translation`), before the request key.
-      return this.admit(snapshot, key, parsed, body, { ...canonical, max_output_tokens: cap.cap }, candidates, { kind: "priced", routes: selected.value.routes, bound: selected.value.bound }, billed, bodyRead);
+      return this.admit(snapshot, key, parsed, body, { ...canonical, max_output_tokens: cap.cap }, candidates, { kind: "priced", routes: selected.value.routes, bound: selected.value.bound, toolReserve: selected.value.toolReserve, features: selected.value.features }, billed, bodyRead);
     }
     const region = snapshot.workspaces[key.workspaceId]?.region ?? "any";
     records = records.filter((r) => regionMatches(region, r.serviceRegion));
@@ -3470,7 +3528,9 @@ export class InferenceRun {
     body: Body,
     canonical: CanonicalRequest,
     candidates: number,
-    eligible: { readonly kind: "native"; readonly records: readonly RouteRecord[] } | { readonly kind: "priced"; readonly routes: Route[]; readonly bound: RateBound },
+    eligible:
+      | { readonly kind: "native"; readonly records: readonly RouteRecord[] }
+      | { readonly kind: "priced"; readonly routes: Route[]; readonly bound: RateBound; readonly toolReserve: bigint; readonly features: RequestedPricingFeatures },
     billed: () => ReturnType<typeof billedInputOf>,
     bodyRead: number,
   ): Promise<ModelResult> {
@@ -3489,7 +3549,9 @@ export class InferenceRun {
     body: Body,
     canonical: CanonicalRequest,
     candidates: number,
-    eligible: { readonly kind: "native"; readonly records: readonly RouteRecord[] } | { readonly kind: "priced"; readonly routes: Route[]; readonly bound: RateBound },
+    eligible:
+      | { readonly kind: "native"; readonly records: readonly RouteRecord[] }
+      | { readonly kind: "priced"; readonly routes: Route[]; readonly bound: RateBound; readonly toolReserve: bigint; readonly features: RequestedPricingFeatures },
     billed: () => ReturnType<typeof billedInputOf>,
     bodyRead: number,
   ): Promise<ModelResult> {
@@ -3521,10 +3583,27 @@ export class InferenceRun {
 
     // Pricing: what the request can be billed at, by the body the upstream executes.
     this.admission = "pricing";
+    const units = this.promptUnits(parsed, canonical);
+    const upstreamProto = this.translation !== null ? this.translation.upstream : protocol;
+    const compacts = units?.compacts() ?? requestCompacts(upstreamProto, this.translation !== null ? this.translation.body : parsed.value);
+    const features =
+      eligible.kind === "priced"
+        ? eligible.features
+        : this.translation !== null
+          ? extractPricingFeatures(this.translation.contract.protocol, this.translation.body, undefined)
+          : extractPricingFeatures(protocol, parsed.value, this.request.headers);
+    this.pricingFeatures = features;
     let initialRoutes: Route[];
     let initialBound: RateBound;
+    let initialToolReserve: bigint;
     if (eligible.kind === "native") {
-      const priced = priceRoutes(eligible.records, billed(), cfg.platformFeeBps, this.preference.maxPrice);
+      const priced = priceRoutes(
+        eligible.records,
+        billed(),
+        cfg.platformFeeBps,
+        this.preference.maxPrice,
+        this.pricingOptionsFor(snapshot, canonical.model, eligible.records, units, features, compacts, upstreamProto),
+      );
       if (!priced.ok) {
         // The ceiling priced out every route the request had: its routing record says so.
         if (priced.pricedOut !== undefined && priced.pricedOut.length > 0) {
@@ -3535,9 +3614,11 @@ export class InferenceRun {
       }
       initialRoutes = priced.routes;
       initialBound = priced.bound;
+      initialToolReserve = priced.toolReserve;
     } else {
       initialRoutes = eligible.routes;
       initialBound = eligible.bound;
+      initialToolReserve = eligible.toolReserve;
     }
     // The routes the request's constraints and price cap exclude are none of its candidates: the hold and the cost ceiling
     // below are sized over the others alone, as over the routes within the customer's max price, and the formula, which
@@ -3561,10 +3642,18 @@ export class InferenceRun {
     );
     const excluded = screened.excluded;
     if (excluded.length > 0) {
-      const repriced = priceRoutes(screened.passing.map((r) => r.record), billed(), cfg.platformFeeBps, this.preference.maxPrice);
+      const passingRecords = screened.passing.map((r) => r.record);
+      const repriced = priceRoutes(
+        passingRecords,
+        billed(),
+        cfg.platformFeeBps,
+        this.preference.maxPrice,
+        this.pricingOptionsFor(snapshot, canonical.model, passingRecords, units, features, compacts, upstreamProto),
+      );
       if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
       initialRoutes = repriced.routes;
       initialBound = repriced.bound;
+      initialToolReserve = repriced.toolReserve;
     }
 
     // The trust gate's look at the request itself; a translated request in both forms.
@@ -3584,7 +3673,6 @@ export class InferenceRun {
     if (!this.inspected(inspected, false)) return final(this.refuse(new ApiError(400, "request_trust_policy_rejected"), "trust_request"));
 
     // Size the hold, admit it; refit a smaller one when the account says how much is left.
-    const units = this.promptUnits(parsed, canonical);
     // No part of the answer is sized here: a non-streaming answer passes as it arrives, what it keeps
     // weighed against ANSWER_HELD_MAX_BYTES as it goes (answer.ts), and a held stream is bounded as it
     // runs (relay.ts `heldLimit`), so a large output cap is never refused for memory at admission.
@@ -3595,6 +3683,7 @@ export class InferenceRun {
     let previous: { readonly held: bigint; readonly refusal: ApiError } | null = null;
     let routes = initialRoutes;
     let bound = initialBound;
+    let toolReserve = initialToolReserve;
     let sizing: Sizing;
     let overlay: Overlay;
     let admittedPlan: { plan: Route[]; head: Promise<HeadPermit> | null; kept: readonly Route[] };
@@ -3605,21 +3694,28 @@ export class InferenceRun {
     let nextAdmitAttempt = baseKey ? this.baseKeyAttempt : 0;
     for (let refit = 0; ; refit++) {
       this.admission = "cost_ceiling";
-      let sized = this.size(snapshot, canonical, candidates, routes, bound, room, keySpend, units, billed);
+      let sized = this.size(snapshot, canonical, candidates, routes, bound, toolReserve, room, keySpend, units, billed, compacts, upstreamProto);
       // A refusal on what the model costs (its ceiling, the output at its price) is the model's: a cheaper
       // model the customer listed may serve the request. One on memory, balance or the key's limit is final.
       if ("error" in sized) {
         if (canonical.max_output_tokens === null && routes.some((r) => this.stackRoute(r.record) && this.stackPlan(r).ok)) {
           const direct = routes.filter((r) => !(this.stackRoute(r.record) && this.stackPlan(r).ok));
           if (direct.length > 0) {
-            const repriced = priceRoutes(direct.map((r) => r.record), billed(), cfg.platformFeeBps, this.preference.maxPrice);
+            const directRecords = direct.map((r) => r.record);
+            const repriced = priceRoutes(
+              directRecords,
+              billed(),
+              cfg.platformFeeBps,
+              this.preference.maxPrice,
+              this.pricingOptionsFor(snapshot, canonical.model, directRecords, units, features, compacts, upstreamProto),
+            );
             if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
-            sized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, room, keySpend, units, billed);
+            sized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, repriced.toolReserve, room, keySpend, units, billed, compacts, upstreamProto);
           }
         }
         if ("error" in sized) return sized.nextModel ? this.unserved(sized.error, "cost_ceiling") : final(this.refuse(sized.error, "cost_ceiling"));
       }
-      ({ sizing, routes, bound } = sized);
+      ({ sizing, routes, bound, toolReserve } = sized);
       let m = sizing.priced.bound(sizing.heldOutput);
       // The rewrite decisions, made once (design v2 §C.7, M2): the main lane derives this refit's
       // request overlay from them, exactly as it built one inline before; the lane derives its declared
@@ -3637,11 +3733,18 @@ export class InferenceRun {
         if (direct.length === 0) {
           return previous !== null && m >= previous.held ? final(this.refuse(previous.refusal, "reservation")) : final(this.refuse(stackCapRequired(), "cost_ceiling"));
         }
-        const repriced = priceRoutes(direct.map((r) => r.record), billed(), cfg.platformFeeBps, this.preference.maxPrice);
+        const directRecords = direct.map((r) => r.record);
+        const repriced = priceRoutes(
+          directRecords,
+          billed(),
+          cfg.platformFeeBps,
+          this.preference.maxPrice,
+          this.pricingOptionsFor(snapshot, canonical.model, directRecords, units, features, compacts, upstreamProto),
+        );
         if (!repriced.ok) return this.unserved(new ApiError(repriced.status, repriced.code), "pricing");
-        const resized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, room, keySpend, units, billed);
+        const resized = this.size(snapshot, canonical, candidates, repriced.routes, repriced.bound, repriced.toolReserve, room, keySpend, units, billed, compacts, upstreamProto);
         if ("error" in resized) return resized.nextModel ? this.unserved(resized.error, "cost_ceiling") : final(this.refuse(resized.error, "cost_ceiling"));
-        ({ sizing, routes, bound } = resized);
+        ({ sizing, routes, bound, toolReserve } = resized);
         m = sizing.priced.bound(sizing.heldOutput);
         written = sizing.defaultCap && sizing.writeCap;
       }
@@ -3976,6 +4079,7 @@ export class InferenceRun {
       // Sized again from every route the request had: a refit may serve a route an earlier sizing left out.
       routes = initialRoutes;
       bound = initialBound;
+      toolReserve = initialToolReserve;
     }
     // A model tried after this one is a request of its own: this one's record stays as it ends.
     this.beforeAdmission = { reserved: this.reserved, firstAdmittedAt: this.firstAdmittedAt };
@@ -3987,7 +4091,8 @@ export class InferenceRun {
     // another has what is left (`Turn::headers_at`).
     this.firstAdmittedAt ??= admittedAt;
     const scope = scopeWithRoutes(scopeOf(protocol, parsed.value), protocol, parsed.value, admittedPlan.plan.some(provesImageOutput));
-    return this.dispatchAndRelay({ snapshot, parsed, body, canonical, routes, kept: admittedPlan.kept, bound, sizing, overlay, candidates, plan: admittedPlan.plan, head: admittedPlan.head, bodyRead, admittedAt, scope });
+    const outputPasses = compacts ? 2 : 1;
+    return this.dispatchAndRelay({ snapshot, parsed, body, canonical, routes, kept: admittedPlan.kept, bound, sizing, overlay, candidates: candidates * outputPasses, plan: admittedPlan.plan, head: admittedPlan.head, bodyRead, admittedAt, scope });
   }
 
   /**
@@ -4090,23 +4195,60 @@ export class InferenceRun {
     return bodyRead + (this.stream ? cfg.streamTotalSeconds * 1000 : cfg.nonStreamTotalMs);
   }
 
-  /** `size_reservation`, leaving out the routes whose larger declared allowance is what the request cannot afford (the server's refit over `lighter` routes). */
+  /** Pricing options for `priceRoutes`: requested service tier / hosted tools + conservative input upper bound. */
+  private pricingOptionsFor(
+    snapshot: GatewaySnapshot,
+    model: string,
+    records: readonly RouteRecord[],
+    units: PromptUnits | null,
+    features: RequestedPricingFeatures,
+    compacts: boolean,
+    upstreamProto: Protocol,
+  ): PricingOptions {
+    // Gemini hosted tools (google_search, code_execution) inject unbounded `toolUsePromptTokenCount` into billed input_tokens.
+    const geminiHostedToolUnbounded = upstreamProto === "gemini" && features.hostedTools.length > 0;
+    const inputBound = geminiHostedToolUnbounded ? undefined : units?.bodyBound();
+    let inputUpperBound: bigint | undefined;
+    if (inputBound !== undefined) {
+      const extra = BigInt(this.toolIds?.resolution.extraBytes ?? 0);
+      let maxPrompt = RESERVED_PROMPT_OVERHEAD_TOKENS;
+      for (const r of records) {
+        const p = r.promptOverheadTokens === null ? RESERVED_PROMPT_OVERHEAD_TOKENS : BigInt(r.promptOverheadTokens);
+        if (p > maxPrompt) maxPrompt = p;
+      }
+      const laneExtra = this.lane !== null ? BigInt(appendReserveTokens(DEFAULT_MAX_TOTAL_BYTES)) : 0n;
+      const passes = compacts ? 2n : 1n;
+      inputUpperBound = (inputBound + extra + maxPrompt + laneExtra) * passes;
+    }
+    return {
+      features,
+      inputUpperBound,
+      modelLongContextThreshold: snapshot.models[model]?.longContextThreshold,
+    };
+  }
+
+  /** `size_reservation`, leaving out the routes whose larger declared allowance or tool reserve is what the request cannot afford (the server's refit over `lighter` routes). */
   private size(
     snapshot: GatewaySnapshot,
     canonical: CanonicalRequest,
     candidates: number,
     routes: Route[],
     bound: RateBound,
+    toolReserve: bigint,
     room: Room,
     keySpend: KeySpend,
     units: PromptUnits | null,
     billed: () => ReturnType<typeof billedInputOf>,
-  ): { sizing: Sizing; routes: Route[]; bound: RateBound } | Unserved {
+    compacts: boolean,
+    upstreamProto: Protocol,
+  ): { sizing: Sizing; routes: Route[]; bound: RateBound; toolReserve: bigint } | Unserved {
     const info = snapshot.models[canonical.model] ?? {};
     const big = (v: number | undefined) => (v === undefined ? undefined : BigInt(v));
     const limits: ModelLimits = { window: big(info.window), maxOutput: big(info.maxOutput), longestOutput: big(info.longestOutput) };
     const largest = big(snapshot.largestWindow);
-    const inputBound = units?.bodyBound();
+    // Gemini hosted tools inject unbounded `toolUsePromptTokenCount` into billed input_tokens, so body bytes cannot bound input.
+    const geminiHostedToolUnbounded = upstreamProto === "gemini" && this.pricingFeatures.hostedTools.length > 0;
+    const inputBound = geminiHostedToolUnbounded ? undefined : units?.bodyBound();
     const extra = BigInt(this.toolIds?.resolution.extraBytes ?? 0);
     // The lane's append reserve (design v2 §C.4, M5; F2 D2): the relay may add up to the largest
     // selection its accepted templates allow to the forwarded body, and the vendor bills those tokens,
@@ -4116,15 +4258,20 @@ export class InferenceRun {
     // covered, whichever relay the policy step allows. A relay with no accepted policy reserves
     // nothing and is passed over (D7); an empty append list costs the same as the whole allowance.
     const reserve = this.laneAppendReserve(routes);
+    const passes = compacts ? 2n : 1n;
+    const effectiveCandidates = BigInt(candidates) * passes;
     for (;;) {
       const prompt = promptOverhead(routes, RESERVED_PROMPT_OVERHEAD_TOKENS);
       const output = outputOverhead(routes);
+      const routeTools = routes.map((r) => routeToolReserveMicrousd(r, this.pricingFeatures, this.deps.cfg.platformFeeBps));
+      const maxRouteTool = routeTools.reduce((a, b) => (b > a ? b : a), 0n);
       const heavierPrompt = routes.some((r) => (r.record.promptOverheadTokens === null ? RESERVED_PROMPT_OVERHEAD_TOKENS : BigInt(r.record.promptOverheadTokens)) < prompt);
       const heavierOutput = routes.some((r) => BigInt(r.record.outputOverheadTokens ?? 0) < output);
-      const lighter = heavierPrompt || heavierOutput;
+      const heavierTool = routeTools.some((t) => t < maxRouteTool);
+      const lighter = heavierPrompt || heavierOutput || heavierTool;
       const hold: Hold = {
         requestedCap: this.stackRequestedCap(routes, canonical.max_output_tokens ?? undefined, snapshot.models),
-        outputCandidates: BigInt(candidates),
+        outputCandidates: effectiveCandidates,
         outputAllowance: output,
         promptAllowance: prompt,
         bound,
@@ -4135,28 +4282,65 @@ export class InferenceRun {
         // lane relay's appends lengthen it again (`reserve`).
         inputTokens: inputBound === undefined ? undefined : inputBound + extra + reserve,
         inputChained: false,
-        passes: units?.compacts() === true ? 2n : 1n,
+        passes,
         expected: undefined,
+        toolCost: toolReserve,
       };
       const sized = sizeReservation(hold, room, lighter, keySpend, largest, BigInt(this.deps.clock()));
       const failed = "error" in sized;
-      if (!failed && !(lighter && sized.heldBack)) return { sizing: sized, routes, bound };
+      if (!failed && !(lighter && sized.heldBack)) return { sizing: sized, routes, bound, toolReserve };
       if (failed && !lighter) return sized;
-      routes = routes.filter((r) => {
+      let nextRoutes = routes.filter((r, i) => {
         const p = r.record.promptOverheadTokens === null ? RESERVED_PROMPT_OVERHEAD_TOKENS : BigInt(r.record.promptOverheadTokens);
         const o = BigInt(r.record.outputOverheadTokens ?? 0);
-        return !((heavierPrompt && p === prompt) || (heavierOutput && o === output));
+        const t = routeTools[i]!;
+        return !((heavierPrompt && p === prompt) || (heavierOutput && o === output) || (heavierTool && t === maxRouteTool));
       });
+      // If routes were heaviest along orthogonal dimensions so dropping all of them at once emptied the pool,
+      // shed whichever dimension contributes the largest excess micro-USD across the remaining routes.
+      if (nextRoutes.length === 0) {
+        const promptOf = (r: Route) => (r.record.promptOverheadTokens === null ? RESERVED_PROMPT_OVERHEAD_TOKENS : BigInt(r.record.promptOverheadTokens));
+        const outputOf = (r: Route) => BigInt(r.record.outputOverheadTokens ?? 0);
+        const minTool = routeTools.reduce((a, b) => (b < a ? b : a), maxRouteTool);
+        const minPrompt = routes.reduce((a, r) => (promptOf(r) < a ? promptOf(r) : a), prompt);
+        const minOutput = routes.reduce((a, r) => (outputOf(r) < a ? outputOf(r) : a), output);
+        const dims: { readonly excess: bigint; readonly filter: () => Route[] }[] = [];
+        if (heavierTool) dims.push({ excess: maxRouteTool - minTool, filter: () => routes.filter((_r, i) => routeTools[i]! < maxRouteTool) });
+        if (heavierPrompt) {
+          dims.push({
+            excess: ((prompt - minPrompt) * bound.input * passes) / 1_000_000n,
+            filter: () => routes.filter((r) => promptOf(r) < prompt),
+          });
+        }
+        if (heavierOutput) {
+          dims.push({
+            excess: ((output - minOutput) * bound.output * effectiveCandidates) / 1_000_000n,
+            filter: () => routes.filter((r) => outputOf(r) < output),
+          });
+        }
+        dims.sort((a, b) => (b.excess > a.excess ? 1 : b.excess < a.excess ? -1 : 0));
+        for (const dim of dims) {
+          const kept = dim.filter();
+          if (kept.length > 0) {
+            nextRoutes = kept;
+            break;
+          }
+        }
+      }
+      routes = nextRoutes;
+      const keptRecords = routes.map((r) => r.record);
       const repriced = priceRoutes(
-        routes.map((r) => r.record),
+        keptRecords,
         billed(),
         this.deps.cfg.platformFeeBps,
         this.preference.maxPrice,
+        this.pricingOptionsFor(snapshot, canonical.model, keptRecords, units, this.pricingFeatures, compacts, upstreamProto),
       );
       // No route of the model is left at a price the request can afford: the model's refusal.
       if (!repriced.ok) return { error: new ApiError(repriced.status, repriced.code), nextModel: true };
       routes = repriced.routes;
       bound = repriced.bound;
+      toolReserve = repriced.toolReserve;
     }
   }
 
@@ -4549,7 +4733,7 @@ export class InferenceRun {
       (this.entryPeers() !== null && (early === "headers" ? hasStackPeerCandidate : early.attempt.peer !== undefined));
     client.startKeepAlive(cfg.streamKeepAliveMs, stackKeepAlive ? STACK_KEEP_ALIVE : keepAliveFrame(this.protocol));
     this.headersSent = true;
-    const headers = new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-request-id": this.requestId });
+    const headers = new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-accel-buffering": "no", "x-request-id": this.requestId });
     if (this.protocol === "anthropic_messages") headers.set("request-id", this.requestId);
     if (early !== "headers") {
       headers.set("x-gray-provider", await providerRef(early.attempt.route));
@@ -4686,6 +4870,15 @@ export class InferenceRun {
     };
   }
 
+  private cleanupInflight(reason: string): void {
+    const attempt = this.current;
+    if (attempt !== null) {
+      attempt.controller.abort(reason);
+      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, reason);
+    }
+    this.releaseHold({ reason, detail: { stage: this.admission, endpoint: attempt?.route.record.endpointId ?? null } });
+  }
+
   /**
    * After a failure of Gray's own (a bug): the attempt in flight is cancelled and its permit handed
    * back as Gray's fault, and the hold released. Nothing is charged.
@@ -4698,12 +4891,7 @@ export class InferenceRun {
           : laneSafeLog({ level: "error", event, request_id: this.requestId, stage: this.admission, ...failureNames(error) }),
       ),
     );
-    const attempt = this.current;
-    if (attempt !== null) {
-      attempt.controller.abort("internal_error");
-      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "internal_error");
-    }
-    this.releaseHold({ reason: "internal_error", detail: { stage: this.admission, endpoint: attempt?.route.record.endpointId ?? null } });
+    this.cleanupInflight("internal_error");
   }
 
   /**
@@ -5513,7 +5701,22 @@ export class InferenceRun {
     const { permit, group, ranked } = acquired;
     // Compute zero-retention continuation expansion up front so stable affinity IDs are ready
     // before scheduler picks (`laneAttempt`) and peer/stack dispatch.
-    const directZdrExpansion = this.stackRoute(route.record) ? null : this.laneZdrExpansionFor(route.record, o.parsed.value);
+    let directZdrExpansion: ExpandZeroRetentionResult | null = null;
+    if (!this.stackRoute(route.record)) {
+      try {
+        directZdrExpansion = this.laneZdrExpansionFor(route.record, o.parsed.value);
+      } catch (error) {
+        if (error instanceof ExpandedBodyTooLargeError) {
+          if (retest !== null) this.gates.drop(retest);
+          this.ctx.waitUntil(releasePermit(this.io.endpoints, this.deps.region, permit, unsentOutcome(permit), false));
+          const label = "lane_zdr_body_over_limit";
+          this.passRoute(d, route, label);
+          if (selection === "same_route") d.stallRepeat(route, stopOfSkip(label));
+          return { kind: "continue" };
+        }
+        throw error;
+      }
+    }
     // S23: a stack relay's route has no scheduler pick and no sealed credential: the relay's container
     // picks its own account, and the attempt is one call to it. A route it cannot be made for (no config
     // version ready, the relay's config does not route it, no `RELAY`) is passed over unsent.
@@ -5883,7 +6086,13 @@ export class InferenceRun {
     if (this.lane?.stackTransport === undefined) return { ok: false, code: "no_relay_binding" };
     if (this.laneReceived === null) return { ok: false, code: "body_not_held" };
     const parsedBody = o?.parsed.value ?? this.laneZdrRequestBody;
-    const expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody);
+    let expansion: ExpandZeroRetentionResult | null;
+    try {
+      expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody, STACK_BODY_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof ExpandedBodyTooLargeError) return { ok: false, code: "body_over_stack_limit" };
+      throw error;
+    }
     const baseBytes = expansion?.changed ? expansion.expandedBytes : this.laneReceived;
     // Relay standard v1.7 section 4: no body over the lane's 4 MiB reaches a stack route; another route may take it.
     if (baseBytes.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
@@ -5907,7 +6116,13 @@ export class InferenceRun {
     const lane = route.record.lane;
     if (this.laneReceived === null) return { ok: false, code: "body_not_held" };
     const parsedBody = o?.parsed.value ?? this.laneZdrRequestBody;
-    const expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody);
+    let expansion: ExpandZeroRetentionResult | null;
+    try {
+      expansion = parsedBody === null ? null : this.laneZdrExpansionFor(route.record, parsedBody, STACK_BODY_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof ExpandedBodyTooLargeError) return { ok: false, code: "body_over_stack_limit" };
+      throw error;
+    }
     const baseBytes = expansion?.changed ? expansion.expandedBytes : this.laneReceived;
     if (baseBytes.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
     const official = checkOfficialUpstream(route.record.url);
@@ -5916,27 +6131,36 @@ export class InferenceRun {
     if (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses") return { ok: false, code: "protocol" };
     const usable = lane === undefined || lane === null ? [] : peers.registry.usable(lane.relayId);
     if (usable.length === 0) return { ok: false, code: "peer_unpinned" };
-    if (this.peerHopBody(protocol, baseBytes) === null) return { ok: false, code: "stack_rewrite_refused" };
+    if (this.peerHopBody(protocol, lane!.relayId, baseBytes, o?.parsed.value) === null) return { ok: false, code: "stack_rewrite_refused" };
     return { ok: true, config: null, route: null, vendor: laneVendor(official.vendor), peers: usable, expansion };
   }
 
   /**
-   * The bytes the peer hop carries (docs/design/one-address.md): `baseBytes` (either the client's bytes or the
-   * zero-retention expanded bytes), or, when the client stated its routing preference in the body, `baseBytes` with
-   * `/provider` removed under the published rewrite policy, so no stack VM and no vendor sees it. The op is declared
-   * on each `peer.forwarded` of the outer receipt, and the customer's verifier replays it before comparing with the
-   * stack VM's inner receipt. Null when the removal does not apply (the route is passed over).
+   * The bytes the peer hop to `relayId`'s VM carries (`lane/claude-code-user-id.ts` `peerHopBody`): `baseBytes` (the
+   * client's bytes or the zero-retention expanded bytes) with the entry's declared ops, a Claude Code `metadata.user_id`
+   * replaced by the stand-in for this workspace, key and relay (any other `user_id` removed) and `/provider` removed when
+   * the client stated its routing preference in the body. The ops are declared on each `peer.forwarded` of the outer
+   * receipt, and the customer's verifier replays them before comparing with the stack VM's inner receipt. Null when they
+   * do not apply (the route is passed over).
    */
-  private peerHopBody(protocol: LaneProtocol, baseBytes?: Uint8Array): { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null {
+  private peerHopBody(protocol: LaneProtocol, relayId: string, baseBytes?: Uint8Array, value?: Json): PeerHopBody | null {
     const base = baseBytes ?? this.laneReceived;
-    if (base === null) return null;
-    if (!this.stripProvider) return { bytes: base, events: [] };
-    if (this.peerHop === null || this.peerHop.base !== base) {
-      const changed = applyDeclaredChanges(base, protocol, { grayOps: [{ op: "remove_member", path: "/provider" }], appends: [] });
-      if (!changed.ok) return null;
-      this.peerHop = { base, bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
-    }
-    return this.peerHop;
+    if (base === null || this.lane === null) return null;
+    const cached = this.peerHops.get(relayId);
+    if (cached !== undefined && cached.base === base) return cached;
+    const key = this.key;
+    const hop = composePeerHop({
+      protocol,
+      base,
+      ...(value === undefined || base !== this.laneReceived ? {} : { value }),
+      stripProvider: this.stripProvider,
+      key: this.lane.state.affinityKey,
+      owner: key === null ? null : { workspaceId: key.workspaceId, keyId: key.keyId },
+      relayId,
+    });
+    if (hop === null) return null;
+    this.peerHops.set(relayId, { ...hop, base });
+    return hop;
   }
 
   /**
@@ -5952,7 +6176,7 @@ export class InferenceRun {
     if (plan.config === null) return plan;
     const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     const baseValue = plan.expansion?.changed ? plan.expansion.expandedValue : o.parsed.value;
-    const body = stackRequestBody({ config: plan.config, route: plan.route, protocol, stream: o.canonical.stream, received: baseBytes, value: baseValue, stripModels: o.parsed.strip });
+    const body = stackRequestBody({ config: plan.config, route: plan.route, protocol, stream: o.canonical.stream, received: baseBytes, value: baseValue, stripModels: o.parsed.strip, stripProvider: this.stripProvider });
     return body.ok ? { ...plan, body } : { ok: false, code: body.code };
   }
 
@@ -5966,12 +6190,13 @@ export class InferenceRun {
     const protocol = attempt.route.record.protocol as LaneProtocol;
     this.peerRid ??= newStackRid();
     this.laneReceiptId ??= newLaneReceiptId();
-    this.lanePeerExpansion = plan.expansion ?? null;
     const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     const conversation = attempt.route.record.lane === undefined || attempt.route.record.lane === null ? undefined : this.laneConversationFor(attempt.route.record.lane.relayId);
+    // `peerPlan` made this relay's hop body (a usable peer of the route's relay), so it is there.
+    const hop = this.peerHopBody(protocol, attempt.route.record.lane!.relayId, baseBytes, o.parsed.value)!;
     const url = this.request.url;
     const query = stackRawQuery(url);
-    return peers.call({
+    const call = peers.call({
       peers: plan.peers,
       entry: lane.state.keysetDigest,
       rid: this.peerRid,
@@ -5980,7 +6205,7 @@ export class InferenceRun {
       route: { endpoint: attempt.route.record.endpointId, protocol, model: attempt.route.record.model },
       path: query === "" ? this.path : `${this.path}?${query}`,
       headers: stackPeerHeaders(this.request.headers, protocol),
-      body: this.peerHopBody(protocol, baseBytes)!.bytes,
+      body: hop.bytes,
       budgetMs: this.deadline(o.bodyRead) - this.deps.clock(),
       // Relay standard v1.7: the conversation id at the route's relay, derived with this entry's boot key, since the
       // envelope names no workspace.
@@ -5994,6 +6219,9 @@ export class InferenceRun {
       timers: this.deps.timers ?? platformTimers,
       signal: attempt.controller.signal,
     });
+    this.lanePeerExpansions.set(call, plan.expansion ?? null);
+    this.peerHopEvents.set(call, hop.events);
+    return call;
   }
 
   /**
@@ -6006,13 +6234,12 @@ export class InferenceRun {
     const transport = this.lane!.stackTransport!;
     const protocol = attempt.route.record.protocol as LaneProtocol;
     const rid = newStackRid();
-    this.laneStackExpansion = plan.expansion ?? null;
     const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     // Relay standard v1.7: the container is sent the required changes and the two headers; egress is registered the
     // base bytes. `openAttempt` made the plan with `stackAttemptPlan`, which sets the body.
     const body = plan.body!;
     const conversationId = this.laneConversationFor(plan.config.relayId);
-    return new StackCall({
+    const call = new StackCall({
       rid,
       endpointId: attempt.route.record.endpointId,
       protocol,
@@ -6051,6 +6278,8 @@ export class InferenceRun {
       deleteBackoffMs: cfg.retryBackoffMs,
       deleteBackoffMaxMs: cfg.retryBackoffMaxMs,
     });
+    this.laneStackExpansions.set(call, plan.expansion ?? null);
+    return call;
   }
 
   /**
@@ -6460,8 +6689,10 @@ export class InferenceRun {
     const rendered = error.render({ shape: shapeOf(this.path), origins: this.origins, requestId: this.requestId });
     const headers = new Headers(rendered.headers);
     headers.delete("content-length");
-    headers.delete("content-type");
-    for (const [name, value] of Object.entries(passthrough.headers)) if (name !== "content-encoding") headers.set(name, value);
+    if (Object.keys(passthrough.headers).some((name) => name.toLowerCase() === "content-type")) {
+      headers.delete("content-type");
+    }
+    for (const [name, value] of Object.entries(passthrough.headers)) if (name.toLowerCase() !== "content-encoding") headers.set(name, value);
     this.laneResponse?.update(passthrough.body);
     this.stackAnsweredAccount = passthrough.accountId;
     // The vendor's error is the served attempt's answer, tied by its body digest (S32), not a replacement.
@@ -7296,7 +7527,7 @@ export class InferenceRun {
     if (this.stackRoute(candidate.record)) return false;
     const laneForwards = this.lane === null || (candidate.record.auth !== "lane_relay" && !this.laneEndpointRoute(candidate.record)) ? null : await this.laneForwardedFor(candidate, prepared, o);
     if (laneForwards !== null) {
-      if (!laneForwards.ok) return false;
+      if (!laneForwards.ok) return laneForwards.error.code === "request_body_limit";
       return laneForwards.bytes.length > Number(requestLimit(prepared.protocol));
     }
     const ids = this.toolIds;
@@ -7336,7 +7567,15 @@ export class InferenceRun {
     if (endpoint && prepared.protocol === "gemini") return { ok: true, bytes: received, events: [], applied: [] };
     const appends = relayId === null ? [] : await this.laneAppendsFor(relayId, prepared.protocol, o);
     const plan = planRewrites(decisions, route.record.upstreamModel, this.laneCodexRoute(route.record), this.laneStoreOffRoute(route.record));
-    const expansion = this.laneZdrExpansionFor(route.record, o.parsed.value);
+    let expansion: ExpandZeroRetentionResult | null;
+    try {
+      expansion = this.laneZdrExpansionFor(route.record, o.parsed.value);
+    } catch (error) {
+      if (error instanceof ExpandedBodyTooLargeError) {
+        return { ok: false, error: bodyTooLarge(prepared.protocol, error.limitBytes, "the most Gray's confidential VM holds of one request") };
+      }
+      throw error;
+    }
     const baseBytes = expansion?.changed ? expansion.expandedBytes : received;
     // F2 hooks-2: the key carries the route's upstream model too. Two models (a customer's fallback
     // list) or two endpoints of one relay (D13) with the same client cap and the same appends would
@@ -7881,7 +8120,7 @@ export class InferenceRun {
    * chain's failure (`end`, @gray/protocol answer-end.ts) is refused before its usage is read, or, for a
    * buffered answer with no stop reason, once its usage shows no output (`answerEndFailed`).
    */
-  private async settle(a: Answering, attempt: Attempt, settlement: Settlement, rawUsage: Json | null, end?: SettleEnd): Promise<SettleOutcome> {
+  private async settle(a: Answering, attempt: Attempt, settlement: Settlement, rawUsage: Json | null, end?: SettleEnd, billingMeta?: ResponseBillingMeta): Promise<SettleOutcome> {
     // The answer's last upstream byte is read: what follows (its tool-call id rows, a Responses bind) waits what the
     // post phase leaves (`RequestBudget`), and so do settle's own retries (`settleTiming`).
     this.budget.startPost();
@@ -7903,20 +8142,65 @@ export class InferenceRun {
     if (settlement.kind === "output_over_limit") return this.finishFailed(attempt, { kind: "output_over_limit", reason: settlement.reason }, rawUsage);
     // A buffered answer with no stop reason and no output (its reasoning counted) is a relay's join of a stream cut short.
     if (end?.unfinished === true && settlement.tokens.output === 0n) return this.answerEndFailed(attempt, UNFINISHED_EMPTY);
-    // A route that prices image or audio tokens apart bills each modality at its own rate (`prices_modalities`).
-    const priced = generationPriceOf(route.record.quote, this.deps.cfg.platformFeeBps);
-    if (priced !== undefined && pricesModalities(priced.supplierMedia)) return this.settleModalities(a, attempt, rawUsage ?? null, priced.supplierMedia);
+    const appliedTier = resolveAppliedServiceTier(this.pricingFeatures.serviceTier, billingMeta?.reportedTier ?? null);
     const tokens = settlement.tokens;
+    const lcThreshold = quoteLongContextThreshold(route.record.quote, appliedTier);
+    const appliedLongContext = lcThreshold !== undefined && tokens.input > BigInt(lcThreshold);
+    const effQuote = effectiveSupplierQuote(route.record.quote, appliedTier, appliedLongContext);
+    const priced = effQuote === undefined ? undefined : generationPriceOf(effQuote, this.deps.cfg.platformFeeBps);
+    if (effQuote === undefined || priced === undefined) {
+      return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "effective tier price unavailable for route quote", rawUsage);
+    }
+    // A route that prices image or audio tokens apart bills each modality at its own rate (`prices_modalities`).
+    if (pricesModalities(priced.supplierMedia)) return this.settleModalities(a, attempt, rawUsage ?? null, priced.supplierMedia, billingMeta);
     // Money arithmetic is exact on safe integers only (docs/cloudflare-native.md 6.2); the ledger's own
     // range is i64 (inference.rs `checked`: "a usage counter is above the ledger's range").
+    // Only bill hosted tools the client actually requested (matching resolveAppliedServiceTier: an upstream
+    // echoing unrequested tool metadata on an ordinary request must neither overcharge nor fail the answer).
+    const requestedTools = new Set(this.pricingFeatures.hostedTools.map((t) => t.tool));
+    const observedTools = billingMeta?.toolCalls ?? {};
+    const toolCalls: Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>> = {};
+    for (const k of HOSTED_TOOL_NAMES) {
+      const count = observedTools[k];
+      if (count !== undefined && count > 0n && requestedTools.has(k)) {
+        if (count > BigInt(Number.MAX_SAFE_INTEGER)) {
+          return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `hosted tool call count for ${k} exceeds safe integer range`, rawUsage);
+        }
+        toolCalls[k] = count;
+      }
+    }
+    const activeTools = HOSTED_TOOL_NAMES.filter((k) => (toolCalls[k] ?? 0n) > 0n);
     const safe = [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write, tokens.cache_write_1h].every((t) => t <= BigInt(Number.MAX_SAFE_INTEGER));
     if (!safe) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `a usage counter is above the safe integer range of ${Number.MAX_SAFE_INTEGER}`, rawUsage);
-    // The charge is the sum of its input side and its output side (`usageCostParts`), which its record keeps.
-    const sides = usageCostParts(tokens, customerTextRates(route.rate));
-    const payable = usageCost(tokens, quoteTextRates(route.record.quote));
+    let customerToolCharge = 0n;
+    let supplierToolPayable = 0n;
+    let supplierToolPrices: Readonly<Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>>> | undefined;
+    let customerToolPrices: Readonly<Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>>> | undefined;
+    if (activeTools.length > 0) {
+      const tp = toolPricesOf(route.record.quote, this.deps.cfg.platformFeeBps, activeTools);
+      if (tp === undefined) {
+        return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `upstream invoked unpriced hosted tool(s): ${activeTools.join(", ")}`, rawUsage);
+      }
+      const cCharge = toolChargeOf(toolCalls, tp.customer);
+      const sPayable = toolChargeOf(toolCalls, tp.supplier);
+      if (cCharge === undefined || sPayable === undefined) {
+        return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid hosted tool charge or arithmetic overflow", rawUsage);
+      }
+      customerToolCharge = cCharge;
+      supplierToolPayable = sPayable;
+      supplierToolPrices = tp.supplier;
+      customerToolPrices = tp.customer;
+    }
+    // The charge is the sum of its input side, output side (`usageCostParts`), and any hosted tool surcharges.
+    const sides = usageCostParts(tokens, customerTextRates(priced.rate));
+    const tokenPayable = usageCost(tokens, quoteTextRates(effQuote));
     // gray-ledger `Error::Amount`'s text, as `charge` refuses it.
-    if (sides === undefined || payable === undefined) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid amount or arithmetic overflow", rawUsage);
-    const cost = sides.input + sides.output;
+    if (sides === undefined || tokenPayable === undefined) return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid amount or arithmetic overflow", rawUsage);
+    const cost = sides.input + sides.output + customerToolCharge;
+    const payable = tokenPayable + supplierToolPayable;
+    if (safeAmount(cost) === undefined || safeAmount(payable) === undefined) {
+      return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid amount or arithmetic overflow", rawUsage);
+    }
     const usage = {
       input_tokens: Number(tokens.input),
       output_tokens: Number(tokens.output),
@@ -7930,15 +8214,30 @@ export class InferenceRun {
       return this.usageRefused(attempt, "billing_usage_invalid", "usage_exceeds_bound", `the usage costs ${cost} micro-USD, more than the ${this.boundM} micro-USD held for the request`, rawUsage);
     }
     const protocol = this.upstreamProtocol;
+    const evidenceRawUsage = activeTools.length > 0 && rawUsage !== null ? attachHostedToolCallsToRawUsage(protocol, rawUsage, toolCalls) : rawUsage;
     const evidence = await evidenceFor(
-      { model: a.model, protocol, clientProtocol: this.translation === null ? null : this.protocol, route, platformFeeBps: this.deps.cfg.platformFeeBps, ceiling: this.ceiling, tokens, rawUsage },
+      {
+        model: a.model,
+        protocol,
+        clientProtocol: this.translation === null ? null : this.protocol,
+        route,
+        platformFeeBps: this.deps.cfg.platformFeeBps,
+        ceiling: this.ceiling,
+        tokens,
+        rawUsage: evidenceRawUsage,
+        quoteOverride: effQuote,
+        rateOverride: priced.rate,
+        ...(appliedTier !== null ? { serviceTier: appliedTier } : {}),
+        ...(appliedLongContext ? { longContext: true } : {}),
+        ...(activeTools.length > 0 ? { toolCalls, supplierToolPrices, customerToolPrices } : {}),
+      },
       cost,
     );
     if (!evidence.ok) {
       console.error(JSON.stringify(this.lane === null ? { level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId, why: evidence.why } : laneSafeLog({ level: "alert", event: "usage_evidence_invalid", request_id: this.requestId, endpoint: route.record.endpointId })));
       return { ok: false, code: "billing_usage_invalid", reason: "usage_evidence_invalid", why: evidence.why };
     }
-    return this.charge(a, attempt, cost, sides, evidence.text, evidence.payable === null ? payable : evidence.payable, usage, rawUsage);
+    return this.charge(a, attempt, cost, sides, evidence.text, evidence.payable === null ? payable : evidence.payable, usage, rawUsage, customerToolCharge);
   }
 
   /**
@@ -7984,7 +8283,7 @@ export class InferenceRun {
    * the output side `cost` is the sum of, which the request's record keeps (docs/effective-prices.md); they
    * are no part of what the shard is sent.
    */
-  private async charge(a: Answering, attempt: Attempt, cost: bigint, sides: TokenSides | null, evidence: string, payable: bigint, usage: Record<string, number>, rawUsage: Json | null): Promise<SettleOutcome> {
+  private async charge(a: Answering, attempt: Attempt, cost: bigint, sides: TokenSides | null, evidence: string, payable: bigint, usage: Record<string, number>, rawUsage: Json | null, extraMicrousd = 0n): Promise<SettleOutcome> {
     // A model check is delivered before it gets here (`checkAnswered`); one that did is Gray's failure, never a charge.
     if (this.modelCheck) throw new Error("a model check is never charged");
     const route = attempt.route;
@@ -8048,7 +8347,7 @@ export class InferenceRun {
     // A generation charge is billed by tokens (no unit): sides that are missing or are not the settled charge are not
     // kept, and alert, and the charge stands as the shard settled it. The line holds ids and amounts only, so a lane
     // says it too (`laneSafeLog`).
-    const kept = recordedSides(sides, settled.amount, null);
+    const kept = recordedSides(sides, settled.amount, null, extraMicrousd);
     if (kept.mismatch) {
       const line = chargeSidesMismatch(this.requestId, route.record.endpointId, sides, settled.amount);
       console.error(JSON.stringify(this.lane === null ? line : laneSafeLog(line)));
@@ -8071,7 +8370,7 @@ export class InferenceRun {
    * `image_usage_unsplit`. An answer whose usage is then refused (past the ledger's range, above the bound)
    * neither alerts nor counts.
    */
-  private async settleModalities(a: Answering, attempt: Attempt, rawUsage: Json | null, supplierMedia: HoldMediaRates): Promise<SettleOutcome> {
+  private async settleModalities(a: Answering, attempt: Attempt, rawUsage: Json | null, supplierMedia: HoldMediaRates, billingMeta?: ResponseBillingMeta): Promise<SettleOutcome> {
     const route = attempt.route;
     const protocol = this.upstreamProtocol;
     const raw = rawUsage ?? null;
@@ -8079,10 +8378,51 @@ export class InferenceRun {
     const read = countersOfUsage(protocol, raw, route.rate.media, attempt.answeredImage === true, policy);
     if (!read.ok) return this.finishFailed(attempt, read.error, rawUsage);
     const counters = read.counters;
+    const appliedTier = resolveAppliedServiceTier(this.pricingFeatures.serviceTier, billingMeta?.reportedTier ?? null);
+    const lcThreshold = quoteLongContextThreshold(route.record.quote, appliedTier);
+    const appliedLongContext = lcThreshold !== undefined && counters.input_tokens > BigInt(lcThreshold);
+    const effQuote = effectiveSupplierQuote(route.record.quote, appliedTier, appliedLongContext);
+    const effPriced = effQuote === undefined ? undefined : generationPriceOf(effQuote, this.deps.cfg.platformFeeBps);
+    if (effQuote === undefined || effPriced === undefined) {
+      return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "effective tier price unavailable for route quote", rawUsage);
+    }
+    const requestedTools = new Set(this.pricingFeatures.hostedTools.map((t) => t.tool));
+    const observedTools = billingMeta?.toolCalls ?? {};
+    const toolCalls: Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>> = {};
+    for (const k of HOSTED_TOOL_NAMES) {
+      const count = observedTools[k];
+      if (count !== undefined && count > 0n && requestedTools.has(k)) {
+        if (count > BigInt(Number.MAX_SAFE_INTEGER)) {
+          return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `hosted tool call count for ${k} exceeds safe integer range`, rawUsage);
+        }
+        toolCalls[k] = count;
+      }
+    }
+    const activeTools = HOSTED_TOOL_NAMES.filter((k) => (toolCalls[k] ?? 0n) > 0n);
+    let customerToolCharge = 0n;
+    let supplierToolPrices: Readonly<Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>>> | undefined;
+    let customerToolPrices: Readonly<Partial<Record<(typeof HOSTED_TOOL_NAMES)[number], bigint>>> | undefined;
+    if (activeTools.length > 0) {
+      const tp = toolPricesOf(route.record.quote, this.deps.cfg.platformFeeBps, activeTools);
+      if (tp === undefined) {
+        return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", `upstream invoked unpriced hosted tool(s): ${activeTools.join(", ")}`, rawUsage);
+      }
+      const cCharge = toolChargeOf(toolCalls, tp.customer);
+      if (cCharge === undefined) {
+        return this.usageRefused(attempt, "billing_usage_invalid", "upstream_usage_invalid", "invalid hosted tool charge or arithmetic overflow", rawUsage);
+      }
+      customerToolCharge = cCharge;
+      supplierToolPrices = tp.supplier;
+      customerToolPrices = tp.customer;
+    }
     // A model check held nothing: only the ledger's own range bounds what its usage may cost.
-    const amount = priced(counters, tokenRates(route.rate), this.modelCheck ? LEDGER_MAX : this.boundM);
+    const maxBound = this.modelCheck ? LEDGER_MAX : this.boundM;
+    const amount = priced(counters, tokenRates(effPriced.rate), maxBound);
     if (!amount.ok) return this.usageRefused(attempt, "billing_usage_invalid", amount.overBound ? "usage_exceeds_bound" : "upstream_usage_invalid", amount.error.reason, rawUsage);
-    const cost = amount.amount;
+    const cost = amount.amount + customerToolCharge;
+    if (cost > maxBound) {
+      return this.usageRefused(attempt, "billing_usage_invalid", "usage_exceeds_bound", `the usage costs ${cost} micro-USD, more than the ${maxBound} micro-USD held for the request`, rawUsage);
+    }
     const note = chargedUsageNote(read.imageUnsplit);
     if (note !== null) {
       this.alertImageUnsplit(attempt, raw, policy);
@@ -8101,6 +8441,8 @@ export class InferenceRun {
       audio_output_tokens: safe(counters.audio_output_tokens),
     };
     if (this.modelCheck) return this.checkAnswered(a, attempt, usage, rawUsage);
+    const evidenceRawUsage = activeTools.length > 0 && raw !== null ? attachHostedToolCallsToRawUsage(protocol, raw, toolCalls) : raw;
+    const evidenceUsage = activeTools.length > 0 ? { ...counters, tool_calls: toolCalls } : counters;
     const evidence = await generationMediaEvidence({
       model: a.model,
       protocol,
@@ -8109,8 +8451,13 @@ export class InferenceRun {
       supplierMedia,
       platformFeeBps: this.deps.cfg.platformFeeBps,
       ceiling: this.ceiling,
-      usage: counters,
-      rawUsage: raw,
+      usage: evidenceUsage,
+      rawUsage: evidenceRawUsage,
+      quoteOverride: effQuote,
+      rateOverride: effPriced.rate,
+      ...(appliedTier !== null ? { serviceTier: appliedTier } : {}),
+      ...(appliedLongContext ? { longContext: true } : {}),
+      ...(activeTools.length > 0 ? { supplierToolPrices, customerToolPrices } : {}),
     });
     const verdict = judgeEvidence(evidence, cost);
     if (!verdict.ok) {
@@ -8119,7 +8466,7 @@ export class InferenceRun {
       return { ok: false, code: "billing_usage_invalid", reason: "usage_evidence_invalid", why: verdict.why };
     }
     // A generation route bills by tokens (`generationPriceOf` leaves a unit price out): its charge has the two sides.
-    return this.charge(a, attempt, cost, tokenSides(amount.parts, null), verdict.text, verdict.payable ?? 0n, usage, rawUsage);
+    return this.charge(a, attempt, cost, tokenSides(amount.parts, null), verdict.text, verdict.payable ?? 0n, usage, rawUsage, customerToolCharge);
   }
 
   /**
@@ -8131,7 +8478,9 @@ export class InferenceRun {
    */
   private alertImageUnsplit(attempt: Attempt, raw: Json | null, policy: ImageUsageUnsplit): void {
     // Losslessly: a count past 2^53 is logged as the upstream sent it (`image_unsplit_alert`).
-    console.error(toJsonString(imageUnsplitAlert(this.requestId, attempt.route.record.endpointId, attempt.route.record.model, raw, policy)));
+    // On the confidential entry (`public_logs`), strip untrusted upstream fields via `laneSafeLog`.
+    const line = imageUnsplitAlert(this.requestId, attempt.route.record.endpointId, attempt.route.record.model, raw, policy);
+    console.error(toJsonString(this.lane === null ? line : laneSafeLog(line)));
     this.retryEvents.push({ kind: "image_usage_unsplit", policy });
   }
 
@@ -8228,6 +8577,9 @@ export class InferenceRun {
     let hasItemRef = false;
     let missingResponseSealed = false;
     let missingItemSealed = false;
+    const maxExpandedBytes =
+      records.length > 0 ? Math.max(...records.map((r) => this.laneZdrBodyLimit(r))) : STACK_BODY_MAX_BYTES;
+    let decryptedBytes = 0;
 
     for (const ref of refs) {
       if (ref.kind === "conversation") continue;
@@ -8251,9 +8603,23 @@ export class InferenceRun {
         continue;
       }
       if (opened.kind === "response") {
+        decryptedBytes +=
+          encoder.encode(toJsonString(opened.items)).byteLength +
+          (opened.instructions === undefined ? 0 : encoder.encode(opened.instructions).byteLength);
+        if (decryptedBytes > maxExpandedBytes) {
+          this.laneSealedResponses.clear();
+          this.laneSealedItems.clear();
+          return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge() };
+        }
         this.laneSealedResponses.set(ref.reference, opened);
         this.laneZdrAffinityId ??= opened.affinityId;
       } else if (opened.kind === "item") {
+        decryptedBytes += encoder.encode(toJsonString(opened.item)).byteLength;
+        if (decryptedBytes > maxExpandedBytes) {
+          this.laneSealedResponses.clear();
+          this.laneSealedItems.clear();
+          return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge() };
+        }
         this.laneSealedItems.set(ref.reference, opened);
         this.laneZdrAffinityId ??= opened.affinityId;
       }
@@ -8278,11 +8644,17 @@ export class InferenceRun {
     return { ok: true };
   }
 
+  private laneZdrBodyLimit(route: RouteRecord): number {
+    if (this.stackRoute(route)) return STACK_BODY_MAX_BYTES;
+    return Math.min(Number(requestLimit(this.protocol)), this.lane!.timing.bodyMaxBytes, this.deps.cfg.bodyParseMaxBytes);
+  }
+
   /**
    * Computes zero-retention continuation expansion for `route`, or `null` when the request is not a
    * zero-retention Responses request (including when the client explicitly opted out with `store: false`).
+   * Throws `ExpandedBodyTooLargeError` if the expanded payload exceeds `maxExpandedBytes`.
    */
-  private laneZdrExpansionFor(route: RouteRecord, parsedBody: Json): ExpandZeroRetentionResult | null {
+  private laneZdrExpansionFor(route: RouteRecord, parsedBody: Json, maxExpandedBytes?: number): ExpandZeroRetentionResult | null {
     if (
       this.lane === null ||
       this.protocol !== "open_ai_responses" ||
@@ -8303,8 +8675,10 @@ export class InferenceRun {
         sealedItems: this.laneSealedItems,
         addEncryptedReasoningInclude: addInclude,
         stripReplayedEncryptedReasoning: this.zdrStripEncryptedReasoning,
+        maxExpandedBytes: maxExpandedBytes ?? this.laneZdrBodyLimit(route),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ExpandedBodyTooLargeError) throw error;
       return null;
     }
     if (this.lane.continuation !== undefined) {
@@ -8344,9 +8718,10 @@ export class InferenceRun {
       previous.close();
       const idx = this.peerCalls.indexOf(previous);
       if (idx >= 0) this.peerCalls.splice(idx, 1);
+      this.lanePeerExpansions.delete(previous);
+      this.peerHopEvents.delete(previous);
       this.peerRid = null;
-      this.peerHop = null;
-      this.lanePeerExpansion = null;
+      this.peerHops.clear();
       const retryPlan = this.stackAttemptPlan(route, o);
       if (!retryPlan.ok || retryPlan.peers === undefined) return null;
       attempt.zdrExpansion = retryPlan.expansion ?? undefined;
@@ -8358,7 +8733,7 @@ export class InferenceRun {
       this.ctx.waitUntil(previous.close());
       const idx = this.stackCalls.indexOf(previous);
       if (idx >= 0) this.stackCalls.splice(idx, 1);
-      this.laneStackExpansion = null;
+      this.laneStackExpansions.delete(previous);
       const retryPlan = this.stackAttemptPlan(route, o);
       if (!retryPlan.ok || retryPlan.config === null) return null;
       attempt.zdrExpansion = retryPlan.expansion ?? undefined;
@@ -8370,7 +8745,12 @@ export class InferenceRun {
       attempt.laneDraft = undefined;
       this.laneReceiptId = laneBefore.receiptId;
       this.laneForwardedDraft = laneBefore.forwardedDraft;
-      attempt.zdrExpansion = this.laneZdrExpansionFor(route.record, o.parsed.value) ?? undefined;
+      try {
+        attempt.zdrExpansion = this.laneZdrExpansionFor(route.record, o.parsed.value) ?? undefined;
+      } catch (error) {
+        if (error instanceof ExpandedBodyTooLargeError) return null;
+        throw error;
+      }
       return await this.send(o, prepared, attempt, until);
     }
     return null;
@@ -8561,6 +8941,7 @@ export class InferenceRun {
     this.toolNames = calls.names;
     // The upstream's stop reasons, read from its events for an end that is the chain's failure (`settle`).
     const answerEnd = new AnswerEnd(a.protocol);
+    const billingObserver = new StreamBillingObserver(a.protocol, this.pricingFeatures);
     const { tap, stateTap } = this.binding(a, attempt);
     // The answer's tool-call ids that not every client keeps get handles (TOOL_CALL_ID_MINTING).
     const mapper = this.toolIds?.beginAnswer(attempt.issuer, a.protocol) ?? null;
@@ -8583,7 +8964,7 @@ export class InferenceRun {
             silenceMs: cfg.upstreamSilenceMs,
             clock,
             outputLimit: this.outputLimit(a, route),
-            settle: (settlement, _usage, rawUsage) => this.settle(a, attempt, settlement, rawUsage, { failure: answerEnd.failure(), unfinished: false }),
+            settle: (settlement, _usage, rawUsage) => this.settle(a, attempt, settlement, rawUsage, { failure: answerEnd.failure(), unfinished: false }, billingObserver.finish(rawUsage)),
             // A Gemini answer is read for the model's refusal, delivered uncharged (`settleRefused`).
             refusal: a.protocol === "gemini" ? new GeminiRefusal() : undefined,
             // A refusal whose end is also its chain's failure is that failure (`answerEndFailed`).
@@ -8616,6 +8997,7 @@ export class InferenceRun {
             onVerdict: (verdict) => this.inspected(verdict, true),
             onDroppedNull: (member) => this.droppedNull(attempt, member),
             onEvents: (events) => {
+              billingObserver.observe(events);
               if (this.traffic !== null) attempt.evidence?.observeEvents(events);
               for (const event of events) {
                 if (event.type === "native") answerEnd.observe(event.payload);
@@ -9027,7 +9409,14 @@ export class InferenceRun {
         const reported = isObject(rawUsage) && parsedAnswer.usage !== null;
         // An answer without usage is missing what it is billed on: delivered free, or refused under
         // GRAY_USAGE_MISSING refuse (`settle`), saying which.
-        const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
+        const settled = await this.settle(
+          a,
+          attempt,
+          reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage),
+          rawUsage,
+          bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
+          extractBufferedBillingMeta(upstream, payload, rawUsage, this.pricingFeatures),
+        );
         if (!settled.ok) {
           // A usage the gateway would not bill charged nothing: another attempt may serve the request. A
           // settlement that was not confirmed may have charged, and a failed review of Gray's own evidence
@@ -9271,7 +9660,14 @@ export class InferenceRun {
       const refused = await this.settleRefused(attempt, refusedFor);
       if (!refused.ok) return failed(refused.code, refused.reason, refused.why, null);
     } else {
-      const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
+      const settled = await this.settle(
+        a,
+        attempt,
+        reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage),
+        rawUsage,
+        bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
+        extractBufferedBillingMeta(upstream, payload, rawUsage, this.pricingFeatures),
+      );
       if (!settled.ok) {
         if (!grayAfterCheck(settled)) return uncommitted({ ...this.defect(attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });
         this.commit(d, attempt);
@@ -9437,7 +9833,14 @@ export class InferenceRun {
     if (!this.inspected(verdict, true)) return uncommitted(this.defect(attempt, "upstream_trust_policy_rejected", false));
     const rawUsage = bufferedUsage(upstream, payload) ?? null;
     const reported = isObject(rawUsage) && parsedAnswer.usage !== null;
-    const settled = await this.settle(a, attempt, reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage), rawUsage, bufferedEnd(upstream, payload, parsedAnswer.finish_reason));
+    const settled = await this.settle(
+      a,
+      attempt,
+      reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, this.outputLimit(a, route)) : unreported(upstream, rawUsage),
+      rawUsage,
+      bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
+      extractBufferedBillingMeta(upstream, payload, rawUsage, this.pricingFeatures),
+    );
     if (!settled.ok) {
       if (!grayAfterCheck(settled)) return uncommitted({ ...this.defect(attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });
       this.commit(d, attempt);

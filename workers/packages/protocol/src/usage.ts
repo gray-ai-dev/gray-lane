@@ -107,6 +107,7 @@ const COUNTERS: ReadonlySet<string> = new Set([
   "thinking_tokens",
   "web_search_requests",
   "web_fetch_requests",
+  "code_execution_requests",
   "promptTokenCount",
   "candidatesTokenCount",
   "totalTokenCount",
@@ -310,6 +311,49 @@ export function foldedCacheWrites(total: bigint, split: bigint, input: bigint): 
   return reported - split;
 }
 
+export const MAX_USAGE_ITERATIONS = 32;
+
+function anthropicPass(obj: JsonObject, baseInput: bigint, baseOutput: bigint): BilledTokens {
+  const cacheRead = optionalCounter(obj, "cache_read_input_tokens") ?? 0n;
+  const total = optionalCounter(obj, "cache_creation_input_tokens");
+  const split = optionalDetails(obj, "cache_creation");
+  let uncached = baseInput;
+  let cacheWrite: bigint;
+  let cacheWrite1h = 0n;
+  if (split !== undefined) {
+    const write5m = optionalCounter(split, "ephemeral_5m_input_tokens") ?? 0n;
+    cacheWrite1h = optionalCounter(split, "ephemeral_1h_input_tokens") ?? 0n;
+    const sum = checkedAdd(write5m, cacheWrite1h);
+    if (total !== undefined && total !== sum) {
+      const folded = foldedCacheWrites(total, sum, baseInput);
+      if (folded === undefined) {
+        throw new RuleError(
+          `cache creation TTL counters do not sum to cache creation tokens: ephemeral_5m_input_tokens ${write5m} + ephemeral_1h_input_tokens ${cacheWrite1h}, cache_creation_input_tokens ${total}, input_tokens ${baseInput}`,
+        );
+      }
+      uncached = folded;
+    }
+    cacheWrite = sum;
+  } else {
+    cacheWrite = total ?? 0n;
+  }
+  const input = checkedAdd(checkedAdd(uncached, cacheRead), cacheWrite);
+  if (cacheRead + cacheWrite > U64_MAX || cacheRead + cacheWrite > input) {
+    throw new RuleError(`cached input exceeds billable input: cache reads ${cacheRead} + cache writes ${cacheWrite}, input ${input}`);
+  }
+  return { input, output: baseOutput, cache_read: cacheRead, cache_write: cacheWrite, cache_write_1h: cacheWrite1h };
+}
+
+function anthropicIterationPass(entry: Json): BilledTokens {
+  if (!isObject(entry)) throw new RuleError("usage.iterations entries must be objects");
+  const baseInput = optionalCounter(entry, "input_tokens");
+  const baseOutput = optionalCounter(entry, "output_tokens");
+  if (baseInput === undefined || baseOutput === undefined) {
+    throw new RuleError("usage.iterations entries must carry input_tokens and output_tokens");
+  }
+  return anthropicPass(entry, baseInput, baseOutput);
+}
+
 /**
  * `usage_rules::billed_tokens`: billable counters from a native usage object, the rule the
  * gateway's billing, the ledger's evidence check and the verifier's serving contract share. Every
@@ -321,8 +365,11 @@ export function foldedCacheWrites(total: bigint, split: bigint, input: bigint): 
  * - OpenAI Responses: `input_tokens_details.cached_tokens` and `.cache_write_tokens`.
  * - Anthropic: `cache_read_input_tokens` and `cache_creation_input_tokens` are added to
  *   `input_tokens`; a `cache_creation` object splits writes by TTL and must sum to the total, except
- *   a total below the split that `input_tokens` holds the rest of (`foldedCacheWrites`).
- * - Gemini: `cachedContentTokenCount` within `promptTokenCount`; thought tokens are output.
+ *   a total below the split that `input_tokens` holds the rest of (`foldedCacheWrites`). When
+ *   `iterations` carries compaction/message passes, its summed counters are billed whenever they
+ *   exceed top-level counters (compact-2026-01-12 / compact-2026-09-04).
+ * - Gemini: `cachedContentTokenCount` within `promptTokenCount`; `toolUsePromptTokenCount` is
+ *   billed as input; thought tokens are output.
  */
 export function billedTokens(protocol: Protocol, usage: Json): BilledUsage {
   if (!completeUsage(protocol, usage)) return { kind: "missing", reason: "missing explicit usage counters" };
@@ -367,32 +414,55 @@ export function billedTokens(protocol: Protocol, usage: Json): BilledUsage {
         cacheWrite = nestedCounter(usage, "input_tokens_details", "cache_write_tokens") ?? 0n;
         break;
       case "anthropic_messages": {
-        cacheRead = optionalCounter(usage, "cache_read_input_tokens") ?? 0n;
-        const total = optionalCounter(usage, "cache_creation_input_tokens");
-        const split = optionalDetails(usage, "cache_creation");
-        let uncached = input;
-        if (split !== undefined) {
-          const write5m = optionalCounter(split, "ephemeral_5m_input_tokens") ?? 0n;
-          cacheWrite1h = optionalCounter(split, "ephemeral_1h_input_tokens") ?? 0n;
-          const sum = checkedAdd(write5m, cacheWrite1h);
-          if (total !== undefined && total !== sum) {
-            const folded = foldedCacheWrites(total, sum, input);
-            if (folded === undefined) {
-              throw new RuleError(
-                `cache creation TTL counters do not sum to cache creation tokens: ephemeral_5m_input_tokens ${write5m} + ephemeral_1h_input_tokens ${cacheWrite1h}, cache_creation_input_tokens ${total}, input_tokens ${input}`,
-              );
-            }
-            uncached = folded;
+        const top = anthropicPass(usage as JsonObject, input, output);
+        let chosenInput = top;
+        let chosenOutput = top.output;
+        const iterations = get(usage, "iterations");
+        if (iterations !== undefined && iterations !== null) {
+          if (!isArray(iterations)) throw new RuleError("usage.iterations must be an array or null");
+          if (iterations.length > MAX_USAGE_ITERATIONS) {
+            throw new RuleError(`usage.iterations has ${iterations.length} entries, above the ${MAX_USAGE_ITERATIONS} allowed`);
           }
-          cacheWrite = sum;
-        } else {
-          cacheWrite = total ?? 0n;
+          if (iterations.length > 0) {
+            let sumInput = 0n;
+            let sumOutput = 0n;
+            let sumCacheRead = 0n;
+            let sumCacheWrite = 0n;
+            let sumCacheWrite1h = 0n;
+            for (const entry of iterations) {
+              const pass = anthropicIterationPass(entry);
+              sumInput = checkedAdd(sumInput, pass.input);
+              sumOutput = checkedAdd(sumOutput, pass.output);
+              sumCacheRead = checkedAdd(sumCacheRead, pass.cache_read);
+              sumCacheWrite = checkedAdd(sumCacheWrite, pass.cache_write);
+              sumCacheWrite1h = checkedAdd(sumCacheWrite1h, pass.cache_write_1h);
+            }
+            if (sumInput > top.input) {
+              chosenInput = {
+                input: sumInput,
+                output: sumOutput,
+                cache_read: sumCacheRead,
+                cache_write: sumCacheWrite,
+                cache_write_1h: sumCacheWrite1h,
+              };
+            }
+            if (sumOutput > chosenOutput) chosenOutput = sumOutput;
+          }
         }
-        input = checkedAdd(checkedAdd(uncached, cacheRead), cacheWrite);
+        input = chosenInput.input;
+        output = chosenOutput;
+        cacheRead = chosenInput.cache_read;
+        cacheWrite = chosenInput.cache_write;
+        cacheWrite1h = chosenInput.cache_write_1h;
         break;
       }
       case "gemini": {
         cacheRead = optionalCounter(usage, "cachedContentTokenCount") ?? 0n;
+        if (cacheRead > input) {
+          throw new RuleError(`cached input exceeds billable input: cache reads ${cacheRead} + cache writes 0, input ${input}`);
+        }
+        const toolUsePrompt = optionalCounter(usage, "toolUsePromptTokenCount") ?? 0n;
+        input = checkedAdd(input, toolUsePrompt);
         // Google's `thoughtsTokenCount`, or a relay's `thinkingTokenCount` for the same counter:
         // billed as output, and when both appear they must agree rather than be added twice.
         const a = optionalCounter(usage, "thoughtsTokenCount");

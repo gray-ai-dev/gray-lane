@@ -8,7 +8,7 @@ import { passedClientHeaders } from "@gray/lane-wire";
 import { type FormPart, formBoundary, partText } from "@gray/media";
 import { OPENAI_LINKING_FIELDS, withDefaultAccept, type Protocol } from "@gray/protocol";
 import { ENTRY_MEDIA_PROTOCOLS } from "@gray/snapshot";
-import { readBody } from "../body.ts";
+import { parseInboundCodings, readBody } from "../body.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
 import { EGRESS_HEADER, addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
@@ -127,13 +127,35 @@ export async function readEntryBody(request: Request, protocol: Protocol, form: 
     const value = document.value as JsonObject;
     return { kind: "json", bytes, value, duplicateKeys: document.duplicateKeys, members: new Set(Object.keys(value)) };
   }
+  const cancelBody = async () => {
+    try {
+      await request.body?.cancel();
+    } catch {
+      // ignore cancel errors on already-closed or detached streams
+    }
+  };
   const contentType = request.headers.get("content-type");
-  if (contentType === null || formBoundary(contentType) === undefined) return new ApiError(400, "multipart_form_required");
+  if (contentType === null || formBoundary(contentType) === undefined) {
+    await cancelBody();
+    return new ApiError(400, "multipart_form_required");
+  }
+  const codings = parseInboundCodings(request.headers.get("content-encoding"));
+  if (codings === null) {
+    await cancelBody();
+    return new ApiError(415, "unsupported_content_encoding");
+  }
   const header = request.headers.get("content-length");
   const declared = header !== null && /^[0-9]+$/.test(header) ? Number(header) : null;
-  if (declared !== null && declared > limits.formBytes) return formTooLarge(limits.formBytes);
-  // Room for the form before a byte is read.
-  if (!share.holdBody(declared ?? 2 * limits.formBytes, limits.pooledBytes)) return formCapacity();
+  if (declared !== null && declared > limits.formBytes) {
+    await cancelBody();
+    return formTooLarge(limits.formBytes);
+  }
+  // Room for the form before a byte is read; when compressed, declared Content-Length is the compressed size so reserve the upper bound.
+  const initialReserve = codings.length > 0 || declared === null ? 2 * limits.formBytes : declared;
+  if (!share.holdBody(initialReserve, limits.pooledBytes)) {
+    await cancelBody();
+    return formCapacity();
+  }
   const letGo = (error: ApiError): ApiError => {
     share.holdBody(0, limits.pooledBytes);
     held(0);
@@ -144,7 +166,7 @@ export async function readEntryBody(request: Request, protocol: Protocol, form: 
   if (!read.ok) return letGo(read.error.code === "request_body_limit" ? formTooLarge(limits.formBytes) : read.error);
   if (read.body.tier === "C") return letGo(new ApiError(500, "internal_error"));
   const bytes = read.body.bytes;
-  share.holdBody(bytes.length, limits.pooledBytes);
+  if (!share.holdBody(bytes.length, limits.pooledBytes)) return letGo(formCapacity());
   held(bytes.length);
   // The fields and the file heads (form.ts): no file's bytes are copied.
   const parsed = await readForm({ headers: new Headers({ "content-type": contentType, "content-length": String(bytes.length) }), body: viewsOf(bytes, ENTRY_FORM_CHUNK_BYTES) }, { textBytes: limits.jsonBytes, waitMs: limits.waitMs });

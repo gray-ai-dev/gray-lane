@@ -32,12 +32,12 @@ function declaredSchema(definition: Json, protocol: Protocol): Json {
       keys = ["input_schema"];
       break;
     case "gemini":
-      keys = ["parameters", "parametersJsonSchema"];
+      keys = ["parameters", "parametersJsonSchema", "parameters_json_schema"];
       break;
     default:
       refuse("trust_opaque_tool_payload");
   }
-  const schemaKeys = ["parameters", "input_schema", "parametersJsonSchema"];
+  const schemaKeys = ["parameters", "input_schema", "parametersJsonSchema", "parameters_json_schema"];
   const presentKeys = schemaKeys.filter((key) => get(definition, key) !== undefined);
   if (presentKeys.length > 1 || presentKeys.some((key) => !keys.includes(key))) refuse("trust_opaque_tool_payload");
   for (const key of keys) {
@@ -80,8 +80,9 @@ export function inspectToolDeclarations(request: CanonicalRequest, raw: Json): v
         break;
       }
       case "gemini": {
-        if (!isObject(tool) || Object.keys(tool).some((k) => k !== "functionDeclarations")) refuse("trust_opaque_tool_payload");
-        for (const fn of array(get(tool, "functionDeclarations"))) {
+        if (!isObject(tool) || Object.keys(tool).some((k) => k !== "functionDeclarations" && k !== "function_declarations")) refuse("trust_opaque_tool_payload");
+        const decls = field(tool, "functionDeclarations");
+        for (const fn of array(decls)) {
           schemas.push(declaredSchema(fn, request.protocol));
           names.push(asStr(get(fn, "name")));
         }

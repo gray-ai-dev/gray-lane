@@ -1,5 +1,4 @@
 import { releaseWithRetry, settleWithRetry, shardName, UNROUTED, type AdmitRefusal, type HoldToken, type SettleInput } from "@gray/account";
-import { workspaceHome } from "./account.ts";
 import { isLocationHint } from "@gray/config";
 import { countKeyRate, keyRateRefusal } from "./key-rate.ts";
 import {
@@ -69,8 +68,9 @@ import {
   type RoutingEvidence,
   type RoutingParams,
 } from "@gray/routing";
+import { workspaceHome } from "./account.ts";
 import { admitOnce } from "./admission.ts";
-import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
+import { hasQueryCredentials, keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { RequestBudget } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, platformTimers } from "./client.ts";
 import { logWithheld, resolveWithheld, settledBy, withheldBilling, type WithheldEnd } from "./withheld.ts";
@@ -79,6 +79,8 @@ import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releas
 import { judgeEvidence, mediaEvidence } from "./evidence.ts";
 import { originsOf } from "./hosts.ts";
 import { type GatewayDeps, planReasons } from "./inference.ts";
+import { checkStaleKey, type KeyLookup } from "./key-lookup.ts";
+import { countLiveKeyRate } from "./key-rate.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { type ResponseHash, bodyHashOf, egressCapacity, egressOwnAnswer, egressRefused, egressSentNothing, laneRoutingParamsInBody, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
@@ -872,17 +874,21 @@ export class ModelApiRun {
     };
   }
 
+  private cleanupInflight(reason: string): void {
+    const attempt = this.current;
+    if (attempt !== null) {
+      attempt.controller.abort(reason);
+      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, reason);
+    }
+    this.releaseHold(reason, { stage: this.admission, endpoint: attempt?.candidate.record.endpointId ?? null });
+  }
+
   /** A failure of Gray's own (a bug): the attempt cancelled, its permit back as Gray's fault, the hold released. */
   private abandon(error: unknown, event: string): void {
     const line = { level: "error", event, request_id: this.requestId, stage: this.admission, message: error instanceof Error ? error.message : String(error) };
     // A lane's log line carries no free text, which may quote a request (lane/hooks.ts `laneSafeLog`).
     console.error(JSON.stringify(laneSafeLog(line)));
-    const attempt = this.current;
-    if (attempt !== null) {
-      attempt.controller.abort("internal_error");
-      this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "internal_error");
-    }
-    this.releaseHold("internal_error", { stage: this.admission, endpoint: attempt?.candidate.record.endpointId ?? null });
+    this.cleanupInflight("internal_error");
   }
 
   // ---------------------------------------------------------------- the request
@@ -992,6 +998,10 @@ export class ModelApiRun {
         this.chargedSides = null;
         this.chargeSeq = null;
       }
+      if (error instanceof ApiError) {
+        this.cleanupInflight(error.code);
+        return await this.closeRate(this.refuse(error, this.admission));
+      }
       this.abandon(error, "request_failed");
       return await this.closeRate(this.refuse(new ApiError(500, "internal_error"), this.admission));
     }
@@ -1000,7 +1010,7 @@ export class ModelApiRun {
   private async serveRequest(): Promise<Response> {
     const { cfg, clock } = this.deps;
     const url = new URL(this.request.url);
-    if (url.searchParams.has("key")) return this.refuse(new ApiError(400, "query_credentials_unsupported"), "query_credentials");
+    if (hasQueryCredentials(url)) return this.refuse(new ApiError(400, "query_credentials_unsupported"), "query_credentials");
 
     // 1. The key, from the snapshot.
     const presented = presentedKey(this.request.headers);
@@ -1020,6 +1030,7 @@ export class ModelApiRun {
     }
     this.isolateGapMs = read.gapMs;
     let snapshot = read.snapshot;
+    let snapshotStale = read.stale;
     const hash = await keyHash(presented.token);
     this.laneOwner = hash;
     let key: KeyRecord | undefined = snapshot.keys[hash];
@@ -1027,6 +1038,7 @@ export class ModelApiRun {
       const confirmed = await this.deps.snapshots.confirm(this.deps.source, timing, this.started, (p) => this.ctx.waitUntil(p), (call) => this.outbound.run(call), snapshotLeft());
       if (confirmed.ok) {
         snapshot = confirmed.snapshot;
+        snapshotStale = confirmed.stale;
         key = snapshot.keys[hash];
       }
     }
@@ -1060,7 +1072,7 @@ export class ModelApiRun {
     if (!entryStandardApi(this.protocol) || (this.protocol === "open_ai_videos" && this.videoIo() === null)) return this.refuse(new ApiError(404, "unsupported_protocol"), "auth");
     // 0. A repeated video create answers with the job its key made, before its body is read (section 2.7).
     if (this.protocol === "open_ai_videos" && this.clientKey) {
-      const replayed = await this.replayEntryVideo(snapshot, key);
+      const replayed = await this.replayEntryVideo(snapshot, key, snapshotStale);
       if (replayed !== null) return replayed;
     }
     return this.serveEntry(snapshot, key, this.lane);
@@ -2826,7 +2838,7 @@ export class ModelApiRun {
    * is signed for it. Null when the store holds no such job: the request goes on as a new one. A store that cannot be
    * read is `503 video_store_unavailable`: going on would ask a provider for a second video.
    */
-  private async replayEntryVideo(snapshot: GatewaySnapshot, key: KeyRecord): Promise<Response | null> {
+  private async replayEntryVideo(snapshot: GatewaySnapshot, key: KeyRecord, snapshotStale: boolean): Promise<Response | null> {
     const io = this.videoIo();
     if (io === null) return null;
     this.admission = "idempotency";
@@ -2838,6 +2850,45 @@ export class ModelApiRun {
     }
     if (job === null || job.requestId !== this.requestKey || !videoJobVisible(job, key)) return null;
     this.model = job.model;
+    if (snapshotStale && this.deps.keyRevoked !== undefined) {
+      const lookup: KeyLookup = {
+        cfg: this.deps.cfg,
+        snapshots: this.deps.snapshots,
+        source: this.deps.source,
+        background: (p) => this.ctx.waitUntil(p),
+        outbound: this.outbound,
+        lane: true,
+      };
+      try {
+        await checkStaleKey({ key, snapshot, stale: true }, this.deps.keyRevoked, lookup, "video_replay_key_check_failed");
+      } catch (error) {
+        this.rateOpen = false;
+        return this.refuse(error instanceof ApiError ? error : new ApiError(503, "auth_snapshot_expired").withRetryAfter(2n), "auth");
+      }
+    }
+    // Count against the key's minute and enforce live revocation before polling upstream (`NEW-05`).
+    const waitMs = this.budget.preWait(this.deps.cfg.accountAdmitAttemptMs);
+    const over =
+      waitMs <= 0
+        ? new ApiError(503, "billing_admission_unavailable").withRetryAfter(1n)
+        : await countLiveKeyRate({
+            locate: this.accounts(),
+            counts: this.deps.shardCounts,
+            workspace: key.workspaceId,
+            region: this.deps.region,
+            home: workspaceHome(snapshot, key.workspaceId),
+            keyId: key.keyId,
+            requestId: this.requestId,
+            waitMs,
+            clock: this.deps.clock,
+            ...(this.deps.admissionTimers === undefined ? {} : { timers: this.deps.admissionTimers }),
+            lane: true,
+          });
+    if (over !== null) {
+      this.rateOpen = false;
+      return this.refuse(over, over.code === "api_key_revoked" ? "auth" : "key_rate");
+    }
+    this.rateOpen = false;
     const route = videoJobRoute(snapshot, job);
     if (route === undefined) return this.refuse(new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
     const observed = await pollVideoJob(io, route, job, undefined, this.request.headers);
@@ -2847,8 +2898,6 @@ export class ModelApiRun {
       return this.refuse(unreadable ? new ApiError(502, "invalid_upstream_response") : new ApiError(503, "video_source_unavailable").withRetryAfter(2n), "idempotency");
     }
     const body = observed.object.forClient(after.id, after.state);
-    // Answered before its body is read: not counted against the key's minute.
-    this.rateOpen = false;
     this.responseBytes = body.length;
     this.responseComplete = true;
     this.ttfbMs = this.deps.clock() - this.started;
@@ -2913,7 +2962,7 @@ export class ModelApiRun {
     const cost = usageCost(evidence.usage, customerRates(evidence));
     const verdict = cost === "amount" || cost > this.ceiling ? { ok: false as const, why: "the held seconds cannot be priced within the request's ceiling" } : judgeEvidence(evidence, cost);
     if (!verdict.ok) {
-      console.error(JSON.stringify(laneSafeLog({ level: "alert", event: "video_evidence_invalid", request_id: this.requestKey, endpoint: record.endpointId, why: verdict.why })));
+      console.error(JSON.stringify(laneSafeLog({ level: "alert", event: "video_evidence_invalid", request_id: this.requestId, endpoint: record.endpointId, why: verdict.why })));
       this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, "billing_usage_invalid");
       return this.fail(new ApiError(502, "billing_usage_invalid"), "video_evidence_invalid", attempt, 0);
     }
@@ -2956,7 +3005,15 @@ export class ModelApiRun {
     const put = await this.putVideoJob(io, create);
     if (put === null || put.outcome === "conflict") {
       const code = put === null ? "video_store_unavailable" : "video_job_unrecorded";
-      console.error(JSON.stringify(put === null ? { level: "alert", event: "video_job_unrecorded", request_id: this.requestKey, job: create.id } : { level: "alert", event: "video_job_conflict", request_id: this.requestKey, job: create.id }));
+      console.error(
+        JSON.stringify(
+          laneSafeLog(
+            put === null
+              ? { level: "alert", event: "video_job_unrecorded", request_id: this.requestId, job: create.id }
+              : { level: "alert", event: "video_job_conflict", request_id: this.requestId, job: create.id },
+          ),
+        ),
+      );
       this.endAttempt(attempt, { kind: "not_counted", reason: "gray_error" }, true, code);
       // A hold the record under this id already owns stays that record's; any other is released.
       const recorded = put?.job.hold;

@@ -1,6 +1,6 @@
 /// <reference path="./uap-ref-impl.d.ts" />
 import makeParser, { type UserAgentParser } from "uap-ref-impl";
-import catalogDocument from "../../../../crates/gray-gateway/src/client_apps.json" with { type: "json" };
+import catalogDocument from "./client_apps.json" with { type: "json" };
 
 /**
  * @gray/client-apps: the client application a request came from (Claude Code, Codex, Cline, ...),

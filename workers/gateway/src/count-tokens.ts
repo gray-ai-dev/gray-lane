@@ -1,6 +1,6 @@
 import { countOnce, type CountResult, type ShardLocator } from "@gray/account";
 import { ReceiptBuilder, checkEventLog } from "@gray/attest";
-import type { LocationHint } from "@gray/config";
+import { isLocationHint, type LocationHint } from "@gray/config";
 import { notWritten } from "@gray/content";
 import {
   ApiError,
@@ -40,11 +40,11 @@ import {
   type CanonicalRequest,
   type Protocol,
 } from "@gray/protocol";
-import { Preference } from "@gray/routing";
+import { DEFAULT_ROUTING_POLICY, Preference, ROUTING_PARAMS_HEADER, keyDefaultPreset, overKeyPreset, resolveRoutingParams, takeRouting } from "@gray/routing";
 import { providerRef, supplierRef } from "@gray/snapshot";
 import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import { workspaceHome } from "./account.ts";
-import { keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
+import { hasQueryCredentials, keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { billedInputOf } from "./billed.ts";
 import { readBody, type Body } from "./body.ts";
 import { RequestBudget } from "./budget.ts";
@@ -53,9 +53,11 @@ import { openCredential } from "./crypto.ts";
 import { endingWith, entryServesNative, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { GateCapacity, type GateVerdict } from "./gate.ts";
 import type { GatewayDeps, Served } from "./inference.ts";
-import { keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
+import { checkStaleKey, type KeyLookup } from "./key-lookup.ts";
+import { admissionUnavailable, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
+import { peerHopBody as composePeerHop, type PeerHopBody } from "./lane/claude-code-user-id.ts";
 import {
   EGRESS_HEADER,
   LANE_CODES,
@@ -73,6 +75,7 @@ import {
   laneOutcomeWord,
   lanePolicyRefused,
   laneRoutingInBody,
+  laneRoutingParamsInBody,
   laneSafeRecord,
   laneToolHandlesUnsupported,
   laneUpstreamOf,
@@ -100,6 +103,7 @@ import {
   refsOf,
   registeredOf,
   retainAdmitted,
+  routingRefused,
   takeTags,
   tierAdmitted,
   unadmitted,
@@ -268,7 +272,10 @@ export class CountTokensRun {
   // Peer hop state.
   private peerRid: string | null = null;
   private readonly peerCalls: LanePeerCall[] = [];
-  private peerHop: { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null = null;
+  /** The body of the peer hop to each relay's VM, by relay id (`lane/claude-code-user-id.ts` `peerHopBody`). */
+  private readonly peerHops = new Map<string, PeerHopBody>();
+  /** The ops each peer call's body carries, which its `peer.forwarded` declares. */
+  private readonly peerHopEvents = new Map<LanePeerCall, readonly JsonObject[]>();
   private peerReturnedBytes: Uint8Array = new Uint8Array(0);
   private peerReplacedError = false;
   private peerGrayBody = false;
@@ -318,8 +325,12 @@ export class CountTokensRun {
     try {
       response = await this.serveRequest();
     } catch (error) {
-      console.error(JSON.stringify({ level: "error", event: "count_tokens_failed", request_id: this.requestId, ...failureNames(error) }));
-      response = await this.closeRate(this.renderError(new ApiError(500, "internal_error"), this.admission));
+      if (error instanceof ApiError) {
+        response = await this.closeRate(this.renderError(error, this.admission));
+      } else {
+        console.error(JSON.stringify({ level: "error", event: "count_tokens_failed", request_id: this.requestId, ...failureNames(error) }));
+        response = await this.closeRate(this.renderError(new ApiError(500, "internal_error"), this.admission));
+      }
     }
 
     if (this.forwarded) {
@@ -398,7 +409,7 @@ export class CountTokensRun {
   private async serveRequest(): Promise<Response> {
     const { cfg, clock } = this.deps;
     const url = new URL(this.request.url);
-    if (url.searchParams.has("key")) {
+    if (hasQueryCredentials(url)) {
       return this.renderError(new ApiError(400, "query_credentials_unsupported"), "query_credentials");
     }
 
@@ -426,6 +437,7 @@ export class CountTokensRun {
     }
     this.isolateGapMs = read.gapMs ?? null;
     let snapshot = read.snapshot;
+    let snapshotStale = read.stale;
     const hash = await keyHash(presented.token);
     this.laneOwner = hash;
     let key: KeyRecord | undefined = snapshot.keys[hash];
@@ -440,6 +452,7 @@ export class CountTokensRun {
       );
       if (confirmed.ok) {
         snapshot = confirmed.snapshot;
+        snapshotStale = confirmed.stale;
         key = snapshot.keys[hash];
       }
     }
@@ -458,6 +471,24 @@ export class CountTokensRun {
     if ((this.lane?.stackConfig?.relayId ?? null) !== null) {
       this.authResult = "lane_entry_required";
       return this.renderError(laneEntryRequired(), "auth");
+    }
+    if (snapshotStale && this.deps.keyRevoked !== undefined) {
+      const lookup: KeyLookup = {
+        cfg,
+        snapshots: this.deps.snapshots,
+        source: this.deps.source,
+        background: (p) => this.ctx.waitUntil(p),
+        outbound: this.outbound,
+        ...(this.lane === null ? {} : { lane: true }),
+      };
+      try {
+        await checkStaleKey({ key, snapshot, stale: true }, this.deps.keyRevoked, lookup, "count_tokens_key_check_failed");
+      } catch (error) {
+        const refused = error instanceof ApiError ? error : new ApiError(503, "auth_snapshot_expired").withRetryAfter(2n);
+        this.authResult = refused.code === "api_key_revoked" ? "revoked" : "unavailable";
+        if (refused.code === "api_key_revoked") this.refusedKey = key;
+        return this.renderError(refused, "auth");
+      }
     }
     this.authResult = "ok";
     this.key = key;
@@ -519,16 +550,24 @@ export class CountTokensRun {
     }
     const value: JsonObject = parsedRead.value;
 
-    // 3. Routing preference & model target.
+    // 3. Routing preference, routing parameters & model target.
     this.admission = "preference";
     const statedProvider = Object.hasOwn(value, "provider");
-    if (this.lane !== null && this.protocol === "gemini" && statedProvider) {
-      return this.renderError(laneRoutingInBody(), "preference");
+    const statedRouting = Object.hasOwn(value, "routing");
+    if (this.lane !== null && ((statedProvider && this.protocol === "gemini") || statedRouting)) {
+      return this.renderError(statedProvider && this.protocol === "gemini" ? laneRoutingInBody() : laneRoutingParamsInBody(), "preference");
     }
     const takenPref = Preference.take(value, this.request.headers);
     if (!takenPref.ok) {
       return this.renderError(unreadablePreference(takenPref.code), "preference");
     }
+    const routed = takeRouting(value, this.request.headers.get(ROUTING_PARAMS_HEADER));
+    if (!routed.ok) {
+      return this.renderError(routingRefused(routed.code, routed.message), "preference");
+    }
+    const based = overKeyPreset(routed.request, keyDefaultPreset(key.routing ?? null));
+    const routingParams = resolveRoutingParams(based.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
+    const basePreference = takenPref.preference.withRoutingExplicit(routingParams.explicit);
 
     this.admission = "parse";
     const geminiPath = this.protocol === "gemini" && this.pathModel !== null ? `/v1beta/models/${this.pathModel}:countTokens` : "";
@@ -593,7 +632,7 @@ export class CountTokensRun {
 
     // 7. Layer preferences & verifiable checks.
     this.admission = "preference";
-    const layered = layeredOver(snapshot, key.routing ?? null, key.workspaceId, takenPref.preference, model, tag);
+    const layered = layeredOver(snapshot, key.routing ?? null, key.workspaceId, basePreference, model, tag);
     if (!layered.ok) {
       return this.renderError(unreadableDefault(layered.code), "preference");
     }
@@ -610,13 +649,13 @@ export class CountTokensRun {
 
     // 8. Main Gateway -> Entry native forwarding (count_tokens is never translated).
     const entry = this.deps.entryChat;
-    if (this.lane === null && entry !== undefined && !statedProvider && entryServesNative(snapshot, model, this.protocol)) {
+    if (this.lane === null && entry !== undefined && !statedProvider && !statedRouting && entryServesNative(snapshot, model, this.protocol)) {
       return this.forwardToEntry(entry, received);
     }
 
-    // 9. Key rate limit + shard revocation check before routing/policy/upstream.
+    // 9. Key rate limit + shard revocation check before routing/policy/upstream (fail-closed).
     this.rateOpen = false;
-    const rateRefused = await this.checkKeyRate(snapshot, key);
+    const rateRefused = await this.checkKeyRate(snapshot, key, true);
     if (rateRefused !== null) {
       return this.renderError(rateRefused.error, rateRefused.stage);
     }
@@ -1190,6 +1229,8 @@ export class CountTokensRun {
     readonly route: Route;
     readonly model: string;
     readonly received: Uint8Array;
+    /** The body as the gateway read it. */
+    readonly value?: JsonObject;
     readonly statedProvider: boolean;
     readonly preference: Preference;
     readonly deadline: number;
@@ -1219,7 +1260,7 @@ export class CountTokensRun {
       this.skipRoute(route, "lane_stack_unavailable:peer_unpinned");
       return { kind: "pass" };
     }
-    const hop = this.peerHopBody(received, statedProvider);
+    const hop = this.peerHopBody(received, statedProvider, relayId!, input.value);
     if (hop === null) {
       this.skipRoute(route, "lane_stack_unavailable:stack_rewrite_refused");
       return { kind: "pass" };
@@ -1260,6 +1301,7 @@ export class CountTokensRun {
       signal: controller.signal,
     });
     this.peerCalls.push(call);
+    this.peerHopEvents.set(call, hop.events);
 
     try {
       let sent = await call.send();
@@ -1688,7 +1730,7 @@ export class CountTokensRun {
         builder.addPeerForwarded({
           n,
           envelopeSha256: call.envelopeSha256,
-          ...(this.peerHop === null || this.peerHop.events.length === 0 ? {} : { modified: this.peerHop.events }),
+          ...((this.peerHopEvents.get(call) ?? []).length === 0 ? {} : { modified: this.peerHopEvents.get(call)! }),
         });
         if (call.head === null) {
           const failure = call.failure ?? { code: "peer_invalid" as const, sent: true };
@@ -1756,7 +1798,9 @@ export class CountTokensRun {
   private async closeRate(response: Response): Promise<Response> {
     if (!this.rateOpen || this.key === null || this.snapshot === null) return response;
     this.rateOpen = false;
-    const refused = await this.checkKeyRate(this.snapshot, this.key);
+    // A snapshot without a valid workspace home has no shard to count at (`workspaceHome`): let the refusal stand.
+    if (!isLocationHint(this.snapshot.workspaces[this.key.workspaceId]?.home)) return response;
+    const refused = await this.checkKeyRate(this.snapshot, this.key, false);
     if (refused === null) return response;
     // Key's 429/401 answers in place of the local refusal; no receipt is issued for a rate-limited request.
     this.laneDraft = null;
@@ -1767,9 +1811,15 @@ export class CountTokensRun {
     return this.renderError(refused.error, refused.stage);
   }
 
-  private async checkKeyRate(snapshot: GatewaySnapshot, key: KeyRecord): Promise<{ readonly error: ApiError; readonly stage: AdmissionStage } | null> {
+  private async checkKeyRate(
+    snapshot: GatewaySnapshot,
+    key: KeyRecord,
+    failClosed: boolean,
+  ): Promise<{ readonly error: ApiError; readonly stage: AdmissionStage } | null> {
     const waitMs = this.budget.preWait(this.deps.cfg.accountAdmitAttemptMs);
-    if (waitMs <= 0) return null;
+    if (waitMs <= 0) {
+      return failClosed ? { error: admissionUnavailable(), stage: "key_rate" } : null;
+    }
     const home: LocationHint = workspaceHome(snapshot, key.workspaceId);
     const input: KeyRateCount = {
       locate: this.io.accounts,
@@ -1791,7 +1841,7 @@ export class CountTokensRun {
     if (result.code === "revoked") {
       return { error: new ApiError(401, "api_key_revoked"), stage: "auth" };
     }
-    if (result.code === "unavailable" || result.code === "bad_request" || result.code === "moved") {
+    if (failClosed || result.code === "unavailable" || result.code === "bad_request" || result.code === "moved") {
       // The entry's container log is readable outside the VM (deploy/tee/IMPLEMENTATION_NOTES.md §9.1): there the line
       // names neither the workspace nor the key, as key-rate.ts's.
       const who = this.lane === null ? { workspace: key.workspaceId, key: key.keyId } : {};
@@ -1805,7 +1855,7 @@ export class CountTokensRun {
         }),
       );
     }
-    return null;
+    return failClosed ? { error: admissionUnavailable(), stage: "key_rate" } : null;
   }
 
   // ---------------------------------------------------------------- Main Gateway -> Entry Forward
@@ -1966,17 +2016,27 @@ export class CountTokensRun {
   private readonly rankRegionOf = (route: RouteRecord): string =>
     this.laneEndpointRoute(route) ? `lane-${this.deps.cfg.deployEnv}` : REST_EGRESS_REGION;
 
-  private peerHopBody(received: Uint8Array, statedProvider: boolean): { readonly bytes: Uint8Array; readonly events: readonly JsonObject[] } | null {
-    if (!statedProvider) {
-      this.peerHop = { bytes: received, events: [] };
-      return this.peerHop;
-    }
-    if (this.peerHop === null) {
-      const changed = applyDeclaredChanges(received, "anthropic_messages", { grayOps: [{ op: "remove_member", path: "/provider" }], appends: [] });
-      if (!changed.ok) return null;
-      this.peerHop = { bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
-    }
-    return this.peerHop;
+  /**
+   * The bytes the peer hop to `relayId`'s VM carries: the client's, with a Claude Code `metadata.user_id` replaced by
+   * the stand-in for this workspace, key and relay (any other `user_id` removed) and `/provider` removed when the
+   * client stated its routing preference in the body, as on the inference path (`inference.ts` `peerHopBody`). Null
+   * when the ops do not apply (the route is passed over).
+   */
+  private peerHopBody(received: Uint8Array, statedProvider: boolean, relayId: string, value?: JsonObject): PeerHopBody | null {
+    const cached = this.peerHops.get(relayId);
+    if (cached !== undefined) return cached;
+    const key = this.key;
+    const hop = composePeerHop({
+      protocol: "anthropic_messages",
+      base: received,
+      ...(value === undefined ? {} : { value }),
+      stripProvider: statedProvider,
+      key: this.lane!.state.affinityKey,
+      owner: key === null ? null : { workspaceId: key.workspaceId, keyId: key.keyId },
+      relayId,
+    });
+    if (hop !== null) this.peerHops.set(relayId, hop);
+    return hop;
   }
 
   private runLanePolicy(lane: LaneDeps, relayId: string, protocol: LaneProtocol, model: string, body: Uint8Array): Promise<PolicyAnswer> | null {

@@ -30,7 +30,7 @@
  * (`textCut`, passed in `OutputAnswer`).
  */
 import { type Json, asU64, get, isArray, parseSerde, pointer, utf8Length } from "@gray/json";
-import { type CanonicalEvent, type CanonicalResponse, type FinishReason, type OutputCheck, PROJECTION_NODE_BYTES, type Protocol, geminiField, parseResponse, rustTrim, stringHeapBytes } from "@gray/protocol";
+import { type CanonicalEvent, type CanonicalResponse, type FinishReason, type OutputCheck, PROJECTION_NODE_BYTES, type Protocol, geminiField, normalizeGeminiSchema, parseResponse, rustTrim, stringHeapBytes } from "@gray/protocol";
 import { compileAllowance, withCompileAllowance } from "./engine.ts";
 import type { GateAnswer, GateRequest } from "./policy.ts";
 import { schemaValidator, withinCompileBudget } from "./schema.ts";
@@ -53,7 +53,8 @@ function askedOf(gate: GateRequest): Asked {
   const format = request.response_format;
   if (format === null || format.type === "text") return NOTHING;
   if (format.type === "json_object") return { kind: "json" };
-  return { kind: "schema", schema: format.schema, strict: format.strict || holdsToSchema(request.protocol) };
+  const schema = request.protocol === "gemini" ? normalizeGeminiSchema(format.schema) : format.schema;
+  return { kind: "schema", schema, strict: format.strict || holdsToSchema(request.protocol) };
 }
 
 /**

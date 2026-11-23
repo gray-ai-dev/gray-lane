@@ -6,6 +6,7 @@ import { within } from "@gray/snapshot";
 import { geminiModelValue, listedIn, openaiModelValue, reachable, suggest, type CatalogJson } from "./catalog.ts";
 import type { GatewayEnv } from "./env.ts";
 import { originsOf } from "./hosts.ts";
+import { hasQueryCredentials } from "./auth.ts";
 import { checkStaleKey, lookUpKey, type KeyLookup, type KeyRevocationCheck } from "./key-lookup.ts";
 import { Outbound } from "./outbound.ts";
 import type { GatewaySnapshot, SnapshotCache, SnapshotSource } from "./snapshot.ts";
@@ -97,17 +98,13 @@ function statusUnavailable(): ApiError {
   return new ApiError(503, "billing_admission_unavailable").withMessage("Gray could not read this key's usage right now. Retry in a moment.").withRetryAfter(5n);
 }
 
-/** `query_credentials`: a Gemini client's `?key=` is refused here as on generation, rather than ignored. */
-function queryCredentials(url: URL): boolean {
-  return url.search.length > 1 && url.search.slice(1).split("&").some((p) => p.startsWith("key="));
-}
-
 /** Serves `route` (`path` is the request's, its client's base URL taken off) as the request `requestId` (its record's, public-record.ts). */
 export async function serveCatalog(request: Request, route: CatalogRoute, path: string, d: CatalogDeps, requestId: string = newRequestId(Date.now())): Promise<Response> {
   const url = new URL(request.url);
   const head = request.method === "HEAD";
-  const lookup: KeyLookup = { cfg: d.cfg, snapshots: d.snapshots, source: d.source, background: d.background, outbound: new Outbound() };
+  const lookup: KeyLookup = { cfg: d.cfg, snapshots: d.snapshots, source: d.source, background: d.background, outbound: new Outbound(), ...(d.lane === true ? { lane: true } : {}) };
   try {
+    if (hasQueryCredentials(url)) throw new ApiError(400, "query_credentials_unsupported");
     switch (route.kind) {
       case "models":
       case "model": {
@@ -117,7 +114,6 @@ export async function serveCatalog(request: Request, route: CatalogRoute, path: 
       }
       case "gemini_models":
       case "gemini_model": {
-        if (queryCredentials(url)) throw new ApiError(400, "query_credentials_unsupported");
         const looked = await lookUpKey(request.headers, lookup, true);
         await checkStaleKey(looked, d.keyRevoked, lookup, "catalog_key_check_failed");
         return geminiListing(route, looked.snapshot, looked.key?.models ?? null, d.cfg, requestId, head, rulesFor(d, request));
@@ -156,7 +152,11 @@ export async function serveCatalog(request: Request, route: CatalogRoute, path: 
       console.error(JSON.stringify(line));
     }
     const rendered = refusal.render({ shape: shapeOf(path), origins: originsOf(d.cfg, url), requestId });
-    return new Response(head ? null : rendered.body, { status: rendered.status, headers: rendered.headers });
+    const headers = new Headers(rendered.headers);
+    if ((route.kind === "models" || route.kind === "model") && !headers.has("request-id")) {
+      headers.set("request-id", requestId);
+    }
+    return new Response(head ? null : rendered.body, { status: rendered.status, headers });
   }
 }
 

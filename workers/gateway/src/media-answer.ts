@@ -960,7 +960,7 @@ export class SsePassAnswer extends Relay {
       this.upstream.cancel();
       return this.failed(new ApiError(502, "invalid_upstream_response"), "invalid_upstream_response", "the upstream's answer to a streamed request is not an event stream", "invalid_response", false);
     }
-    const headers = () => new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache" });
+    const headers = () => new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" });
     for (;;) {
       const next = await this.next();
       if (next.kind === "eof") break;
@@ -1016,7 +1016,7 @@ export class SsePassAnswer extends Relay {
   }
 
   deliver(): Promise<MediaDelivery> {
-    return this.finish(new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache" }));
+    return this.finish(new Headers({ "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" }));
   }
 }
 

@@ -92,6 +92,8 @@ export class RemoteContinuation extends BridgeClient implements LaneContinuation
           return { ok: false, error: CONTINUATION_ERRORS.notFound(), unanswered: [] };
         case "conflict":
           return { ok: false, error: CONTINUATION_ERRORS.endpointConflict(), unanswered: [] };
+        case "too_large":
+          return { ok: false, error: CONTINUATION_ERRORS.stateTooLarge(), unanswered: [] };
         case "unavailable":
           return unavailable;
       }

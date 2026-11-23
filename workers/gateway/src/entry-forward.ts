@@ -98,6 +98,7 @@ const DROPPED_REQUEST = new Set([
   "upgrade",
   "host",
   "content-length",
+  "content-encoding",
   "forwarded",
   "via",
   "x-real-ip",

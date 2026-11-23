@@ -18,6 +18,9 @@
  *   Chat and Responses request is sent with (docs/relay-request-changes.md: no vendor-side storage under a relay's
  *   account).
  *
+ * `set_member /metadata/user_id` is the stand-in an entry writes for a Claude Code user id before the hop to a relay's
+ * VM, a string of at most 256 bytes; gray-lane-verify 1.5.0 and earlier refuse it, so they fail such a receipt.
+ *
  * `remove_member /provider` takes out the customer's routing preference stated in the body (docs/design/one-address.md),
  * which the gateway reads and the vendor would refuse; it was added after gray-lane-verify 1.0.0, whose copy of this
  * policy refuses it, so that verifier fails such a receipt rather than passing it.
@@ -136,6 +139,12 @@ const STREAM_OPTIONS_ON = { kind: "const", value: { include_usage: true } } as c
 /** D129: a Codex route's upstream request streams (the only form chatgpt.com's Codex backend takes); no OpenAI stack request is stored. */
 const STREAM_ON = { kind: "const", value: true } as const;
 const STORE_OFF = { kind: "const", value: false } as const;
+/**
+ * The stand-in an entry writes for a Claude Code `metadata.user_id` before the hop to a relay's VM (gateway
+ * `lane/claude-code-user-id.ts`): a JSON object's text, `{"device_id":<64 hex>,"account_uuid":"","session_id":<uuid>}`
+ * with an optional `"parent_session_id":<uuid>`, 209 bytes at most.
+ */
+const CLAUDE_CODE_USER_ID = { kind: "string", min_bytes: 1, max_bytes: 256, forbid_control: true } as const;
 
 const RAW_POLICY: unknown = {
   id: "gray-lane-rewrites-v1",
@@ -149,6 +158,7 @@ const RAW_POLICY: unknown = {
       { op: "set_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "insert_member", path: "/max_tokens", value: OUTPUT_CAP },
       { op: "remove_member", path: "/metadata/user_id" },
+      { op: "set_member", path: "/metadata/user_id", value: CLAUDE_CODE_USER_ID },
     ],
     open_ai_chat: [
       { op: "set_member", path: "/model", value: MODEL_STRING },

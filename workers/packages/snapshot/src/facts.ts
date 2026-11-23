@@ -108,6 +108,8 @@ export interface ModelLimits {
   readonly window: number | null;
   readonly maxOutput: number | null;
   readonly longestOutput: number | null;
+  /** Input token threshold above which the vendor applies long-context tiered pricing (from catalog overrides); omitted/null when flat. */
+  readonly longContextThreshold?: number | null;
 }
 
 /** `ModelLimits` of one model, as the snapshot carries them (by model, in byte order). */

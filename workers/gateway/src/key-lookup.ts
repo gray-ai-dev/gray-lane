@@ -19,6 +19,8 @@ export interface KeyLookup {
   readonly source: SnapshotSource;
   readonly background: (p: Promise<unknown>) => void;
   readonly outbound: Outbound;
+  /** Confidential entry container logs are readable outside the VM (`public_logs`): omit raw error messages. */
+  readonly lane?: boolean;
 }
 
 export type Looked =
@@ -81,7 +83,11 @@ export async function checkStaleKey(looked: Looked, keyRevoked: KeyRevocationChe
     const home = workspaceHome(looked.snapshot, key.workspaceId);
     revoked = await d.outbound.run(() => keyRevoked(key.workspaceId, home, key.keyId));
   } catch (error) {
-    console.error(JSON.stringify({ level: "error", event, message: error instanceof Error ? error.message : String(error) }));
+    const line =
+      d.lane === true
+        ? { level: "error", event, code: error instanceof Error ? error.name : "error" }
+        : { level: "error", event, message: error instanceof Error ? error.message : String(error) };
+    console.error(JSON.stringify(line));
     throw new ApiError(503, "auth_snapshot_expired").withRetryAfter(2n);
   }
   if (revoked) throw new ApiError(401, "api_key_revoked");
