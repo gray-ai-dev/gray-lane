@@ -127,6 +127,9 @@ export const STACK_LAYOUT = deepFreeze({
     // relay-outbound-only §3.9: a stack VM has no public name and no ACME (gray-acme refuses each of these in its
     // self-signed mode; the entrypoint refuses TLS_DOMAIN).
     "TLS_DOMAIN", "ACME_DIRECTORY_URLS", "ACME_DIRECTORY_URL", "ACME_STATE_DIR", "ACME_EMAIL", "ACME_EAB_KID", "ACME_EAB_HMAC_KEY",
+    // docs/design/entry-replicas.md ER5: the entrypoint gives gray-acme a replica's name and its dns-01 socket itself;
+    // ACME_DNS01_RESOLVERS is the simulator's DNS server, never a release's (app-compose.mjs FORBIDDEN_ENV_NAMES).
+    "TLS_REPLICA_DOMAIN", "ACME_DNS01_SOCKET", "ACME_DNS01_RESOLVERS",
   ],
   /** The compose project name app-compose.mjs's layouts use. */
   composeName: "gray-lane",
@@ -210,8 +213,11 @@ export const STACK_LAYOUT = deepFreeze({
     egress: {
       restart: "unless-stopped",
       entrypoint: ["/usr/local/bin/gray-egress"],
-      // S17: the budget (192 MiB) and Go's soft limit (288 MiB), fixed; deploy/tee/compose.stack.yaml names
-      // the measurement they come from.
+      // S17: the stack budget (192 MiB) and Go's soft limit (288 MiB), fixed; deploy/tee/compose.stack.yaml names
+      // the measurement they come from. There is no -max-inflight-body-bytes: with -relay-listen and -memory-limit
+      // egress defaults the in-flight body budget to what the limit leaves, 288 - 192 - 32 MiB of headroom = 64 MiB.
+      // Deployed Phase-1 relay kits (1.4.5) hold a stack's egress command to this exact list, so a change here
+      // makes their pull-token service refuse the compose (app_compose_refused).
       command: ["-socket", `${EGRESS_MOUNT}/egress.sock`, "-max-body-bytes", "4194304", "-relay-listen", `${EGRESS_ADDRESS}:${EGRESS_RELAY_PORT}`, "-stack-max-bytes", "201326592", "-memory-limit", "301989888",
         "-sign-in-key-dir", SIGN_IN_KEY_MOUNT, "-sign-in-bundle", SIGN_IN_BUNDLE],
       user: "10002:10002",
@@ -310,10 +316,13 @@ export const STACK_LAYOUT = deepFreeze({
    * relay stack VM is never an entry (section 4.6), so its lane never routes to other relays' VMs.
    * docs/design/entry-replicas.md ER2: nor an entry replica's (app-compose.mjs `REPLICA_PATTERN_ENV` and `REPLICA_ENV`):
    * the replicas' name pattern and a replica's index name an entry, and a stack VM has no public name.
+   * docs/design/one-address.md: nor the API Worker's origin and forward key (app-compose.mjs `API_FORWARD_ENVS`): only
+   * the entry forwards to and from the API Worker.
    */
   entryEnvironment: [
     "LANE_PEERS", "PEER_PROBE_MS", "PEER_DOWN_MS", "PEER_DOWN_MAX_MS", "PEER_RECHECK_MS", "PEER_RENEW_MS", "PEER_CALL_MS", "PEER_FOLLOW_UP_MS",
     "TLS_REPLICA_DOMAIN_PATTERN", "LANE_REPLICA",
+    "API_ORIGIN", "LANE_API_FORWARD_PUBLIC_KEY",
   ],
   /** S4: the relay's environment (also in `fixed.relay`). */
   relay: { environment: RELAY_ENVIRONMENT },
@@ -364,3 +373,22 @@ export const STACK_LAYOUT = deepFreeze({
 } as const);
 
 export type StackLayout = typeof STACK_LAYOUT;
+
+/**
+ * P2c-2: the problem with lane's `kmsUrlName` value, or null. It is https://<host>[:port][/path] without credentials,
+ * query or fragment (the form deploy/tee/bin/kms-lease.mjs dials), never a reserved .invalid host. app-compose.mjs's
+ * `--kms-url` and its stack gate use this function too.
+ */
+export function kmsUrlProblem(text: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return "is not a URL";
+  }
+  if (url.protocol !== "https:" || url.hostname === "" || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return "is not https://<host>[:port][/path] without credentials, query or fragment";
+  }
+  if (url.hostname.endsWith(".invalid")) return "names a reserved .invalid host";
+  return null;
+}

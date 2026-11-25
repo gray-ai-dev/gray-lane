@@ -214,10 +214,16 @@ func (h *stackHold) free() { h.shrink(h.bytes) }
 
 var errStackBudget = errors.New("egress stack budget exceeded")
 
+// heldBodyChunkBytes is the read buffer of a chunked relay body. It is inside the call's share of the budget:
+// serveRelay takes relayCallBytes, forward's copy buffer among it, before it reads the body, and the read buffer is
+// dropped before forward makes its copy buffer, so the one share covers both. It is no larger than that buffer.
+const heldBodyChunkBytes = forwardBufferBytes
+
 // readHeldBody reads a relay call's body under both the stack budget and the
 // global in-flight body budget: a declared length is taken whole before the
 // read, a chunked body as its buffer grows (doubling, or exactly what is needed
-// when doubling does not fit). The buffer's capacity is what both holds cover.
+// when doubling does not fit). The buffer's capacity is what both holds cover;
+// a chunked body's read buffer is in the call's own share (heldBodyChunkBytes).
 // The errors are readRequestBody's, plus errStackBudget and errBodyBudgetExceeded.
 func readHeldBody(r *http.Request, max int64, hold *stackHold, global *bodyHold) ([]byte, int64, error) {
 	if r.Body == nil || r.ContentLength == 0 {
@@ -239,7 +245,7 @@ func readHeldBody(r *http.Request, max int64, hold *stackHold, global *bodyHold)
 		return body[:n], int64(n), err
 	}
 	var body []byte
-	chunk := make([]byte, 32*1024)
+	chunk := make([]byte, heldBodyChunkBytes)
 	for {
 		n, err := r.Body.Read(chunk)
 		if int64(len(body)+n) > max {

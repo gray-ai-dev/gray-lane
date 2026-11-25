@@ -35,6 +35,7 @@
     "@gray/translation": "0.0.0",
     "@gray/verifier": "0.0.0",
     "@noble/hashes": "1.8.0",
+    "@simplewebauthn/server": "14.0.3",
     "fastest-levenshtein": "1.0.16",
     "hono": "4.13.12",
     "ipaddr.js": "2.5.0",

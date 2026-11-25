@@ -169,6 +169,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Alias, LineCounter, isScalar, isSeq, parseDocument } from "yaml";
 import { SETTINGS } from "../../workers/packages/config/src/index.ts";
+// The stack layout's environment rules (allowed_envs, the interpolations, the names no stack service sets and their
+// formats) come from @gray/lane-compose's layout, the one source both stack gates read. layout.ts imports nothing, so
+// it loads in a checkout that installed only deploy/tee, unlike the policy below.
+import { STACK_LAYOUT, kmsUrlProblem } from "../../workers/packages/lane-compose/src/layout.ts";
 import { PEER_TUNABLE_NAMES } from "./bin/entrypoint.mjs";
 
 // S7: the stack layout's final gate is `@gray/lane-compose`, the policy the relay's pull-token service
@@ -260,6 +264,12 @@ export const SERVICE_KEYS = Object.freeze([
   "image", "restart", "depends_on", "ports", "entrypoint", "command", "environment", "volumes",
   "read_only", "tmpfs", "cap_drop", "security_opt", "ulimits",
 ]);
+/**
+ * The lane runs the image's own entrypoint (bin/entrypoint.mjs), which renders the config and starts gray-acme and
+ * workerd. An entrypoint or command on lane would run something else under the measured image, so lane has neither.
+ * egress and peerlink run other binaries of the image and set theirs.
+ */
+export const LANE_SERVICE_KEYS = Object.freeze(SERVICE_KEYS.filter((key) => key !== "entrypoint" && key !== "command"));
 
 /**
  * D94: these names may never be set by a measured service (the rendered config is fixed). D133: nor
@@ -448,8 +458,9 @@ export const STACK_PRE_LAUNCH_PATH = join(here, "pre-launch.stack.sh");
  * identity, which pre-launch validates and measures into RTMR3 before lane reads its relay id
  * (STACK_INTERPOLATIONS). The relay's registry login uses the pull token (§4), never env. relay-outbound-only §3.9:
  * no EAB (gray-acme is self-signed in this layout) and no GRAY_STACK_TLS_DOMAIN (the VM has no public name).
+ * @gray/lane-compose's `STACK_LAYOUT.allowedEnvs` is the list.
  */
-export const STACK_ALLOWED_ENVS = Object.freeze(["LANE_BRIDGE_KEY_SEED", ...REGISTRY_ENVS, "GRAY_STACK_RELAY_ID", "GRAY_STACK_TOKEN_URL", "GRAY_STACK_RELAY_KEY"]);
+export const STACK_ALLOWED_ENVS = Object.freeze([...STACK_LAYOUT.allowedEnvs]);
 
 /** S2: the stack's services (D133 merged acme into lane). `relay` is the only one that runs the relay's image. */
 export const STACK_SERVICE_NAMES = Object.freeze(["egress", "isolation-check", "lane", "peerlink", "relay"]);
@@ -531,7 +542,9 @@ export const STACK_FIXED = Object.freeze({
   egress: Object.freeze({
     restart: "unless-stopped",
     entrypoint: ["/usr/local/bin/gray-egress"],
-    // S17: the budget and Go's soft limit, fixed (compose.stack.yaml names the measurement).
+    // S17: the stack budget and Go's soft limit, fixed (compose.stack.yaml names the measurement). No
+    // -max-inflight-body-bytes: with -relay-listen egress defaults it to 288 - 192 - 32 = 64 MiB, and the command
+    // stays the one deployed Phase-1 relay kits (1.4.5) accept.
     command: ["-socket", "/run/gray/egress.sock", "-max-body-bytes", "4194304", "-relay-listen", "10.231.11.2:8080", "-stack-max-bytes", "201326592", "-memory-limit", "301989888",
       "-sign-in-key-dir", SIGN_IN_KEY_MOUNT, "-sign-in-bundle", SIGN_IN_BUNDLE],
     user: "10002:10002",
@@ -641,17 +654,29 @@ export const STACK_VOLUMES = Object.freeze({
   [SIGN_IN_CA_VOLUME]: {},
 });
 
-/** S8/S4: the seed's interpolation. */
-const STACK_SEED_EXPRESSION = "${LANE_BRIDGE_KEY_SEED:-}";
-/** S54: the identity's one interpolation (relay-outbound-only §3.9 removed the TLS name's), exactly this expression. */
-export const STACK_RELAY_ID_EXPRESSION = "${GRAY_STACK_RELAY_ID:?the relay identity is missing}";
+/**
+ * D17, S8/S4: the bridge seed's name and its one form in either layout, `${LANE_BRIDGE_KEY_SEED:-}`: the seed comes
+ * from the encrypted env, so a literal seed (or any other spelling) never enters a measured compose (checkSeed).
+ */
+export const SEED_ENV = STACK_LAYOUT.seed.name;
+export const SEED_EXPRESSION = STACK_LAYOUT.seed.expression;
+const SEED_PATH = `services.lane.environment.${SEED_ENV}`;
 /**
  * S4/S8/S54: every interpolation the stack compose may hold, by path: lane's seed and the identity's relay id
- * (@gray/lane-compose `STACK_LAYOUT.interpolations`).
+ * (@gray/lane-compose `STACK_LAYOUT.interpolations`, the list).
  */
-export const STACK_INTERPOLATIONS = Object.freeze({
-  "services.lane.environment.LANE_BRIDGE_KEY_SEED": STACK_SEED_EXPRESSION,
-  "services.lane.environment.LANE_STACK_RELAY_ID": STACK_RELAY_ID_EXPRESSION,
+export const STACK_INTERPOLATIONS = Object.freeze({ ...STACK_LAYOUT.interpolations });
+/** S54: the identity's one interpolation (relay-outbound-only §3.9 removed the TLS name's), exactly this expression. */
+export const STACK_RELAY_ID_EXPRESSION = STACK_INTERPOLATIONS["services.lane.environment.LANE_STACK_RELAY_ID"];
+/**
+ * D17, D133, ER2: every interpolation the default compose may hold, by path, each exactly its expression: lane's bridge
+ * seed, the two EAB names and an entry replica's index (REPLICA_EXPRESSION, which `--tls-replica-domain-pattern` adds).
+ * Any other `$` would let the host's encrypted env change what the measured bytes run.
+ */
+export const DEFAULT_INTERPOLATIONS = Object.freeze({
+  [SEED_PATH]: SEED_EXPRESSION,
+  ...Object.fromEntries(EAB_ENVS.map((name) => [`services.lane.environment.${name}`, `\${${name}:-}`])),
+  [`services.lane.environment.${REPLICA_ENV}`]: REPLICA_EXPRESSION,
 });
 /** relay-outbound-only §3.2: the stack lane's default entry list (--peer-entries), lower-case DNS names, comma-separated. */
 export const PEER_ENTRIES_ENV = "LANE_PEER_ENTRIES";
@@ -683,9 +708,12 @@ const LAYOUT_SPECS = Object.freeze({
     preLaunchPath: PRE_LAUNCH_PATH,
     services: SERVICE_NAMES,
     topLevelKeys: TOP_LEVEL_KEYS,
-    serviceKeys: (name) => (name === PEERLINK_SERVICE ? ENTRY_PEERLINK_KEYS : SERVICE_KEYS),
+    serviceKeys: (name) => (name === PEERLINK_SERVICE ? ENTRY_PEERLINK_KEYS : name === "lane" ? LANE_SERVICE_KEYS : SERVICE_KEYS),
     ports: SERVICE_PORTS,
     allowedEnvs: ALLOWED_ENVS,
+    interpolations: DEFAULT_INTERPOLATIONS,
+    interpolationWho: "the measured compose",
+    interpolationRefs: "D17/D133/ER2",
     identityNames: "TLS_DOMAIN, LANE_BRIDGE_URL, KEYSET_NOT_AFTER, LANE_RELEASE_PUBLIC_KEY, LANE_RELEASE_FRESHNESS_PUBLIC_KEY",
     certsBind: undefined,
     vaultBind: undefined,
@@ -703,6 +731,9 @@ const LAYOUT_SPECS = Object.freeze({
     // relay-outbound-only O1: no stack service publishes a port.
     ports: Object.freeze(Object.fromEntries(STACK_SERVICE_NAMES.map((name) => [name, Object.freeze([])]))),
     allowedEnvs: STACK_ALLOWED_ENVS,
+    interpolations: STACK_INTERPOLATIONS,
+    interpolationWho: "the stack",
+    interpolationRefs: "S4/S8/S54",
     identityNames: "LANE_BRIDGE_URL, KEYSET_NOT_AFTER, LANE_RELEASE_PUBLIC_KEY, LANE_RELEASE_FRESHNESS_PUBLIC_KEY, LANE_PEER_ENTRIES (--peer-entries)",
     certsBind: undefined,
     vaultBind: VAULT_BIND_PATH,
@@ -907,7 +938,11 @@ function mountsOf(service, serviceName, label, problems) {
           const type = item.get("type");
           const target = scalarText(item.get("target")) ?? "";
           if (type === "tmpfs") tmpfs.push(target);
-          else mounts.push({ source: scalarText(item.get("source")) ?? "", target, readOnly: item.get("read_only") === true });
+          // A long-form bind is a host path whatever its source spells (compose resolves `certs` against the project
+          // directory), so it is marked and held to the bind rule like a short-form `/path`.
+          else if (type === "bind" || type === "volume") {
+            mounts.push({ source: scalarText(item.get("source")) ?? "", target, readOnly: item.get("read_only") === true, bind: type === "bind" });
+          } else problems.push(`${label}: ${serviceName} has a long-form volume of type ${JSON.stringify(type ?? null)}; the measured compose mounts only named volumes, tmpfs and the allowed binds`);
           continue;
         }
         problems.push(`${label}: ${serviceName} has a volume entry this checker cannot inspect`);
@@ -1025,7 +1060,7 @@ function checkVolumesAndPorts(services, data, spec, problems) {
     mounts.set(name, found);
     for (const mount of found.mounts) {
       const source = mount.source;
-      if (source.startsWith("/") || source.startsWith(".") || source.startsWith("~")) {
+      if (mount.bind === true || source.startsWith("/") || source.startsWith(".") || source.startsWith("~")) {
         const guestAgent = name === "lane" && source === "/var/run/dstack.sock" && mount.target === "/var/run/dstack.sock";
         // S2a, D133: the stack's ACME account directory, read-write on lane only, at /certs only.
         const certs = spec.certsBind !== undefined && source === spec.certsBind && mount.target === CERTS_MOUNT
@@ -1530,6 +1565,25 @@ function checkStackNetworks(data, label, problems) {
   }
 }
 
+/**
+ * D94, default layout: a top-level named volume is plain (docker's own storage, like lane-certs) or the in-memory form
+ * the socket volumes use (ENTRY_TMPFS_VOLUME), exactly. Any other definition can back a name with a host path
+ * (`driver_opts: {type: none, o: bind, device: /host/dir}`), another driver or an external volume, which the bind rule
+ * on the services' mounts would not see.
+ */
+export const ENTRY_TMPFS_VOLUME = Object.freeze({ driver: "local", driver_opts: Object.freeze({ type: "tmpfs", device: "tmpfs" }) });
+
+function checkEntryVolumes(data, label, problems) {
+  const volumes = data.get("volumes");
+  if (!isMap(volumes)) return;
+  for (const [name, definition] of volumes) {
+    const plain = definition === null || (isMap(definition) && definition.size === 0);
+    if (!plain && !sameValue(definition, ENTRY_TMPFS_VOLUME)) {
+      problems.push(`${label}: top-level volume '${String(name)}' is ${canonicalJson(plainValue(definition))}; a named volume is plain or exactly ${canonicalJson(ENTRY_TMPFS_VOLUME)}, never a host path, another driver or an external volume (D94)`);
+    }
+  }
+}
+
 /** D63/S2a: the stack's top-level volumes are exactly the egress socket's tmpfs. */
 function checkStackVolumes(data, label, problems) {
   const volumes = data.get("volumes");
@@ -1539,27 +1593,48 @@ function checkStackVolumes(data, label, problems) {
 }
 
 /**
- * S4/S8/S54: lane's bridge seed and the identity's two values are the only interpolations in the stack's file,
- * each exactly its expression at its place (STACK_INTERPOLATIONS). Any other `$` would let the host's encrypted
- * env change what the measured bytes run, so it is refused in every key and value.
+ * S4/S8/S54 (stack), D17/D133/ER2 (default): the layout's interpolations (`spec.interpolations`: the bridge seed, and
+ * the identity's relay id in the stack, the EAB and a replica's index in the default layout) are the only ones in the
+ * file, each exactly its expression at its place. Any other `$` would let the host's encrypted env change what the
+ * measured bytes run, so it is refused in every key and value.
  */
-function checkStackInterpolation(data, label, problems) {
+function checkInterpolation(data, spec, problems) {
+  const { label, interpolations, interpolationWho: who, interpolationRefs: refs } = spec;
   const walk = (value, path) => {
     if (isMap(value)) {
       for (const [key, member] of value) {
         const keyText = String(key);
-        if (keyText.includes("$")) problems.push(`${label}: ${[...path, keyText].join(".")} has a '$' in its key; the stack allows no interpolation there (S8)`);
+        if (keyText.includes("$")) problems.push(`${label}: ${[...path, keyText].join(".")} has a '$' in its key; ${who} allows no interpolation there (S8)`);
         walk(member, [...path, keyText]);
       }
     } else if (isList(value)) {
       value.forEach((member, index) => walk(member, [...path, String(index)]));
     } else if (typeof value === "string" && value.includes("$")) {
-      if (STACK_INTERPOLATIONS[path.join(".")] !== value) {
-        problems.push(`${label}: ${path.join(".")} interpolates '${value}'; the stack allows only ${Object.entries(STACK_INTERPOLATIONS).map(([at, expression]) => `${at}: "${expression}"`).join(", ")} (S4/S8/S54)`);
+      if (interpolations[path.join(".")] !== value) {
+        problems.push(`${label}: ${path.join(".")} interpolates '${value}'; ${who} allows only ${Object.entries(interpolations).map(([at, expression]) => `${at}: "${expression}"`).join(", ")} (${refs})`);
       }
     }
   };
   walk(data, []);
+}
+
+/**
+ * D17, S4/S8: lane's bridge seed is exactly SEED_EXPRESSION in either layout, and no other service names it. The `$`
+ * rule above only sees values with a `$`: a literal seed has none, and it would put the secret in the measured,
+ * public compose.
+ */
+function checkSeed(services, label, problems) {
+  for (const [name, service] of services) {
+    if (!isMap(service)) continue;
+    const environment = environmentOf(service);
+    if (name === "lane") {
+      if (environment.get(SEED_ENV) !== SEED_EXPRESSION) {
+        problems.push(`${label}: lane must set ${SEED_ENV}: "${SEED_EXPRESSION}"; the bridge seed comes from the encrypted env and is never a measured literal (D17, S8)`);
+      }
+    } else if (environment.has(SEED_ENV)) {
+      problems.push(`${label}: ${name} sets ${SEED_ENV}; only lane takes the bridge seed, from the encrypted env (D17, S8)`);
+    }
+  }
 }
 
 function isPlaceholderText(text) {
@@ -1684,10 +1759,11 @@ export function checkCompose(composeText, options = {}) {
     checkStackUsers(parsed.services, label, problems);
     checkStackNetworks(parsed.data, label, problems);
     checkStackVolumes(parsed.data, label, problems);
-    checkStackInterpolation(parsed.data, label, problems);
     checkStackNotEntry(parsed.services, label, problems);
+    checkStackEnvironmentNames(parsed.services, label, problems);
   } else {
     checkImages(parsed.services, images, options, problems);
+    checkEntryVolumes(parsed.data, label, problems);
     checkEntryPeers(parsed.services, label, problems);
     checkEntryRoutes(parsed.services, label, problems);
     checkEntryPeerlink(parsed.services, label, problems);
@@ -1703,6 +1779,8 @@ export function checkCompose(composeText, options = {}) {
       }
     }
   }
+  checkInterpolation(parsed.data, spec, problems);
+  checkSeed(parsed.services, label, problems);
   checkIdentity(parsed.services, parsed.data, options, spec, problems);
   checkSchedulerPick(parsed.services, label, problems);
   checkReleaseKeys(parsed.services, options, label, problems);
@@ -1758,23 +1836,10 @@ function addListLineAfter(composeText, anchor, item, flag) {
 }
 
 /**
- * `--kms-url` and the gate's LANE_KMS_URL: https://<host>[:port][/path] without credentials, query or fragment (the form
- * kms-lease.mjs dials), never a reserved .invalid host. Returns the problem, or null.
+ * `--kms-url` and the gate's LANE_KMS_URL take @gray/lane-compose's `kmsUrlProblem` form (the relay's policy holds lane's
+ * LANE_KMS_URL to the same one): https://<host>[:port][/path] without credentials, query or fragment (the form
+ * kms-lease.mjs dials), never a reserved .invalid host.
  */
-function kmsUrlProblem(text) {
-  let url;
-  try {
-    url = new URL(text);
-  } catch {
-    return "is not a URL";
-  }
-  if (url.protocol !== "https:" || url.hostname === "" || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
-    return "is not https://<host>[:port][/path] without credentials, query or fragment";
-  }
-  if (url.hostname.endsWith(".invalid")) return "names a reserved .invalid host";
-  return null;
-}
-
 function validateKmsUrl(text, flag) {
   const problem = kmsUrlProblem(text);
   if (problem !== null) throw new Error(`${flag} '${text}' ${problem} (the KMS of the app's measured key provider)`);
@@ -2217,20 +2282,51 @@ function checkEntryReplica(services, label, problems) {
   return true;
 }
 
-/** Routing PR 9, relay-stack layout: lane sets no entry setting: a relay stack VM is never an entry (section 4.6). */
+/**
+ * Routing PR 9, relay-stack layout: lane sets no entry setting: a relay stack VM is never an entry (section 4.6). The
+ * names are @gray/lane-compose's `STACK_LAYOUT.entryEnvironment`, which the relay's policy refuses too; every entry
+ * setting this file names is among them (checked when the module loads).
+ */
 function checkStackNotEntry(services, label, problems) {
   const lane = services.get("lane");
   if (!isMap(lane)) return;
   const environment = environmentOf(lane);
-  for (const name of ENTRY_ENVS) {
-    if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry's setting: a relay stack VM is never an entry (routing PR 9)`);
+  for (const name of STACK_LAYOUT.entryEnvironment) {
+    if (!environment.has(name)) continue;
+    if (REPLICA_ENVS.includes(name)) problems.push(`${label}: lane sets ${name}, an entry replica's setting: a relay stack VM is never an entry and has no public name (entry-replicas ER2)`);
+    else if (API_FORWARD_ENVS.includes(name)) problems.push(`${label}: lane sets ${name}, an entry's setting: only the entry forwards to and from the API Worker (one-address)`);
+    else problems.push(`${label}: lane sets ${name}, an entry's setting: a relay stack VM is never an entry (routing PR 9)`);
   }
-  for (const name of REPLICA_ENVS) {
-    if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry replica's setting: a relay stack VM is never an entry and has no public name (entry-replicas ER2)`);
+}
+
+/**
+ * D94, relay-stack layout: no stack service sets a name of @gray/lane-compose's `STACK_LAYOUT.forbiddenEnvironment`, the
+ * list the relay's policy refuses. The names with a check of their own here (KEYSET_SUBJECT, LANE_KEY_ID and the ACME
+ * settings of a self-signed lane) are reported there; every name FORBIDDEN_ENV_NAMES refuses in the default layout is
+ * on the list (checked when the module loads).
+ */
+const STACK_OWN_ENV_CHECKS = Object.freeze(["KEYSET_SUBJECT", "LANE_KEY_ID", ...STACK_ACME_FORBIDDEN, ...FORBIDDEN_ENV_NAMES]);
+function checkStackEnvironmentNames(services, label, problems) {
+  for (const name of STACK_SERVICE_NAMES) {
+    const service = services.get(name);
+    if (!isMap(service)) continue;
+    const environment = environmentOf(service);
+    for (const key of STACK_LAYOUT.forbiddenEnvironment) {
+      if (!STACK_OWN_ENV_CHECKS.includes(key) && environment.has(key)) {
+        problems.push(`${label}: ${name} sets ${key}, which no stack service sets (@gray/lane-compose STACK_LAYOUT.forbiddenEnvironment, D94)`);
+      }
+    }
   }
-  for (const name of API_FORWARD_ENVS) {
-    if (environment.has(name)) problems.push(`${label}: lane sets ${name}, an entry's setting: only the entry forwards to and from the API Worker (one-address)`);
-  }
+}
+
+// C-4: the stack gate and @gray/lane-compose refuse the same names. A name this file refuses on a stack lane that the
+// layout's lists do not hold would pass the relay's policy, so the module refuses to load instead.
+for (const [list, names] of [
+  ["entryEnvironment", [...ENTRY_ENVS, ...REPLICA_ENVS, ...API_FORWARD_ENVS]],
+  ["forbiddenEnvironment", STACK_OWN_ENV_CHECKS],
+]) {
+  const missing = names.filter((name) => !STACK_LAYOUT[list].includes(name));
+  if (missing.length > 0) throw new Error(`@gray/lane-compose STACK_LAYOUT.${list} lacks ${missing.join(", ")}, which app-compose.mjs refuses on a stack service`);
 }
 
 /**

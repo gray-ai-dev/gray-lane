@@ -3,7 +3,7 @@ import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type Locati
 import { workspaceHome } from "./account.ts";
 import type { KeyRevocationCheck } from "./key-lookup.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
-import { endingWith, entryServesChain, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
+import { endingWith, entryAnswerUsable, entryServesChain, entryUnreachable, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
 import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
 import {
@@ -2492,6 +2492,9 @@ export class InferenceRun {
       authFailed: attempt.status === 401 || attempt.status === 403,
       quotaExhausted: attempt.status === 402,
       overloaded: attempt.status === 503 || attempt.status === 529,
+      // A 4xx the classifier read as the supplier's (its own credit or key refused in the body, a route fault) still
+      // cools the account; one it read as the customer's request refused does not (AF-19).
+      supplierFailure: outcome.kind === "supplier_failure",
     });
     const previous = this.lanePrevious.get(serving.relayId);
     if (previous === undefined) this.lanePrevious.set(serving.relayId, [{ account_id: serving.accountId, outcome: word }]);
@@ -3037,11 +3040,20 @@ export class InferenceRun {
     let answer: Response;
     try {
       headers.set(API_FORWARD_HEADER, await entry.mark({ method: this.request.method, host: target.host, pathAndQuery: `${target.pathname}${target.search}` }, this.deps.clock()));
-      answer = await entry.fetch(new Request(target, { method: this.request.method, headers, body: payload, ...(payload instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit));
+      // Not followed (`redirect: "manual"`), and ended with the client's request (docs/cloudflare-native.md 5.6).
+      answer = await entry.fetch(
+        new Request(target, { method: this.request.method, headers, body: payload, redirect: "manual", signal: this.request.signal, ...(payload instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit),
+      );
     } catch (error) {
       bodyDone();
       console.error(JSON.stringify({ level: "error", event: "lane_entry_unreachable", request_id: this.requestId, error: error instanceof Error ? error.message : String(error) }));
-      return this.refuse(new ApiError(502, "upstream_unavailable").withMessage("Gray could not reach its confidential entry for this request. You are not charged for it; retry."), "preference");
+      return this.refuse(entryUnreachable(), "preference");
+    }
+    if (!entryAnswerUsable(answer)) {
+      bodyDone();
+      await answer.body?.cancel().catch(() => undefined);
+      console.error(JSON.stringify({ level: "error", event: "lane_entry_unreachable", request_id: this.requestId, status: answer.status }));
+      return this.refuse(entryUnreachable(), "preference");
     }
     // Its place in the count is given back once, by whoever took the request's end (`forwarded`, or `record` before it).
     const counted = this.forwarded();
@@ -8715,7 +8727,11 @@ export class InferenceRun {
     until: number,
     laneBefore: { readonly receiptId: string | null; readonly forwardedDraft: LaneReceiptDraft | null },
   ): Promise<SendResult | null> {
+    // The retry is planned before the first call is let go: a plan that fails leaves that call, its answer, inner
+    // receipt and trace as they were, and the attempt is settled on its own answer.
     if (attempt.peer !== undefined) {
+      const retryPlan = this.stackAttemptPlan(route, o);
+      if (!retryPlan.ok || retryPlan.peers === undefined) return null;
       const previous = attempt.peer;
       previous.close();
       const idx = this.peerCalls.indexOf(previous);
@@ -8724,20 +8740,18 @@ export class InferenceRun {
       this.peerHopEvents.delete(previous);
       this.peerRid = null;
       this.peerHops.clear();
-      const retryPlan = this.stackAttemptPlan(route, o);
-      if (!retryPlan.ok || retryPlan.peers === undefined) return null;
       attempt.zdrExpansion = retryPlan.expansion ?? undefined;
       attempt.peer = this.peerCall(retryPlan, attempt, o);
       return await this.send(o, prepared, attempt, until);
     }
     if (attempt.stack !== undefined) {
+      const retryPlan = this.stackAttemptPlan(route, o);
+      if (!retryPlan.ok || retryPlan.config === null) return null;
       const previous = attempt.stack;
       this.ctx.waitUntil(previous.close());
       const idx = this.stackCalls.indexOf(previous);
       if (idx >= 0) this.stackCalls.splice(idx, 1);
       this.laneStackExpansions.delete(previous);
-      const retryPlan = this.stackAttemptPlan(route, o);
-      if (!retryPlan.ok || retryPlan.config === null) return null;
       attempt.zdrExpansion = retryPlan.expansion ?? undefined;
       attempt.stack = this.stackCall(retryPlan, attempt, o);
       return await this.send(o, prepared, attempt, until);

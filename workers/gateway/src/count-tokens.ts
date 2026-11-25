@@ -15,7 +15,7 @@ import {
   type ClassifyContext,
   type Origins,
 } from "@gray/errors";
-import { type Json, type JsonObject, cloneJson, get, isObject, parseStrictBytes, readSerdeBytes, setMember, toJsonString } from "@gray/json";
+import { type Json, type JsonObject, get, isObject, parseStrictBytes, readSerdeBytes, setMember, toJsonString } from "@gray/json";
 import {
   applyDeclaredChanges,
   checkOfficialUpstream,
@@ -31,6 +31,7 @@ import { newRequestId } from "@gray/ledger-keys";
 import { requestLimit } from "@gray/limits";
 import {
   COUNT_REPLY_LIMIT,
+  Overlay,
   ProtocolError,
   countOverlay,
   countReply,
@@ -50,7 +51,7 @@ import { readBody, type Body } from "./body.ts";
 import { RequestBudget } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, platformTimers } from "./client.ts";
 import { openCredential } from "./crypto.ts";
-import { endingWith, entryServesNative, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
+import { endingWith, entryAnswerUsable, entryServesNative, entryUnreachable, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { GateCapacity, type GateVerdict } from "./gate.ts";
 import type { GatewayDeps, Served } from "./inference.ts";
 import { checkStaleKey, type KeyLookup } from "./key-lookup.ts";
@@ -914,7 +915,9 @@ export class CountTokensRun {
       return { kind: "pass" };
     }
 
-    const cloned = cloneJson(value) as JsonObject;
+    // End-user identifiers never reach the provider (docs/api-provider-standard.en.md 2.3): Anthropic's
+    // `metadata.user_id` is taken out, and `metadata` with it when it held nothing else, as on generation.
+    const cloned = new Overlay().withoutEndUserIds(this.protocol, value).apply(value) as JsonObject;
     const overlay = countOverlay(this.protocol, cloned, route.record.upstreamModel);
     if (overlay !== undefined) {
       setMember(cloned, overlay[0], overlay[1]);
@@ -988,6 +991,9 @@ export class CountTokensRun {
     if (this.protocol === "anthropic_messages") {
       const grayOps: GrayRewriteOp[] = [{ op: "set_member", path: "/model", value: route.record.upstreamModel }];
       if (statedProvider) grayOps.push({ op: "remove_member", path: "/provider" });
+      // The end-user identifier is a declared removal, as on the lane relay path and on generation.
+      const metadata = get(value, "metadata");
+      if (isObject(metadata) && Object.hasOwn(metadata, "user_id")) grayOps.push({ op: "remove_member", path: "/metadata/user_id" });
       const applied = applyDeclaredChanges(received, "anthropic_messages", { grayOps, appends: [] });
       if (!applied.ok) {
         return {
@@ -1562,6 +1568,9 @@ export class CountTokensRun {
             authFailed: status === 401 || status === 403,
             quotaExhausted: status === 402,
             overloaded: status === 503 || status === 529,
+            // Only a refusal every provider would give is the customer's (`countStep`): anything else that goes to the
+            // next route is the account's or its route's, and still cools it (AF-19).
+            supplierFailure: step !== "rejected",
           });
           this.recordLanePrevious(laneContext.relayId, laneContext.accountId, word);
           if (step === "rejected") {
@@ -1870,13 +1879,16 @@ export class CountTokensRun {
         API_FORWARD_HEADER,
         await entry.mark({ method: this.request.method, host: target.host, pathAndQuery: `${target.pathname}${target.search}` }, this.deps.clock()),
       );
-      answer = await entry.fetch(new Request(target, { method: this.request.method, headers, body: received }));
+      // Not followed (`redirect: "manual"`), and ended with the client's request (docs/cloudflare-native.md 5.6).
+      answer = await entry.fetch(new Request(target, { method: this.request.method, headers, body: received, redirect: "manual", signal: this.request.signal }));
     } catch (error) {
       console.error(JSON.stringify({ level: "error", event: "lane_entry_unreachable", request_id: this.requestId, ...failureNames(error) }));
-      return this.renderError(
-        new ApiError(502, "upstream_unavailable").withMessage("Gray could not reach its confidential entry for this request. You are not charged for it; retry."),
-        "preference",
-      );
+      return this.renderError(entryUnreachable(), "preference");
+    }
+    if (!entryAnswerUsable(answer)) {
+      await answer.body?.cancel().catch(() => undefined);
+      console.error(JSON.stringify({ level: "error", event: "lane_entry_unreachable", request_id: this.requestId, status: answer.status }));
+      return this.renderError(entryUnreachable(), "preference");
     }
     this.forwarded = true;
     this.rateOpen = false;

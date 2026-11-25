@@ -4,14 +4,15 @@
  *
  * Request: `model`; `input` (a string, strings, one token array or token arrays; at most 2,048
  * inputs, none empty, token arrays of at most 32,768 u32 ids); optional `encoding_format` and
- * `dimensions`; `user` dropped. Bound: token arrays exactly, a string by its UTF-8 length plus 32
+ * `dimensions`; `user`, `safety_identifier` and `metadata` dropped (OPENAI_LINKING_FIELDS, as the other APIs drop
+ * them; docs/design/standard-media-at-entry.md clause 11.2). Bound: token arrays exactly, a string by its UTF-8 length plus 32
  * tokens of template overhead. A batch whose honest answer could exceed the response limit is
  * refused before dispatch. Response: one embedding per input of the asked encoding and width, usage
  * counters that agree. The model the answer names is not read: an upstream can print any name, and an
  * upgraded model answers under a new one (main 2c165fb7, the owner's rule of 2026-10-16).
  */
 import { ApiError } from "@gray/errors";
-import { ZERO_COUNTERS } from "@gray/protocol";
+import { OPENAI_LINKING_FIELDS, ZERO_COUNTERS } from "@gray/protocol";
 import { type Json, type JsonObject, get, isObject } from "@gray/json";
 import { type Billed, UsageError, apiError, checkMetered, invalid, jsonModel, metered, missing, optionalCounter, capabilityUnproved, preferProvingAll } from "./common.ts";
 import type { ApiRequest, MediaRoute, Received } from "./types.ts";
@@ -33,7 +34,7 @@ const ITEM_BYTES = 128n;
 /** The envelope around the data: `object`, `model` and `usage`. */
 const ENVELOPE_BYTES = 4096n;
 
-const FIELDS = ["model", "input", "encoding_format", "dimensions", "user"];
+const FIELDS = ["model", "input", "encoding_format", "dimensions"];
 
 /** Most model widths cached in one isolate (bounds global WIDTHS memory). */
 export const MAX_WIDTH_ENTRIES = 1024;
@@ -86,14 +87,13 @@ export function decodeEmbeddings(received: Received, responseBytes: number): Api
   };
 }
 
-/** `read`: the body readied for forwarding (`user` and unset options dropped). Throws the client error code as a string. */
+/** `read`: the body readied for forwarding (the linking fields and unset options dropped). Throws the client error code as a string. */
 function read(value: Json): [JsonObject, Expected] {
   if (!isObject(value)) throw "invalid_protocol_request";
-  if (Object.keys(value).some((k) => !FIELDS.includes(k))) throw "unsupported_request_field";
   const fields: JsonObject = {};
-  for (const key of Object.keys(value)) fields[key] = value[key] as Json;
-  const user = fields.user;
-  delete fields.user;
+  for (const key of Object.keys(value)) if (!OPENAI_LINKING_FIELDS.includes(key)) fields[key] = value[key] as Json;
+  if (Object.keys(fields).some((k) => !FIELDS.includes(k))) throw "unsupported_request_field";
+  const user = value.user;
   if (user !== undefined && typeof user !== "string" && user !== null) throw "invalid_protocol_request";
   for (const key of ["encoding_format", "dimensions"]) if (Object.hasOwn(fields, key) && fields[key] === null) delete fields[key];
   return [fields, expectedOf(fields)];

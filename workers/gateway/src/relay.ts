@@ -925,7 +925,9 @@ export interface PrimeInput {
    * When the first bytes after the headers must have come (epoch ms), if earlier than the deadline:
    * the server's `first_bytes_by` (GRAY_UPSTREAM_ATTEMPT_SECONDS), which the dispatch rules set for an
    * attempt another operator's attempt could follow. Silence after the first bytes is bounded by
-   * `silenceMs` alone: a reasoning model whose first content comes late is not cut.
+   * `silenceMs` alone: a reasoning model whose first content comes late is not cut. Keep-alives are
+   * not the first bytes, and before the commit they are silence: neither ends this bound nor puts off
+   * `silenceMs`.
    */
   readonly firstBytesBy?: number;
   readonly silenceMs: number;
@@ -971,6 +973,19 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
   // ANSWER_HELD_MAX_BYTES; tests that prime one stream alone may leave it out (only the answer limit then).
   const heldLimit = input.heldLimit ?? Number.MAX_SAFE_INTEGER;
   let received = 0;
+  /**
+   * When the answer last moved (its headers, before any): a frame other than a keep-alive came, or the
+   * frame being assembled grew. Keep-alives are no progress: before the commit they neither end the
+   * first bytes' bound nor put off the silence limit, so an upstream that sends only keep-alives fails
+   * over like one that sends nothing (CI-35). `answered`: some answer byte has come; `receivedAtProgress`:
+   * the bytes read by then, so a silence after keep-alives says so.
+   */
+  let progressAt = clock();
+  let answered = false;
+  let receivedAtProgress = 0;
+  /** What was taken as answer and was being assembled before the last chunk was decoded. */
+  let answerBefore = 0;
+  let partialBefore = 0;
   /** What priming holds is let go: the attempt ended before its commit. */
   const forget = (): void => {
     input.retained?.set("frame", 0);
@@ -1094,13 +1109,23 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
       const ended = take(events, frame, false);
       if (ended !== null) return ended;
     }
+    // The last chunk moved the answer when it completed an answer frame or grew the frame being assembled;
+    // one made only of keep-alives did not.
+    if (heldAnswer > answerBefore || frames.length > partialBefore) {
+      progressAt = clock();
+      answered = true;
+      receivedAtProgress = received;
+    }
+    answerBefore = heldAnswer;
+    partialBefore = frames.length;
     // A frame still arriving is part of the answer, and no larger.
     if (frames.length > frameLimit) return overLimit("upstream_frame_limit", frameLimit, `a frame passed its limit of ${frameLimit} bytes`);
     const over = weighed();
     if (over !== null) return over;
     const code = received === 0 ? "upstream_stream_empty" : "upstream_stream_incomplete";
-    const until = received === 0 && input.firstBytesBy !== undefined ? Math.min(input.deadline, input.firstBytesBy) : input.deadline;
-    const next = await upstream.next(until, input.silenceMs);
+    const until = !answered && input.firstBytesBy !== undefined ? Math.min(input.deadline, input.firstBytesBy) : input.deadline;
+    // The silence limit runs from the answer's last progress, not from the last keep-alive.
+    const next = await upstream.next(until, Math.max(0, progressAt + input.silenceMs - clock()));
     if (next.kind === "left") {
       upstream.cancel();
       forget();
@@ -1135,11 +1160,16 @@ export async function primeStream(input: PrimeInput): Promise<PrimeEnd> {
     }
     if (next.kind === "broken") return failed("transport", code, "the upstream connection broke before the stream committed", true);
     // The silence limit, the first bytes' bound or the deadline.
+    const keptAlive = received > receivedAtProgress;
     const why =
       next.kind === "silence"
-        ? "the upstream was silent past its limit before the stream committed"
+        ? keptAlive
+          ? "the upstream sent only keep-alives past its silence limit before the stream committed"
+          : "the upstream was silent past its limit before the stream committed"
         : until < input.deadline
-          ? "the upstream sent nothing by the attempt's bound for its first bytes"
+          ? keptAlive
+            ? "the upstream sent only keep-alives by the attempt's bound for its first bytes"
+            : "the upstream sent nothing by the attempt's bound for its first bytes"
           : "the request deadline passed before the stream committed";
     const timedOut = failed("timeout", code, why, true);
     return next.kind === "deadline" && received > 0 ? { ...timedOut, cutByDeadline: true } : timedOut;

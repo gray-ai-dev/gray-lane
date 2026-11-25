@@ -72,6 +72,10 @@ const COMMIT_HEX = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MEASUREMENT_HEX = /^[0-9a-f]{96}$/;
 /** `name@sha256:<64 hex>`: a digest, never a tag (app-compose.mjs, `@gray/lane-compose`). */
 const PINNED_IMAGE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]*@sha256:[0-9a-f]{64}$/;
+/** Relay integration standard version (`<major>.<minor>`, e.g. `4.3`). */
+const STANDARD_VERSION = /^[0-9]{1,4}\.[0-9]{1,4}$/;
+/** Strict semver for gray-assistant (`major.minor.patch`, optional pre-release/build). */
+const KIT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /** S11a/S55: the public parts of a relay-stack compose, which every relay's token service checks against. */
 export interface ReleaseStack {
@@ -90,6 +94,10 @@ export interface ReleaseEntry {
   readonly stack: ReleaseStack | null;
   /** P6: the measured app-compose text, whose SHA-256 is `compose_hash`; null when the list does not publish it. */
   readonly app_compose: string | null;
+  /** Minimum relay integration standard version required before moving a VM onto this release; null when unrestricted. */
+  readonly min_standard?: string | null;
+  /** Minimum gray-assistant kit semver required before moving a VM onto this release; null when unrestricted. */
+  readonly min_kit?: string | null;
 }
 
 export interface OsImageEntry {
@@ -190,8 +198,16 @@ function parseReleases(value: Json | undefined, problems: ReleaseListProblem[]):
     if (appCompose !== null && sha256BareHex(utf8Bytes(appCompose)) !== composeHash) {
       problems.push({ path: `${path}.app_compose`, message: "its SHA-256 is not compose_hash" });
     }
+    const minStandard = optionalString(entry, "min_standard", path, problems);
+    if (minStandard !== null && !STANDARD_VERSION.test(minStandard)) {
+      problems.push({ path: `${path}.min_standard`, message: "not a standard version (<major>.<minor>)" });
+    }
+    const minKit = optionalString(entry, "min_kit", path, problems);
+    if (minKit !== null && (minKit.length > 80 || !KIT_VERSION.test(minKit))) {
+      problems.push({ path: `${path}.min_kit`, message: "not a kit semver (<major>.<minor>.<patch>)" });
+    }
     seen.add(composeHash);
-    out.push({ compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack, app_compose: appCompose });
+    out.push({ compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack, app_compose: appCompose, min_standard: minStandard, min_kit: minKit });
   }
   return out;
 }

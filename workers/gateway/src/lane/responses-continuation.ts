@@ -716,8 +716,8 @@ export function expandZeroRetentionContinuation(input: ExpandZeroRetentionInput)
       if (sanitized.item !== null) pushBounded(sanitized.item);
     }
     delete expanded.previous_response_id;
-    const currentInstructions = get(expanded, "instructions");
-    if ((currentInstructions === undefined || currentInstructions === null) && typeof sealedParent.instructions === "string") {
+    // Only an omitted `instructions` inherits the parent's: an explicit `null` clears them and is sent as the client wrote it.
+    if (!Object.hasOwn(expanded, "instructions") && typeof sealedParent.instructions === "string") {
       if (maxBytes !== undefined) {
         runningBytes += utf8Length(toJsonString(sealedParent.instructions)) + 16;
         if (runningBytes > maxBytes) throw new ExpandedBodyTooLargeError(maxBytes);

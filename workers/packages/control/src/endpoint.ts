@@ -153,6 +153,9 @@ export const MAX_OUTPUT_OVERHEAD_TOKENS = 65_536;
 export const MODEL_ID_RULE = "A model ID starts with a letter or digit and uses only letters, digits and . _ : @ + / -, at most 256 characters.";
 export const PROMPT_OVERHEAD_RULE = "The hidden prompt allowance is a whole number of tokens from 4096 to 65536.";
 export const OUTPUT_OVERHEAD_RULE = "The output allowance is a whole number of tokens from 1 to 65536.";
+/** The most mappings one endpoint may hold: a check run covers at most this many (console verification `MAX_MAPPINGS`). */
+export const MAX_ENDPOINT_MAPPINGS = 32;
+export const MAPPINGS_RULE = `An endpoint holds at most ${MAX_ENDPOINT_MAPPINGS} model mappings. Register the other models on another endpoint with the same base URL and credential.`;
 export const NATIVE_PATH_TEMPLATE =
   'A native request path cannot contain "{" or "}": Gray sends the path exactly as written and fills in no placeholder. Write the upstream model ID into the path, for example /v1beta/models/gemini-2.5-flash:generateContent for a Gemini mapping.';
 /** Why registration refuses a Gemini mapping's native path that names no model and generation method (lib.rs `GEMINI_PATH_RULE`). */
@@ -420,6 +423,8 @@ export function requiredCredentialOf(c: EndpointConfig): string | null {
  */
 export function validateEndpoint(c: EndpointConfig, credential?: string | null): void {
   validateEndpointShape(c);
+  // Registration only: the shape a stored endpoint keeps has no cap, so one saved before it stays recoverable.
+  if (c.mappings.length > MAX_ENDPOINT_MAPPINGS) throw new InvalidConfig(MAPPINGS_RULE);
   if (c.auth === "lane_relay") {
     validateLaneEndpoint(c, credential ?? null);
   } else if (c.lane !== null) {

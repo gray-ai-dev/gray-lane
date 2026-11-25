@@ -2,7 +2,7 @@ import { asArray, asStr, compareUtf8, get, isObject, JsonError, parseSerdeBytes,
 import type { Class } from "./classify.ts";
 import { B, D, DOT, LINE_START, NOT_S, S } from "./rust-regex.ts";
 import { spanMs } from "./span.ts";
-import { accountState, providerMessage, retryDelay, rustF64, rustTrim, type HeaderReader } from "./upstream.ts";
+import { accountState, firstItem, providerMessage, retryDelay, rustF64, rustTrim, type HeaderReader } from "./upstream.ts";
 
 /**
  * How long a route that failed rests, by why it failed (crates/gray-gateway/src/rests.rs; docs/runtime-operations.md,
@@ -432,11 +432,6 @@ function serdeValue(body: Uint8Array): Json | undefined {
     if (error instanceof JsonError) return undefined;
     throw error;
   }
-}
-
-/** A body Google's OpenAI-compatible endpoint wraps in an array, as its first item (`items.first().unwrap_or(value)`). */
-function firstItem(value: Json): Json {
-  return Array.isArray(value) && value.length > 0 ? (value as readonly Json[])[0]! : value;
 }
 
 /**

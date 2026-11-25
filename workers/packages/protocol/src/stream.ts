@@ -651,6 +651,7 @@ export class ProtocolStreamDecoder {
   /** A call's id or name, kept from its first statement on: its string, once. */
   private identity(current: string | null, merged: string | null): void {
     if (current === null && merged !== null) this.kept += PROJECTION_NODE_BYTES.string + stringHeapBytes(merged);
+    else if (current === "" && merged !== null && merged !== "") this.kept += stringHeapBytes(merged) - stringHeapBytes("");
   }
 
   /** The output item or content block at `i` is now `item`. */
@@ -1187,7 +1188,7 @@ export class ProtocolStreamDecoder {
           tool.textHeap += heap;
           this.kept += heap;
         }
-        keep.push({ ...event, id: event.id ?? tool.id, name: event.name ?? tool.name });
+        keep.push({ ...event, id: identityOf(event.id, tool.id), name: identityOf(event.name, tool.name) });
       } else if (event.type === "tool_call_complete") {
         const tool = this.tool(event.index);
         const [id, name] = [tool.id, tool.name];
@@ -1208,7 +1209,7 @@ export class ProtocolStreamDecoder {
         tool.textHeap = 0;
         tool.initialHeap = 0;
         tool.completeHeap = heap;
-        keep.push({ ...event, id: event.id ?? tool.id, name: event.name ?? tool.name });
+        keep.push({ ...event, id: identityOf(event.id, tool.id), name: identityOf(event.name, tool.name) });
       } else {
         keep.push(event);
       }
@@ -1253,12 +1254,24 @@ function cutAtOutputLimit(protocol: Protocol, native: Json | undefined): boolean
   }
 }
 
+/**
+ * A call's id or name merged with what a later fragment says. An empty string says nothing, as a
+ * null does: Chat relays repeat `"id": ""` or `"name": ""` on continuation chunks of a call whose
+ * first chunk named it. A non-empty value fills an empty one; two different non-empty values for
+ * the same index fail the stream.
+ */
 function mergeIdentity(current: string | null, incoming: string | null, protocol: Protocol, field: string): string | null {
-  if (incoming === null) return current;
-  if (current !== null && current !== incoming) {
+  if (incoming === null || incoming === current) return current;
+  if (incoming === "") return current ?? incoming;
+  if (current !== null && current !== "") {
     throw streamState(protocol, `conflicting ${field} for the same index`);
   }
   return incoming;
+}
+
+/** What a fragment's event carries as its call's id or name: the merged one when the fragment says nothing. */
+function identityOf(own: string | null, merged: string | null): string | null {
+  return own === null || own === "" ? merged : own;
 }
 
 /**

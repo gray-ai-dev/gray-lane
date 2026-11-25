@@ -47,7 +47,8 @@ const (
 
 	// -max-inflight-body-bytes bounds total request body bytes buffered concurrently across all paths (/route/,
 	// vendor, peer, control and relay-stack). Unset (0) it defaults to 128 MiB (capped to -memory-limit when set
-	// lower, and floored at max(-max-body-bytes, -route-max-body-bytes)).
+	// lower, or with -relay-listen to what -memory-limit leaves beside -stack-max-bytes and its headroom, and
+	// floored at max(-max-body-bytes, -route-max-body-bytes)).
 	defaultMaxInflightBodyBytes = int64(128 << 20)
 	maxMaxInflightBodyBytes     = int64(1 << 30)
 
@@ -99,10 +100,10 @@ const (
 
 	defaultStackMaxBytes = int64(192 << 20)
 	maxStackMaxBytes     = int64(1 << 30)
-	// stackMemoryHeadroomCap caps the minimum Go runtime and non-stack headroom required above
-	// -stack-max-bytes when both -relay-listen and -memory-limit are set (headroom is
-	// min(stackMaxBytes/4, stackMemoryHeadroomCap), i.e. 32 MiB at the 192 MiB default, matching
-	// compose.stack.yaml's 288 MiB limit with comfortable margin).
+	// stackMemoryHeadroomCap caps the Go runtime headroom required above -stack-max-bytes and the in-flight
+	// body budget when both -relay-listen and -memory-limit are set (headroom is
+	// min(stackMaxBytes/4, stackMemoryHeadroomCap), i.e. 32 MiB at the 192 MiB default). compose.stack.yaml's
+	// 288 MiB limit is exactly 192 MiB of stack budget, 64 MiB of in-flight bodies and this headroom.
 	stackMemoryHeadroomCap = int64(32 << 20)
 
 	defaultStackMaxRequests = 1024
@@ -289,6 +290,8 @@ func (c config) largestBodyBytes() int64 {
 // inflightBodyBudget is the global cap on concurrently buffered request bodies across all paths.
 // When -max-inflight-body-bytes is unset (0), it defaults to 128 MiB, capped to -memory-limit
 // when that is lower, and floored at largestBodyBytes so at least one legal request always fits.
+// With -relay-listen the default is also capped to what -memory-limit leaves beside the stack
+// budget and its headroom (stackMemoryBytes), so the unset flag never adds up past the limit.
 func (c config) inflightBodyBudget() int64 {
 	if c.maxInflightBodyBytes > 0 {
 		return c.maxInflightBodyBytes
@@ -297,7 +300,19 @@ func (c config) inflightBodyBudget() int64 {
 	if c.memoryLimit > 0 && c.memoryLimit < budget {
 		budget = c.memoryLimit
 	}
+	if c.relayListen != "" && c.memoryLimit > 0 {
+		budget = min(budget, c.memoryLimit-c.stackMemoryBytes())
+	}
 	return max(budget, c.largestBodyBytes())
+}
+
+// stackMemoryBytes is what the relay-stack path needs under -memory-limit besides the in-flight body
+// budget: -stack-max-bytes and the runtime's headroom above it. The two budgets are separate pools: the
+// stack budget holds registrations, answers and feeds that the body budget never sees, and the vendor,
+// /peer/ and control paths hold bodies only in the body budget, so both can be full at once. A relay
+// call's body is in both, which only makes the sum an upper bound.
+func (c config) stackMemoryBytes() int64 {
+	return c.stackMaxBytes + min(c.stackMaxBytes/4, stackMemoryHeadroomCap)
 }
 
 // stackAppendLimits are the S18 check's append limits from the flags.
@@ -479,12 +494,14 @@ func (c config) validate() error {
 			return errors.New("memory-limit must be 0 or at least max-inflight-body-bytes")
 		}
 	}
-	// On the relay-stack path, -memory-limit must also leave headroom above -stack-max-bytes for the Go
-	// runtime and non-stack buffers (login calls, account tests, control pushes).
+	// On the relay-stack path, -memory-limit must hold -stack-max-bytes, the in-flight body budget beside it
+	// (the vendor, /peer/, control, login and account-test bodies, which the stack budget does not count) and
+	// headroom for the Go runtime (stackMemoryBytes).
 	if c.relayListen != "" && c.memoryLimit != 0 {
 		headroom := min(c.stackMaxBytes/4, stackMemoryHeadroomCap)
-		if c.memoryLimit < c.stackMaxBytes+headroom {
-			return fmt.Errorf("memory-limit with -relay-listen must be 0 or at least stack-max-bytes plus %d bytes headroom", headroom)
+		if need := c.stackMemoryBytes() + c.inflightBodyBudget(); c.memoryLimit < need {
+			return fmt.Errorf("memory-limit with -relay-listen must be 0 or at least %d: stack-max-bytes, the in-flight body budget (%d) and %d bytes headroom",
+				need, c.inflightBodyBudget(), headroom)
 		}
 	}
 	for _, suffix := range c.routeDenySuffixes {

@@ -1,4 +1,5 @@
 import type { GatewayConfig } from "@gray/config";
+import { ApiError } from "@gray/errors";
 import { API_FORWARD_HEADER, API_FORWARD_KEY_ID, apiForwardSeed, checkForwardMark, ENTRY_FORWARD_HEADER, forwardMarkKeys, signForwardMark, VIA_ENTRY_HEADER, type ForwardMarkTarget } from "@gray/lane-wire";
 import type { Protocol } from "@gray/protocol";
 import { entryEndpointRoute, entryTranslationTargets, laneServedKey } from "@gray/snapshot";
@@ -169,6 +170,20 @@ export function forwardedAnswer(answer: Response, onEnd: () => void = () => {}):
   if (answer.body === null) onEnd();
   const body = answer.body === null ? null : endingWith(answer.body, onEnd);
   return new Response(body, { status: answer.status, statusText: answer.statusText, headers });
+}
+
+/**
+ * Whether an answer of the entry is one to pass on to the client. A forward to the entry is sent with
+ * `redirect: "manual"`, as a hop to Gray's API is (lane/api-forward.ts): the entry never redirects, so a 3xx, or a status
+ * outside 200-599, is a failed hop, never followed and never passed on.
+ */
+export function entryAnswerUsable(answer: Response): boolean {
+  return answer.status >= 200 && answer.status <= 599 && (answer.status < 300 || answer.status >= 400);
+}
+
+/** What the client is told when the forward to the entry failed or got no answer to pass on: nothing was charged. */
+export function entryUnreachable(): ApiError {
+  return new ApiError(502, "upstream_unavailable").withMessage("Gray could not reach its confidential entry for this request. You are not charged for it; retry.");
 }
 
 /**

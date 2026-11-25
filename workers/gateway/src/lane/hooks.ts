@@ -539,8 +539,25 @@ function addPolicyEvent(builder: ReceiptBuilder, outcome: LanePolicyOutcome): vo
  * The one coarse outcome word a relay's scheduler is told (design v2 §C.10, §D): a closed set of
  * metadata, never a status code or Gray's code, and never anything of the request's content. A
  * success is `ok`; everything else maps by what the relay can act on — its own account's health.
+ *
+ * The vendor's refusal of the customer's own request (`CLIENT_FAULT_STATUSES`) is the account working: it is told
+ * `ok`, so neither the TEE's picker (`@gray/relay-connector` `DEFAULT_OUTCOME_COOLDOWNS_MS`, 10 s for
+ * `upstream_error`) nor the relay cools a healthy account because a client sent a malformed request (AF-19). The
+ * closed set has no word of its own for it, and a new one would break every relay's strict report schema. A caller
+ * whose classifier read such a status as the supplier's failure (`supplierFailure`: a 400 whose body says the
+ * provider's own credit or key was refused, a throttling code on a 4xx) keeps `upstream_error` for it.
  */
-export function laneOutcomeWord(o: { readonly ok: boolean; readonly status: number | null; readonly clientLeft: boolean; readonly timedOut: boolean; readonly rateLimited: boolean; readonly authFailed: boolean; readonly quotaExhausted: boolean; readonly overloaded: boolean }): string {
+export function laneOutcomeWord(o: {
+  readonly ok: boolean;
+  readonly status: number | null;
+  readonly clientLeft: boolean;
+  readonly timedOut: boolean;
+  readonly rateLimited: boolean;
+  readonly authFailed: boolean;
+  readonly quotaExhausted: boolean;
+  readonly overloaded: boolean;
+  readonly supplierFailure?: boolean;
+}): string {
   if (o.ok) return "ok";
   if (o.clientLeft) return "client_left";
   if (o.rateLimited) return "rate_limited";
@@ -548,8 +565,18 @@ export function laneOutcomeWord(o: { readonly ok: boolean; readonly status: numb
   if (o.quotaExhausted) return "quota_exhausted";
   if (o.overloaded) return "overloaded";
   if (o.timedOut) return "timeout";
+  if (o.status !== null && CLIENT_FAULT_STATUSES.has(o.status) && o.supplierFailure !== true) return "ok";
   return "upstream_error";
 }
+
+/**
+ * The statuses a vendor answers a request it refuses as the customer's (@gray/errors `classify`: 400 and 422 a
+ * refusal, 413 a final one, a 404 for what the request referenced): they say nothing of the account's health. 401,
+ * 402, 403 and 429 are the account's, and are mapped above. A plain 404 the classifier reads as the route's (no
+ * mapping for the model at that account) comes with `supplierFailure` and stays `upstream_error`; 405 and 415 are
+ * Gray's request to the route, not the customer's, and stay `upstream_error` too.
+ */
+export const CLIENT_FAULT_STATUSES: ReadonlySet<number> = new Set([400, 404, 413, 422]);
 
 /**
  * The connector's closed error codes (`@gray/relay-connector` `RELAY_CONNECTOR_ERROR_CODES`), copied

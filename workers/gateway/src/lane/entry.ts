@@ -1087,7 +1087,7 @@ function unmatched(request: Request, cfg: GatewayConfig, url: URL, path: string)
 /**
  * The `Allow` header of a mounted entry route for `path`, or null when `path` is not mounted in the active layout:
  * inference and token counting routes (`POST`), mounted standard media routes (`POST` when `endpointRoutes` is active,
- * plus `videos` for `/v1/videos`), mounted video job routes (`GET` when `videos` is active), and model catalog routes
+ * plus `videos` for `/v1/videos`), mounted video job routes (`GET,HEAD` when `videos` is active), and model catalog routes
  * (`GET,HEAD`, excluding `/v1/key` and Gemini RPC suffixes).
  */
 function entryAllowed(path: string, mounted: { readonly endpointRoutes: boolean; readonly videos: boolean }): string | null {
@@ -1096,7 +1096,7 @@ function entryAllowed(path: string, mounted: { readonly endpointRoutes: boolean;
     const api = modelApi("POST", path);
     if (api !== null && entryStandardApi(api) && (api !== "open_ai_videos" || mounted.videos)) return allowOf(["POST"]);
   }
-  if (mounted.videos && entryVideoRoute("GET", path) !== null) return "GET";
+  if (mounted.videos && entryVideoRoute("GET", path) !== null) return allowOf(["GET"]);
   const cat = catalogRoute("GET", path);
   if (cat !== null && cat.kind !== "key" && !(cat.kind === "gemini_model" && path.includes(":"))) return allowOf(["GET"]);
   return null;

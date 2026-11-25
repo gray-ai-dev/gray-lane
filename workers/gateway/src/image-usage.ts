@@ -47,17 +47,21 @@ export function geminiImages(value: Json): boolean {
   return (asArray(get(value, "candidates")) ?? []).some((candidate) => (asArray(get(get(candidate, "content"), "parts")) ?? []).some(image));
 }
 
-/** What `billUnsplitImage` made of the counters: billed at the image price, delivered free, or refused as invalid usage. */
+/** What `billUnsplitImage` made of the counters: billed at the image price, delivered free, refused as invalid usage, or missing the count it bills by. */
 export type UnsplitBilling =
   | { readonly kind: "image_price"; readonly counters: UsageCounters }
   | { readonly kind: "free"; readonly reason: string }
-  | { readonly kind: "invalid"; readonly reason: string };
+  | { readonly kind: "invalid"; readonly reason: string }
+  | { readonly kind: "missing"; readonly reason: string };
 
 /**
  * `counters` of a Gemini answer that carried a generated image its usage `raw` did not count apart, on a route
  * that prices image output tokens, by `policy`: `image_price` bills the visible output (`candidatesTokenCount`)
  * as image output, thoughts staying text output as Google bills them; `free` delivers it at $0. A visible
  * output larger than the billable output is invalid usage, as a counter that is not a non-negative integer is.
+ * Under `image_price` a usage without `candidatesTokenCount` is missing the count it bills by (`usage_missing`, as
+ * a count that is not a number is): it counts the image neither apart nor as visible output, and billing it as 0
+ * image tokens would deliver the image at $0.
  */
 export function billUnsplitImage(counters: UsageCounters, raw: Json, policy: ImageUsageUnsplit): UnsplitBilling {
   const stated = get(raw, "candidatesTokenCount");
@@ -67,6 +71,7 @@ export function billUnsplitImage(counters: UsageCounters, raw: Json, policy: Ima
     if (count === undefined) return { kind: "invalid", reason: "usage.candidatesTokenCount must be a non-negative integer" };
     visible = count;
   }
+  if (policy === "image_price" && (stated === undefined || stated === null)) return { kind: "missing", reason: "the usage has no candidatesTokenCount" };
   if (policy === "free") {
     return { kind: "free", reason: `the answer carried a generated image and its usage counted no image tokens apart (no IMAGE entry in candidatesTokensDetails; candidatesTokenCount ${visible})` };
   }
@@ -147,6 +152,7 @@ export function usageCounters(protocol: Protocol, raw: Json, media: MediaRates, 
   if (!unsplit) return { ok: true, counters, imageUnsplit: false };
   const unsplitBilled = billUnsplitImage(counters, raw, policy);
   if (unsplitBilled.kind === "invalid") return { ok: false, error: { kind: "upstream_usage", reason: unsplitBilled.reason } };
+  if (unsplitBilled.kind === "missing") return { ok: false, error: { kind: "usage_missing", reason: unsplitBilled.reason } };
   if (unsplitBilled.kind === "free") return { ok: false, error: { kind: "image_usage_unsplit", reason: unsplitBilled.reason } };
   return { ok: true, counters: unsplitBilled.counters, imageUnsplit: true };
 }

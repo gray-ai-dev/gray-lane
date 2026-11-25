@@ -516,7 +516,7 @@ export interface RequestRecord {
   readonly startedAt: number;
   readonly finishedAt: number;
   readonly method: string;
-  /** The path as asked; its index row and wide event keep MAX_PATH bytes of it. */
+  /** The path as asked; its index row and wide event keep its route template (`recordedPath`), at most MAX_PATH bytes. */
   readonly path: string;
   /** The generation or model API the client spoke; null for a request no API serves (a listing, a setup route, a 404: public-record.ts). */
   readonly protocol: string | null;
@@ -710,7 +710,7 @@ export function indexRow(r: RequestRecord, result: WriterResult): RequestIndexRo
     ttftMs: r.ttftMs,
     origin: "api",
     method: r.method,
-    path: bounded(r.path, MAX_PATH),
+    path: bounded(recordedPath(r.path), MAX_PATH),
     protocol: r.protocol,
     model: r.model,
     stream: r.stream,
@@ -925,6 +925,76 @@ export function r2Outbox(bucket: ContentBucket): NonNullable<Sinks["outbox"]> {
  * keyless one too, and the request log and the wide event keep this much of it. The routing and the answer see it whole.
  */
 export const MAX_PATH = 512;
+/** What an index row and a wide event record for a path no route of the public API serves (public-record.ts UNMATCHED_PATH). */
+export const RECORDED_UNMATCHED_PATH = "/__unmatched__";
+
+/** The model APIs' paths (apis.ts PATHS, held to MODEL_API_PATHS by test/workerd/public-record.test.ts). */
+const RECORDED_MODEL_API_PATHS = [
+  "/v1/systemone",
+  "/v1/embeddings",
+  "/v1/rerank",
+  "/v1/images/generations",
+  "/v1/images/edits",
+  "/v1/audio/speech",
+  "/v1/audio/transcriptions",
+  "/v1/audio/translations",
+  "/v1/videos",
+];
+
+/** The public paths that name no value: the generation APIs (paths.ts), token counting, the listings (listings.ts) and the model APIs. */
+const RECORDED_STATIC_PATHS: ReadonlySet<string> = new Set([
+  "/v1/chat/completions",
+  "/chat/completions",
+  "/v1/responses",
+  "/responses",
+  "/v1/messages",
+  "/messages",
+  "/v1/messages/count_tokens",
+  "/v1/models",
+  "/models",
+  "/v1beta/models",
+  "/v1/key",
+  ...RECORDED_MODEL_API_PATHS,
+]);
+
+/** Gemini's actions on a model path (paths.ts `servedProtocol`, `countTokensProtocol`). */
+const GEMINI_ACTION = /:(generateContent|streamGenerateContent|countTokens)$/;
+
+/** The setup routes gray-console serves (paths.ts `isSetupPath`); their fixed segments are lower-case words. */
+const SETUP_PREFIXES = ["/v1/setup/", "/v1/provider-setup/", "/v1/lane-stack/"];
+const SETUP_WORD = /^[a-z]+(?:[-.][a-z]+)*$/;
+
+/**
+ * The path an index row and a wide event keep (AF-14b): the route template the path matched, never a value the client
+ * put in it, so a key or token pasted into a URL is not persisted. A model id, a video id or a setup route's id becomes
+ * `:model` or `:id`; a path no public route serves is RECORDED_UNMATCHED_PATH. The routing and the answer see the path whole.
+ *
+ * - The generation, listing and model API paths are kept as they are (RECORDED_STATIC_PATHS).
+ * - `/v1/models/{*id}` is `/v1/models/:model`; `/v1/videos/{id}` and `/v1/videos/{id}/content` name `:id`.
+ * - `/v1beta/models/{model}:{action}` is `/v1beta/models/:model:{action}`, the path without the `models/` segment
+ *   (`/v1beta/{vendor}/{model}:{action}`) is `/v1beta/:model:{action}`, and another `/v1beta/models/...` is `/v1beta/models/:model`.
+ * - A setup path keeps each segment that is a lower-case word (`agent.md`, `pull-token-issues`), as every fixed segment
+ *   of the console's tables is, and names every other segment `:id` (`/v1/provider-setup/endpoints/:id/pause`).
+ */
+export function recordedPath(path: string): string {
+  if (RECORDED_STATIC_PATHS.has(path)) return path;
+  if (path.startsWith("/v1/models/") && path.length > "/v1/models/".length) return "/v1/models/:model";
+  const video = /^\/v1\/videos\/[^/]+(\/content)?$/.exec(path);
+  if (video !== null) return `/v1/videos/:id${video[1] ?? ""}`;
+  if (path.startsWith("/v1beta/") && path.length > "/v1beta/".length) {
+    const action = GEMINI_ACTION.exec(path)?.[1];
+    if (path.startsWith("/v1beta/models/")) return action === undefined ? "/v1beta/models/:model" : `/v1beta/models/:model:${action}`;
+    return action === undefined ? RECORDED_UNMATCHED_PATH : `/v1beta/:model:${action}`;
+  }
+  const prefix = SETUP_PREFIXES.find((p) => path.startsWith(p));
+  if (prefix !== undefined) {
+    const rest = path.slice(prefix.length);
+    if (rest === "") return RECORDED_UNMATCHED_PATH;
+    return prefix + rest.split("/").map((segment) => (segment.length <= 40 && SETUP_WORD.test(segment) ? segment : ":id")).join("/");
+  }
+  return RECORDED_UNMATCHED_PATH;
+}
+
 /** Longest stored session id and user agent, in bytes (crates/gray-gateway/src/request_log/client.rs MAX_SESSION_ID, MAX_USER_AGENT). */
 export const MAX_SESSION_ID = 256;
 export const MAX_USER_AGENT = 1024;
@@ -1664,7 +1734,7 @@ export function wideEvent(r: RequestRecord, result: WriterResult, service: { rea
     request_id: r.requestId,
     origin: "api",
     method: r.method,
-    path: bounded(r.path, MAX_PATH),
+    path: bounded(recordedPath(r.path), MAX_PATH),
     // Optional in the stream: a request no API serves names none.
     ...(r.protocol === null ? {} : { protocol: r.protocol }),
     auth_result: r.authResult,

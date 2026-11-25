@@ -18,10 +18,10 @@
 import { get, isArray, isObject, parseStrict, type Json, type JsonObject } from "@gray/json";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import { STACK_LAYOUT } from "./layout.ts";
+import { kmsUrlProblem, STACK_LAYOUT } from "./layout.ts";
 import { isYamlMap, parseComposeText, type YamlMap, type YamlValue } from "./yaml.ts";
 
-export { STACK_LAYOUT, type StackLayout } from "./layout.ts";
+export { kmsUrlProblem, STACK_LAYOUT, type StackLayout } from "./layout.ts";
 // The strict compose reader, for relay-kit's `upgrade`, which reads the kit's own compose.yaml.
 export { isYamlMap, parseComposeText, type YamlMap } from "./yaml.ts";
 
@@ -75,6 +75,7 @@ const PROBLEM_TEXT = {
   volumes_mismatch: "the service's mounts are not the layout's",
   interpolation_forbidden: "a `$` interpolation other than lane's LANE_BRIDGE_KEY_SEED and EAB expressions and the identity's two (S54, D133)",
   identity_interpolation_mismatch: "lane's LANE_STACK_RELAY_ID is not the layout's interpolation (S54)",
+  seed_not_interpolated: "the bridge seed is missing from lane or is a literal; it is only lane's LANE_BRIDGE_KEY_SEED interpolation (D17, S8)",
   env_passthrough: "an environment name without a value (taken from the host)",
   environment_invalid: "an environment block this policy cannot read (a mapping of names to values)",
   environment_mismatch: "the relay environment must be exactly S4's literals",
@@ -361,8 +362,17 @@ function checkEnvironment(name: string, environment: Map<string, EnvValue>, path
     if ((STACK_LAYOUT.entryEnvironment as readonly string[]).includes(key)) problems.add("entry_environment_forbidden", `${path}.environment.${key}`);
     if (name !== "lane" && (STACK_LAYOUT.releaseKeyEnvs as readonly string[]).includes(key)) problems.add("release_key_invalid", `${path}.environment.${key}`);
   }
+  // D17, S4/S8: lane's bridge seed is exactly the layout's interpolation, and no other service names it. A value with a
+  // `$` that is not the expression is the interpolation rule's, a name without a value env_passthrough's; this refuses
+  // the rest: a missing seed on lane and a literal anywhere, which would put the secret in the measured compose.
+  const seed = environment.get(STACK_LAYOUT.seed.name);
+  const literalSeed = typeof seed === "string" && !seed.includes("$");
+  if (literalSeed || (name === "lane" && seed === undefined)) problems.add("seed_not_interpolated", `${path}.environment.${STACK_LAYOUT.seed.name}`);
   if (name !== "lane") return;
   checkReleaseKeys(environment, path, expect, problems);
+  // P2c-2: lane's KMS URL, when it names one, in the form app-compose.mjs renders (kmsUrlProblem).
+  const kmsUrl = environment.get(STACK_LAYOUT.kmsUrlName);
+  if (typeof kmsUrl === "string" && kmsUrlProblem(kmsUrl) !== null) problems.add("lane_environment_mismatch", `${path}.environment.${STACK_LAYOUT.kmsUrlName}`);
   // S3: lane's client listener is its front address.
   if (environment.get("LISTEN_ADDRESS") !== STACK_LAYOUT.laneListenAddress) {
     problems.add("listen_address_mismatch", `${path}.environment.LISTEN_ADDRESS`);

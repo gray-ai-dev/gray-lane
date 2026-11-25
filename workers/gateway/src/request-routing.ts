@@ -8,6 +8,7 @@
 import {
   confidentialRouting,
   firstChoiceShares,
+  isRoutingRef,
   Preference,
   REQUEST_ROUTING_VERSION,
   workloadCost,
@@ -105,8 +106,8 @@ export interface PreferenceLevelFacts {
   /** Micro-USD per million tokens. */
   readonly maxPrice: { readonly input: number | null; readonly output: number | null } | null;
   /**
-   * The request's `model@pattern`, the request's level alone (`model_tag`): an allow list of its own beside `only`
-   * (`Preference.resolved`), which the record writes as one more entry of `only`, after it.
+   * The request's `model@pattern` or `model@<64-hex>`, the request's level alone (`model_tag`): an allow list of its
+   * own beside `only` (`Preference.resolved`), which the record writes as one more entry of `only`, after it.
    */
   readonly modelTag?: LevelEntry;
 }
@@ -654,17 +655,15 @@ export function routingRecordOrNull(facts: RoutingFacts | null, confidential = f
 // The facts as the request path gathers them (inference.rs `record_facts`, `session_facts`, `preference_levels`).
 // ---------------------------------------------------------------------------------------------
 
-/** A route's or a supplier's reference (64 hex digits); anything else a level's list holds is a tag pattern. */
-const REFERENCE = /^[0-9a-fA-F]{64}$/;
-
 /**
  * The provider preference by level, as the routing record tells it (`preference_levels`): the request's own as it stated
  * it, its key's stored default and its workspace's, each that states one, their lists as written. An entry serves when
  * it names a route of `model` on `protocol`, the request's API, in the snapshot by the route's or its supplier's
- * reference. The pattern of the request's `model@pattern` (`tag`) is the request level's `modelTag`, an allow list of its
- * own as layering has it, which the record writes after what its `provider` states (lead decision r18). A tag pattern
- * always serves (lead decision r18: what it resolves to is not recorded), and carries the references it resolves to
- * against the model's routes as layering resolves it, which tell the record which level's list left a route out.
+ * reference. What follows the `@` of the request's model string (`tag`) is the request level's `modelTag`, an allow list
+ * of its own as layering has it, which the record writes after what its `provider` states (lead decision r18), read as
+ * any list entry is: a 64-hex reference serves as the lists' references do. A tag pattern always serves (lead decision
+ * r18: what it resolves to is not recorded), and carries the references it resolves to against the model's routes as
+ * layering resolves it, which tell the record which level's list left a route out.
  */
 export function preferenceLevels(
   snapshot: Omit<PreferenceSnapshot, "routes"> & { readonly routes: readonly (PreferenceSnapshot["routes"][number] & { readonly protocol?: string })[] },
@@ -695,7 +694,8 @@ export function preferenceLevels(
   const named = new Set(snapshot.routes.filter((r) => r.model === model && r.protocol === protocol).flatMap((r) => [providerRef(r.operator, r.endpointId), supplierRef(r.operator)]));
   const tags = tagsOf(snapshot, model);
   const pattern = (value: string): LevelEntry => ({ value, serves: true, refs: patternRefs(tags, value) });
-  const entries = (list: readonly string[]): LevelEntry[] => list.map((value) => (REFERENCE.test(value) ? { value, serves: named.has(value) } : pattern(value)));
+  const entry = (value: string): LevelEntry => (isRoutingRef(value) ? { value, serves: named.has(value) } : pattern(value));
+  const entries = (list: readonly string[]): LevelEntry[] => list.map(entry);
   return stating.map(([source, level]) => ({
     source,
     only: entries(level.only),
@@ -704,7 +704,7 @@ export function preferenceLevels(
     allowFallbacks: level.allowFallbacks,
     maxPrice: level.maxPrice === null ? null : { input: level.maxPrice.input === null ? null : Number(level.maxPrice.input), output: level.maxPrice.output === null ? null : Number(level.maxPrice.output) },
     // The request's model tag, an allow list of its own beside its `only`.
-    ...(source === "request" && tag !== null ? { modelTag: pattern(tag) } : {}),
+    ...(source === "request" && tag !== null ? { modelTag: entry(tag) } : {}),
   }));
 }
 

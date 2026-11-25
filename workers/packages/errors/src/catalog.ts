@@ -52,7 +52,7 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   [["reservation_cannot_cover_output"], "The input of this request alone reaches the per-request cost limit, so no output could be paid for. Shorten the input.", null],
   [["request_exceeds_cost_ceiling"], "This request could cost more than the per-request cost limit. Lower `max_tokens` or shorten the input.", null],
   [["output_limit_exceeds_reservation"], "`max_tokens` asks for more output than one request may cost at this model's price. Lower `max_tokens`.", null],
-  [["request_body_limit"], "The request body is larger than this API accepts: 32 MB for Anthropic Messages and token counting, 512 MB for OpenAI Chat and Responses, 100 MB for Gemini; the other model APIs take what their provider takes.", null],
+  [["request_body_limit"], "The request body is larger than this request may send: the limit of the API it calls, or a lower one Gray sets where the request is served. Send a smaller body.", null],
   [["request_body_timeout"], "The request body did not arrive in time. Retry the request; on a slow connection, send a smaller one.", null],
   [["request_body_incomplete"], "The request body ended before it was complete. Retry the request.", null],
   [["unsupported_content_encoding"], "The `Content-Encoding` header names an encoding this gateway does not support. Send an uncompressed body, or compress with `gzip` or `deflate`.", null],
@@ -202,7 +202,7 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   // A confidential-lane relay is checked by the lane, never probed (@gray/control LANE_PROBE_RULE).
   [["lane_relay_not_probed"], "A confidential-lane endpoint is verified by attestation and signatures in the lane, not by a console probe or benchmark: it accepts no probe and no benchmark.", null],
   [["provider_probe_price_required"], "This probe needs the provider's price first: its check buys a generation or is billed per unit, and Gray counts every check against the workspace's daily check budget. Send `prices`.", null],
-  [["provider_check_budget_exhausted"], "The workspace's daily check budget cannot cover this probe, so nothing was sent. Raise `check_budget_usd_per_day` in the spec (or in the provider console), or wait until the budget resets at 00:00 UTC. `GET /v1/provider-setup/status` shows what is left.", "provider_setup"],
+  [["provider_check_budget_exhausted"], "The workspace's daily check budget cannot cover this probe, so nothing was sent. If a lower voluntary cap is set below the automatic cap ($2/day minimum, or 1% of the workspace's last 24 hours of billed earnings), raise it up to the automatic cap; otherwise wait until 00:00 UTC or until 24-hour billed earnings grow, or contact Gray operations for a higher floor. `GET /v1/provider-setup/status` shows what is left.", "provider_setup"],
 ];
 
 const TABLE: ReadonlyMap<string, readonly [string, Help | null]> = new Map(ENTRIES.flatMap(([codes, text, help]) => codes.map((code) => [code, [text, help]] as const)));

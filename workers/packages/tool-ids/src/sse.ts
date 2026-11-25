@@ -110,10 +110,15 @@ export function rewriteSseFrame(frame: Uint8Array, rewrite: (data: Uint8Array) =
     return frame.subarray(line.end, line.next);
   };
   const endings = data.map((d) => ending(d.index));
-  const lastEnding = endings[endings.length - 1]!;
+  const firstData = data[0]!.index;
+  // The last data line may be the frame's last line, without an ending. The new data takes the
+  // place of the first data line, so when other lines follow it the new data's last line still
+  // needs an ending of its own, or it would run into the next line ("data: a\nid: 1\ndata: b").
+  const followed = all.some((line, index) => index > firstData && dataValue(frame, line) === null);
+  const lastEnding = endings[endings.length - 1]!.length === 0 && followed ? LF_ONLY : endings[endings.length - 1]!;
   const out: Uint8Array[] = [];
   all.forEach((line, index) => {
-    if (index === data[0]!.index) {
+    if (index === firstData) {
       pieces.forEach((piece, n) => {
         out.push(DATA_PREFIX, piece);
         if (n + 1 === pieces.length) out.push(lastEnding);

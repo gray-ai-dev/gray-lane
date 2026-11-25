@@ -4,14 +4,38 @@
  */
 import { type Json, type JsonObject, asStr, asU64, pointer } from "@gray/json";
 import type { Protocol } from "../types.ts";
+import { billedTokens, reasoningTokens } from "../usage.ts";
 import { type Finish, type Usage, saturatingAdd, saturatingSub } from "./ir.ts";
 
 function n(v: Json, path: string): bigint | undefined {
   return asU64(pointer(v, path));
 }
 
-/** Reads a protocol's raw usage object (as merged over a stream). */
+/**
+ * Reads a protocol's raw usage object (as merged over a stream) with the counters Gray bills
+ * (`billedTokens`, src/usage.ts), so a translated answer reports the usage its request is billed
+ * by: Anthropic's `usage.iterations` when compaction passes exceed the top-level counters,
+ * DeepSeek's `prompt_cache_hit_tokens`, `cache_write_tokens`, Gemini's `toolUsePromptTokenCount`
+ * and a relay's `thinkingTokenCount`. A cache counter the usage does not report and bills as 0
+ * stays unreported. Usage the billing rule calls missing or invalid is read field by field.
+ */
 export function readUsage(protocol: Protocol, raw: Json): Usage {
+  const fields = readFields(protocol, raw);
+  const billed = billedTokens(protocol, raw);
+  if (billed.kind !== "billed") return fields;
+  const t = billed.tokens;
+  const reported = (field: bigint | undefined, value: bigint) => (field === undefined && value === 0n ? undefined : value);
+  return {
+    inputTotal: t.input,
+    cacheRead: reported(fields.cacheRead, t.cache_read),
+    cacheWrite: reported(fields.cacheWrite, t.cache_write),
+    outputTotal: t.output,
+    reasoning: reasoningTokens(protocol, raw) ?? fields.reasoning,
+  };
+}
+
+/** The usage fields of the design's usage mapping, read one by one. */
+function readFields(protocol: Protocol, raw: Json): Usage {
   switch (protocol) {
     case "open_ai_chat":
       return {

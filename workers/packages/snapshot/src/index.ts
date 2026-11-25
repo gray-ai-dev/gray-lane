@@ -27,6 +27,7 @@ export * from "./keys.ts";
 export * from "./model-check-keys.ts";
 export * from "./offers.ts";
 export * from "./publish.ts";
+export * from "./reference-catalog.ts";
 export * from "./rests.ts";
 export * from "./signed.ts";
 export * from "./snapshot.ts";

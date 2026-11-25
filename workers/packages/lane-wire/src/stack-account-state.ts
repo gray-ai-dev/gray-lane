@@ -22,7 +22,8 @@ import type { StackReport, StackReportAccount, StackReportCooling } from "./stac
  * 7. `proxy_failing`: ≥ 5 `proxy` attempts and none `ok` in 15 min.
  * 8. `credential_expiring`: the sealed credential's renewal is overdue (`renewalOverdue`: under a quarter of its sealed
  *    length left, at most 24 h ahead, or ended) and no `ok` agent login covers it; for an account the relay renews in
- *    the VM, only once its token ended (`credentialEndingMs`).
+ *    the VM (by the report's `login`, or on a later boot by the console's memory of it), only once its token ended
+ *    (`credentialEndingMs`).
  * 9. `failing`: ≥ 20 attempts in 1 h, at least half of them failures (FAILURE_CLASSES).
  * 10. `serving`.
  *
@@ -79,18 +80,43 @@ export const RENEWED_IN_VM_GRACE_MS = 15 * 60_000;
 export const renewedInVm = (report: Pick<StackReportAccount, "login">): boolean => report.login?.by === "relay";
 
 /**
+ * What the console remembers of a report in which the relay renews the account in the VM (`renewedInVm`): the sealed
+ * version that report names, else null. Egress keeps `login` in memory only (deploy/tee/egress/signin_session.go), so a
+ * new boot (a release move, a restart) reports none until the relay's software next exchanges a token through the
+ * sign-in proxy; the console keeps this across reports (lane_stack_account_state.renewed_in_vm_version) and hands it
+ * back as `StateInput.renewedInVmVersion`.
+ */
+export const renewedInVmVersion = (report: Pick<StackReportAccount, "sealed" | "login">): number | null =>
+  renewedInVm(report) && report.sealed !== null ? report.sealed.version : null;
+
+/**
+ * Whether the relay renews the account in the VM by the report or by what the console remembers: an earlier report
+ * showed it renewing the credential the VM still holds (`rememberedVersion`, `renewedInVmVersion` of that report, is the
+ * report's sealed version). Egress keeps a refreshed token under the first seal's version, and the vault hands it to
+ * the next boot under the same one; a credential sealed again from the source (a new version) is the source's to renew
+ * until a report shows the relay renewing it again.
+ */
+export function renewedInVmNow(report: Pick<StackReportAccount, "sealed" | "login">, rememberedVersion: number | null): boolean {
+  if (renewedInVm(report)) return true;
+  return rememberedVersion !== null && report.sealed !== null && report.sealed.version === rememberedVersion;
+}
+
+/**
  * When an account's sealed credential ends, if the panel shows it as ending now (`credential_expiring`), else null.
- * `renewalOverdue` for a credential the source renews. For one the relay renews in the VM, only once it ended
- * `RENEWED_IN_VM_GRACE_MS` ago: egress keeps each refreshed token with the first seal's version, so the length
+ * `renewalOverdue` for a credential the source renews. For one the relay renews in the VM (`renewedInVmNow`), only once
+ * it ended `RENEWED_IN_VM_GRACE_MS` ago: egress keeps each refreshed token with the first seal's version, so the length
  * `renewalOverdue` measures from the seal grows with every refresh, a quarter of it outlasts a whole token, and such an
  * account read "expiring" most of the time, with an "Accounts that need attention" alert every few hours (Roteo, kit
- * 1.9.0). Routing reads none of this: the state is the panel's, the alerts' and the setup status's.
+ * 1.9.0). A refresh moves the token's end later, so the account reads as ended only when its token ended and no report
+ * since named a later one. `rememberedVersion` keeps the rule on a new boot whose report has no `login` yet (Roteo,
+ * 2026-11-25: an account read "ends soon" from a release move until its next refresh, six hours ahead). Routing reads
+ * none of this: the state is the panel's, the alerts' and the setup status's.
  */
-export function credentialEndingMs(report: Pick<StackReportAccount, "sealed" | "login">, nowMs: number): number | null {
+export function credentialEndingMs(report: Pick<StackReportAccount, "sealed" | "login">, nowMs: number, rememberedVersion: number | null = null): number | null {
   const sealed = report.sealed;
   if (sealed === null || sealed.expires_at_s === null) return null;
   const endsMs = sealed.expires_at_s * 1000;
-  if (renewedInVm(report)) return endsMs + RENEWED_IN_VM_GRACE_MS <= nowMs ? endsMs : null;
+  if (renewedInVmNow(report, rememberedVersion)) return endsMs + RENEWED_IN_VM_GRACE_MS <= nowMs ? endsMs : null;
   return renewalOverdue(endsMs, sealedAtMs(sealed.version), nowMs) ? endsMs : null;
 }
 
@@ -136,6 +162,11 @@ export interface StateInput {
   readonly absent: StackReport["config"]["absent"];
   readonly attempts: AttemptCounts;
   readonly nowMs: number;
+  /**
+   * The sealed version under which an earlier report showed the relay renewing the account in the VM
+   * (`renewedInVmVersion`, kept by the console across boots); null or absent when none did (`credentialEndingMs`).
+   */
+  readonly renewedInVmVersion?: number | null;
 }
 
 export interface AccountState {
@@ -204,7 +235,7 @@ export function accountStateOf(input: StateInput): AccountState {
   const quarter = input.attempts.quarter;
   if ((quarter.get("proxy") ?? 0) >= PROXY_FAILING_MIN && (quarter.get("ok") ?? 0) === 0) return of("proxy_failing", "proxy_failing");
 
-  const expires = credentialEndingMs(report, nowMs);
+  const expires = credentialEndingMs(report, nowMs, input.renewedInVmVersion ?? null);
   if (expires !== null) return of("credential_expiring", expires <= nowMs ? "credential_expired" : "credential_expiring", expires);
 
   const hour = input.attempts.hour;

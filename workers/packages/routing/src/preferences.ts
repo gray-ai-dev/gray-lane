@@ -89,6 +89,14 @@ const HANDLE = /^[a-z0-9][a-z0-9-]{1,31}$/;
 const SEGMENT = /^[a-z0-9][a-z0-9.-]{0,31}$/;
 const REF = new RegExp(`^[0-9A-Fa-f]{${REF_LEN}}$`);
 
+/**
+ * Whether `text` has the form of a route's or a supplier's reference (REF_LEN hex digits, either case), as a list entry
+ * and the `@` suffix of a model string accept it. An uppercase one has the form but names nothing registered.
+ */
+export function isRoutingRef(text: string): boolean {
+  return REF.test(text);
+}
+
 /** A tag pattern (`TagPattern`): a handle and up to three segments. */
 interface TagPattern {
   readonly handle: string;
@@ -540,8 +548,8 @@ export class Preference {
 
   /**
    * This level with every pattern of its lists resolved against `tags` (`Preference::resolved`), so that layering
-   * and the filters read references alone. `modelTag`, the pattern of a request's `model@pattern`, is one more
-   * allow list on top of every level's.
+   * and the filters read references alone. `modelTag`, what follows the `@` of a request's model string (a pattern,
+   * or a 64-hex reference that stays as written), is one more allow list on top of every level's.
    */
   resolved(modelTag: string | null, tags: Tags): Preference {
     const known = [...this.resolution.known];

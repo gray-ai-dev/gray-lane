@@ -74,7 +74,7 @@ export const RPC_SURFACES = {
     target: "ConfigDO",
     kind: "object",
     callers: ["gateway", "lane-bridge", "console", "jobs"],
-    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain"],
+    calls: ["current", "putDebtMode", "debtMode", "catalog", "ensure", "rebuild", "status", "emergencyRevoke", "tellAgain", "syncReferenceCatalog"],
   },
   configReplica: { callee: "jobs", target: "ConfigReplicaDO", kind: "object", callers: ["gateway", "lane-bridge", "jobs"], calls: ["current", "version", "snapshot", "gatewaySnapshot", "debtMode"] },
   round: {
@@ -131,6 +131,10 @@ export const ADDED_CALLS: Readonly<Record<string, string>> = {
   // An endpoint root whose storage started over asks ConfigDO to tell it its terms again (M12): a gray-jobs of a release
   // before `tellAgain` throws, and the root waits for the hourly re-send as before.
   "config.tellAgain": "gateway/test/workerd/endpoint.test.ts > a root whose storage started over waits for the hourly re-send when gray-jobs is of a release before tellAgain",
+  // An operator's refresh of the live reference catalog (gray-console POST /api/v1/ops/reference-catalog/refresh): a
+  // gray-jobs of a release before `syncReferenceCatalog` throws, and the console answers 503 reference_catalog_unavailable.
+  // The jobs cron's own call goes to its own ConfigDO, which rolls after it: that failure is a warning, tried next minute.
+  "config.syncReferenceCatalog": "console/test/workerd/reference-catalog.test.ts > a gray-jobs of a release before syncReferenceCatalog: 503 reference_catalog_unavailable",
   // The lane bridge asks a lane route's shard to hold its standing permit before the route's first request (M13): a shard
   // of a release before `warm` throws, the bridge answers unavailable, and the lane serves as before (its first request borrows).
   "endpointShard.warm": "lane-bridge/test/workerd/bridge.test.ts > a shard of a release before warm answers that it has no such method: unavailable, and the lane serves as before",

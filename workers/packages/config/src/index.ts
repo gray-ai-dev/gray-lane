@@ -18,6 +18,7 @@
  * Pure code, erasable TypeScript only: loaded by workerd, vitest and Node (deploy checks).
  */
 
+import { DEPOSIT_TEXT_CROSS_CHECKS, depositLedgerProblem, depositSettings, type DepositConfig, type DepositJobsConfig } from "./deposit.ts";
 import { LEDGER_CROSS_CHECKS, ledgerSettings, type LedgerJobsConfig } from "./ledger.ts";
 
 export type WorkerName = "gateway" | "jobs" | "console" | "identity" | "alerts" | "content";
@@ -2525,6 +2526,33 @@ export const SETTINGS: readonly SettingSpec[] = [
       "only. Never a lane relay's route, and never a model check or a verifiable preference.",
   },
   {
+    name: "REFERENCE_CATALOG_URL",
+    key: "referenceCatalogUrl",
+    workers: ["jobs"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || (httpUrlProblem(v) === null && v.startsWith("https://")) ? null : "is not an https URL"),
+    source:
+      "scripts/update-model-catalog.py SOURCE, https://openrouter.ai/api/v1/models?output_modalities=all (the list with non-text models). " +
+      "Empty by default, so local development and the tests never reach OpenRouter; staging and production set it (workers/jobs/wrangler.jsonc).",
+    doc:
+      "Where ConfigDO fetches the reference model catalog it keeps in SNAPSHOT_KV (@gray/snapshot reference-catalog.ts), which gray-jobs and " +
+      "gray-console read in place of the bundled frontend/src/catalog/openrouter-models.json. Empty: no fetch; the bundled copy is served.",
+  },
+  {
+    name: "REFERENCE_CATALOG_SYNC_INTERVAL_MS",
+    key: "referenceCatalogSyncIntervalMs",
+    workers: ["jobs"],
+    type: "int",
+    default: "21600000",
+    min: 60000,
+    max: 86400000,
+    source:
+      "Six hours: the catalog-refresh workflow refreshed the bundled copy once a day, and a model released upstream should be registrable " +
+      "the same day. The minimum keeps a fetch of about 1 MB from every cron minute; the maximum is the daily refresh it replaces.",
+    doc: "How often gray-jobs' cron asks ConfigDO to fetch the reference model catalog again (a failed fetch is tried again after 15 minutes).",
+  },
+  {
     name: "JOBS_LOCATION_HINT",
     key: "jobsLocationHint",
     // The gateway (the snapshot's last source) and the console (publish, operations, the chain reader's
@@ -2900,6 +2928,105 @@ export const SETTINGS: readonly SettingSpec[] = [
     textCheck: walletListProblem,
     source: "GRAY_ADMIN_WALLETS of the server (crates/gray-gateway/src/config/mod.rs:371-376): comma-separated, empty by default (no global admin).",
     doc: "Wallets that become global administrators when they sign in (control_admins). The deploy task also syncs the table to this list.",
+  },
+  {
+    name: "CONSOLE_SIGN_IN",
+    key: "consoleSignIn",
+    workers: ["console"],
+    type: "enum",
+    values: ["moss", "social"],
+    default: "moss",
+    source:
+      "Social sign-in, track A2 (the owner's plan of 2026-11-24, reviewed the same day): the console's pages move from MOSS wallet sign-in to " +
+      "Google, GitHub, e-mail codes and passkeys behind this switch, which production keeps at moss until launch day. The server has only wallet sign-in.",
+    doc:
+      "Which sign-in the console's pages offer (GET /api/v1/config `sign_in.mode`): `moss`, wallet sign-in; `social`, Google, GitHub, e-mail codes " +
+      "and passkeys. The social sign-in routes answer either way once their own settings are made; under `moss` a wallet still counts as a sign-in " +
+      "method a user keeps when removing another.",
+  },
+  {
+    name: "WEBAUTHN_RP_ID",
+    key: "webauthnRpId",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || (v.length <= 253 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(v)) ? null : "is not a lower-case host name"),
+    source:
+      "WebAuthn Level 3, section 5.1.3 (RP ID): a passkey belongs to the RP ID it was registered for, and the browser accepts an RP ID equal to " +
+      "the page's host or a registrable suffix of it. Set explicitly rather than read from ORIGIN (plan review of 2026-11-24, item 10), so a move " +
+      "of the console to another subdomain keeps every passkey. workers/console/src/settings.ts checks it against ORIGIN.",
+    doc:
+      "The WebAuthn relying party id of the console's passkeys: ORIGIN's host or a registrable domain it is under (production: usefallback.com). " +
+      "Stored with each passkey. Empty: passkey routes answer 503.",
+  },
+  {
+    name: "AUTH_EMAIL_FROM",
+    key: "authEmailFrom",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) =>
+      v === "" || (v.length <= 320 && /^([A-Za-z0-9 ._-]{1,64} <)?[A-Za-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}>?$/.test(v) && v.includes("<") === v.endsWith(">"))
+        ? null
+        : "is not an e-mail address or `Name <address>`",
+    source:
+      "Sign-in codes and team invitations go out through Resend's HTTP API (POST https://api.resend.com/emails, resend.com/docs/api-reference, " +
+      "read 2026-11-24) with the secret RESEND_API_KEY, from an address on a sending domain of its own (auth.usefallback.com), so sign-in mail " +
+      "never shares a reputation with relay alerts.",
+    doc:
+      "The sender of sign-in codes and team invitation e-mails, an address or `Name <address>` on a domain verified with Resend (production: " +
+      "`Gray <noreply@auth.usefallback.com>`). Empty, or without the secret RESEND_API_KEY: those e-mails are not sent and their routes answer 503.",
+  },
+  {
+    name: "GOOGLE_OAUTH_CLIENT_ID",
+    key: "googleOauthClientId",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || /^[0-9A-Za-z._-]{1,200}\.apps\.googleusercontent\.com$/.test(v) ? null : "is not a Google OAuth client id"),
+    source:
+      "Google's OpenID Connect sign-in (developers.google.com/identity/openid-connect/openid-connect, read 2026-11-24): the web client's id, " +
+      "which every ID token names as its audience. The client secret is the secret GOOGLE_OAUTH_CLIENT_SECRET.",
+    doc: "The Google OAuth web client id of the console's Google sign-in. Empty, or without GOOGLE_OAUTH_CLIENT_SECRET: Google sign-in answers 503.",
+  },
+  {
+    name: "GITHUB_OAUTH_CLIENT_ID",
+    key: "githubOauthClientId",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || /^[0-9A-Za-z._-]{1,100}$/.test(v) ? null : "is not a GitHub OAuth client id"),
+    source:
+      "GitHub's OAuth app web flow (docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps, read 2026-11-24), with PKCE. " +
+      "The client secret is the secret GITHUB_OAUTH_CLIENT_SECRET.",
+    doc: "The GitHub OAuth app client id of the console's GitHub sign-in. Empty, or without GITHUB_OAUTH_CLIENT_SECRET: GitHub sign-in answers 503.",
+  },
+  {
+    name: "TURNSTILE_SITE_KEY",
+    key: "turnstileSiteKey",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" || /^[0-9A-Za-z_-]{1,100}$/.test(v) ? null : "is not a Turnstile site key"),
+    source:
+      "Cloudflare Turnstile (developers.cloudflare.com/turnstile, read 2026-11-24) in front of the e-mail code's start: the page renders the " +
+      "widget with this public key and the console checks its token with the secret TURNSTILE_SECRET_KEY.",
+    doc:
+      "The Turnstile site key the sign-in page renders before it asks for an e-mail code (GET /api/v1/config). The secret TURNSTILE_SECRET_KEY " +
+      "is required outside DEPLOY_ENV local; locally, without it, the check is skipped.",
+  },
+  {
+    name: "AUTH_PROVIDER_TIMEOUT_MS",
+    key: "authProviderTimeoutMs",
+    workers: ["console"],
+    type: "int",
+    default: "10000",
+    min: 1000,
+    max: 30000,
+    source:
+      "Each call the console makes for a sign-in to Google, GitHub, Resend or Turnstile [estimate: each answers within a few seconds]. Maximum: " +
+      "30 s, past which the browser's sign-in has long given up.",
+    doc: "How long the console waits for one answer of Google, GitHub, Resend or Turnstile during a sign-in; then the sign-in answers 503.",
   },
   {
     name: "ACCESS_TEAM_DOMAIN",
@@ -3442,11 +3569,48 @@ export const SETTINGS: readonly SettingSpec[] = [
     key: "checkWorkspaceDailyMicroUsd",
     workers: ["console"],
     type: "int",
-    default: "5000000",
+    default: "2000000",
     min: 0,
     max: 1_000_000_000_000,
-    source: "GRAY_CHECK_WORKSPACE_DAILY_MICROUSD of the server: $5 a day by default, at most 10^12 (crates/gray-gateway/src/check_budget.rs CheckBudget::new).",
-    doc: "A provider workspace's daily check budget until it sets its own (PUT /api/v1/provider-check-budget).",
+    source:
+      "Default cold-start daily check floor per provider workspace ($2 a day, lowered from $5 in Provider Policy Item 2; at most 10^12). " +
+      "Combined with CHECK_WORKSPACE_REVENUE_BPS, any operator workspace floor override, and the single-check minimum for media and video probes.",
+    doc:
+      "Cold-start minimum daily check budget per provider workspace, in micro-USD. A workspace's automatic cap is the higher of this floor " +
+      "(or an operator floor override) and CHECK_WORKSPACE_REVENUE_BPS of its trailing 24-hour third-party billed supplier payable, with a " +
+      "single-check minimum for media and video probes. PUT /api/v1/provider-check-budget only sets a lower voluntary cap.",
+  },
+  {
+    name: "CHECK_WORKSPACE_REVENUE_BPS",
+    key: "checkWorkspaceRevenueBps",
+    workers: ["console"],
+    type: "int",
+    default: "100",
+    min: 0,
+    max: 10_000,
+    source:
+      "Provider Policy Item 2: automatic per-workspace daily check cap scales at 1% (100 bps) of trailing 24-hour third-party billed " +
+      "supplier payable above CHECK_WORKSPACE_DAILY_MICROUSD.",
+    doc:
+      "Share of a workspace's trailing 24-hour third-party billed supplier payable (in basis points; 100 = 1%) used to calculate its " +
+      "automatic daily check cap when higher than the workspace floor. Excludes self-spend (tenant = workspace) and written-off accruals; " +
+      "supplier adjustments and refunds are not deducted.",
+  },
+  {
+    name: "CHECK_WORKSPACE_FLOOR_OVERRIDES_JSON",
+    key: "checkWorkspaceFloorOverridesJson",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    // The console reads it again with @gray/json (settings.ts `checkFloorsOf`), whose rule this is too.
+    textCheck: checkFloorOverridesProblem,
+    source:
+      "Provider Policy Item 2 (review B2-1): Gray operations raise one workspace's daily check floor, for a media or video provider whose " +
+      "checks need more than the default floor, without a migration; unset by default.",
+    doc:
+      "Optional JSON object mapping workspace_id to a custom daily check floor in micro-USD (0 to 10^12) set by Gray operations. " +
+      "Replaces CHECK_WORKSPACE_DAILY_MICROUSD for those workspaces while keeping the 1% trailing 24-hour billed supplier payable scaling " +
+      "and platform daily caps in force.",
   },
   {
     name: "ALLOW_PRIVATE_UPSTREAMS",
@@ -4078,6 +4242,23 @@ export const SETTINGS: readonly SettingSpec[] = [
       "The Phala KMS ids (`kms_…`, comma-separated; empty: none) of RELAY_CHAIN_KMS_IDS that take no new VM. A phase-2 relay's first " +
       "Deploy boots the release it paired on even after Gray released a newer one, unless that release's kms_id is one of these: then it " +
       "boots a newer release effective on the relay's contract, or is refused with what to do (workers/console lane-stack/provision.ts `phase2BootOf`).",
+  },
+  {
+    name: "RELAY_CHAIN_OS_IMAGES_CLOSED",
+    key: "relayChainOsImagesClosed",
+    workers: ["console"],
+    type: "text",
+    default: "",
+    textCheck: (v) => (v === "" ? null : osImageListProblem(v)),
+    source:
+      "Phala's refusal \"OS image dstack-0.6.1 is disabled\" for a new app, measured on 2026-11-24: the running " +
+      "VMs on it keep running, restart and replicate, but Phala creates no new VM on it. Production and staging name it.",
+    doc:
+      "The dstack OS images (`dstack-<x.y.z>`, comma-separated; empty: none) Phala creates no new VM on. A phase-2 relay's Deploy " +
+      "never boots a release profile on one of them: it boots the newest image's profile for every relay effective on its contract, " +
+      "is refused with what to do, or, when the relay's own profile names such an image, is refused as Gray's side to fix " +
+      "(workers/console lane-stack/provision.ts `phase2BootOf`); a new pairing never takes one (pairing.ts `phase2Profile`). " +
+      "A running VM's release move is not affected: Phala still replicates on these images.",
   },
   {
     name: "RELAY_CHAIN_KIT_RPC_URLS",
@@ -4867,6 +5048,7 @@ export const SETTINGS: readonly SettingSpec[] = [
     doc: "SET LOCAL statement_timeout of the content Worker's transactions.",
   },
   ...ledgerSettings(LOCATION_HINTS),
+  ...depositSettings(),
 ];
 
 /** The server's GRAY_ORIGIN rule (crates/gray-gateway/src/config/mod.rs:331-343), parsed by the platform's URL parser. */
@@ -5033,6 +5215,13 @@ export function kmsIdListProblem(value: string): string | null {
   return new Set(ids).size === ids.length ? null : "names one KMS twice";
 }
 
+/** RELAY_CHAIN_OS_IMAGES_CLOSED: dstack OS image names (`dstack-<x.y.z>`), comma-separated, each once. */
+export function osImageListProblem(value: string): string | null {
+  const names = value.split(",").map((name) => name.trim());
+  if (names.some((name) => !/^dstack-\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(name))) return "is not dstack OS image names (dstack-<x.y.z>) separated by commas";
+  return new Set(names).size === names.length ? null : "names one image twice";
+}
+
 /** RELAY_CHAIN_KIT_RPC_URLS: exactly two http(s) URLs of different origins, with no user or password in them. */
 export function kitRpcUrlsProblem(value: string): string | null {
   const urls = value.split(",").map((url) => url.trim());
@@ -5071,12 +5260,38 @@ function requestTablesProblem(value: string): string | null {
 /** gray-control's wallet rule (lib.rs wallet()): an EVM address, or a non-EVM identity of 1 to 256 characters without control characters. */
 /** A JSON document (its shape is the reader's to check: TRUST_POLICY is compiled by @gray/trust). */
 function jsonDocumentProblem(value: string): string | null {
+  return jsonDocument(value).ok ? null : "is not JSON";
+}
+
+/** `value` read as JSON, for a rule of a configured value only: what the Worker uses is read again by @gray/json. */
+function jsonDocument(value: string): { readonly ok: true; readonly document: unknown } | { readonly ok: false } {
   try {
-    JSON.parse(value);
-    return null;
+    return { ok: true, document: JSON.parse(value) };
   } catch {
-    return "is not JSON";
+    return { ok: false };
   }
+}
+
+/** The most a workspace's daily check floor may be: the check budget's MAX_DAILY_LIMIT, 10^12 micro-USD. */
+const CHECK_FLOOR_MAX = 1_000_000_000_000;
+
+/**
+ * The rule of CHECK_WORKSPACE_FLOOR_OVERRIDES_JSON (Gray operations' daily check floors): blank, or a JSON object of
+ * workspace ids (1 to 128 characters) to integers of micro-USD from 0 to 10^12. The console holds the value it reads to
+ * the same rule (settings.ts `checkFloorsOf`).
+ */
+export function checkFloorOverridesProblem(value: string): string | null {
+  if (value.trim() === "") return null;
+  const read = jsonDocument(value);
+  const document = read.ok ? read.document : null;
+  if (document === null || typeof document !== "object" || Array.isArray(document)) return "must be a JSON object of workspace ids to daily check floors in micro-USD";
+  for (const [workspace, floor] of Object.entries(document)) {
+    if (workspace === "" || workspace.length > 128) return `${JSON.stringify(workspace)} is not a workspace id`;
+    if (typeof floor !== "number" || !Number.isSafeInteger(floor) || floor < 0 || floor > CHECK_FLOOR_MAX) {
+      return `the floor of ${workspace} must be an integer of micro-USD from 0 to 10^12`;
+    }
+  }
+  return null;
 }
 
 function walletListProblem(value: string): string | null {
@@ -5516,6 +5731,7 @@ export const TEXT_CROSS_CHECKS: readonly TextCrossCheck[] = [
       "docs/design/entry-replicas.md ER2 and ER11: the shared name reaches whichever replica the front door picks, so a read through it is no " +
       "one replica's, and a relay's tunnel lane origin stays at it, so it must be set whenever replicas are.",
   },
+  ...DEPOSIT_TEXT_CROSS_CHECKS,
 ];
 
 /**
@@ -5615,6 +5831,8 @@ export function parseSettings(worker: WorkerName, env: Readonly<Record<string, u
     const problem = cross.check(a, b);
     if (problem !== null) problems.push({ name: cross.names[0], message: problem, names: cross.names });
   }
+  const ledger = depositLedgerProblem(worker, values);
+  if (ledger !== null) problems.push(ledger);
   return { values, problems };
 }
 
@@ -5804,12 +6022,16 @@ export interface GatewayConfig {
   readonly contentRecipientKeys: string;
 }
 
-export interface JobsConfig extends LedgerJobsConfig {
+export interface JobsConfig extends LedgerJobsConfig, DepositJobsConfig {
   readonly deployEnv: DeployEnv;
   readonly endpointRootLocationHint: LocationHint;
   readonly configRebuildMs: number;
   /** ENTRY_TRANSLATION: whether the confidential entry translates between text APIs (ConfigDO writes it into the snapshot). */
   readonly entryTranslation: EntryTranslation;
+  /** REFERENCE_CATALOG_URL: where ConfigDO fetches the reference catalog it keeps in SNAPSHOT_KV; "" when unset: none. */
+  readonly referenceCatalogUrl: string;
+  /** REFERENCE_CATALOG_SYNC_INTERVAL_MS: how often the cron asks for that fetch. */
+  readonly referenceCatalogSyncIntervalMs: number;
   readonly configAlertAgeMs: number;
   readonly alertGroupMs: number;
   readonly internalCallTimeoutMs: number;
@@ -5852,6 +6074,22 @@ export interface JobsConfig extends LedgerJobsConfig {
   readonly modeltraceModels: string;
 }
 export { LEDGER_JOBS_KEYS, type LedgerJobsConfig } from "./ledger.ts";
+export {
+  DEPOSIT_LEDGER_CHAIN_ID,
+  DEPOSIT_MIN_MICROUSD,
+  PRODUCTION_DEPOSIT_TOKENS,
+  REFUSED_PRODUCTION_SOURCE_CHAINS,
+  depositChain,
+  depositChains,
+  depositMicrousd,
+  depositsEnabled,
+  parseDepositTokens,
+  productionDepositTokensProblem,
+  type DepositChain,
+  type DepositConfig,
+  type DepositJobsConfig,
+  type DepositToken,
+} from "./deposit.ts";
 
 /** The most one prepaid VM charge may be: GrayCredit.maxEntryAmount ($100 in micro-USD). */
 export const PREPAID_VM_MAX_CHARGE_MICROUSD = 100_000_000;
@@ -5916,7 +6154,7 @@ export function prepaidVmChargeProblem(rates: Readonly<Record<string, number>>, 
   return null;
 }
 
-export interface ConsoleConfig {
+export interface ConsoleConfig extends DepositConfig {
   readonly deployEnv: DeployEnv;
   readonly endpointRootLocationHint: LocationHint;
   /** GATEWAY_FALLBACK_REGION: a new workspace's home region when its request names no continent (`requestRegion`). */
@@ -5936,6 +6174,16 @@ export interface ConsoleConfig {
   readonly opencodeSmallModel: string;
   /** Comma-separated; workers/console reads it as a list. */
   readonly adminWallets: string;
+  /** CONSOLE_SIGN_IN: which sign-in the console's pages offer. */
+  readonly consoleSignIn: "moss" | "social";
+  /** WEBAUTHN_RP_ID: the passkeys' relying party id; "" when passkeys are off. */
+  readonly webauthnRpId: string;
+  /** AUTH_EMAIL_FROM: the sender of sign-in codes and invitations; "" when none are sent. */
+  readonly authEmailFrom: string;
+  readonly googleOauthClientId: string;
+  readonly githubOauthClientId: string;
+  readonly turnstileSiteKey: string;
+  readonly authProviderTimeoutMs: number;
   readonly accessTeamDomain: string;
   readonly accessAud: string;
   readonly identityTimeoutMs: number;
@@ -6057,6 +6305,8 @@ export interface ConsoleConfig {
   readonly relayChainKmsIds: string;
   /** RELAY_CHAIN_KMS_CLOSED_IDS: the KMS ids of RELAY_CHAIN_KMS_IDS that take no new VM, comma-separated; "" for none. */
   readonly relayChainKmsClosedIds: string;
+  /** RELAY_CHAIN_OS_IMAGES_CLOSED: the dstack OS images Phala creates no new VM on, comma-separated; "" for none. */
+  readonly relayChainOsImagesClosed: string;
   /** RELAY_CHAIN_KIT_RPC_URLS: the two endpoints a phase-2 pairing gives gray-assistant, comma-separated. */
   readonly relayChainKitRpcUrls: string;
   /** Always off on Workers (DEBT_MODE_RULE). */
@@ -6089,6 +6339,9 @@ export interface ConsoleConfig {
   /** CHECK_MEDIA_GLOBAL_DAILY_MICROUSD: the platform cap of checks that buy a media generation. */
   readonly checkMediaGlobalDailyMicroUsd: number;
   readonly checkWorkspaceDailyMicroUsd: number;
+  readonly checkWorkspaceRevenueBps: number;
+  /** CHECK_WORKSPACE_FLOOR_OVERRIDES_JSON as written; the console's `checkFloorsOf` reads it. */
+  readonly checkWorkspaceFloorOverridesJson: string;
   readonly checkConfirmation: CheckConfirmation;
   /** ALLOW_PRIVATE_UPSTREAMS, as set; `allowPrivateUpstreams` says whether it applies. */
   readonly allowPrivateUpstreams: PrivateUpstreamSwitch;

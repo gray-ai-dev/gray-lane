@@ -1,7 +1,7 @@
 import { ApiError } from "@gray/errors";
 import { LANE_PROTOCOLS } from "@gray/lane";
 import type { Protocol } from "@gray/protocol";
-import { Preference, SessionStore, parseTagPattern, type Constraint, type RequestedSort, type RouteTag, type Tags, type TtftPercentile, type UtilityResult } from "@gray/routing";
+import { Preference, SessionStore, isRoutingRef, parseTagPattern, type Constraint, type RequestedSort, type RouteTag, type Tags, type TtftPercentile, type UtilityResult } from "@gray/routing";
 import { laneServedKey, providerRef, routeServes, supplierRef } from "@gray/snapshot";
 import type { PlanPreference } from "./plan-order.ts";
 import type { GatewaySnapshot, RouteRecord } from "./snapshot.ts";
@@ -30,10 +30,11 @@ export interface PreferenceSnapshot extends Pick<GatewaySnapshot, "routingDefaul
 }
 
 /**
- * The model a request's model string names and the tag pattern it carries (inference.rs `untagged`, `model_tag`):
- * `model@pattern` selects the routes of `model` the pattern matches, for a client that can only set a model
- * string. A string the snapshot maps or routes as a model is that model, whatever it holds; `routing_invalid`
- * when what follows the first `@` is no pattern. Every API that serves a model reads its model string through here.
+ * The model a request's model string names and the selector it carries (inference.rs `untagged`, `model_tag`), for a
+ * client that can only set a model string: `model@pattern` selects the routes of `model` the pattern matches, and
+ * `model@<64-hex>` names a route's or a supplier's reference as `only: ["<64-hex>"]` does. A string the snapshot maps
+ * or routes as a model is that model, whatever it holds; `routing_invalid` when what follows the first `@` is neither
+ * a reference nor a pattern. Every API that serves a model reads its model string through here.
  */
 export function untagged(
   snapshot: { readonly routes: readonly { readonly model: string }[]; readonly mapped?: readonly { readonly model: string }[] },
@@ -42,7 +43,7 @@ export function untagged(
   const at = stated.indexOf("@");
   if (at < 0 || snapshot.mapped?.some((m) => m.model === stated) === true || snapshot.routes.some((r) => r.model === stated)) return { ok: true, model: stated, tag: null };
   const tag = stated.slice(at + 1);
-  if (parseTagPattern(tag) === null) return { ok: false, code: "routing_invalid" };
+  if (!isRoutingRef(tag) && parseTagPattern(tag) === null) return { ok: false, code: "routing_invalid" };
   return { ok: true, model: stated.slice(0, at), tag };
 }
 

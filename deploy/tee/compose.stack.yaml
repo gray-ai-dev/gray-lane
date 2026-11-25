@@ -208,6 +208,11 @@ services:
     # without a limit, 276 MiB with 288 MiB; with answers held for their digests through the whole
     # chain it reached 595 MiB without a limit (the copies made as answers complete are outside the
     # budget), at most 277 MiB with it. 240 MiB held it at 231 MiB but leaves the collector less room.
+    # -max-inflight-body-bytes, the separate budget of request bodies egress holds at once, is left out on purpose.
+    # With -relay-listen and -memory-limit egress defaults it to what the limit leaves after the stack budget and the
+    # runtime's 32 MiB headroom, 288 - 192 - 32 = 64 MiB, and refuses to start if the sum passes the limit. Leaving the
+    # command as it was keeps it equal to the fixed command of @gray/lane-compose in deployed Phase-1 relay kits
+    # (1.4.5), whose pull-token service refuses any other stack egress command (app_compose_refused).
     entrypoint: ["/usr/local/bin/gray-egress"]
     # D1 (docs/design/relay-sign-in-in-vm.md): egress makes this boot's sign-in CA on its own volume and writes the
     # relay's trust bundle (system roots and the CA) to the bundle volume before its relay listener serves.

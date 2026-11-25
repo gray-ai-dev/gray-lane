@@ -137,15 +137,21 @@ function serdeValue(body: Uint8Array): Json | undefined {
   }
 }
 
+/** A body Google's OpenAI-compatible endpoint (and Vertex) wraps in an array, as its first item (`items.first().unwrap_or(value)`). */
+export function firstItem(value: Json): Json {
+  return Array.isArray(value) && value.length > 0 ? (value as readonly Json[])[0]! : value;
+}
+
 /**
  * The message of an error body in any of the common shapes (`error.message`; `error` as a string;
  * `message`; `detail`; `errors[0].message`), or the body itself when it is short plain text (at most
  * `MESSAGE_LIMIT` bytes, not markup); and the machine codes it states, lowercased: codes, types and
  * statuses, and each Google `error.details` entry's `reason` and `@type` (without its
- * `type.googleapis.com/` prefix).
+ * `type.googleapis.com/` prefix). A body wrapped in an array (`[{"error":...}]`) is read as its first item.
  */
 export function providerMessage(body: Uint8Array): { readonly message: string | undefined; readonly codes: readonly string[] } {
-  const value = serdeValue(body);
+  const parsed = serdeValue(body);
+  const value = parsed === undefined ? undefined : firstItem(parsed);
   if (value === undefined) {
     const text = rustTrim(utf8Lossy(body));
     const plain = text.length > 0 && !text.startsWith("<") && utf8Length(text) <= MESSAGE_LIMIT;
@@ -186,6 +192,10 @@ const OVERFLOW = new RegExp(
     "input token count[^\\n]*exceeds",
     "too many (?:input )?tokens",
     "reduce the length of the messages",
+    // Anthropic: "input length and `max_tokens` exceed context limit: 197202 + 8192 > 200000".
+    "exceeds? (?:the )?context limit",
+    // xAI: "This model's maximum prompt length is 131072 but the request contains 150000 tokens."
+    "maximum prompt length",
   ].join("|"),
   "iu",
 );

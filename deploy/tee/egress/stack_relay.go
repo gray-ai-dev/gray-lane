@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -157,11 +158,20 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		return
 	}
 	// The call's share of the budget (S17), until it returns: egress's copy of its headers, forward's copy
-	// buffer and a direct call's HTTP/2 window (relayCallBytes), and its body.
+	// buffer and a direct call's HTTP/2 window (relayCallBytes). Its body has holds of its own, in the stack
+	// budget and in the in-flight body budget, which letGo gives back once the vendor has the body and its
+	// answer's head came (sentBody), so a streamed answer of up to an hour does not pin the request it answers.
+	// letGo may run on the transport's goroutine after forward returned, hence the holds apart from hold and the
+	// once.
 	hold := stackHold{budget: &s.stack.budget}
 	defer hold.free()
+	bodyStack := stackHold{budget: &s.stack.budget}
 	bHold := bodyHold{budget: &s.bodyBudget}
-	defer bHold.free()
+	letGo := sync.OnceFunc(func() {
+		bodyStack.free()
+		bHold.free()
+	})
+	defer letGo()
 	// A call in a vendor tunnel whose hello offers HTTP/2 may get an HTTP/2 vendor connection through a proxy too.
 	// Its window is the one the vendor connection announces: relayStreamWindow on the direct transport, the
 	// learned preface's on a mirrored HTTP/2 connection (mirrorStreamWindow).
@@ -185,7 +195,7 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		refuse(errStackHeaderRefused, "", refusedHeaderName(name))
 		return
 	}
-	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &hold, &bHold)
+	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &bodyStack, &bHold)
 	entry.RequestBytes = readBytes
 	if errors.Is(err, errStackBudget) || errors.Is(err, errBodyBudgetExceeded) {
 		refuse(errEgressLimit, "", "")
@@ -274,7 +284,7 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		}
 		observer.hold.free()
 	}()
-	entry.Error = s.forward(ctx, s.relayClient, rec, r.Method, plan, header, body, nil, observer)
+	entry.Error = s.forward(ctx, s.relayClient, rec, r.Method, plan, header, body, letGo, observer)
 	if entry.Error == errEgressLimit || entry.Error == errResponseRead {
 		// S17: an answer egress could not hold or read whole is cut, not ended: the connection closes (in an HTTP/2
 		// tunnel, the call's stream is reset) without the response's end, so the relay cannot take what it got for the

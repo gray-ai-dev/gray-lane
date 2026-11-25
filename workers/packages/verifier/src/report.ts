@@ -342,17 +342,12 @@ export function servedNothing(status: number): boolean {
 }
 
 /**
- * `route_status`: a report's status (decision (a) of 2026-10-23: verification is scoped to the mode it tested).
- * Pass when the streamed basic check proved (`provenStreaming`): the route serves streamed requests, whatever its
- * buffered basic check found, a 401 or 403 on that one included (the key evidently works for the other mode), and
- * serving routes it no buffered request unless that check proved too (`provenBuffered`). Otherwise from the checks
- * that decide the route (`provesCapability` false): fail when one failed, else inconclusive when one was unclear,
- * else pass, so a report whose streamed check did not prove keeps the status its buffered basic check gives, and
- * one where both modes failed keeps the buffered one's. A capability check's verdict withdraws only its capability
- * (`provenCapabilities`).
+ * `route_status`: a report's status, from the checks that decide the route (`provesCapability` false): fail when
+ * one failed, else inconclusive when one was unclear, else pass. On a generation API these are both basic checks,
+ * buffered and streamed, and each output-cap check of both modes, so a route that fails either mode fails. A
+ * capability check's verdict withdraws only its capability (`provenCapabilities`).
  */
 export function routeStatus(checks: readonly CheckResult[], requireUsage: boolean): VerificationStatus {
-  if (provenStreaming(checks, requireUsage)) return "pass";
   const route = checks.filter((c) => !provesCapability(c.kind));
   if (route.some((c) => c.status === "fail")) return "fail";
   if (route.some((c) => c.status === "inconclusive")) return "inconclusive";
@@ -488,7 +483,7 @@ export function provenCapabilities(checks: readonly CheckResult[], requireUsage:
 
 /**
  * `ProbeReport::admissible`: a current pass of the supported plan whose every check deciding the route
- * proved (but the buffered basic check of a route that proved it streams), which claims only the capabilities its
+ * proved, which claims only the capabilities its
  * checks proved in every mode it serves, its hash intact. A capability check that did not pass withdraws its
  * capability without refusing the report (owner decision of 2026-10-16).
  */
@@ -521,10 +516,8 @@ export async function admissible(r: ProbeReport, nowMs: number, required: Capabi
   if (!planOk || r.checks.length === 0 || r.checks.length !== checks.length) return false;
   if (!r.checks.every((c, i) => c.kind === checks[i])) return false;
   const requireUsage = r.manifest.require_usage;
-  // Every check that decides the route passed, except the buffered basic check of a route that proved it streams,
-  // which serves streamed requests only (`routeStatus`).
-  const streams = provenStreaming(r.checks, requireUsage);
-  if (!r.checks.filter((c) => !provesCapability(c.kind)).every((c) => proved(c, requireUsage) || (streams && (answersBuffered(c.kind) || isOutputCap(c.kind))))) return false;
+  // Every check that decides the route proved: on a generation API, both basic checks and every output-cap check.
+  if (!r.checks.filter((c) => !provesCapability(c.kind)).every((c) => proved(c, requireUsage))) return false;
   if (!satisfies(provenCapabilities(r.checks, requireUsage, r.manifest.require_streaming), r.verified_capabilities)) return false;
   // What it says it withdrew, it does not prove.
   const proven = provenOf(r.checks, requireUsage, r.manifest.require_streaming);

@@ -59,6 +59,8 @@ type Op =
 interface SeenTool {
   started: boolean;
   ended: boolean;
+  /** Argument fragments a Chat upstream streamed before it named the call, given once it does. */
+  pending: string;
 }
 
 /**
@@ -256,10 +258,17 @@ export class StreamTranslator {
         case "reasoning_delta":
           if (event.text !== "") ops.push({ kind: "reasoning", text: event.text });
           break;
-        case "tool_call_delta":
+        case "tool_call_delta": {
+          // A Chat upstream may name a call in a later chunk than the one that opens it (its first
+          // chunk only the id and the start of the arguments): its fragments wait for the name.
+          if (!this.seen(event.index).started && (event.name === null || event.name === "")) {
+            if (event.arguments !== "" && this.streamsCallArguments()) this.holdArguments(event.index, event.arguments);
+            break;
+          }
           this.startTool(event.index, event.id, event.name, undefined, ops);
           if (event.arguments !== "" && this.streamsCallArguments()) ops.push({ kind: "tool_args", key: event.index, delta: event.arguments });
           break;
+        }
         case "tool_call_complete": {
           if (this.tools.get(event.index)?.ended === true) continue;
           const signature = native !== undefined ? this.geminiSignature(native, event.index) : undefined;
@@ -295,7 +304,7 @@ export class StreamTranslator {
   private seen(key: bigint): SeenTool {
     let seen = this.tools.get(key);
     if (seen === undefined) {
-      seen = { started: false, ended: false };
+      seen = { started: false, ended: false, pending: "" };
       this.tools.set(key, seen);
       this.kept += TRANSLATOR_CALL_BYTES;
     }
@@ -342,6 +351,18 @@ export class StreamTranslator {
     }
     this.calls += 1;
     ops.push({ kind: "tool_start", key, id: callId, name, signature });
+    if (seen.pending !== "") {
+      ops.push({ kind: "tool_args", key, delta: seen.pending });
+      this.kept -= stringHeap(seen.pending);
+      seen.pending = "";
+    }
+  }
+
+  /** Keeps an argument fragment of call `key`, not named yet. */
+  private holdArguments(key: bigint, text: string): void {
+    const seen = this.seen(key);
+    this.kept += stringHeap(seen.pending + text) - (seen.pending === "" ? 0 : stringHeap(seen.pending));
+    seen.pending += text;
   }
 
   private static geminiPartsOf(v: Json): Json[] | undefined {

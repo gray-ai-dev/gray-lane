@@ -24,9 +24,10 @@ export interface ProbeEvidence {
   readonly verified: Capabilities;
   /**
    * Whether the report's buffered basic check passed (`gray_verifier::proven_buffered`: the text challenge, the
-   * image of a mapping claiming image output, or a non-chat API's contract check). A report whose buffered basic
-   * check failed while its streamed one passed still passes (decision (a) of 2026-10-23), and its route serves
-   * streamed requests only.
+   * image of a mapping claiming image output, or a non-chat API's contract check). A generation report the verifier
+   * signs now passes only when both modes' basic checks proved; one signed before both were required, whose buffered
+   * basic check failed while its streamed one passed, still passes until it expires, and its route serves streamed
+   * requests only.
    */
   readonly buffered: boolean;
   readonly streaming: boolean;
@@ -224,10 +225,11 @@ function servedModes(report: ProbeReport): { buffered: boolean; streaming: boole
 
 /**
  * One control_probe_reports row as ProbeEvidence (`probe_evidence`), or null. `streaming` is
- * `gray_verifier::proven_streaming` on a passing report: the streamed form of its basic check proved. A report
- * whose streamed check failed still passes (a failed capability check withdraws only that capability), and its
- * route serves buffered requests only; one whose buffered basic check failed while its streamed one proved passes
- * too, and its route serves streamed requests only (`buffered`, decision (a) of 2026-10-23).
+ * `gray_verifier::proven_streaming` on a passing report: the streamed form of its basic check proved. A generation
+ * report the verifier signs now passes only when both modes proved. One signed before both were required may have
+ * passed one mode only, and is read as it was signed until it expires: whose streamed check failed, its route serves
+ * buffered requests only; whose buffered basic check failed while its streamed one proved, streamed requests only
+ * (`buffered`).
  */
 export function probeEvidence(row: { readonly endpoint_id: string; readonly generation: number; readonly fingerprint: string; readonly signed_report: string }): ProbeEvidence | null {
   const report = parseSignedProbeReport(row.signed_report);

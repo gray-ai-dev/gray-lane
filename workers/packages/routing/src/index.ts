@@ -2001,6 +2001,7 @@ export {
   type RouteTag,
   type Tags,
   type Taken,
+  isRoutingRef,
   parseTagPattern,
   tagSentinel,
   affinityKey,

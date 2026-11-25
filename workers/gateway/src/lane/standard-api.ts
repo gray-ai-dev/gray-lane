@@ -105,7 +105,13 @@ export const ENTRY_FORM_CHUNK_BYTES = 64 * 1024;
  */
 export async function readEntryBody(request: Request, protocol: Protocol, form: boolean, limits: EntryBodyLimits, share: AnswerShare, held: (bytes: number) => void): Promise<EntryBody | ApiError> {
   if (!form) {
-    const read = await readBody(request, { protocol, limit: limits.jsonBytes, parseMax: limits.jsonBytes, rawMax: limits.jsonBytes, waitMs: limits.waitMs }, undefined, held);
+    // The cap is the lane's (`jsonBytes`), so a 413 names it as the text APIs' lane does (inference.ts `receive`).
+    const read = await readBody(
+      request,
+      { protocol, limit: limits.jsonBytes, parseMax: limits.jsonBytes, rawMax: limits.jsonBytes, waitMs: limits.waitMs, limitSource: "the most Gray's confidential VM holds of one request" },
+      undefined,
+      held,
+    );
     if (!read.ok) {
       held(0);
       return read.error;

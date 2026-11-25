@@ -574,6 +574,9 @@ function kitVersionText(text: string): boolean {
 }
 const restartKitSchema = z.string().min(5).max(80).refine(kitVersionText, { message: "a kit version is strict semver" });
 
+/** A relay integration standard version (`<major>.<minor>`, e.g. `4.3`). */
+export const STACK_IMAGE_STANDARD_PATTERN = /^[0-9]{1,4}\.[0-9]{1,4}$/;
+
 /**
  * S53: the relay asks Gray to restart its stack app so the next boot takes the image its token service now names.
  * `image` is what the relay rolled out (null for a plain restart); Gray never acts on it, since the VM gets its image
@@ -582,7 +585,9 @@ const restartKitSchema = z.string().min(5).max(80).refine(kitVersionText, { mess
  * P7 (docs/design/relay-no-always-on-host.md 13.4): a phase-2 relay's tool adds its own version (`kit`), which the
  * console's rollout gate reads for a relay with no gray-relay daemon to report it, and the boot box version the VM's
  * receipt named (`boot_version`), which the provisioner waits for in Gray's copy before it starts a second instance.
- * Both optional; the signature covers them when present.
+ * `image_standard` declares the relay integration standard version the rolled-out container image meets (verified with
+ * the conformance harness); Gray promotes it onto `lane_stack_relays.image_standard` once the rollout succeeds.
+ * All three are optional; the signature covers them when present.
  */
 export const stackRestartRequestSchema = z
   .object({
@@ -594,6 +599,7 @@ export const stackRestartRequestSchema = z
     image: z.string().max(512).regex(STACK_RELAY_IMAGE_PATTERN).nullable(),
     kit: restartKitSchema.optional(),
     boot_version: u64.optional(),
+    image_standard: z.string().regex(STACK_IMAGE_STANDARD_PATTERN).optional(),
   })
   .strict()
   .refine((r) => r.reason === "restart" || r.image !== null, { message: "a rollout or rollback names its image", path: ["image"] });
@@ -608,12 +614,16 @@ export const STACK_RESTART_REQUEST_DOMAIN = "gray-relay-stack-restart/v1";
 
 /**
  * The bytes the relay signs: the domain and each member on its own line, in this order; a null image is empty. P7's
- * `kit` and `boot_version` add two lines (an absent one empty) only when either is present, so a request without them
- * signs exactly the bytes it did before, and one message has one reading (seven lines or nine).
+ * `kit` and `boot_version` add two lines (an absent one empty) when either is present; `image_standard` adds a tenth
+ * line only when present (filling lines 8 and 9 as empty if absent), so requests without newer fields sign exactly the
+ * bytes they did before (seven, nine, or ten lines, each unambiguous).
  */
 export function stackRestartRequestMessage(r: StackRestartRequest): Uint8Array {
   const lines = [STACK_RESTART_REQUEST_DOMAIN, r.relay_id, r.request_id, String(r.issued_ms), r.app_id, r.reason, r.image ?? ""];
-  if (r.kit !== undefined || r.boot_version !== undefined) lines.push(r.kit ?? "", r.boot_version === undefined ? "" : String(r.boot_version));
+  if (r.kit !== undefined || r.boot_version !== undefined || r.image_standard !== undefined) {
+    lines.push(r.kit ?? "", r.boot_version === undefined ? "" : String(r.boot_version));
+    if (r.image_standard !== undefined) lines.push(r.image_standard);
+  }
   return new TextEncoder().encode(lines.join("\n"));
 }
 

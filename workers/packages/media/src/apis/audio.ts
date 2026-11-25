@@ -32,6 +32,8 @@ import {
 import { type ApiRequest, type FormPart, type MediaRoute, type Metered, type Received, UNBOUNDED, partSize, partText } from "./types.ts";
 
 const SPEECH_FIELDS = ["model", "input", "voice", "instructions", "response_format", "speed", "stream_format"];
+/** The optional speech fields: each sent as null reads as left out. */
+const SPEECH_OPTIONAL = ["instructions", "response_format", "speed", "stream_format"];
 const SPEECH_FORMATS = ["mp3", "opus", "aac", "flac", "wav", "pcm"];
 /** Formats whose size follows the audio length (FLAC at its worst). */
 const UNCOMPRESSED_FORMATS = ["wav", "pcm", "flac"];
@@ -103,6 +105,8 @@ function decodeSpeech(value: Json, responseBytes: number, entry: boolean): ApiRe
   const body: JsonObject = {};
   for (const key of Object.keys(value)) if (!OPENAI_LINKING_FIELDS.includes(key)) body[key] = value[key] as Json;
   if (Object.keys(body).some((k) => !SPEECH_FIELDS.includes(k))) throw invalid("unsupported_request_field");
+  // An optional field sent as null is left out, as an SDK that serializes unset options sends it (embeddings does the same).
+  for (const key of SPEECH_OPTIONAL) if (Object.hasOwn(body, key) && body[key] === null) delete body[key];
   const model = jsonModel(body);
   const input = get(body, "input");
   if (typeof input !== "string" || rustTrim(input).length === 0 || chars(input) > MAX_SPEECH_CHARACTERS) throw bad();

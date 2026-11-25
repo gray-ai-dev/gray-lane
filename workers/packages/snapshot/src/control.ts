@@ -1,4 +1,4 @@
-import type { UpstreamAuth as ControlUpstreamAuth, LaneEndpoint } from "@gray/control";
+import { rustTrim, type UpstreamAuth as ControlUpstreamAuth, type LaneEndpoint } from "@gray/control";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { isProtocol, type Protocol } from "@gray/protocol";
@@ -298,11 +298,11 @@ export function registeredRefs(endpoints: Iterable<readonly [workspaceId: string
 
 /** ControlStore::validate_endpoint_shape: what a stored configuration must keep passing to be published. */
 export function validEndpointShape(c: EndpointConfig): boolean {
-  if (c.name.trim().length === 0 || utf8Bytes(c.base_url) > 2048 || !(c.base_url.startsWith("https://") || c.base_url.startsWith("http://"))) return false;
+  if (rustTrim(c.name) === "" || utf8Bytes(c.base_url) > 2048 || !(c.base_url.startsWith("https://") || c.base_url.startsWith("http://"))) return false;
   if (/[@?#]/.test(c.base_url) || c.mappings.length === 0) return false;
   const seen = new Set<string>();
   for (const m of c.mappings) {
-    if (m.requested_model.trim().length === 0 || m.requested_model === "*" || m.upstream_model.trim().length === 0) return false;
+    if (rustTrim(m.requested_model) === "" || m.requested_model === "*" || rustTrim(m.upstream_model) === "") return false;
     if (!m.native_path.startsWith("/") || m.native_path.startsWith("//") || /[?#]/.test(m.native_path)) return false;
     const key = `${m.requested_model}\u0000${m.protocol}`;
     if (seen.has(key)) return false;

@@ -114,14 +114,14 @@ export function isBasic(kind: CheckKind): boolean {
 }
 
 /**
- * `CheckKind::proves_capability`: the check proves a capability (streaming, which every chat plan checks,
- * or one the endpoint claims) or a declaration about its billing (the cache lifetime), rather than the
+ * `CheckKind::proves_capability`: the check proves a capability (one the endpoint claims, or the streaming a media
+ * mapping declared) or a declaration about its billing (the cache lifetime), rather than the
  * route itself. A capability check that fails or is unclear withdraws only what it proves: the report still
  * passes on the other checks, and requests that do not need the capability are still routed (`routeStatus`,
  * `provenCapabilities`, `provenStreaming`; owner decision of 2026-10-16: a failed capability check withdraws
- * only that capability). Every other check (the buffered basic one, a non-chat API's contract check) decides
- * whether the route passes, unless the streamed basic check proved: then the route serves streamed requests whatever
- * its buffered basic check found (decision (a) of 2026-10-23, `routeStatus`).
+ * only that capability). Every other check decides whether the route passes (`routeStatus`): a non-chat API's
+ * contract check, and on a generation API both basic checks, buffered and streamed, with each output-cap check of
+ * both modes, so a route that fails either mode does not go live.
  */
 export function provesCapability(kind: CheckKind): boolean {
   switch (kind) {
@@ -137,16 +137,11 @@ export function provesCapability(kind: CheckKind): boolean {
     case "embedding_dimensions":
     case "timed_transcript":
     case "cache_ttl":
-    // A streamed output-cap check decides the streamed mode only (`provenStreaming`), as the streamed basic check
-    // does; the buffered ones decide the route as the buffered basic check does (`routeStatus`, `admissible`).
-    case "streaming_max_tokens_cap":
-    case "streaming_max_completion_tokens_cap":
-    case "streaming_max_output_tokens_cap":
     // A media API's streamed form withdraws only the streamed requests: the route still serves buffered ones.
     case "streaming_api_contract":
       return true;
     default:
-      return provesStreaming(kind);
+      return false;
   }
 }
 

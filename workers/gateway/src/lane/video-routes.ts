@@ -46,9 +46,12 @@ const CONTENT_ERROR_BYTES = 64 * 1024;
 
 export type EntryVideoRoute = { readonly kind: "get" | "content"; readonly id: string };
 
-/** The job route `method` and `path` name at the entry, or null: a GET of a job id in the store's form. */
+/**
+ * The job route `method` and `path` name at the entry, or null: a GET of a job id in the store's form, or a HEAD, which
+ * is the GET without its body (as `public-routes.ts` and the server's router take it).
+ */
 export function entryVideoRoute(method: string, path: string): EntryVideoRoute | null {
-  if (method !== "GET") return null;
+  if (method !== "GET" && method !== "HEAD") return null;
   const match = /^\/v1\/videos\/([^/]+)(\/content)?$/.exec(path);
   if (match === null || !VIDEO_JOB_ID_PATTERN.test(match[1]!)) return null;
   return { kind: match[2] === undefined ? "get" : "content", id: match[1]! };
@@ -132,11 +135,17 @@ class VideoRouteRun {
     }
   }
 
-  /** A whole answer: its bytes hashed for the receipt, which is signed behind it. */
+  /** A HEAD: the GET's answer, its headers as the GET's, without its body. */
+  get head(): boolean {
+    return this.o.request.method === "HEAD";
+  }
+
+  /** A whole answer: its bytes hashed for the receipt, which is signed behind it. A HEAD gets none of them, and its receipt says so. */
   whole(status: number, body: Uint8Array, headers: Headers): Response {
     headers.set("content-length", String(body.length));
-    const response = new Response(body, { status, headers: this.headers(headers) });
-    this.o.ctx.waitUntil(this.sign(bodyHashOf(body)));
+    const sent = this.head ? new Uint8Array(0) : body;
+    const response = new Response(this.head ? null : body, { status, headers: this.headers(headers) });
+    this.o.ctx.waitUntil(this.sign(bodyHashOf(sent)));
     return response;
   }
 
@@ -283,7 +292,10 @@ async function content(o: EntryVideoRequest, io: VideoJobIo, run: VideoRouteRun,
   const hash = responseHash();
   let finish!: () => void;
   const ended = new Promise<void>((resolve) => (finish = resolve));
+  // A HEAD asks the provider as a GET does (a provider need not take HEAD) and hands on its headers alone: the body is
+  // cancelled unread, and the receipt hashes the no bytes the client got.
   const streamed = streamMedia(upstream, limits, {
+    head: run.head,
     tap: (bytes) => hash.update(bytes),
     ended: (how) => {
       console.log(JSON.stringify({ level: how === "complete" ? "info" : "warn", event: "lane_video_content", request_id: run.requestId, job: job.id, ended: how, bytes: hash.byteLength }));
