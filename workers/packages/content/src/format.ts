@@ -72,8 +72,12 @@ export const RECORD_HEAD_BYTES = 10;
 /** The header record's `v`. */
 export const HEADER_VERSION = "gray.request-content.v3";
 
-/** Why a part stopped being stored before its end (content.md 3.7), or why the content is not there at all. */
-export const CONTENT_REASONS = ["no_recipient", "recipient_invalid", "store", "deadline", "cap", "capture_backpressure", "capture_budget", "isolate_budget", "keyless_rate"] as const;
+/**
+ * Why a part stopped being stored before its end (content.md 3.7), or why the content is not there at all.
+ * `confidential`: the request went through the confidential entry, which keeps no request content by design (the
+ * content status `withheld`, never a failure).
+ */
+export const CONTENT_REASONS = ["no_recipient", "recipient_invalid", "store", "deadline", "cap", "capture_backpressure", "capture_budget", "isolate_budget", "keyless_rate", "confidential"] as const;
 export type ContentReason = (typeof CONTENT_REASONS)[number];
 /** The reasons a part is cut short for, and stays readable up to there. */
 export const TRUNCATION_REASONS = ["cap", "capture_backpressure", "capture_budget"] as const;

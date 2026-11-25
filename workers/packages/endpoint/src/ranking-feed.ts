@@ -29,7 +29,7 @@
  * Pure: the caller supplies the times and the epoch.
  */
 
-import { DEFAULT_RANKING_CONFIG, FEED_VERSION, feedColumnsCount, feedKeyValid, feedRecordValid, feedSampleValid, RECORDS_BOUND, recordSummaryValid, SampleColumns, type AttemptFailure, type FeedAnswer, type FeedCircuit, type FeedColumns, type FeedHave, type FeedKey, type FeedRecord, type FeedSample, type FeedTrial, type RankingConfig, type RecordSummary } from "@gray/routing";
+import { DEFAULT_RANKING_CONFIG, FEED_VERSION, feedColumnsCount, feedKeyValid, feedRecordValid, feedSampleValid, RECORDS_BOUND, recordSummaryValid, SampleColumns, summaryEstimateOf, type AttemptFailure, type FeedAnswer, type FeedCircuit, type FeedColumns, type FeedHave, type FeedKey, type FeedRecord, type FeedSample, type FeedTrial, type RankingConfig, type RecordSummary, type SummaryEstimate } from "@gray/routing";
 import type { RootRankingKey } from "./circuit.ts";
 
 /** A root's push to the collector: its name, its epoch (each instance's own), and the keys that changed, each whole. */
@@ -135,18 +135,27 @@ const sameFailures = (a: readonly (readonly [number, AttemptFailure])[], b: read
 /** The members of a record's summary (`RecordSummary`), in its order. */
 const SUMMARY_NAMES = ["s", "f", "tokens", "decodeMs", "ttftP50", "ttftP90", "ttftP99", "ttftCount", "tpsCount", "at"] as const;
 
-/** `v` as a record's summary, copied member by member, when it is one (@gray/routing `recordSummaryValid`); else null. */
+/**
+ * `v` as a record's summary, copied member by member, when it is one (@gray/routing `recordSummaryValid`); else null. Its
+ * buffered estimate too (r24), when that is one (`summaryEstimateOf`): one that is not is left out alone.
+ */
 function summaryOf(v: unknown): RecordSummary | null {
   if (!recordSummaryValid(v)) return null;
-  return Object.fromEntries(SUMMARY_NAMES.map((name) => [name, v[name]])) as unknown as RecordSummary;
+  return { ...(Object.fromEntries(SUMMARY_NAMES.map((name) => [name, v[name]])) as unknown as RecordSummary), ...summaryEstimateOf(v.est) };
 }
 
-const sameSummary = (a: RecordSummary, b: RecordSummary) => SUMMARY_NAMES.every((name) => a[name] === b[name]);
+const sameEstimate = (a: SummaryEstimate | undefined, b: SummaryEstimate | undefined) =>
+  a === undefined || b === undefined ? a === b : a.n === b.n && a.ttftMs === b.ttftMs && a.tps === b.tps && a.rev === b.rev;
+
+const sameSummary = (a: RecordSummary, b: RecordSummary) => SUMMARY_NAMES.every((name) => a[name] === b[name]) && sameEstimate(a.est, b.est);
 
 /**
  * Whether summary `s` is of an older state of its root's record than `held`, as `olderRun` reads a key's run: merged last
  * before it (`at`), or at the same `at` not ahead of it in outcomes (S + F), then TTFT samples, then throughput samples
- * (each merge at one time only adds; the counts never decay). Not older: newer, or another summary of the same state.
+ * (each merge at one time only adds; the counts never decay), then the buffered estimate's revision (r24; none: before
+ * every one), then its points. A withdrawal or a publication without a merge (another build's figures at a root's
+ * start, a new rate cap) is a revision of its own, so an export taken before it never replaces it. Not older: newer, or
+ * another summary of the same state.
  */
 function olderSummary(s: RecordSummary, held: RecordSummary): boolean {
   const at = s.at ?? -1;
@@ -154,7 +163,11 @@ function olderSummary(s: RecordSummary, held: RecordSummary): boolean {
   if (at !== heldAt) return at < heldAt;
   if (s.s + s.f !== held.s + held.f) return s.s + s.f < held.s + held.f;
   if (s.ttftCount !== held.ttftCount) return s.ttftCount < held.ttftCount;
-  return s.tpsCount <= held.tpsCount;
+  if (s.tpsCount !== held.tpsCount) return s.tpsCount < held.tpsCount;
+  const rev = s.est?.rev ?? -1;
+  const heldRev = held.est?.rev ?? -1;
+  if (rev !== heldRev) return rev < heldRev;
+  return (s.est?.n ?? 0) <= (held.est?.n ?? 0);
 }
 
 /** `v` as a key's circuit in a collector's answer (`FeedKey.circuit`), when it is one; else null. */

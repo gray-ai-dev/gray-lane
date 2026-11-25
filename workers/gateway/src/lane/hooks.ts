@@ -25,7 +25,7 @@ import { passedClientHeaders } from "@gray/lane-wire";
 import { openAiFamily, withDefaultAccept, type Protocol } from "@gray/protocol";
 import type { RequestRecord } from "../sinks.ts";
 import type { LaneContinuationExpanded, LaneEgress, LanePolicyOutcome, LaneReceiptDraft, LaneTiming, RewritePlan } from "./types.ts";
-import { planOps } from "./plan.ts";
+import { planOps, rewritePolicyOf } from "./plan.ts";
 
 /**
  * The lane's request-path rules that are not one line at a hook site: the body cap's refusal, the
@@ -424,7 +424,7 @@ export function forwardedBody(received: Uint8Array, protocol: Protocol, plan: Re
   if (!ops.ok) {
     return { ok: false, error: ops.reason === "duplicate_key" ? laneDuplicateKey() : new ApiError(400, "invalid_stream_options") };
   }
-  const applied = applyDeclaredChanges(received, protocol as LaneProtocol, { grayOps: ops.ops, appends });
+  const applied = applyDeclaredChanges(received, protocol as LaneProtocol, { grayOps: ops.ops, appends, policy: rewritePolicyOf(ops.ops) });
   if (!applied.ok) {
     if (applied.code === "duplicate_key") return { ok: false, error: laneDuplicateKey() };
     if (applied.code === "position_protocol" || applied.code === "invalid_text" || applied.code === "append_shape") {
@@ -442,7 +442,7 @@ export function modifiedEvents(ops: readonly GrayRewriteOp[], declaredIn: string
     requestModifiedEvent({
       op: op.op,
       path: op.path,
-      ...(op.op === "remove_member" ? {} : { value: op.value }),
+      ...(op.op === "remove_member" || op.op === "wrap_input_text" ? {} : { value: op.value }),
       declaredIn,
     }) as unknown as Readonly<Record<string, unknown>>,
   );
@@ -682,6 +682,8 @@ export const LANE_RECORD_POLICY = Object.freeze({
   model: "keep",
   stream: "keep",
   region: "keep",
+  // The replica's node word and its region (0110): what the owner let leave the CVM with the row, nothing of the client.
+  entry: "keep",
   authResult: "keep",
   authScheme: "keep",
   workspaceId: "keep",

@@ -1,6 +1,7 @@
 import { get, isObject, parseStrict, readSerdeBytes, type Json, type JsonObject } from "@gray/json";
 import { applyDeclaredChanges, type GrayRewriteOp, type LaneProtocol } from "@gray/lane";
 import { deriveClaudeCodeDevice } from "./affinity.ts";
+import { codexInputOp, rewritePolicyOf } from "./plan.ts";
 
 /**
  * What an entry sends a relay's VM in place of a Messages request's `metadata.user_id` (docs/relay-request-changes.md,
@@ -99,8 +100,10 @@ export interface PeerHopBody {
  * The body of the peer hop to `relayId`'s VM (docs/confidential-lane-stack-routing.md section 4.5): `base` (the
  * client's bytes, or their zero-retention expansion) with the entry's declared ops, in path order: Messages'
  * `metadata.user_id` (`userIdOp`), then `/provider` when the client stated its routing preference in the body
- * (docs/design/one-address.md). `value` is `base` as the gateway read it, when it has it; otherwise `base` is read here.
- * Null when the ops cannot be applied (the route is passed over).
+ * (docs/design/one-address.md), then on a Codex route (`codex`) a Responses `input` that is a string wrapped as the one
+ * user message it means (`wrap_input_text /input`, gray-lane-rewrites-v3, plan.ts `codexInputOp`), which the Codex
+ * backend requires and the stack VM does not write. `value` is `base` as the gateway read it, when it has it; otherwise
+ * `base` is read here. Null when the ops cannot be applied (the route is passed over).
  */
 export function peerHopBody(input: {
   readonly protocol: LaneProtocol;
@@ -110,6 +113,8 @@ export function peerHopBody(input: {
   readonly key: Uint8Array;
   readonly owner: StandInOwner | null;
   readonly relayId: string;
+  /** The route's upstream is ChatGPT's Codex backend (`chatgpt_codex`). */
+  readonly codex?: boolean;
 }): PeerHopBody | null {
   const grayOps: GrayRewriteOp[] = [];
   if (input.protocol === "anthropic_messages") {
@@ -125,8 +130,19 @@ export function peerHopBody(input: {
     if (op !== null) grayOps.push(op);
   }
   if (input.stripProvider) grayOps.push({ op: "remove_member", path: "/provider" });
+  if (input.codex === true && input.protocol === "open_ai_responses") {
+    // Read from `base` itself: the gateway's parse of a large body may leave the conversation out, and `input` is it.
+    let body: Json;
+    try {
+      body = readSerdeBytes(input.base).value;
+    } catch {
+      return null;
+    }
+    const op = codexInputOp(body);
+    if (op !== null) grayOps.push(op);
+  }
   if (grayOps.length === 0) return { bytes: input.base, events: [] };
-  const changed = applyDeclaredChanges(input.base, input.protocol, { grayOps, appends: [] });
+  const changed = applyDeclaredChanges(input.base, input.protocol, { grayOps, appends: [], policy: rewritePolicyOf(grayOps) });
   if (!changed.ok) return null;
   return { bytes: changed.forwarded, events: changed.events as unknown as readonly JsonObject[] };
 }

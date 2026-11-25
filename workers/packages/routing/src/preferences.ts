@@ -12,7 +12,8 @@
  * new vocabulary.
  *
  * Here: how a request states one (`Preference.take`, `fromHeader`) and a key or workspace stores one
- * (`parseDefault`), read exactly as routing.rs reads `Preference` (see `statedOf`); how the
+ * (`parseDefault`; a key's by `parseKeyDefault`, without the mode r20 let it state), read exactly as routing.rs reads
+ * `Preference` (see `statedOf`); how the
  * levels layer (`layered`) and what the layered preference decides (`admits`, `position`, `selected`,
  * `affinityAllowed`, `optsIn`, `allowsOtherOperators`, `withinMaxPrice`); and the cache key a session of
  * kind `cache` is made of (`affinityKey`; session.ts). Since r17 a `sort` orders and admits nothing. The
@@ -26,7 +27,6 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { type Json, type JsonObject, get, isArray, isObject, parseStrict, toJsonString } from "@gray/json";
 import { type CanonicalRequest, anthropicCache, promptBlocks } from "@gray/protocol";
-import { PRESETS, type Preset } from "./utility-types.ts";
 
 /**
  * What the customer asked the eligible candidates to be ordered by (`RequestedSort`). Since r17
@@ -479,32 +479,26 @@ export class Preference {
   }
 
   /**
-   * An API key's stored default (`PUT /keys/{id}/routing`, `Preference::parse_key_default`): the provider preference
-   * `parseDefault` reads, beside the key's routing mode, its member `mode` (one of the four presets; null or absent:
-   * none). Anything else in `mode` makes the default unreadable, as any member this version cannot apply. Only a key's
-   * default carries a mode: a workspace's is read by `parseDefault`, which refuses one as a member it does not know.
+   * An API key's stored default (`PUT /keys/{id}/routing`): read as `parseDefault` reads any stored default, without a
+   * top-level member `mode` whatever its value. r20 let a key's default state its routing mode there; r21 took the mode
+   * off keys (the product owner, 2026-11-24; docs/utility-routing.md "No mode on a key"), so a default r20 stored, or any
+   * other value in the member, never refuses a request. Everything else that makes a default unreadable still does: a
+   * key stated twice at any depth (`mode` too: the text is read strictly first), a value that is no object, a member this
+   * version does not know (`preset` among them). A workspace's default never held a mode, and `parseDefault` reads it.
    */
-  static parseKeyDefault(stored: string): { readonly preference: Preference; readonly preset: Preset | null } | "routing_default_invalid" {
+  static parseKeyDefault(stored: string): Preference | "routing_default_invalid" {
     let value: Json;
     try {
       value = parseStrict(stored);
     } catch {
       return "routing_default_invalid";
     }
-    let preset: Preset | null = null;
     if (isObject(value) && Object.hasOwn(value, "mode")) {
-      const stated = get(value, "mode")!;
-      if (stated !== null) {
-        const named = PRESETS.find((p) => p === stated);
-        if (named === undefined) return "routing_default_invalid";
-        preset = named;
-      }
       const rest: JsonObject = { ...value };
       delete rest.mode;
       value = rest;
     }
-    const preference = Preference.read(value);
-    return preference === null ? "routing_default_invalid" : { preference, preset };
+    return Preference.read(value) ?? "routing_default_invalid";
   }
 
   /** The header form alone, for a request whose body has no place for a routing object, a multipart form (`Preference::from_header`). */
@@ -858,14 +852,3 @@ export function affinityKey(workspaceId: string, request: CanonicalRequest, body
  */
 export const AFFINITY_PER_WORKSPACE = 512;
 export const AFFINITY_WORKSPACES = 4096;
-
-/**
- * The routing mode an API key's stored default (`stored`, null: none) sets (`key_default_preset`,
- * `Preference.parseKeyDefault`); null for none and for a default that does not read, which refuses the request when its
- * preference is layered.
- */
-export function keyDefaultPreset(stored: string | null): Preset | null {
-  if (stored === null) return null;
-  const read = Preference.parseKeyDefault(stored);
-  return typeof read === "string" ? null : read.preset;
-}

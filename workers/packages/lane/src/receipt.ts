@@ -185,9 +185,9 @@ export function replayForwarded(
     if (event.type !== "request.modified") return null;
     if (event.declared_in !== policy.id) return null;
     if (typeof event.path !== "string") return null;
-    if (event.op === "remove_member") {
+    if (event.op === "remove_member" || event.op === "wrap_input_text") {
       if (event.value !== undefined || event.value_sha256 !== undefined) return null;
-      ops.push({ op: "remove_member", path: event.path });
+      ops.push({ op: event.op, path: event.path });
       continue;
     }
     if (event.op !== "set_member" && event.op !== "insert_member") return null;

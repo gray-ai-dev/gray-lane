@@ -1,12 +1,29 @@
 import { LOCATION_HINTS } from "@gray/config";
 import { isGeneration, isProtocol } from "@gray/protocol";
-import { addAttempt, DEFAULT_RECORD_PARAMS, emptyDelta, emptyRecord, mergeDelta, recordFromJson, recordParamsWithinBounds, summaryOf, type LongRecord, type RecordDelta, type RecordParams, type RecordSummary } from "@gray/routing";
+import {
+  addAttempt,
+  addEstimation,
+  DEFAULT_RECORD_PARAMS,
+  emptyDelta,
+  emptyRecord,
+  isEstimationPoint,
+  mergeDelta,
+  recordFromJson,
+  recordParamsWithinBounds,
+  reviseEstimate,
+  summaryOf,
+  type LongRecord,
+  type RecordDelta,
+  type RecordParams,
+  type RecordSummary,
+} from "@gray/routing";
 import { mergeAccountBlockViews } from "./account-blocks.ts";
 import { Circuits, decodeRuns, ROUTE_CIRCUIT, validMeasure, type CircuitHealth, type CircuitsSnapshot, type ProbeLease, type RankingStateJson } from "./circuit.ts";
 import type { RankingPush, RankingPushAck } from "./ranking-feed.ts";
 import { retryConcurrencyLimit } from "./retry.ts";
 import { circuitSettings, inDoubtMs, type EndpointSettings } from "./settings.ts";
 import {
+  EST_POINTS_MAX,
   recordSuccess,
   SUPPLIER_FAILURES,
   type AnsweredInput,
@@ -14,6 +31,7 @@ import {
   type ConfigureInput,
   type Delivery,
   type EndRestsInput,
+  type EstPoint,
   type FiledRest,
   type GateView,
   type ProbeAnswered,
@@ -77,6 +95,12 @@ import {
  *   `configure` (`recordParams`, the highest version, on disk in the root's state); while it has fewer than `threshold`
  *   TTFT samples the root grants at most `unmeasuredInflight` permits in all (`ceiling`), and its summary goes to the
  *   ranking collector with the pushes.
+ * - The buffered estimate (r24, docs/utility-routing.md "The buffered estimate"). A report's buffered points
+ *   (`ShardReport.est`) are weighed into the record's estimation once, when the report is applied and was built within
+ *   idleReturnMs, against the reference fit the record held before them and the rate cap the root holds. The summary
+ *   publishes the estimate once its gates pass, and the in-flight cap is lifted while it is published; each change of
+ *   the published figures (a withdrawal too) is a new revision of the record, which holds them, and a record with an
+ *   estimation reaches the collector only as written.
  *
  * Pure: the Durable Object (workers/gateway/src/objects/endpoint-root.ts) supplies the storage and
  * the clock, and delivers the returned messages to the shards.
@@ -359,6 +383,12 @@ export class EndpointRootCore {
   private recordUnsaved = false;
   /** The record's place on disk holds something (a record, or one this build cannot read). */
   private recordOnDisk: boolean;
+  /**
+   * The record as last written to its place (or as read from it at start). A record with a buffered estimation goes to
+   * the collector as written, never ahead of its disk (`exposed`): a root that comes back then never holds less than the
+   * feed was shown, so a revision it makes at start (another build's figures) is newer than any summary it pushed before.
+   */
+  private committed: LongRecord;
   /** The record changed since the last push to the ranking collector (`takeRankingPush`). */
   private recordPushDue = false;
   /** The disk held a record this build cannot read (another `v`, a bad shape): it started a new one. Said in the log. */
@@ -425,6 +455,7 @@ export class EndpointRootCore {
     this.recordOnDisk = stored !== null;
     this.recordDropped = stored !== null && record === null;
     this.record = record ?? emptyRecord();
+    this.committed = this.record;
     if (record === null && this.root.configured) {
       // A configured root without a record it reads (one of an earlier release, or one whose record was dropped): the route
       // starts on start values and its in-flight cap (docs/utility-routing.md "Deployment"), which reaches every shard
@@ -437,6 +468,11 @@ export class EndpointRootCore {
         store.saveRoot(this.root);
       }
       this.writeRecordPlace();
+    } else if (record !== null) {
+      this.startEstimation();
+      // A record with an estimation goes to the collector once at start: the instance before may have written a revision
+      // (a withdrawal at a new rate cap) and gone before its push (review r24 R10).
+      if (this.record.est !== undefined) this.recordPushDue = true;
     }
     // A root this build wrote keeps its leases and their spells' clocks, unlike the server's restart of its own
     // checkpoint (ranking.rs `restore`, where the process took the probe's request with it): the platform takes an idle
@@ -449,6 +485,23 @@ export class EndpointRootCore {
       this.root = { ...this.root, build };
       this.store.saveRoot(this.root);
     }
+  }
+
+  /**
+   * A readable record at start (r24): its estimation's figures as this build works them out under the rate cap the root
+   * holds now (`reviseEstimate`): when they differ from what the record on disk published (another build wrote it, its
+   * gates other than this one's), the next revision, written at once and pushed. A ceiling that fell with it (this build
+   * withholds an estimate the other published) caps the leases at once and makes a newer view, which every shard holding
+   * permits is sent (`pending`), as a merge that withdraws the estimate does; a ceiling that rose is heard the same way.
+   */
+  private startEstimation(): void {
+    const ceiling = this.ceiling();
+    const synced = reviseEstimate(this.record, this.recordParams().maxRateTps);
+    if (synced === this.record) return;
+    this.record = synced;
+    this.recordPushDue = true;
+    this.writeRecordPlace();
+    if (this.root.configured) this.ceilingMoved(ceiling);
   }
 
   /**
@@ -643,7 +696,8 @@ export class EndpointRootCore {
    */
   private ceiling(): number {
     const p = this.recordParams();
-    if (!generationRoute(this.root.endpointId) || this.record.ttftCount >= p.threshold) return this.root.maxConcurrency;
+    // r24: the cap is lifted while the buffered estimate is published (docs "The buffered estimate").
+    if (!generationRoute(this.root.endpointId) || this.record.ttftCount >= p.threshold || (this.record.est?.ttftMs ?? null) !== null) return this.root.maxConcurrency;
     return Math.min(this.root.maxConcurrency, p.unmeasuredInflight);
   }
 
@@ -662,10 +716,47 @@ export class EndpointRootCore {
     }
   }
 
-  /** The record as the gateways read it (`RankingPush.record`): its summary, or null before its first merge. */
+  /**
+   * When the most this root grants in all is no longer `before` (the in-flight cap lifted or set again): every lease capped
+   * to it and a new view, which every shard holding permits is sent, as a raise or a lowering of the maximum is. True
+   * when it moved.
+   */
+  private ceilingMoved(before: number): boolean {
+    if (this.ceiling() === before) return false;
+    this.capLeases(this.ceiling());
+    const version = this.root.version + 1;
+    this.root = { ...this.root, version, deliverVersion: version };
+    this.store.saveRoot(this.root);
+    return true;
+  }
+
+  /**
+   * The record's place now holds the record (r24): it is the committed one, and when it has a buffered estimation (or the
+   * one written before had) its summary waits for a push, which until now showed the record written before.
+   */
+  private recordWritten(): void {
+    this.recordOnDisk = true;
+    if (this.committed === this.record) return;
+    if (this.record.est !== undefined || this.committed.est !== undefined) this.recordPushDue = true;
+    this.committed = this.record;
+  }
+
+  /**
+   * The record the collector is shown (a push, a sweep's export): a record with a buffered estimation as last written
+   * (`committed`), so the feed never holds a merge time, a revision or a figure the disk does not (review r24 R1: a root
+   * that restarted before its checkpoint and withdrew at start was refused for an older merge time); one without, as
+   * merged (the feed then leads the disk by at most ENDPOINT_HEALTH_CHECKPOINT_MS, as before). A store without the
+   * record's place keeps it in memory: as merged.
+   */
+  private exposed(): LongRecord {
+    if (this.store.saveRecord === undefined || (this.record.est === undefined && this.committed.est === undefined)) return this.record;
+    return this.committed;
+  }
+
+  /** The record as the gateways read it (`RankingPush.record`): its summary (`exposed`), or null before its first merge. */
   private recordSummary(): RecordSummary | null {
-    const r = this.record;
-    return r.avail.at === null && r.tps.at === null && r.ttft.at === null ? null : summaryOf(r);
+    const r = this.exposed();
+    return r.avail.at === null && r.tps.at === null && r.ttft.at === null && r.est === undefined ? null : summaryOf(r);
   }
 
   /**
@@ -674,18 +765,28 @@ export class EndpointRootCore {
    * caller then sends every shard the new view, which carries the new maximum (as a raise or a lowering does).
    */
   private mergeRecord(delta: RecordDelta, now: number): boolean {
+    return this.setRecord(mergeDelta(this.record, delta, now, this.recordParams()));
+  }
+
+  /**
+   * A report's buffered points (r24) weighed into the record's estimation at `now` (`addEstimation`, under the rate cap
+   * held now), as `mergeRecord` merges increments: true when it lifted the in-flight cap or set it again (a publication or
+   * a withdrawal).
+   */
+  private mergeEstimation(points: readonly EstPoint[], now: number): boolean {
+    const p = this.recordParams();
+    return this.setRecord(addEstimation(this.record, points.map(([u, c, o, y]) => ({ u, c, o, y })), now, p.maxRateTps));
+  }
+
+  /** The record becomes `next`, to be written with the next health write and pushed; true when the ceiling moved. */
+  private setRecord(next: LongRecord): boolean {
+    if (next === this.record) return false;
     const before = this.ceiling();
-    const merged = mergeDelta(this.record, delta, now, this.recordParams());
-    if (merged === this.record) return false;
-    this.record = merged;
+    this.record = next;
     this.recordUnsaved = true;
-    this.recordPushDue = true;
-    if (this.ceiling() === before) return false;
-    this.capLeases(this.ceiling());
-    const version = this.root.version + 1;
-    this.root = { ...this.root, version, deliverVersion: version };
-    this.store.saveRoot(this.root);
-    return true;
+    // A record shown as written waits for its write to be pushed (`recordWritten`).
+    if (this.exposed() === this.record) this.recordPushDue = true;
+    return this.ceilingMoved(before);
   }
 
   /**
@@ -700,7 +801,7 @@ export class EndpointRootCore {
     }
     if (this.store.saveRecord !== undefined) {
       this.store.saveRecord(this.record);
-      this.recordOnDisk = true;
+      this.recordWritten();
     }
     this.recordUnsaved = false;
   }
@@ -942,12 +1043,16 @@ export class EndpointRootCore {
      * increments, which a copy delayed past its idle lease's removal would count again. Said in the log.
      */
     readonly recordLate: boolean;
+    /** The report's buffered points were not ones (`estPointsValid`): applied without them. Said in the log. */
+    readonly estRefused: boolean;
+    /** The report carried buffered points but was built more than idleReturnMs ago, or says not when: applied without them. */
+    readonly estLate: boolean;
   } {
     this.checkEndpoint(input.endpointId, false);
     checkReport(input);
     const now = this.clock();
     let lease = this.leases.get(input.shard);
-    const stale = (held: Lease) => ({ reply: { stale: true, view: this.view(), allowance: held.granted }, deliveries: [], tripped: [], startedOver: null, behind: null, recordRefused: false, recordLate: false });
+    const stale = (held: Lease) => ({ reply: { stale: true, view: this.view(), allowance: held.granted }, deliveries: [], tripped: [], startedOver: null, behind: null, recordRefused: false, recordLate: false, estRefused: false, estLate: false });
     let startedOver: StartedOver | null = null;
     const another = lease !== undefined && input.incarnation !== undefined && lease.incarnation !== undefined && input.incarnation !== lease.incarnation;
     // A report of a storage made before the lease's: one that was replaced, its report still on its way (an instance
@@ -1068,7 +1173,14 @@ export class EndpointRootCore {
     const built: unknown = input.builtAt;
     const recordLate = input.record !== undefined && !recordRefused && built !== undefined && (!Number.isSafeInteger(built) || (built as number) < 0 || now - (built as number) > this.settings.idleReturnMs);
     const merged = input.record !== undefined && !recordRefused && !recordLate;
-    const moved = merged && this.mergeRecord(input.record!, now);
+    const movedByRecord = merged && this.mergeRecord(input.record!, now);
+    // The buffered points (r24) by the same rule, whether or not the report has increments (a probe's or a trial's point
+    // comes without), and from a report that says when it was built only: a shard that sends them always says.
+    const estRefused = input.est !== undefined && !estPointsValid(input.est);
+    const estLate = input.est !== undefined && !estRefused && (built === undefined || !Number.isSafeInteger(built) || (built as number) < 0 || now - (built as number) > this.settings.idleReturnMs);
+    const estMerged = input.est !== undefined && !estRefused && !estLate && input.est.length > 0;
+    const movedByEst = estMerged && this.mergeEstimation(input.est!, now);
+    const moved = movedByRecord || movedByEst;
     const outcomes = this.root.configured && input.outcomes !== undefined && input.outcomes.length > 0;
     let opened = false;
     let durable = false;
@@ -1092,7 +1204,7 @@ export class EndpointRootCore {
     }
     // The reporter has the view in its reply.
     if (opened || moved) deliveries.push(...this.deliveriesForAll().filter((d) => d.shard !== input.shard));
-    if (outcomes || merged) {
+    if (outcomes || merged || estMerged) {
       this.unsavedSeq.add(lease.shard);
       // In memory only until the next write: the alarm writes them once the reports stop (`tick`), a checkpoint at the latest.
       if (durable || moved || now - this.healthSavedAt >= this.settings.healthCheckpointMs) this.saveHealth();
@@ -1132,7 +1244,7 @@ export class EndpointRootCore {
     else this.unsavedSeq.add(lease.shard);
     // The reply carries the view too, but it may be lost: only an acknowledged message counts as
     // delivered (`delivered`), so a broadcast the shard missed is sent again.
-    return { reply: { stale: false, view: this.view(), allowance, ...(recalled > 0 ? { recalled } : {}) }, deliveries, tripped, startedOver, behind, recordRefused, recordLate };
+    return { reply: { stale: false, view: this.view(), allowance, ...(recalled > 0 ? { recalled } : {}) }, deliveries, tripped, startedOver, behind, recordRefused, recordLate, estRefused, estLate };
   }
 
   /**
@@ -1434,6 +1546,14 @@ export class EndpointRootCore {
     const rate = this.recordParams().maxRateTps;
     this.root = { ...this.root, recordParams: params };
     this.store.saveRoot(this.root);
+    if (this.record.est !== undefined) {
+      // r24: the rate cap bounds the estimate's decode time, so a new one may move the published figures: the next
+      // revision. The record is written in this turn with the parameters, the leases whose reports it holds with it (review
+      // r24 R10): a root that comes back reads the rate cap and the record that goes with it, never the new cap beside a
+      // record behind what the feed was shown.
+      this.record = reviseEstimate(this.record, params.maxRateTps);
+      this.writeRecordPlace();
+    }
     return this.ceiling() !== ceiling || params.maxRateTps !== rate ? "view" : "taken";
   }
 
@@ -1526,7 +1646,7 @@ export class EndpointRootCore {
     // The long record in the same turn, after the leases whose reports it holds (row 4).
     if (this.recordUnsaved && this.store.saveRecord !== undefined) {
       this.store.saveRecord(this.record);
-      this.recordOnDisk = true;
+      this.recordWritten();
     }
     this.recordUnsaved = false;
     this.healthUnsavedAt = null;
@@ -1792,6 +1912,16 @@ function recordParamsWithin(input: unknown): RecordParams | null {
   if (!RECORD_PARAM_NAMES.every((name) => typeof p[name] === "number" && Number.isFinite(p[name]))) return null;
   const params = Object.fromEntries(RECORD_PARAM_NAMES.map((name) => [name, p[name]])) as unknown as RecordParams;
   return recordParamsWithinBounds(params) ? params : null;
+}
+
+/**
+ * Whether `v` is a shard report's buffered points (`ShardReport.est`, r24): a list of at most `EST_POINTS_MAX`, each four
+ * members that make a point the estimation takes (@gray/routing `isEstimationPoint`). A report with a list that is not
+ * is applied without it.
+ */
+function estPointsValid(v: unknown): v is readonly EstPoint[] {
+  if (!Array.isArray(v) || v.length > EST_POINTS_MAX) return false;
+  return v.every((p) => Array.isArray(p) && p.length === 4 && isEstimationPoint({ u: p[0], c: p[1], o: p[2], y: p[3] }));
 }
 
 /**

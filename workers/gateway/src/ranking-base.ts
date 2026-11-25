@@ -58,10 +58,23 @@ export class RankingBase {
     return this.records;
   }
 
-  /** What the base holds of the feed (`FeedHave`), null before its first answer: what a check asks with. */
+  /** What the base holds of the feed (`FeedHave`), null before its first answer. */
   have(): FeedHave | null {
     return this.ranker?.feed() ?? null;
   }
+
+  /**
+   * What a check asks with: what the base holds (`have`), or null, the whole feed, while a whole answer is due since the
+   * form of its records changed (`apply`'s `estimates`).
+   */
+  ask(): FeedHave | null {
+    return this.wholeDue ? null : this.have();
+  }
+
+  /** Whether the records the base holds carry their estimates (r24): null before an answer that says (`apply`). */
+  private estimates: boolean | null = null;
+  /** A whole answer is due: the form of the records changed, and the base asks for the whole feed until it takes one. */
+  private wholeDue = false;
 
   /**
    * Takes a feed answer at `nowMs` (`Ranker.applyFeed`: times after `nowMs` taken as `nowMs`). An answer of the base's
@@ -70,14 +83,27 @@ export class RankingBase {
    * was, for an answer it cannot read; never throws, so a ranking answer never costs a snapshot. `config`: the ranking
    * configuration the base ranks with (the roots' ENDPOINT_BREAKER_* settings, @gray/endpoint `rankingConfigOf`), taken
    * when the base is made.
+   *
+   * `estimates` (r24, the TEE's bridge): whether the read asked for each record's estimate. When it differs from the form
+   * the base holds, a whole answer is due (`ask`), and a base that held estimates forgets them at once
+   * (`Ranker.dropFeedEstimates`): a bridge rolled back to r23 sends no estimate and no withdrawal, and an unchanged route
+   * would keep its old figures in a delta of r23. Only a whole answer the base takes ends the wait. Absent (every other
+   * source): no form to keep.
    */
-  apply(answer: unknown, nowMs: number, config: RankingConfig = DEFAULT_RANKING_CONFIG): boolean {
+  apply(answer: unknown, nowMs: number, config: RankingConfig = DEFAULT_RANKING_CONFIG, estimates?: boolean): boolean {
     try {
       if (!feedAnswerValid(answer)) throw new Error("not a feed answer");
       const have = this.have();
+      // The form first, whatever the answer brings: a delta behind the base still says the bridge changed.
+      if (estimates !== undefined && this.estimates !== null && estimates !== this.estimates) {
+        this.wholeDue = true;
+        if (!estimates) this.ranker?.dropFeedEstimates();
+      }
+      if (estimates !== undefined) this.estimates = estimates;
       if (!answer.full && have !== null && answer.epoch === have.epoch && answer.seq < have.seq) return true;
       const ranker = this.ranker ?? new Ranker(config);
       ranker.applyFeed(answer, nowMs);
+      if (answer.full) this.wholeDue = false;
       this.ranker = ranker;
       this.records = answer.records !== undefined;
       // A whole answer replaces the base, its age with it (another replica's older copy is that old); a delta adds to it.

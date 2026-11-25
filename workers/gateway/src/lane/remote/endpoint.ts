@@ -54,6 +54,12 @@ import { LegacyLatch } from "./legacy.ts";
  * and measure kept, and the measures' latch (`RemoteEndpointOptions.measures`) keeps the measures to four for
  * LANE_BRIDGE_LEGACY_RETRY_MS. The shard then counts a 429 of the lane's as outside a session: its availability loses
  * nothing else. A bridge before r16 refuses the four members too, and the call ends at the document of before.
+ *
+ * Since r24 a buffered success's release carries its estimation point (`est`, two integers: docs/utility-routing.md). A
+ * bridge before r24 refuses the member (400): the release goes again without it, as `#sendMeasured` sends it, and the
+ * points' latch (`RemoteEndpointOptions.points`) keeps releases without it for LANE_BRIDGE_LEGACY_RETRY_MS. The root then
+ * counts no point of the lane's; the permit and its measure are as before. A release runs in the background after its
+ * attempt ended (inference.ts `endAttempt`), so the extra call is never on a request's path.
  */
 
 /** What the remote endpoint clients share: the endpoint ops' latch and its clock. */
@@ -64,6 +70,8 @@ export interface RemoteEndpointOptions {
   readonly now?: () => number;
   /** Whether the bridge refused a measure of five members lately (r17); the process's own (`MEASURES`) by default. */
   readonly measures?: LegacyLatch;
+  /** Whether the bridge refused a release's estimation point lately (r24); the process's own (`POINTS`) by default. */
+  readonly points?: LegacyLatch;
 }
 
 /**
@@ -72,14 +80,25 @@ export interface RemoteEndpointOptions {
  */
 const MEASURES = new LegacyLatch();
 
+/** The process's points latch (r24): a bridge before r24 refused a release's `est` within LANE_BRIDGE_LEGACY_RETRY_MS. */
+const POINTS = new LegacyLatch();
+
 interface Legacy {
   readonly latch: LegacyLatch;
   readonly measures: LegacyLatch;
+  readonly points: LegacyLatch;
   readonly now: () => number;
 }
 
 function legacyOf(options: BridgeClientOptions, endpoint: RemoteEndpointOptions): Legacy {
-  return { latch: endpoint.legacy ?? new LegacyLatch("endpoint"), measures: endpoint.measures ?? MEASURES, now: endpoint.now ?? options.now ?? Date.now };
+  return { latch: endpoint.legacy ?? new LegacyLatch("endpoint"), measures: endpoint.measures ?? MEASURES, points: endpoint.points ?? POINTS, now: endpoint.now ?? options.now ?? Date.now };
+}
+
+/** A release as a bridge before r24 takes it: without its estimation point (`est`); null when it carries none. */
+function releaseWithoutPoint(input: ReleaseInput): ReleaseInput | null {
+  if (input.est === undefined) return null;
+  const { est: _est, ...before } = input;
+  return before;
 }
 
 /** The measure of r16: the four members before the fifth (`inSession`) of r17. */
@@ -103,7 +122,7 @@ function permitBefore(permit: PermitToken): PermitToken {
 
 function releaseBefore(input: ReleaseInput): ReleaseInput | null {
   if (input.permit.key === undefined && input.measure === undefined) return null;
-  const { measure: _measure, ...before } = input;
+  const { measure: _measure, est: _est, ...before } = input;
   return { ...before, permit: permitBefore(input.permit) };
 }
 
@@ -172,12 +191,34 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
     }
   }
 
+  /**
+   * A release with its estimation point (r24), or without it (`without`) when the points' latch holds, the endpoint ops'
+   * latch holds, or the bridge refuses it (400): then as `#sendMeasured` sends a release of r23. The latch is set once that
+   * release was taken, so a 400 for another reason, which it gets too, throws and changes nothing. No point: as r23.
+   */
+  async #sendPoint(call: BridgeCall, input: ReleaseInput): Promise<BridgeResponseOf<"endpoint.release">> {
+    const without = releaseWithoutPoint(input);
+    const measured = (i: ReleaseInput) => this.#sendMeasured("endpoint.release", call, i, fourMembers(i), releaseBefore(i), endpointReleaseInputDtoOf);
+    if (without === null) return measured(input);
+    const { latch, measures, points, now } = this.#legacy;
+    if (latch.legacy(now()) || measures.legacy(now()) || points.legacy(now())) return measured(without);
+    try {
+      return await this.call("endpoint.release", call, endpointReleaseInputDtoOf(input));
+    } catch (error) {
+      if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
+      const answer = await measured(without);
+      if (!points.legacy(now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "endpoint_point", window_ms: points.retryMs }));
+      points.refused(now());
+      return answer;
+    }
+  }
+
   async acquire(input: AcquireInput): Promise<AcquireResult> {
     return acquireResultOf(await this.#send("endpoint.acquire", bridgeCall("endpoint.acquire", this.#target()), input, acquireBefore(input), acquireInputDtoOf));
   }
 
   async release(input: ReleaseInput): Promise<ReleaseResult> {
-    return endpointReleaseResultOf(await this.#sendMeasured("endpoint.release", bridgeCall("endpoint.release", this.#target()), input, fourMembers(input), releaseBefore(input), endpointReleaseInputDtoOf));
+    return endpointReleaseResultOf(await this.#sendPoint(bridgeCall("endpoint.release", this.#target()), input));
   }
 
   async reserveRetry(input: RetryReserveInput): Promise<RetryReserveResult> {

@@ -2,7 +2,8 @@ import { ApiError } from "@gray/errors";
 import { compareUtf8 } from "@gray/json";
 import { type CanonicalRequest, type Protocol, endpointPath, isGeneration, reasoningRequested, structured } from "@gray/protocol";
 import { protocolTitle } from "@gray/translation";
-import { laneModel } from "./preference.ts";
+import { PRESETS, type Preference } from "@gray/routing";
+import { awaitsMode, laneModel, tierAdmitted } from "./preference.ts";
 import { chatFor, type GatewaySnapshot, type ModeCapabilities, type RouteRecord, routeServes, takesTraffic } from "./snapshot.ts";
 import type { TranslationRules } from "./translate.ts";
 
@@ -48,6 +49,21 @@ export function noProviderUndated(model: string, atLane: boolean): ApiError {
   return new ApiError(503, "no_available_provider")
     .withMessage(`No verified provider can serve \`${model}\` right now, and Gray cannot say when one will. Choose another model, or retry later.${lane}`)
     .withMeta("limit_source", "provider_availability");
+}
+
+const quoted = (word: string) => `\`${word}\``;
+
+/**
+ * 400 `routing_mode_required` for a model whose routes on the API called all have a tier (docs/utility-routing.md "Tiered
+ * routes"), asked by a request that states no routing parameters and names none of those routes. Such a route serves only
+ * a request that opts in, and any routing mode does; a retry without one cannot pass, so the answer is no 503.
+ */
+export function modeRequired(model: string): ApiError {
+  return new ApiError(400, "routing_mode_required")
+    .withMessage(
+      `The model \`${model}\` is served only by routes that a request uses when it names a routing mode, and this request names none. Send a mode (${PRESETS.slice(0, -1).map(quoted).join(", ")} or ${quoted(PRESETS.at(-1)!)}) in the \`x-gray-routing-params\` header, for example \`{"mode":"standard"}\`.`,
+    )
+    .withMeta("modes", [...PRESETS]);
 }
 
 function andList(items: readonly string[]): string {
@@ -129,9 +145,11 @@ export function missingCapability(model: string, protocol: Protocol, routes: rea
 
 /**
  * `policy`: the operator's translation policy; an API it lets reach a served one is named as a path
- * the model can be called through, as one that serves it natively is.
+ * the model can be called through, as one that serves it natively is. `preference`: the request's layered preference,
+ * which tells a model left without a route only because the request named no routing mode (`modeRequired`); without
+ * it that model's answer is `no_available_provider`.
  */
-export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, protocol: Protocol, nowMs: number, mediaUnknown: boolean, policy?: TranslationRules): ApiError {
+export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, protocol: Protocol, nowMs: number, mediaUnknown: boolean, policy?: TranslationRules, preference?: Preference): ApiError {
   const model = request.model;
   // Whether Gray's confidential VM serves the model on this API there (`laneModel`): a pause here says so, and a model
   // this gateway does not know is served there. The lane's own snapshot carries no lane pairs, so in lane mode never.
@@ -146,7 +164,8 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
   const targets: Protocol[] = [protocol, ...(policy?.upstreams(model, protocol) ?? [])];
   // A lane relay's route serves its own API only, never a translation (translate.ts `entryRules`): on a target API it
   // proves nothing for this request. Only the confidential entry's snapshot has such routes.
-  const here = live.filter((r) => r.protocol === protocol || (targets.includes(r.protocol) && r.auth !== "lane_relay"));
+  const reaches = (r: RouteRecord) => r.protocol === protocol || (targets.includes(r.protocol) && r.auth !== "lane_relay");
+  const here = live.filter(reaches);
   if (here.length > 0) {
     // Where else the model takes images: an image edits route, or a generation route of another API that
     // proved image input (model_resolution.rs on main), each path once, in order.
@@ -157,7 +176,12 @@ export function unrouted(snapshot: GatewaySnapshot, request: CanonicalRequest, p
           .map((r) => `POST ${endpointPath(r.protocol, model, false)}`),
       ),
     ].sort(compareUtf8);
-    return missingCapability(model, protocol, here, request, mediaUnknown, elsewhere) ?? noProvider(model, atLane);
+    const missing = missingCapability(model, protocol, here, request, mediaUnknown, elsewhere);
+    if (missing !== null) return missing;
+    // A mode would let a live route here serve, and no unexpired route here serves without one: a route the request may
+    // use that is resting or out of traffic for now keeps the answer a pause.
+    if (preference !== undefined && here.some((r) => awaitsMode(preference, r)) && !unexpired.some((r) => reaches(r) && tierAdmitted(preference, r))) return modeRequired(model);
+    return noProvider(model, atLane);
   }
   // Its routes here have not expired, and every one is past its traffic limit: a pause with no time to name.
   if (unexpired.some((r) => targets.includes(r.protocol))) return noProviderUndated(model, atLane);

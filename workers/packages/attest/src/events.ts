@@ -137,16 +137,33 @@ export const REQUEST_MODIFIED_FORM_OPS = Object.freeze(["set_form_field", "remov
 export type RequestModifiedFormOp = (typeof REQUEST_MODIFIED_FORM_OPS)[number];
 
 /**
- * The closed op vocabulary of `request.modified` (one event per op, in application order). A verifier that does not
- * know an op fails the receipt that carries it: gray-lane-verify 1.3.0 and earlier know the three member ops only.
+ * The structural ops on a JSON body (`gray-lane-rewrites-v3`): a member's value rewritten into a fixed shape around the
+ * client's own bytes. `wrap_input_text /input` turns a Responses `input` that is a JSON string `S` into
+ * `[{"type":"message","role":"user","content":[{"type":"input_text","text":S}]}]`, with `S` the client's string token
+ * byte for byte, so the event carries no value: its replay takes `S` from the bytes the client sent. The Codex backend
+ * refuses a string `input`; every other API takes it. gray-lane-verify 1.6.0 and earlier do not know the op.
  */
-export const REQUEST_MODIFIED_OPS = Object.freeze([...REQUEST_MODIFIED_MEMBER_OPS, ...REQUEST_MODIFIED_FORM_OPS] as const);
+export const REQUEST_MODIFIED_STRUCTURAL_OPS = Object.freeze(["wrap_input_text"] as const);
+
+export type RequestModifiedStructuralOp = (typeof REQUEST_MODIFIED_STRUCTURAL_OPS)[number];
+
+/**
+ * The closed op vocabulary of `request.modified` (one event per op, in application order). A verifier that does not
+ * know an op fails the receipt that carries it: gray-lane-verify 1.3.0 and earlier know the three member ops only, and
+ * 1.6.0 and earlier do not know the structural op.
+ */
+export const REQUEST_MODIFIED_OPS = Object.freeze([...REQUEST_MODIFIED_MEMBER_OPS, ...REQUEST_MODIFIED_FORM_OPS, ...REQUEST_MODIFIED_STRUCTURAL_OPS] as const);
 
 export type RequestModifiedOp = (typeof REQUEST_MODIFIED_OPS)[number];
 
 /** Whether `op` is one of the two form ops. */
 export function isFormOp(op: unknown): op is RequestModifiedFormOp {
   return typeof op === "string" && (REQUEST_MODIFIED_FORM_OPS as readonly string[]).includes(op);
+}
+
+/** Whether `op` is a structural op (`wrap_input_text`): a JSON body's op that carries no value. */
+export function isStructuralOp(op: unknown): op is RequestModifiedStructuralOp {
+  return typeof op === "string" && (REQUEST_MODIFIED_STRUCTURAL_OPS as readonly string[]).includes(op);
 }
 
 /** The four types no extension may use (§7.4: `MUST NOT reuse the required types`). */
@@ -284,11 +301,14 @@ export function isFormFieldName(value: unknown): value is string {
 const declaredInSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,127}$/, "a lower_case policy id");
 const modifiedValueSchema = z.union([z.string(), z.boolean(), z.bigint(), z.record(z.string(), z.unknown())]);
 
-/** The value rule of a member op: `remove_member` carries neither value; `set_member` and `insert_member` exactly one. */
+/**
+ * The value rule of a JSON body's op: `remove_member` and a structural op carry neither value; `set_member` and
+ * `insert_member` exactly one.
+ */
 function checkMemberValue(event: { readonly op: string; readonly value?: unknown; readonly value_sha256?: unknown }, ctx: z.RefinementCtx): void {
-  if (event.op === "remove_member") {
+  if (event.op === "remove_member" || isStructuralOp(event.op)) {
     if (event.value !== undefined || event.value_sha256 !== undefined) {
-      ctx.addIssue({ code: "custom", path: ["value"], message: "remove_member carries no value" });
+      ctx.addIssue({ code: "custom", path: ["value"], message: `${event.op} carries no value` });
     }
     return;
   }
@@ -305,6 +325,21 @@ export const requestMemberModifiedSchema = z
   .object({
     type: z.literal(EVENT_REQUEST_MODIFIED),
     op: z.enum(REQUEST_MODIFIED_MEMBER_OPS),
+    path: modifiedPathSchema,
+    value: modifiedValueSchema.optional(),
+    value_sha256: hex32.optional(),
+    declared_in: declaredInSchema,
+  })
+  .superRefine(checkMemberValue);
+
+/**
+ * A `peer.forwarded`'s op: a member op, or the structural `wrap_input_text` (gray-lane-rewrites-v3), which the entry
+ * applies before the hop on a Codex route. The relay stack's own attempts take member ops alone.
+ */
+export const requestPeerModifiedSchema = z
+  .object({
+    type: z.literal(EVENT_REQUEST_MODIFIED),
+    op: z.enum([...REQUEST_MODIFIED_MEMBER_OPS, ...REQUEST_MODIFIED_STRUCTURAL_OPS]),
     path: modifiedPathSchema,
     value: modifiedValueSchema.optional(),
     value_sha256: hex32.optional(),
@@ -892,10 +927,11 @@ export const peerForwardedSchema = z
     /**
      * The entry's declared ops on the body it sent the peer (docs/design/one-address.md), in order, under the published
      * rewrite policy: the client's `request.received` bytes with them applied are the bytes the stack VM received (its
-     * inner `request.received`). Absent when the entry sent the client's bytes as they came. Today the one such op is
-     * `remove_member /provider`, the routing preference the client stated in the body.
+     * inner `request.received`). Absent when the entry sent the client's bytes as they came. The ops are Messages'
+     * `metadata.user_id` stand-in or removal, `remove_member /provider` (the routing preference the client stated in the
+     * body), and on a Codex route `wrap_input_text /input` (gray-lane-rewrites-v3).
      */
-    modified: z.array(requestMemberModifiedSchema).min(1).optional(),
+    modified: z.array(requestPeerModifiedSchema).min(1).optional(),
   })
   .strict();
 
@@ -1182,8 +1218,8 @@ export function requestModifiedEvent(input: {
   }
   if (!modifiedPathSchema.safeParse(input.path).success || !input.path.isWellFormed()) throw new Error("path is an absolute JSON Pointer of at most 256 characters");
   if (!declaredInSchema.safeParse(input.declaredIn).success) throw new Error(`not a lane rewrite policy id: ${input.declaredIn}`);
-  if (input.op === "remove_member") {
-    if (input.value !== undefined || input.valueSha256 !== undefined) throw new Error("remove_member carries no value");
+  if (input.op === "remove_member" || isStructuralOp(input.op)) {
+    if (input.value !== undefined || input.valueSha256 !== undefined) throw new Error(`${input.op} carries no value`);
   } else if ((input.value === undefined) === (input.valueSha256 === undefined)) {
     throw new Error("exactly one of value and value_sha256 is required");
   }
@@ -1483,6 +1519,8 @@ export type EventLogProblem =
   // A form op (`set_form_field`, `remove_form_field`, docs/design/standard-media-at-entry.md section 2.4):
   | "form_op_mixed"
   | "form_op_position"
+  // A structural op (`wrap_input_text`, gray-lane-rewrites-v3) in a relay stack's attempt, which never declares one:
+  | "structural_op_position"
   // Relay-stack receipts (S26):
   | "stack_event_repeated"
   | "returned_not_last"
@@ -1895,6 +1933,7 @@ function checkStackOrder(events: readonly Json[], types: readonly (string | unde
       }
       case EVENT_REQUEST_MODIFIED:
         if (isFormOp(get(event, "op"))) push("form_op_position", `request.modified at event ${index} names a form op: a relay stack's request is JSON`);
+        if (isStructuralOp(get(event, "op"))) push("structural_op_position", `request.modified at event ${index} names ${String(get(event, "op"))}: the entry declares it, a relay stack's attempt does not`);
         if (open === null) outside(index, type);
         else if (open.stage !== "started" && open.stage !== "modified") push("attempt_order", `request.modified at event ${index} follows ${STAGE_EVENTS[open.stage]}`);
         else open.stage = "modified";

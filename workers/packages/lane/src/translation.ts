@@ -294,7 +294,7 @@ export function translatedForwarded(
   if (!replay.ok) return replay;
   const translationPolicy = TRANSLATIONS[spec.declaredIn].policy;
   const events = (ops: readonly GrayRewriteOp[], policy: LaneRewritePolicy): JsonObject[] =>
-    ops.map((op) => requestModifiedEvent({ op: op.op, path: op.path, ...(op.op === "remove_member" ? {} : { value: op.value }), declaredIn: policy.id }));
+    ops.map((op) => requestModifiedEvent({ op: op.op, path: op.path, ...(op.op === "remove_member" || op.op === "wrap_input_text" ? {} : { value: op.value }), declaredIn: policy.id }));
   return {
     ok: true,
     forwarded: replay.forwarded,

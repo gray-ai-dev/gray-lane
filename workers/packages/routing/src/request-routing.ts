@@ -96,8 +96,9 @@ export interface OpsRequestRouting {
   readonly preset: Preset;
   readonly preset_stated: boolean | null;
   /**
-   * Where the preset came from: the request named it, or its API key's default did; null when neither did (the standard
-   * preset). Written by both entries; a record written before it has none.
+   * Where the preset came from: the request named it; null when it did not (the standard preset). Written by both
+   * entries; a record written before r20 has none. `key`, its API key's default named it, is only in records r20 wrote:
+   * since r21 a key's default names no mode (`ModeSource`).
    */
   readonly mode_source: ModeSource | null;
   readonly explicit: boolean | null;
@@ -224,7 +225,7 @@ const HEAD_REASONS = wordsOf<RoutingHeadReason>({
 const SESSION_STATES = wordsOf<RoutingSession["state"]>({ new: true, kept: true, changed: true, off: true });
 const REDRAWS = wordsOf<SessionRedraw>({ failed: true, circuit: true, rest: true, blocked: true, price: true, preference: true, constraint: true, gone: true });
 const STANDINGS = wordsOf<RoutingCandidate["standing"]>({ chosen: true, draw: true, behind: true, excluded: true, unavailable: true });
-const METRIC_SOURCES = wordsOf<MetricSource>({ own: true, start: true, fixed: true });
+const METRIC_SOURCES = wordsOf<MetricSource>({ own: true, estimated: true, start: true, fixed: true });
 const RATES = wordsOf<"input" | "output">({ input: true, output: true });
 const REFERENCE_SOURCES = wordsOf<"catalog" | "override">({ catalog: true, override: true });
 

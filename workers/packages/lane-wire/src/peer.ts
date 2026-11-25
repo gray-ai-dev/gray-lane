@@ -85,8 +85,19 @@ export const PEER_READS_HEADER = "x-gray-peer-reads";
  * `relay_status`: the status the relay's container answered a token count with, when it answered an error before any
  * vendor call (`not_dialed`, `relay_error_status`), so the entry reads a container without a count path (404, 405 or
  * 501, docs/relay-integration-standard.en.md section 2) as a route without a counter, not as its failure.
+ *
+ * `gate_refused`: `end.code` `PEER_GATE_REFUSED` on a `relay_failed` end, when the stack VM's trust gate refused the
+ * vendor's answer before anything of it was released, so the entry answers it as a local stack attempt's
+ * (`upstream_trust_policy_rejected`) and does not count it as the relay's transport failure. An entry that did not name
+ * it gets `relay_transport` there, as before: its strict `end` refuses a code it does not know.
+ *
+ * `gate_cut`: `end.code` `PEER_GATE_REFUSED` on a `cut` end, when the stack VM's trust gate refused the vendor's answer
+ * after part of it was released (a streamed tool call whose frames came after the commit), so the entry ends the client's
+ * stream with `upstream_trust_policy_rejected`, as a local stack attempt's, and not as the upstream's broken stream. A
+ * word of its own: an entry that named `gate_refused` alone refuses that code on a `cut` end, and gets `entry_internal`
+ * there, as before.
  */
-export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers", "relay_status"] as const;
+export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers", "relay_status", "gate_refused", "gate_cut"] as const;
 export type PeerEndRead = (typeof PEER_END_READS)[number];
 
 /**
@@ -393,8 +404,8 @@ export type PeerHeadDto = z.infer<typeof peerHeadSchema>;
  * How the attempt ended (section 4.7's rows):
  * - `served`: the answer was released whole;
  * - `vendor_error`: the vendor's own error answer was released (S24 `error_body`);
- * - `relay_failed`: a vendor was dialed and nothing can be released (`lane_relay_failed`, no other route);
- * - `cut`: bytes were released, then the answer could not go on (Gray's error frame on the entry);
+ * - `relay_failed`: a vendor was dialed and nothing can be released (`lane_relay_failed`, or `upstream_trust_policy_rejected` for `PEER_GATE_REFUSED`; no other route);
+ * - `cut`: bytes were released, then the answer could not go on (Gray's error frame on the entry, `upstream_trust_policy_rejected` for `PEER_GATE_REFUSED`);
  * - `not_dialed`: no vendor attempt was dialed (S25): the entry may try another route.
  */
 export const PEER_END_OUTCOMES = ["served", "vendor_error", "relay_failed", "cut", "not_dialed"] as const;
@@ -402,8 +413,15 @@ export type PeerEndOutcome = (typeof PEER_END_OUTCOMES)[number];
 
 /** Why an attempt was not made: the lane's `stackPlan` codes a backend can still meet after its envelope checks. */
 export const PEER_PLAN_CODES = ["config_unready", "no_relay_binding", "body_not_held", "upstream_not_official", "protocol", "stream_options_unusable", "body_over_stack_limit", "stack_rewrite_refused"] as const;
-/** `end.code`: a plan code, or the closed word of what failed (`STACK_FAULT_WHYS`, the trace's). */
-export const PEER_END_CODES = [...PEER_PLAN_CODES, ...STACK_FAULT_WHYS] as const;
+/**
+ * The stack VM's trust gate refused the vendor's answer: before its commit (`relay_failed`: a vendor was dialed, nothing
+ * was released; sent only to an entry that named `gate_refused`), or after it (`cut`: sent only to an entry that named
+ * `gate_cut`). Not a fault of the relay's container or of egress, so not one of `STACK_FAULT_WHYS`, which the trace,
+ * egress and the console's health lists read as one.
+ */
+export const PEER_GATE_REFUSED = "upstream_trust_policy_rejected";
+/** `end.code`: a plan code, the closed word of what failed (`STACK_FAULT_WHYS`, the trace's), or `PEER_GATE_REFUSED`. */
+export const PEER_END_CODES = [...PEER_PLAN_CODES, ...STACK_FAULT_WHYS, PEER_GATE_REFUSED] as const;
 
 /** An S26 receipt document, as the stack VM serves it (`@gray/attest` `receiptDocumentSchema`; the value is kept as sent). */
 const receiptValue = z.record(z.string(), z.unknown()).refine((value) => receiptDocumentSchema.safeParse(value).success, { message: "not an ACI receipt document" });
@@ -475,6 +493,7 @@ export const peerEndSchema = z
     if (end.receipt_refused !== undefined && (!dialed || end.receipt !== null)) issue("receipt_refused", "receipt_refused names why a dialed attempt has no receipt");
     if (end.vendor_event !== undefined && end.outcome !== "relay_failed") issue("vendor_event", "vendor_event names the vendor's error that ended an answer nothing of which was released");
     if (end.relay_status !== undefined && (end.outcome !== "not_dialed" || end.code !== "relay_error_status")) issue("relay_status", "relay_status names the container's error before any vendor call");
+    if (end.code === PEER_GATE_REFUSED && end.outcome !== "relay_failed" && end.outcome !== "cut") issue("code", "a gate refusal is of a dialed answer");
   });
 export type PeerEndDto = z.infer<typeof peerEndSchema>;
 

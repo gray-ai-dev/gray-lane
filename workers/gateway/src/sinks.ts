@@ -22,6 +22,7 @@ import {
   type RequestIndexRow as IndexRow,
   type RouteActivity,
   type RouteAttempt,
+  type ServingEntry,
   type StackTrace,
 } from "@gray/request-index";
 import { providerRefOf, r2ContentStore } from "./content.ts";
@@ -522,7 +523,14 @@ export interface RequestRecord {
   readonly protocol: string | null;
   readonly model: string | null;
   readonly stream: boolean | null;
+  /** The request's region: the Durable Object location hint of its client's continent, or the fallback (`requestRegion`). */
   readonly region: string;
+  /**
+   * The entry that served and indexed the request (docs/design/request-logs.md "The serving entry", 0110): its node and
+   * that node's region (entry-location.ts), as the request's dependencies name it (`GatewayDeps.entry`), never `region`.
+   * Written to the index row's `entry_node` and `entry_region` alone; no routing reads it.
+   */
+  readonly entry: ServingEntry;
   readonly authResult: string;
   readonly authScheme: string | null;
   readonly workspaceId: string | null;
@@ -761,6 +769,11 @@ export function indexRow(r: RequestRecord, result: WriterResult): RequestIndexRo
     toolCalls: r.toolCalls,
     toolNames: r.toolNames,
     reasoningTokens: r.reasoningTokens,
+    // 0110 (docs/design/request-logs.md "The serving entry"): the CF database's own two columns, on every row this
+    // gateway writes. A lane's row carries them only as a TEE's pair (`laneIndexRowDtoOf`), and a bridge before them
+    // gets the row again without them (lane/remote/sinks.ts), so it is then the one a gateway before them sent.
+    entryNode: r.entry.node,
+    entryRegion: r.entry.region,
     // S27: the CF database's own column (0029_lane_stack.sql), set on a stack relay's rows only, so every
     // other row keeps the server's insert columns (store.rs).
     ...(r.relayAccountId === undefined || r.relayAccountId === null ? {} : { relayAccountId: r.relayAccountId }),

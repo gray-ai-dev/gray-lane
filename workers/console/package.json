@@ -26,6 +26,7 @@
     "@gray/lane-wire": "0.0.0",
     "@gray/ledger-keys": "0.0.0",
     "@gray/modeltrace": "0.0.0",
+    "@gray/performance": "0.0.0",
     "@gray/protocol": "0.0.0",
     "@gray/relay-app-auth": "0.0.0",
     "@gray/relay-connector": "0.0.0",

@@ -53,6 +53,7 @@ import { BackgroundClient } from "./remote/background.ts";
 import { setLaneNonceReplica } from "./remote/nonces.ts";
 import { platformTimers } from "../client.ts";
 import { EntryRoleClient, entryReadiness, LaneEntryRole, laneReplicaIndex } from "./entry-role.ts";
+import type { EntryReplica } from "@gray/request-index";
 import { API_FORWARD_HEADER, VIDEO_LEASE_MS } from "@gray/lane-wire";
 import { apiForwardOf, forwardedPath, forwardToApi, SERVED_BY_HEADER, type ApiForward } from "./api-forward.ts";
 import type { LanePeers, LaneVideos } from "./types.ts";
@@ -1168,7 +1169,7 @@ async function serveLane(request: Request, env: LaneGatewayEnv, ctx: ExecutionCo
   const deployed = cfg.deployEnv !== "local";
   let identityRead: LaneIdentityRead;
   let identity: LaneIdentity;
-  let replicaIndex: number | null;
+  let replicaIndex: EntryReplica | null;
   try {
     identityRead = readLaneIdentity(env, deployed);
     if (identityRead.identity === null) throw new LaneBootError(identityRead.problems);
@@ -1230,7 +1231,8 @@ async function serveLane(request: Request, env: LaneGatewayEnv, ctx: ExecutionCo
     if (missing.length > 0) {
       answer = misconfigured(request, url, state, missing);
     } else {
-      const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward, videos);
+      // The replica index as the boot validated it, 1 to 16 (`laneReplicaIndex`): the rows' node (0110).
+      const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward, videos, replicaIndex);
       end?.hold(routed);
       answer = await routed;
     }
@@ -1295,6 +1297,8 @@ async function route(
   replica: LaneEntryRole | null,
   api: ApiForward | null = null,
   videos: EntryVideos | null = null,
+  // The replica index the boot validated: required, so a caller that forgets it fails the type check.
+  entryReplica: EntryReplica | null,
 ): Promise<Response> {
   const preflighted = preflight(request, origin);
   if (preflighted !== null) return preflighted;
@@ -1370,6 +1374,7 @@ async function route(
     ...endpointRoutesField(endpointRoutes),
     ...(videos === null ? {} : { videos: videos.videos }),
     ...(arrival?.kind === "gray_api" ? { arrival: "gray_api" as const } : {}),
+    entryReplica,
   };
   const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
   if (listing !== null) {

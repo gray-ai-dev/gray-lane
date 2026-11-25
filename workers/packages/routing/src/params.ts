@@ -247,20 +247,20 @@ export function takeRouting(body: unknown, header: string | null): RoutingTaken 
   }
 }
 
-/** Where a request's preset came from (`ModeSource`): the request named it, or its API key's default did. */
+/**
+ * Where a request's preset came from, as its routing record says (`mode_source`): the request named it, or its API key's
+ * default did. A record is written with `request` or null alone (`modeSourceOf`); `key` is read in the records written
+ * while a key's default could name a mode (r20, until r21 took it out: docs/utility-routing.md "No mode on a key").
+ */
 export type ModeSource = "request" | "key";
 
 /**
- * The request's routing parameters with its API key's default preset (`key`, the stored default's `mode`) as their base
- * (`over_key_preset`): the request's own preset > the key's > none (the standard preset, `resolveRoutingParams`). A
- * request that states members and no preset takes the key's, so its members resolve over that preset; it is then as a
- * request that names the key's preset (explicit: tiered routes join). With where the preset came from: null when neither
- * states one.
+ * Where the mode of a request with these routing parameters (null: none) came from: `request` when it names one (`mode`,
+ * or `preset`, its earlier name), else null, the standard preset (`resolveRoutingParams`). Nothing else names a mode: an
+ * API key's stored default has none (r21).
  */
-export function overKeyPreset(request: RoutingRequest | null, key: Preset | null): { readonly request: RoutingRequest | null; readonly modeSource: ModeSource | null } {
-  if (request?.preset !== undefined) return { request, modeSource: "request" };
-  if (key !== null) return { request: { ...(request ?? {}), preset: key }, modeSource: "key" };
-  return { request, modeSource: null };
+export function modeSourceOf(request: RoutingRequest | null): "request" | null {
+  return request?.preset !== undefined ? "request" : null;
 }
 
 /**

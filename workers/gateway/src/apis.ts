@@ -60,11 +60,9 @@ import {
   DEFAULT_ROUTING_POLICY,
   Preference,
   ROUTING_PARAMS_HEADER,
-  keyDefaultPreset,
-  overKeyPreset,
+  modeSourceOf,
   resolveRoutingParams,
   takeRouting,
-  type ModeSource,
   type RoutingEvidence,
   type RoutingParams,
 } from "@gray/routing";
@@ -84,6 +82,7 @@ import { countLiveKeyRate } from "./key-rate.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
 import { type ResponseHash, bodyHashOf, egressCapacity, egressOwnAnswer, egressRefused, egressSentNothing, laneRoutingParamsInBody, laneSafeLog, laneSafeRecord, laneUpstreamOf, receiptDraft, responseHash } from "./lane/hooks.ts";
 import { flushSinks } from "./lane/remote/sinks.ts";
+import { confidentialContent } from "./content.ts";
 import { type EntryBody, type EntryForward, ENTRY_FORM_CHUNK_BYTES, entryBodyHash, entryBodyRefusal, entryForwarded, entryStandardApi, entryUpstreamHeaders, formTooLarge, readEntryBody, signEntryReceipt, statedModel } from "./lane/standard-api.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./lane/types.ts";
 import { type VideoJobIo, advanceVideoJob, pollVideoJob, readWhole, videoJobIo, videoJobRoute, videoJobVisible } from "./lane/video-jobs.ts";
@@ -117,7 +116,6 @@ import {
   type UtilityRoutes,
 } from "./routes.ts";
 import { formulaRefusal, listFilter, preferenceLevels, preferenceRefusedFacts, recordOfFacts, routingFactsOf, sharesOf, statedOf, type PreferenceLevelFacts, type RoutingFacts, type StatedRouting } from "./request-routing.ts";
-import { notWritten } from "@gray/content";
 import { AttemptEvidence, RequestEvidence } from "./traffic-evidence.ts";
 import { attemptMeasures, candidatesOf, clientFields, constraintSkips, dispatchRecord, unbudgeted, emitRecord, FREE_NO_USAGE, recordDelivery, utilityCandidates, type AdmissionStage, type AttemptRecord, type BillingOutcome, type CandidateRecord, type FreeReason, type RequestOutcome, type RequestRecord, type RetryEvent } from "./sinks.ts";
 import { usageRefusalEvent, type UsageOutcome } from "./usage-refusal.ts";
@@ -448,8 +446,8 @@ export class ModelApiRun {
   private routingParams: RoutingParams = resolveRoutingParams(null, DEFAULT_ROUTING_POLICY);
   /** What the request stated itself of them, as its routing record tells it apart from its preset (`statedOf`). */
   private routingStated: StatedRouting = statedOf(null);
-  /** Where its preset came from: the request, its API key's default (`overKeyPreset`), or neither. */
-  private routingModeSource: ModeSource | null = null;
+  /** Where its preset came from (`modeSourceOf`): the request, or none (the standard preset). */
+  private routingModeSource: "request" | null = null;
   /** The provider preference by level, as the request's routing record tells it (`preferenceLevels`). */
   private preferenceLevels: readonly PreferenceLevelFacts[] = [];
   /** The routing record's facts once the formula ranked or refused the model (request-routing.ts); null before. */
@@ -585,6 +583,7 @@ export class ModelApiRun {
       model: this.model,
       stream: false,
       region: this.deps.region,
+      entry: this.deps.entry,
       authResult: this.authResult,
       authScheme: this.authScheme,
       workspaceId: this.key?.workspaceId ?? null,
@@ -663,7 +662,7 @@ export class ModelApiRun {
     const sinks = this.outbound.sinks(this.deps.sinks);
     // A record of the confidential entry carries no client fingerprint (lane/hooks.ts `laneSafeRecord`).
     const safe = laneSafeRecord(record);
-    // No content of the model APIs is sealed yet (docs/cloudflare-native/gateway.md section 13): their row says so.
+    // The confidential entry keeps no request content (inference.ts `openContent`): the row says so, never a failure.
     // The platform's 30 s run from the answer's end, or from the client's leaving when that came first.
     const end = Math.min(finishedAt, this.presence.at ?? finishedAt) + AFTER_CLIENT_LEFT_MS;
     const delivery = recordDelivery(this.deps.cfg, end, this.deps.clock, platformTimers);
@@ -676,7 +675,7 @@ export class ModelApiRun {
       // still has its reserve (CONTENT_TAIL_RESERVE_MS, as on the inference path); past it the record says unsettled.
       const timers = this.deps.waitTimers ?? this.deps.timers ?? platformTimers;
       const ended = withheld !== null && (await settledBy(withheld, end - this.deps.cfg.contentTailReserveMs, this.deps.clock, timers)) ? { ...safe, billing: this.billing, releaseReason: this.releaseReason } : safe;
-      await emitRecord({ record: ended, sinks, content: notWritten("failed", null), service: this.deps.service, evidence: this.traffic.buffer.wire(), delivery });
+      await emitRecord({ record: ended, sinks, content: confidentialContent(), service: this.deps.service, evidence: this.traffic.buffer.wire(), delivery });
       await receipt;
       // The lane's sinks buffer: the request's point and service events exist from here on (lane/remote/sinks.ts).
       await flushSinks(this.deps.sinks as unknown as { flush?: () => Promise<unknown> });
@@ -1084,14 +1083,13 @@ export class ModelApiRun {
    * refusal is 400 naming the member (`routingRefused`). The preference `stated` is the request's, marked with
    * whether they are explicit before it is layered (`withRoutingExplicit`). Null once read.
    */
-  private takeRouting(snapshot: GatewaySnapshot, key: KeyRecord, body: Json | null, stated: Preference): Response | null {
+  private takeRouting(snapshot: GatewaySnapshot, body: Json | null, stated: Preference): Response | null {
     const routed = takeRouting(body, this.request.headers.get(ROUTING_PARAMS_HEADER));
     if (!routed.ok) return this.refuse(routingRefused(routed.code, routed.message), "preference");
-    // The key's default preset is the base of a request that names none (`overKeyPreset`).
-    const based = overKeyPreset(routed.request, keyDefaultPreset(key.routing ?? null));
-    this.routingParams = resolveRoutingParams(based.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
+    // The request's own parameters alone: an API key's stored default names no mode (r21), whatever r20 stored in it.
+    this.routingParams = resolveRoutingParams(routed.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
     this.routingStated = statedOf(routed.request);
-    this.routingModeSource = based.modeSource;
+    this.routingModeSource = modeSourceOf(routed.request);
     this.preference = stated.withRoutingExplicit(this.routingParams.explicit);
     return null;
   }
@@ -1167,7 +1165,7 @@ export class ModelApiRun {
     // naming the header, as on the entry's generation APIs (inference.ts; docs/utility-routing.md "Request parameters").
     const routingInBody = body.kind === "json" ? isObject(body.value) && Object.hasOwn(body.value, "routing") : body.parts.some((part) => part.name === "routing");
     if (routingInBody) return this.refuse(laneRoutingParamsInBody(), "preference");
-    const routed = this.takeRouting(snapshot, key, null, preference);
+    const routed = this.takeRouting(snapshot, null, preference);
     if (routed !== null) return routed;
 
     this.admission = "parse";
@@ -1207,7 +1205,7 @@ export class ModelApiRun {
     const records = live.filter((r) => !api.stream || streams(r));
     // A streamed request that only routes without streaming could take is told which capability it needs (400
     // `unsupported_capability` naming streaming, apis/mod.rs `capability_unproved`), not to retry for a provider.
-    if (records.length === 0) return this.refuse(unrouted(snapshot, { ...contract(api.model, this.protocol), stream: api.stream }, this.protocol, now, false), "routes");
+    if (records.length === 0) return this.refuse(unrouted(snapshot, { ...contract(api.model, this.protocol), stream: api.stream }, this.protocol, now, false, undefined, this.preference), "routes");
     // The customer's own filter, applied as the generation path applies it (`retain_admitted`): a reference
     // naming nothing registered, or a filter that leaves no route, refuses the request (400). No lane relay serves a
     // model API, so no verifiable route does: a `verifiable` request is told none serves it.

@@ -419,9 +419,9 @@ func encodeStackChanged(body *stackChanged, headers []stackChange) json.RawMessa
 var stackFramingHeaders = setOf("content-type", "content-encoding", "content-length", "accept-encoding", "host",
 	"transfer-encoding", "connection", "te", "trailer", "upgrade", "keep-alive", "proxy-connection")
 
-// stackAccountHeaders are refused (P6): they carry a second credential or choose the organization or project the
-// account's key acts and bills as.
-var stackAccountHeaders = setOf("cookie", "proxy-authorization", "openai-organization", "openai-project")
+// stackAccountHeaders are refused (P6): they carry a second credential or choose the organization, project or
+// workspace the account's key acts and bills as (DashScope's x-dashscope-workspace is OpenAI's openai-project).
+var stackAccountHeaders = setOf("cookie", "proxy-authorization", "openai-organization", "openai-project", "x-dashscope-workspace")
 
 // stackListHeaders are compared as lists of values (sameValues): the same betas in another spelling are no change.
 var stackListHeaders = setOf("anthropic-beta", "openai-beta")
@@ -435,7 +435,8 @@ func stackRelayChangesOn(rewrite json.RawMessage) bool {
 }
 
 // stackAccountRefusal is the first header name (in name order) a call under relay_changes may not send: an account
-// header, or another route's credential form (this route's are S15's, checked by stackCredential).
+// header, or a credential header that is not this route's form (this route's are S15's, checked by stackCredential):
+// another route's, or any of headers.go's protectedAuthHeaders, such as Google's x-goog-api-key.
 func stackAccountRefusal(rt route, h http.Header) string {
 	names := make([]string, 0, len(h))
 	for name := range h {
@@ -447,6 +448,9 @@ func stackAccountRefusal(rt route, h http.Header) string {
 			return name
 		}
 		if !slices.Contains(stackCredentialHeaders[rt.name], name) {
+			if protectedAuthHeaders[http.CanonicalHeaderKey(name)] {
+				return name
+			}
 			for _, other := range stackCredentialHeaders {
 				if slices.Contains(other, name) {
 					return name

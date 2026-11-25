@@ -367,6 +367,13 @@ export interface SnapshotAnswer {
    */
   readonly rankingFailingSince?: number | null;
   /**
+   * The form of `ranking`'s records, from a source that negotiates it (r24, the TEE's bridge, lane/remote/snapshot.ts):
+   * true when the read asked for each record's estimate (`ranking_est`), false when it did not. Absent from every other
+   * source, whose records carry the estimates whenever the roots publish them. The base keeps the form it holds
+   * (ranking-base.ts `apply`).
+   */
+  readonly rankingEstimates?: boolean;
+  /**
    * The replica that answered (its name, `region/index`), from a `ReplicaSource`; absent from other sources. The soak reads
    * it on the `ranking_check` point (a fallback to another replica, a replica's restart) and the base's span for (b1)
    * counts only checks one replica answered (ranking-base.ts `spanAt`).
@@ -1331,7 +1338,7 @@ export class SnapshotCache {
       this.checkingId = id;
     }
     const judge = confirming ? undefined : this.judgement(timing, now);
-    const asked = ranking && !confirming && this.copy !== null ? this.base.have() : undefined;
+    const asked = ranking && !confirming && this.copy !== null ? this.base.ask() : undefined;
     const first = this.copy === null;
     /** The source keeps a copy of the ranking collector (it says how its syncs go): only then is the D7 check worth a call. */
     let feedKept = false;
@@ -1396,7 +1403,7 @@ export class SnapshotCache {
     // The ranking feed's changes go to the base whatever the snapshot's version says (the base outlives versions), after
     // the snapshot: an answer the base cannot read leaves ranking unmeasured, never the snapshot behind (`apply` never throws).
     // True when it brought a ranking answer the base took.
-    return answer.ranking !== undefined && this.base.apply(answer.ranking, gatewayNow(), timing.ranking);
+    return answer.ranking !== undefined && this.base.apply(answer.ranking, gatewayNow(), timing.ranking, answer.rankingEstimates);
   }
 
   /**

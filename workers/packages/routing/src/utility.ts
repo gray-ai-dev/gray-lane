@@ -5,6 +5,7 @@
  * operation, so that every decision comes out the same (docs "Numeric conventions").
  */
 import { compareUtf8 } from "@gray/json";
+import { decodeTokensPerSecond } from "@gray/performance";
 import { sha256 } from "@noble/hashes/sha2";
 import { tauOf } from "./policy.ts";
 import { CONSTRAINTS, TTFT_PERCENTILES } from "./utility-types.ts";
@@ -76,10 +77,18 @@ function ownTtftP99(summary: RecordSummary, rules: StartRules): number | null {
   return summary.ttftP99;
 }
 
-/** A record's own throughput (tok/s), when it has `threshold` samples and decode time. */
+/** A record's own throughput (tok/s), when it has `threshold` samples and decode time (`decodeTokensPerSecond`: null without). */
 function ownTps(summary: RecordSummary, rules: StartRules): number | null {
-  if (summary.tpsCount >= rules.threshold && summary.decodeMs > 0) return (summary.tokens * 1000) / summary.decodeMs;
-  return null;
+  return summary.tpsCount >= rules.threshold ? decodeTokensPerSecond(summary.tokens, summary.decodeMs) : null;
+}
+
+/**
+ * A record's published buffered estimate (r24, docs "The buffered estimate"): its typical TTFT and decode rate, or null
+ * when the record has none or withholds it (too few points, the phases not separable).
+ */
+function estimated(summary: RecordSummary | null): { readonly ttftMs: number; readonly tps: number } | null {
+  const est = summary?.est;
+  return est === undefined || est.ttftMs === null || est.tps === null ? null : { ttftMs: est.ttftMs, tps: est.tps };
 }
 
 /** An operator's vote: its best value so far (lowest or highest). */
@@ -141,6 +150,10 @@ function metricsOf(route: UtilityRoute, start: StartValues, rules: StartRules, f
     };
   }
   const summary = route.summary;
+  // Own measured figures first, then the buffered estimate, then start values, then the fixed ones (docs "Effective
+  // metrics"). The estimate stands as one set: p50 = T, p90 = 2T, and p99 = max(4T, the p90 chosen) where the route's own
+  // tail does not qualify, so a measured head with an unmeasured tail never reads a p99 under its p90.
+  const est = estimated(summary);
   let p50 = fixed.ttftP50Ms;
   let p90 = fixed.ttftP90Ms;
   let ttft: MetricSource = "fixed";
@@ -149,6 +162,10 @@ function metricsOf(route: UtilityRoute, start: StartValues, rules: StartRules, f
     p50 = ownHead[0];
     p90 = ownHead[1];
     ttft = "own";
+  } else if (est !== null) {
+    p50 = est.ttftMs;
+    p90 = 2 * est.ttftMs;
+    ttft = "estimated";
   } else if (start.ttft !== null) {
     p50 = start.ttft[0] / rules.discount;
     p90 = start.ttft[1] / rules.discount;
@@ -160,6 +177,9 @@ function metricsOf(route: UtilityRoute, start: StartValues, rules: StartRules, f
   if (ownTail !== null) {
     p99 = ownTail;
     ttftP99 = "own";
+  } else if (est !== null) {
+    p99 = Math.max(4 * est.ttftMs, p90);
+    ttftP99 = "estimated";
   } else if (start.ttftP99 !== null) {
     p99 = start.ttftP99 / rules.discount;
     ttftP99 = "start";
@@ -170,6 +190,9 @@ function metricsOf(route: UtilityRoute, start: StartValues, rules: StartRules, f
   if (ownThroughput !== null) {
     tps = ownThroughput;
     tpsSource = "own";
+  } else if (est !== null) {
+    tps = est.tps;
+    tpsSource = "estimated";
   } else if (start.tps !== null) {
     tps = start.tps * rules.discount;
     tpsSource = "start";

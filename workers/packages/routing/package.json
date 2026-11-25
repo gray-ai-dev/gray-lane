@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@gray/json": "0.0.0",
+    "@gray/performance": "0.0.0",
     "@gray/protocol": "0.0.0",
     "@noble/hashes": "1.8.0"
   },

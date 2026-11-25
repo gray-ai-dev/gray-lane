@@ -65,6 +65,8 @@ const BY_CODE: ReadonlyMap<string, ErrorCategory> = new Map<string, ErrorCategor
       "routing_invalid",
       "routing_ambiguous",
       "routing_unknown_provider",
+      // A model served only by tiered routes, asked without a routing mode.
+      "routing_mode_required",
       // A price cap the request sets on a model without a reference price.
       "routing_reference_price_unavailable",
       // Verifiable routes are served at another address, or not for this API at all.

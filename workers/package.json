@@ -17,6 +17,7 @@
     "packages/errors",
     "packages/json",
     "packages/routing",
+    "packages/performance",
     "packages/control",
     "packages/modeltrace",
     "packages/attest",

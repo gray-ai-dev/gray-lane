@@ -25,9 +25,13 @@ export const CONTENT_STATUSES = ["stored", "withheld", "truncated", "failed", "s
 /**
  * Why the content is not all there (docs/cloudflare-native/content.md 3.7, the column `content_reason`):
  * the same list as @gray/content's CONTENT_REASONS (the gateway's tests hold the two equal), less
- * `keyless_rate`, which never reaches a row (a request past the keyless limit writes none).
+ * `keyless_rate`, which never reaches a row (a request past the keyless limit writes none). `confidential`, with the
+ * status `withheld`: a request of the confidential entry, which keeps no request content by design. A consumer must know
+ * a reason before a gateway sends it (gray-jobs and the lane bridge refuse a row whose reason they do not know), so the
+ * Workers that take `confidential` deploy before the entry release that sends it; the entry sends a bridge older than
+ * that the row as an entry before it did (lane/remote/sinks.ts).
  */
-export const CONTENT_REASONS = ["no_recipient", "recipient_invalid", "store", "deadline", "cap", "capture_backpressure", "capture_budget", "isolate_budget"] as const;
+export const CONTENT_REASONS = ["no_recipient", "recipient_invalid", "store", "deadline", "cap", "capture_backpressure", "capture_budget", "isolate_budget", "confidential"] as const;
 /** How a request ended (record.rs Outcome). */
 export const OUTCOMES = ["completed", "rejected", "failed", "interrupted", "cancelled"] as const;
 /** Where it came from (record.rs Origin). */
@@ -173,7 +177,69 @@ export interface RequestIndexRow {
    * not reach routing, and of a gateway before it; one this consumer cannot read is left out, never refusing the row.
    */
   readonly routing?: RoutingColumn;
+  /**
+   * The columns `entry_node` and `entry_region` (workers/db/migrations/0110; docs/design/request-logs.md "The serving
+   * entry"): the gateway that served and indexed the request, and its region, both or neither (`entryPairOf`). Null or
+   * absent on a row of a gateway before them, and on one whose pair this consumer cannot read (`parseRow` drops the
+   * pair, never the row). Recorded only: no routing reads them.
+   */
+  readonly entryNode?: EntryNode | null;
+  readonly entryRegion?: EntryRegion | null;
 }
+
+/** An entry replica's index: LANE_REPLICA is a whole number from 1 to 16 (gateway lane/entry-role.ts `laneReplicaIndex`). */
+export type EntryReplica = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16;
+/** The most replicas an entry has (@gray/lane-wire `ENTRY_REPLICA_MAX`, which this package cannot import). */
+const REPLICAS = 16;
+
+/**
+ * A request's serving entry (docs/design/request-logs.md "The serving entry"): a TEE entry replica by its validated
+ * index (`tee:1` to `tee:16`), a TEE entry without one (`tee:single`, never folded into `tee:1`), or a Workers gateway
+ * by its Cloudflare data center (`cf:` and three upper-case letters, `cf:unknown` without a readable one). Never a host
+ * name, an address, a VM id or a value the caller sent.
+ */
+export type EntryNode = `cf:${string}` | `tee:${EntryReplica}` | "tee:single";
+
+/** The TEE's seventeen node words: the only ones a lane row may carry (@gray/lane-wire). */
+export const TEE_ENTRY_NODES: readonly EntryNode[] = Object.freeze([...Array.from({ length: REPLICAS }, (_, i) => `tee:${i + 1}` as EntryNode), "tee:single"]);
+
+/** A Workers gateway's node word: `cf:` and a data center's three upper-case letters, or `cf:unknown`. */
+const WORKER_ENTRY_NODE = /^cf:(?:[A-Z]{3}|unknown)$/;
+
+/**
+ * The entry's region: a word of the location vocabulary (@gray/config `LOCATION_HINTS`, the gateway's tests hold the two
+ * equal) or `unknown`, the node recorded and its region in no inventory (gateway entry-location.ts).
+ */
+export const ENTRY_REGIONS = Object.freeze(["wnam", "enam", "sam", "weur", "eeur", "apac", "apac-ne", "apac-se", "oc", "afr", "me", "unknown"] as const);
+export type EntryRegion = (typeof ENTRY_REGIONS)[number];
+
+/** Where a request was served: its entry's node and that node's region. */
+export interface ServingEntry {
+  readonly node: EntryNode;
+  readonly region: EntryRegion;
+}
+
+const TEE_NODES: ReadonlySet<unknown> = new Set(TEE_ENTRY_NODES);
+
+/** Whether `v` is a node word of a TEE entry (`TEE_ENTRY_NODES`) or of a Workers gateway (`WORKER_ENTRY_NODE`). */
+const isEntryNode = (v: unknown): v is EntryNode => TEE_NODES.has(v) || (typeof v === "string" && WORKER_ENTRY_NODE.test(v));
+/** Whether `v` is one of the TEE's seventeen node words, the only ones a lane row carries. */
+export const isTeeEntryNode = (v: unknown): v is EntryNode => TEE_NODES.has(v);
+export const isEntryRegion = (v: unknown): v is EntryRegion => (ENTRY_REGIONS as readonly unknown[]).includes(v);
+
+/**
+ * A row's raw pair as one value: the entry when both are a node word and a region word; `null` when neither is there
+ * (null or absent: a gateway before them); `"invalid"` for anything else (one of the two, free text, a code off its
+ * form, a replica off 1 to 16).
+ */
+function entryPairOf(node: unknown, region: unknown): ServingEntry | null | "invalid" {
+  const absent = (v: unknown) => v === null || v === undefined;
+  if (absent(node) && absent(region)) return null;
+  return isEntryNode(node) && isEntryRegion(region) ? { node, region } : "invalid";
+}
+
+/** The pair's two members, handled apart from the column loop (`parseRow`). */
+const ENTRY_KEYS: ReadonlySet<string> = new Set(["entryNode", "entryRegion"]);
 
 /** A routing record as a row carries it: a JSON object of format 1 (`v`), read for its format alone. */
 export type RoutingColumn = object;
@@ -453,6 +519,9 @@ export const COLUMNS: readonly { readonly key: keyof RequestIndexRow; readonly c
   { key: "chargedInputMicrousd", column: "charged_input_microusd", kind: "int8", nullable: true },
   { key: "chargedOutputMicrousd", column: "charged_output_microusd", kind: "int8", nullable: true },
   { key: "upstreamProtocol", column: "upstream_protocol", kind: "text", nullable: true },
+  // 0110: the serving entry, read as a pair (`entryPairOf`) before the loop of `parseRow`.
+  { key: "entryNode", column: "entry_node", kind: "text", nullable: true },
+  { key: "entryRegion", column: "entry_region", kind: "text", nullable: true, values: ENTRY_REGIONS },
 ];
 
 function column(kind: Kind, field: string, v: unknown): unknown {
@@ -477,12 +546,23 @@ function column(kind: Kind, field: string, v: unknown): unknown {
   }
 }
 
-/** A row as the gateway sends it, checked: every column present with its type, NUL replaced in text. */
-export function parseRow(v: unknown): RequestIndexRow {
+/**
+ * A row as the gateway sends it, checked: every column present with its type, NUL replaced in text. The serving entry
+ * is read first, as a pair (`entryPairOf`): one this consumer cannot read is not the row's fault, so the row keeps both
+ * null and `onEntryDropped` hears of it (once per row, without the values), where the column loop would refuse the row
+ * and gray-jobs then the whole message.
+ */
+export function parseRow(v: unknown, onEntryDropped?: () => void): RequestIndexRow {
   if (v === null || typeof v !== "object" || Array.isArray(v)) throw new InvalidRow("row", "must be an object");
   const o = v as Record<string, unknown>;
   const out: Record<string, unknown> = {};
+  const entry = entryPairOf(o.entryNode, o.entryRegion);
+  if (entry === "invalid") onEntryDropped?.();
   for (const c of COLUMNS) {
+    if (ENTRY_KEYS.has(c.key)) {
+      out[c.key] = entry === null || entry === "invalid" ? null : c.key === "entryNode" ? entry.node : entry.region;
+      continue;
+    }
     const value = o[c.key];
     if (value === null || value === undefined) {
       if (!c.nullable) throw new InvalidRow(c.key, "is required");

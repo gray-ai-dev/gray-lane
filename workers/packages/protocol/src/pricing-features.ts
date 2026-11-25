@@ -6,7 +6,7 @@
  * Pure code: reads `@gray/json` values and standard `Headers`, never re-serializes client bodies,
  * and keeps counters exact as `bigint`.
  */
-import { type Json, type JsonObject, asArray, asStr, asU64, get, isArray, isObject } from "@gray/json";
+import { type Json, type JsonObject, asArray, asStr, asU64, get, isObject } from "@gray/json";
 import type { CanonicalEvent, Protocol } from "./types.ts";
 
 /** Accelerated service tiers that carry an explicit price table on an offer. */
@@ -219,18 +219,38 @@ function anthropicServerToolCounts(rawUsage: Json | null, counts: Map<HostedTool
   if (ce !== undefined && ce > 0n) addCount(counts, "code_execution", ce);
 }
 
+/** The hosted tool an OpenAI Responses output item type bills, if any. */
+function responsesItemTool(itemType: string | undefined): HostedToolName | null {
+  if (itemType === "web_search_call") return "web_search";
+  if (itemType === "code_interpreter_call") return "code_execution";
+  if (itemType === "file_search_call") return "file_search";
+  return null;
+}
+
+/**
+ * Records one OpenAI Responses output item under its id (or, without one, its type and position) with
+ * the hosted tool it bills, or null when it bills none (not a hosted tool call, or `status: "failed"`).
+ * A later record of the same item replaces the earlier one, so each item counts at most once and its
+ * latest status decides.
+ */
+function recordResponsesItem(items: Map<string, HostedToolName | null>, item: Json | undefined, position: string): void {
+  if (!isObject(item)) return;
+  const itemType = asStr(get(item, "type"))?.toLowerCase();
+  const failed = asStr(get(item, "status"))?.toLowerCase() === "failed";
+  const key = asStr(get(item, "id")) ?? `${itemType ?? ""}:${position}`;
+  items.set(key, failed ? null : responsesItemTool(itemType));
+}
+
+function countResponsesItems(items: Map<string, HostedToolName | null>, counts: Map<HostedToolName, bigint>): void {
+  for (const tool of items.values()) if (tool !== null) addCount(counts, tool, 1n);
+}
+
 function responsesOutputToolCounts(output: Json | undefined, counts: Map<HostedToolName, bigint>): void {
-  const items = asArray(output);
-  if (!items) return;
-  for (const item of items) {
-    if (!isObject(item)) continue;
-    const status = asStr(get(item, "status"))?.toLowerCase();
-    if (status === "failed") continue;
-    const typ = asStr(get(item, "type"))?.toLowerCase();
-    if (typ === "web_search_call") addCount(counts, "web_search", 1n);
-    else if (typ === "code_interpreter_call") addCount(counts, "code_execution", 1n);
-    else if (typ === "file_search_call") addCount(counts, "file_search", 1n);
-  }
+  const list = asArray(output);
+  if (!list) return;
+  const items = new Map<string, HostedToolName | null>();
+  list.forEach((item, i) => recordResponsesItem(items, item, String(i)));
+  countResponsesItems(items, counts);
 }
 
 function geminiCandidateToolCounts(candidates: Json | undefined, counts: Map<HostedToolName, bigint>): void {
@@ -296,9 +316,13 @@ export class StreamBillingObserver {
   private readonly protocol: Protocol;
   private readonly requested: RequestedPricingFeatures;
   private reportedTier: string | null = null;
-  private responsesFinalOutput: Json | undefined;
-  private readonly responsesDoneIds = new Set<string>();
-  private readonly responsesDoneCounts = new Map<HostedToolName, bigint>();
+  /**
+   * Responses output items seen so far, from `response.output_item.done` and the terminal
+   * `response.completed` / `response.incomplete` output, merged by item (recordResponsesItem). The
+   * terminal output may be empty or partial, so it updates the items already seen and never replaces them.
+   */
+  private readonly responsesItems = new Map<string, HostedToolName | null>();
+  private responsesUnindexedDone = 0;
   private chatSawCitation = false;
   private readonly geminiSearchCandidates = new Set<bigint>();
   private geminiCodeExecCount = 0n;
@@ -334,24 +358,12 @@ export class StreamBillingObserver {
         const tier = asStr(get(resp, "service_tier"));
         if (tier) this.reportedTier = tier;
         if (typ === "response.completed" || typ === "response.incomplete") {
-          const out = get(resp, "output");
-          if (isArray(out)) this.responsesFinalOutput = out;
+          const out = asArray(get(resp, "output"));
+          out?.forEach((item, i) => recordResponsesItem(this.responsesItems, item, String(i)));
         }
       } else if (typ === "response.output_item.done") {
-        const item = get(payload, "item");
-        if (isObject(item)) {
-          const status = asStr(get(item, "status"))?.toLowerCase();
-          if (status !== "failed") {
-            const itemType = asStr(get(item, "type"))?.toLowerCase();
-            const id = asStr(get(item, "id")) ?? `${itemType ?? ""}:${String(get(payload, "output_index") ?? this.responsesDoneIds.size)}`;
-            if (!this.responsesDoneIds.has(id)) {
-              this.responsesDoneIds.add(id);
-              if (itemType === "web_search_call") addCount(this.responsesDoneCounts, "web_search", 1n);
-              else if (itemType === "code_interpreter_call") addCount(this.responsesDoneCounts, "code_execution", 1n);
-              else if (itemType === "file_search_call") addCount(this.responsesDoneCounts, "file_search", 1n);
-            }
-          }
-        }
+        const index = asU64(get(payload, "output_index"));
+        recordResponsesItem(this.responsesItems, get(payload, "item"), index !== undefined ? String(index) : `done-${this.responsesUnindexedDone++}`);
       }
     } else if (this.protocol === "open_ai_chat") {
       const tier = asStr(get(payload, "service_tier"));
@@ -400,11 +412,7 @@ export class StreamBillingObserver {
       if (speed) this.reportedTier = speed;
       anthropicServerToolCounts(rawUsage, counts);
     } else if (this.protocol === "open_ai_responses") {
-      if (this.responsesFinalOutput !== undefined) {
-        responsesOutputToolCounts(this.responsesFinalOutput, counts);
-      } else {
-        for (const [k, v] of this.responsesDoneCounts) addCount(counts, k, v);
-      }
+      countResponsesItems(this.responsesItems, counts);
     } else if (this.protocol === "open_ai_chat") {
       if (this.chatSawCitation) addCount(counts, "web_search", 1n);
     } else if (this.protocol === "gemini") {

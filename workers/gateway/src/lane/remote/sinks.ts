@@ -1,5 +1,5 @@
 import { asNumber, bridgeCall, laneEventsDtoOf, laneIndexMessageDtoOf, lanePointsDtoOf, laneServiceEventsDtoOf, RECORDS_TARGET } from "@gray/lane-wire";
-import { ATTEMPT_MEASURES, type RouteAttempt } from "@gray/request-index";
+import { ATTEMPT_MEASURES, isEntryRegion, isTeeEntryNode, type RouteAttempt } from "@gray/request-index";
 import type { RequestIndexMessage, Sinks } from "../../sinks.ts";
 import { BridgeCallError, BridgeClient, type BridgeClientOptions } from "./client.ts";
 
@@ -25,7 +25,13 @@ import { BridgeCallError, BridgeClient, type BridgeClientOptions } from "./clien
  * `bindingSinks.serviceEvent` does (`console.log(JSON.stringify(event))`), so it lands in the same
  * Workers Logs. The CVM's own log is not that place: a lane log line carries no record (M13).
  */
-export interface LaneSinksOptions extends BridgeClientOptions {}
+export interface LaneSinksOptions extends BridgeClientOptions {
+  /**
+   * Where a downgrade is said (`RemoteSinks.sendIndex`): one warn line, `lane_index_downgraded` with the member taken out
+   * as `reason`, as remote/legacy.ts says its own; the console by default.
+   */
+  readonly log?: (line: Record<string, unknown>) => void;
+}
 
 /** What a flush sent, for the request's own accounting; never a body. */
 export interface LaneSinkFlush {
@@ -58,39 +64,70 @@ function withoutModeSource<R extends object>(routing: R): R {
 /** A route attempt without its provider failure (2026-11-23): what a bridge before it knows. */
 const withoutProviderFailure = ({ providerFailure: _failure, ...a }: RouteAttempt): RouteAttempt => a;
 
+/** A row that says the entry kept no content (`withheld`, `confidential`, content.ts `confidentialContent`). */
+const confidential = (row: RequestIndexMessage["rows"][number]): boolean => row.contentReason === "confidential";
+
 /**
- * `message` without what a bridge that answered `error` to it may have refused it for (`RemoteSinks.sendIndex`): its
- * rows' traces after a 404; after a 400 the newest member first, so a bridge that knows the older ones still gets them:
- * their routing records' preset source (r20), then their routing records (r18, docs/utility-routing-reads.md); then their
- * route attempts' provider failure (2026-11-23, docs/design/one-address.md "Provider defects at the entry"); then their
- * five measures (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept; then the route attempts
- * (r14); then their charge sides and route API (0076). Null when the failure is another, or the rows carry nothing of
- * that kind to take out: the failure stands.
+ * The row as an entry before `confidential` sent it: content `failed`, `no_recipient`, which a bridge and a console of
+ * that time read as the entry's (console request-log.ts `laneServed`).
  */
-function withoutRefused(error: unknown, message: RequestIndexMessage): RequestIndexMessage | null {
+function asBeforeConfidential<R extends RequestIndexMessage["rows"][number]>(row: R): R {
+  return { ...row, contentWithheld: false, contentStatus: "failed", contentReason: "no_recipient" };
+}
+
+/**
+ * A row whose document names its serving entry (0110), what a bridge before it refuses: a TEE's pair, the only one
+ * `laneIndexRowDtoOf` sends. Half a pair or a Workers gateway's was never in the document, so it is nothing to take out.
+ */
+const namesEntry = (row: RequestIndexMessage["rows"][number]): boolean => isTeeEntryNode(row.entryNode) && isEntryRegion(row.entryRegion);
+
+/** What `withoutRefused` took out of a message: the member it names in its log line. */
+type Downgrade = "entry" | "confidential" | "mode_source" | "routing" | "provider_failure" | "measures" | "route_attempts" | "charge_sides" | "trace";
+
+/**
+ * `message` without what a bridge that answered `error` to it may have refused it for (`RemoteSinks.sendIndex`), and
+ * what was taken: its rows' traces after a 404; after a 400 the newest member first, so a bridge that knows the older
+ * ones still gets them: their serving entry (0110, docs/design/request-logs.md "The serving entry"), then their content
+ * reason `confidential` (the row as an entry before it sent it, `asBeforeConfidential`), then their routing records'
+ * preset source (r20), then their routing records (r18, docs/utility-routing-reads.md); then their route attempts'
+ * provider failure (2026-11-23, docs/design/one-address.md "Provider defects at the entry"); then their five measures
+ * (r15, docs/live-speed.md "Compatibility and rollout"), r14's seven members kept; then the route attempts (r14); then their charge sides and route API (0076). Null when the failure is another, or the rows carry nothing of
+ * that kind to take out: the failure stands. Only a bridge's answer comes here: a document the CVM's own check refused
+ * (`laneIndexRowDtoOf` projects nothing it would) was never sent.
+ */
+function withoutRefused(error: unknown, message: RequestIndexMessage): { readonly message: RequestIndexMessage; readonly downgrade: Downgrade } | null {
   if (!(error instanceof BridgeCallError)) return null;
+  const rows = (map: (row: RequestIndexMessage["rows"][number]) => RequestIndexMessage["rows"][number]) => ({ ...message, rows: message.rows.map(map) });
   if (error.status === 404 && message.rows.some((row) => row.stackTrace !== undefined)) {
-    return { ...message, rows: message.rows.map(({ stackTrace: _stackTrace, ...row }) => row) };
+    return { message: rows(({ stackTrace: _stackTrace, ...row }) => row), downgrade: "trace" };
   }
-  // r20's member of the routing record, where its preset came from, the newest: a bridge of r18 knows the record without it.
+  // 0110's serving entry, the newest: a bridge that knows `confidential` knows every other member of the row.
+  if (error.status === 400 && message.rows.some(namesEntry)) {
+    return { message: rows(({ entryNode: _node, entryRegion: _region, ...row }) => row), downgrade: "entry" };
+  }
+  // The content reason `confidential`: a bridge before it gets the row as an entry before it sent it.
+  if (error.status === 400 && message.rows.some(confidential)) {
+    return { message: rows((row) => (confidential(row) ? asBeforeConfidential(row) : row)), downgrade: "confidential" };
+  }
+  // r20's member of the routing record, where its preset came from: a bridge of r18 knows the record without it.
   if (error.status === 400 && message.rows.some(statesModeSource)) {
-    return { ...message, rows: message.rows.map((row) => (statesModeSource(row) ? { ...row, routing: withoutModeSource(row.routing!) } : row)) };
+    return { message: rows((row) => (statesModeSource(row) ? { ...row, routing: withoutModeSource(row.routing!) } : row)), downgrade: "mode_source" };
   }
   // r18's routing record (docs/utility-routing-reads.md "The confidential entry's record").
   if (error.status === 400 && message.rows.some((row) => row.routing !== undefined)) {
-    return { ...message, rows: message.rows.map(({ routing: _routing, ...row }) => row) };
+    return { message: rows(({ routing: _routing, ...row }) => row), downgrade: "routing" };
   }
   if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some((a) => a.providerFailure !== undefined) === true)) {
-    return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(withoutProviderFailure) })) };
+    return { message: rows((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(withoutProviderFailure) })), downgrade: "provider_failure" };
   }
   if (error.status === 400 && message.rows.some((row) => row.routeAttempts?.some(measured) === true)) {
-    return { ...message, rows: message.rows.map((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(unmeasured) })) };
+    return { message: rows((row) => (row.routeAttempts === undefined ? row : { ...row, routeAttempts: row.routeAttempts.map(unmeasured) })), downgrade: "measures" };
   }
   if (error.status === 400 && message.rows.some((row) => row.routeAttempts !== undefined)) {
-    return { ...message, rows: message.rows.map(({ routeAttempts: _attempts, ...row }) => row) };
+    return { message: rows(({ routeAttempts: _attempts, ...row }) => row), downgrade: "route_attempts" };
   }
   if (error.status === 400 && message.rows.some((row) => (row.chargedInputMicrousd ?? row.chargedOutputMicrousd ?? row.upstreamProtocol ?? null) !== null)) {
-    return { ...message, rows: message.rows.map(({ chargedInputMicrousd: _input, chargedOutputMicrousd: _output, upstreamProtocol: _api, ...row }) => row) };
+    return { message: rows(({ chargedInputMicrousd: _input, chargedOutputMicrousd: _output, upstreamProtocol: _api, ...row }) => row), downgrade: "charge_sides" };
   }
   return null;
 }
@@ -99,9 +136,17 @@ export class RemoteSinks extends BridgeClient implements Sinks {
   readonly #points: AnalyticsEngineDataPoint[] = [];
   readonly #serviceEvents: Record<string, unknown>[] = [];
   #flushing: Promise<LaneSinkFlush> | null = null;
+  readonly #log: (line: Record<string, unknown>) => void;
+  #downgrades = 0;
 
   constructor(options: LaneSinksOptions) {
     super(options);
+    this.#log = options.log ?? ((line) => console.warn(JSON.stringify(line)));
+  }
+
+  /** How many times these sinks sent index rows again without a member a bridge refused (`withoutRefused`). */
+  get downgrades(): number {
+    return this.#downgrades;
   }
 
   /**
@@ -120,8 +165,14 @@ export class RemoteSinks extends BridgeClient implements Sinks {
    * rows go again with r14's seven members of each attempt, which count in the error rates and in none of the three
    * figures. A bridge that predates the attempts' provider failure (2026-11-23) refuses it the same way, so it goes
    * before the measures: the rows go again without it, and gray-jobs reads their defects as it reads those of an entry
-   * before it (jobs traffic-evidence.ts `rowDefects`). Each is tried once, since rows sent again carry nothing left to
-   * take out: a document refused for another reason throws as before.
+   * before it (jobs traffic-evidence.ts `rowDefects`). A bridge that predates the content reason `confidential` refuses
+   * it the same way, so it goes before those: the rows go again as an entry before it sent them (`failed`,
+   * `no_recipient`). The Workers that take it deploy before the entry release that sends it (@gray/request-index
+   * CONTENT_REASONS), so this is the wrong order's fallback. A bridge that predates the serving entry (0110) refuses the
+   * pair the same way, so it goes first of all: the rows go again without it, every other member kept, and are indexed
+   * with both columns NULL, the identity unavailable (docs/design/request-logs.md "The serving entry"). Each is tried
+   * once, since rows sent again carry nothing left to take out: a document refused for another reason throws as before.
+   * Each downgrade is counted (`downgrades`) and said in one line naming the member, never a value.
    */
   async sendIndex(message: RequestIndexMessage): Promise<void> {
     try {
@@ -129,7 +180,9 @@ export class RemoteSinks extends BridgeClient implements Sinks {
     } catch (error) {
       const without = withoutRefused(error, message);
       if (without === null) throw error;
-      await this.sendIndex(without);
+      this.#downgrades += 1;
+      this.#log({ level: "warn", event: "lane_index_downgraded", reason: without.downgrade });
+      await this.sendIndex(without.message);
     }
   }
 

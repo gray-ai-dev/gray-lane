@@ -1,6 +1,6 @@
 import { get, isObject, type Json, type JsonObject, cloneJson } from "@gray/json";
 import { Overlay, type Protocol, attemptOverlay, openAiFamily } from "@gray/protocol";
-import { checkOfficialUpstream, stackStoreOff, type GrayRewriteOp } from "@gray/lane";
+import { GRAY_LANE_REWRITES_V1, GRAY_LANE_REWRITES_V3_TEXT, WRAP_INPUT_TEXT_PATH, checkOfficialUpstream, stackStoreOff, type GrayRewriteOp, type LaneRewritePolicy } from "@gray/lane";
 import type { RewriteCap, RewritePlan, RewriteRemoval } from "./types.ts";
 
 /**
@@ -165,6 +165,9 @@ export function planOverlay(plan: RewritePlan, protocol: Protocol, stream: boole
   if (codexMembers(plan, protocol)) {
     overlay.set("stream", true);
     overlay.set("store", false);
+    // The value `wrap_input_text` writes (`codexInputOp`): the string as the one user message it means.
+    const input = overlay.field(body, "input");
+    if (typeof input === "string") overlay.set("input", [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }]);
   } else if (storeOffMember(plan, protocol)) {
     overlay.set("store", false);
   }
@@ -216,10 +219,13 @@ function applyRemoval(overlay: Overlay, path: string, body: Json): void {
  *   when the body has the member with another value, `insert_member` when it has none, and no op
  *   when it already says so. `store` is written whatever the customer sent: the backend refuses
  *   every other value, and the lane continues no stored response (`previous_response_id` is refused);
+ * - a Codex route's Responses request whose `input` is a JSON string: `wrap_input_text /input`, the one user message the
+ *   string means, since the backend refuses a string `input` (400 "Input must be a list"). A list `input` (a client's
+ *   own, or one a zero-retention expansion built) has no op. The op is gray-lane-rewrites-v3's (`rewritePolicyOf`);
  * - each removal: `remove_member` of a path the plan recorded as present.
  *
  * A plan with `collapsed` members has no op form (`duplicate_key`, M3). The ops are in application
- * order (model, cap, stream option, Codex stream and store, removals), the order `request.modified`
+ * order (model, cap, stream option, Codex stream and store, Codex input, removals), the order `request.modified`
  * events are logged in and `verifyForwardedWithChanges` replays.
  */
 export type PlanOps =
@@ -263,6 +269,10 @@ export function planOps(plan: RewritePlan, protocol: Protocol, body: Json): Plan
       ops.push(current === undefined ? { op: "insert_member", path: "/store", value: false } : { op: "set_member", path: "/store", value: false });
     }
   }
+  if (codexMembers(plan, protocol)) {
+    const op = codexInputOp(body);
+    if (op !== null) ops.push(op);
+  }
   for (const removal of plan.removals) {
     // Only a member the received body actually carries: `@gray/lane`'s `remove_member` refuses
     // `not_found`, and the plan may name `/models` on the strength of `parsed.strip` alone (the
@@ -280,4 +290,23 @@ function removalPresent(body: Json, path: string): boolean {
     return isObject(metadata) && Object.hasOwn(metadata, "user_id");
   }
   return path.startsWith("/") && !path.slice(1).includes("/") && get(body, path.slice(1)) !== undefined;
+}
+
+/**
+ * The op a Codex route's Responses body needs on its `input`: `wrap_input_text /input` when `input` is a JSON string,
+ * since ChatGPT's Codex backend answers a string `input` 400 "Input must be a list"; null for any other `input` (a list
+ * goes as it is; an absent or malformed one is the backend's to answer). `body` is the body the op applies to: the
+ * client's, or its zero-retention expansion, whose `input` is a list once an expansion rebuilt it.
+ */
+export function codexInputOp(body: Json): GrayRewriteOp | null {
+  return typeof get(body, "input") === "string" ? { op: "wrap_input_text", path: WRAP_INPUT_TEXT_PATH } : null;
+}
+
+/**
+ * The policy a request's ops are declared in: gray-lane-rewrites-v3 when one of them is `wrap_input_text`, which only
+ * v3 has, and v1 otherwise, so a request that needs no such op is declared exactly as before v3. An event names one
+ * policy and a verifier replays the ops of one request under one, so every op of a request names the same.
+ */
+export function rewritePolicyOf(ops: readonly GrayRewriteOp[]): LaneRewritePolicy {
+  return ops.some((op) => op.op === "wrap_input_text") ? GRAY_LANE_REWRITES_V3_TEXT : GRAY_LANE_REWRITES_V1;
 }

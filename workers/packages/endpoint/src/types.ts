@@ -383,6 +383,14 @@ export interface ReleaseInput {
    * for the request's model and client and tool shape. The gateway's isolates decide from gates of their own.
    */
   readonly accountBlock?: AccountBlockNote;
+  /**
+   * A buffered success's input for the route's buffered estimate (r24, docs/utility-routing.md "The buffered estimate"):
+   * the uncached input tokens (input less cache reads, cache writes included) and the cache-read ones. The entry sends it
+   * for a charged answer or a model check read from a buffered upstream, with output tokens and no TTFT in its measure.
+   * The shard takes it on a first release it can prove, with the measure's output tokens and latency, as one point of its
+   * next report (`ShardReport.est`). Absent: no point (a gateway of an earlier release, a stream, any other attempt).
+   */
+  readonly est?: readonly [u: number, c: number];
 }
 
 /**
@@ -564,7 +572,21 @@ export interface ShardReport extends ShardIdentity {
    * Absent from a shard of an earlier release; a root of an earlier release ignores it.
    */
   readonly builtAt?: number;
+  /**
+   * The buffered successes released since the last report (r24): each `[u, c, o, y]`, uncached input, cache-read input and
+   * output tokens and the latency in ms, at most `EST_POINTS_MAX`. The root weighs them into the record's estimation once,
+   * when it applies this report, and not from a report built more than idleReturnMs ago (`builtAt`), with or without
+   * `record`. Dropped with `record` when a report is resent after that. Absent: none, or a shard of an earlier release
+   * (a root of an earlier release ignores it).
+   */
+  readonly est?: readonly EstPoint[];
 }
+
+/** A buffered success as a shard report carries it: uncached input, cache-read input and output tokens, latency in ms. */
+export type EstPoint = readonly [u: number, c: number, o: number, y: number];
+
+/** The most points one shard report carries (`ShardReport.est`); a shard drops the ones after and counts them. */
+export const EST_POINTS_MAX = 256;
 
 /** A probe claim's identity: the claiming shard is the reporter. */
 export interface ProbeKey {

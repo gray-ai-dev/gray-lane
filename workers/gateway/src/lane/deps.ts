@@ -2,7 +2,9 @@ import { lowerHexBytes } from "@gray/attest";
 import type { DeployEnv, GatewayConfig, LocationHint } from "@gray/config";
 import type { ShardCountTable } from "@gray/account";
 import { checkOfficialUpstream, OPENAI_COMPATIBLE_VENDORS, type OfficialVendor } from "@gray/lane";
+import type { EntryReplica } from "@gray/request-index";
 import { DegradedAdmissions } from "../admission.ts";
+import { ENTRY_INVENTORIES, teeEntry } from "../entry-location.ts";
 import { ContentState, keylessLimits } from "../content.ts";
 import { continuationStores } from "../continuation.ts";
 import { EndpointCounts, endpointShards } from "../endpoints.ts";
@@ -181,6 +183,12 @@ export interface LaneRequestState {
    * it reached this VM through Gray's API. Absent for a client's own connection.
    */
   readonly arrival?: "gray_api";
+  /**
+   * The entry replica's index, 1 to 16, as the boot validated it (entry-role.ts `laneReplicaIndex`, LANE_REPLICA): its
+   * rows name it (`tee:<n>`, 0110). Null for an entry without one, whose rows name `tee:single`. Required, so a new
+   * constructor that forgets it fails the type check rather than recording `tee:single`.
+   */
+  readonly entryReplica: EntryReplica | null;
 }
 
 /** The process's per-isolate tables and load, bounded as the main lane bounds them. */
@@ -289,6 +297,9 @@ export function laneGatewayDeps(request: Request, env: LaneEnv, state: LaneReque
     // route's key from `lane.endpointCredentials`.
     master: async () => null,
     region,
+    // The replica serving the request (0110), from the boot and never from the request: not its cf blob, which a front
+    // end may forward and which names the client's region above, nor GATEWAY_FALLBACK_REGION.
+    entry: teeEntry(state.entryReplica, ENTRY_INVENTORIES[cfg.deployEnv].tee),
     service: { env: cfg.deployEnv, ...isolate.identity },
     load: isolate.load,
     degraded: learned.degraded,

@@ -27,6 +27,7 @@
     "@gray/ledger-keys": "0.0.0",
     "@gray/limits": "0.0.0",
     "@gray/media": "0.0.0",
+    "@gray/performance": "0.0.0",
     "@gray/protocol": "0.0.0",
     "@gray/relay-connector": "0.0.0",
     "@gray/relay-policy": "0.0.0",

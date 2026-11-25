@@ -11,6 +11,7 @@ import {
   PEER_CHECKS_WORDS,
   PEER_COMMENT,
   PEER_FRAME_MAX_BYTES,
+  PEER_GATE_REFUSED,
   PEER_REFUSAL_STATUS,
   peerErrorHeadersOf,
   peerReadsOf,
@@ -290,6 +291,10 @@ class BackendRun {
   readonly #readsErrorHeaders: boolean;
   /** The entry named `relay_status`: it reads the container's own error status on a token count not dialed. */
   readonly #readsRelayStatus: boolean;
+  /** The entry named `gate_refused`: it reads `PEER_GATE_REFUSED` as the code of an answer the gate refused before the commit. */
+  readonly #readsGateRefused: boolean;
+  /** The entry named `gate_cut`: it reads `PEER_GATE_REFUSED` as the code of an answer the gate refused after the commit. */
+  readonly #readsGateCut: boolean;
   /** The vendor's own error event that ended its stream before the commit (`primeStream`'s `event`), as it came. */
   #vendorEvent: Json | null = null;
   /** Why the receipt was not signed (a closed word, `receiptProblem`), once `#receipt` failed. */
@@ -311,6 +316,8 @@ class BackendRun {
     this.#readsVendorEvent = reads.has("vendor_event");
     this.#readsErrorHeaders = reads.has("error_headers");
     this.#readsRelayStatus = reads.has("relay_status");
+    this.#readsGateRefused = reads.has("gate_refused");
+    this.#readsGateCut = reads.has("gate_cut");
     this.#presence = new ClientPresence(null, input.clock, 0);
     hop.onLeave(() => this.#presence.leave("client_left"));
     this.#presence.onLeave(() => {
@@ -399,7 +406,9 @@ class BackendRun {
       served_attempt: served === null ? null : BigInt(served),
       // Egress's calls for the rid (its `n` counts each one, refused or dialed), so `served_attempt` is one of them.
       attempts: dialed ? BigInt(call?.feed.attempts.size ?? 0) : 0n,
-      relay_account_id: dialed ? (attempts.at(-1)?.accepted?.accountId ?? null) : null,
+      // The served attempt's account (S61), as `served_attempt` names it and a local stack attempt's `accountId` reads it;
+      // the last dialed attempt's when none was served.
+      relay_account_id: dialed ? (call?.served?.accepted?.accountId ?? attempts.at(-1)?.accepted?.accountId ?? null) : null,
       usage: dialed ? usage : null,
       code: ended.code,
       receipt: receipt === null ? null : (receiptDocument(receipt) as Record<string, unknown>),
@@ -642,11 +651,34 @@ class BackendRun {
     return { outcome: "relay_failed", code: limited ? "egress_limit" : (fault?.why ?? (timedOut ? "timeout" : "relay_transport")) };
   }
 
-  /** An answer that failed before it committed (S25): the feed settles first, then decides; nothing of it was written. */
-  async #uncommitted(call: StackCall): Promise<Ended> {
+  /**
+   * An answer that failed before it committed (S25): the feed settles first, then decides; nothing of it was written.
+   *
+   * `gateRefused`: the lane's trust gate refused the vendor's answer. A vendor was dialed, so the request ends here, and
+   * its error is the request's own, `upstream_trust_policy_rejected`, as `InferenceRun.stackFailed` ends a local stack
+   * attempt's: `end.code` says so (`PEER_GATE_REFUSED`) in place of `relay_transport`, which the entry reads as the
+   * relay's failure. A fault of the relay's container or egress's cut at its budget keeps its own code, as it does there.
+   * Only to an entry that reads it (`gate_refused`): an older entry's strict `end` refuses a code it does not know.
+   */
+  async #uncommitted(call: StackCall, gateRefused = false): Promise<Ended> {
     const outcome = await call.failedAfterAnswer();
     if (outcome.kind !== "vendor_error") call.served = null;
-    return this.#failed(call, outcome, false);
+    const ended = await this.#failed(call, outcome, false);
+    const fault = call.fault;
+    const relayFault = fault?.by === "relay" || fault?.by === "egress" || call.feed.limited !== null;
+    return gateRefused && this.#readsGateRefused && ended.outcome === "relay_failed" && !relayFault ? { ...ended, code: PEER_GATE_REFUSED } : ended;
+  }
+
+  /**
+   * An answer cut after its commit, part of it released: `code` its own (`entry_internal` when none). `gateRefused`: the
+   * lane's trust gate refused a later part of it, which the entry ends the client's stream with as a local stack attempt's
+   * (`upstream_trust_policy_rejected`), not as the upstream's broken stream: `end.code` says so (`PEER_GATE_REFUSED`)
+   * when no fault of the call (the relay's container, egress, its budget) has a word of its own, which stands.
+   * Only to an entry that reads it (`gate_cut`): an entry before it refuses that code on a `cut` end.
+   */
+  #cut(call: StackCall, gateRefused: boolean, code: Ended["code"] = call.fault?.why ?? "entry_internal"): Ended {
+    const faulted = call.fault !== null || call.feed.limited !== null;
+    return { outcome: "cut", code: gateRefused && this.#readsGateCut && !faulted ? PEER_GATE_REFUSED : code };
   }
 
   /** A stream (S24 released events), primed to its commit and relayed as `InferenceRun.relay` relays one. */
@@ -693,7 +725,7 @@ class BackendRun {
     // The vendor's own error event before the commit (an Anthropic `error` after `message_start`): nothing was released,
     // and the entry answers it as the vendor's error, as the main gateway answers an upstream's in-band error (`end`).
     if (primed.kind === "uncommitted" && primed.event !== null) this.#vendorEvent = primed.event;
-    if (primed.kind !== "committed") return this.#uncommitted(call);
+    if (primed.kind !== "committed") return this.#uncommitted(call, primed.kind === "uncommitted" && primed.violation !== undefined);
     await this.#head(200, true);
     const client = new ClientStream(this.#presence, clock, cfg.streamClientStallMs, undefined, (bytes) => this.#tap(bytes), this.#input.timers);
     const pumped = this.#pump(client.readable);
@@ -749,7 +781,7 @@ class BackendRun {
     client.end(errorFrame(protocol, code, 0n));
     this.#replacedError = true;
     await pumped;
-    return { outcome: "cut", code: fault?.why ?? "entry_internal" };
+    return this.#cut(call, end.code === PEER_GATE_REFUSED);
   }
 
   /** A buffered answer, passed through `AnswerRelay` as `InferenceRun.nativeAnswer` passes one. */
@@ -798,12 +830,12 @@ class BackendRun {
       if (read.code === "gateway_capacity" || read.limitSource !== undefined) this.#ownEnd = "gray_error";
       if (!relay.started) {
         relay.abort(read.code);
-        return this.#uncommitted(call);
+        return this.#uncommitted(call, read.violation !== undefined);
       }
       relay.abort(read.code);
       this.#replacedError = true;
       await pumped;
-      return { outcome: "cut", code: call.fault?.why ?? "entry_internal" };
+      return this.#cut(call, read.violation !== undefined);
     }
     let answer;
     try {
@@ -824,10 +856,10 @@ class BackendRun {
     this.#checks = relay.refusedByGate !== undefined ? refusedAnswerChecks(answerInspector) : this.#input.gate.responseChecks(contract, { protocol, body: read.projection, textCut: read.textCut });
     if (!this.#input.gate.inspectResponse(contract, { protocol, body: read.projection }, Number.MAX_SAFE_INTEGER).ok || relay.refusedByGate !== undefined) {
       relay.abort("upstream_trust_policy_rejected");
-      if (!relay.started) return this.#uncommitted(call);
+      if (!relay.started) return this.#uncommitted(call, true);
       this.#replacedError = true;
       await pumped;
-      return { outcome: "cut", code: "entry_internal" };
+      return this.#cut(call, true, "entry_internal");
     }
     const raw = bufferedUsage(protocol, read.projection) ?? null;
     this.#rawUsage = isObject(raw) && answer.usage !== null ? raw : null;
@@ -888,7 +920,7 @@ class BackendRun {
     // The terminal response is the answer, as `InferenceRun.codexAnswer` reads its checks and enforces the gate verdict.
     this.#checks = this.#input.gate.responseChecks(contract, { protocol, body: read.response });
     if (!this.#input.gate.inspectResponse(contract, { protocol, body: read.response }, Number.MAX_SAFE_INTEGER).ok) {
-      return this.#uncommitted(call);
+      return this.#uncommitted(call, true);
     }
     const raw = bufferedUsage(protocol, read.response) ?? null;
     this.#rawUsage = isObject(raw) ? raw : null;

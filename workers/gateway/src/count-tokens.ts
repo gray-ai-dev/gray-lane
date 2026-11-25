@@ -41,7 +41,7 @@ import {
   type CanonicalRequest,
   type Protocol,
 } from "@gray/protocol";
-import { DEFAULT_ROUTING_POLICY, Preference, ROUTING_PARAMS_HEADER, keyDefaultPreset, overKeyPreset, resolveRoutingParams, takeRouting } from "@gray/routing";
+import { DEFAULT_ROUTING_POLICY, Preference, ROUTING_PARAMS_HEADER, resolveRoutingParams, takeRouting } from "@gray/routing";
 import { providerRef, supplierRef } from "@gray/snapshot";
 import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import { workspaceHome } from "./account.ts";
@@ -50,6 +50,7 @@ import { billedInputOf } from "./billed.ts";
 import { readBody, type Body } from "./body.ts";
 import { RequestBudget } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, platformTimers } from "./client.ts";
+import { confidentialContent } from "./content.ts";
 import { openCredential } from "./crypto.ts";
 import { endingWith, entryAnswerUsable, entryServesNative, entryUnreachable, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { GateCapacity, type GateVerdict } from "./gate.ts";
@@ -394,7 +395,8 @@ export class CountTokensRun {
         await emitRecord({
           record: emittedRecord,
           sinks: this.io.sinks,
-          content: notWritten("withheld", null),
+          // Nothing of a count is kept; at the confidential entry the row says why (`confidential`).
+          content: lane === null ? notWritten("withheld", null) : confidentialContent(),
           service: this.deps.service,
           delivery,
         });
@@ -566,8 +568,8 @@ export class CountTokensRun {
     if (!routed.ok) {
       return this.renderError(routingRefused(routed.code, routed.message), "preference");
     }
-    const based = overKeyPreset(routed.request, keyDefaultPreset(key.routing ?? null));
-    const routingParams = resolveRoutingParams(based.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
+    // The request's own parameters alone: an API key's stored default names no mode (r21), whatever r20 stored in it.
+    const routingParams = resolveRoutingParams(routed.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
     const basePreference = takenPref.preference.withRoutingExplicit(routingParams.explicit);
 
     this.admission = "parse";
@@ -720,7 +722,7 @@ export class CountTokensRun {
       if (!routed && upstreams !== undefined && upstreams.length > 0) {
         return this.renderError(new ApiError(400, "count_tokens_translation_unsupported"), "routes");
       }
-      return this.renderError(unrouted(snapshot, canonical, this.protocol, now, false, NO_TRANSLATION), "routes");
+      return this.renderError(unrouted(snapshot, canonical, this.protocol, now, false, NO_TRANSLATION, preference), "routes");
     }
 
     // 11. Main Gateway tool-call ID resolution.
@@ -2199,6 +2201,7 @@ export class CountTokensRun {
       model: this.model,
       stream: false,
       region: this.deps.region,
+      entry: this.deps.entry,
       authResult: this.authResult,
       authScheme: this.authScheme,
       workspaceId: key?.workspaceId ?? null,

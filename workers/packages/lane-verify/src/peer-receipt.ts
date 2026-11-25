@@ -58,7 +58,7 @@ import {
   type RelayStackChanges,
   type RequestModifiedEvent,
 } from "@gray/attest";
-import { GRAY_LANE_REWRITES_V1, GRAY_LANE_REWRITES_V2, GRAY_LANE_REWRITES_V2_TEXT, isLaneProtocol, replayForwarded, rewriteRuleFor, ruleAllowsValue } from "@gray/lane";
+import { isLaneProtocol, replayForwarded, rewriteRuleFor, ruleAllowsValue, textPolicyOf } from "@gray/lane";
 import { get, isObject, parseStrict, type Json } from "@gray/json";
 import type { QuoteVerifier } from "./attestation.ts";
 import { verifyPeerAttestation, type PeerReleaseList } from "./peer.ts";
@@ -414,7 +414,7 @@ async function checkPeer(
         }
         parsedOps.push(parsed.data as RequestModifiedEvent);
       }
-      const policy = parsedOps.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const policy = textPolicyOf(parsedOps);
       const opsLabel = parsedOps.map((op) => `${op.op} ${op.path}`).join(", ");
       const disallowed = parsedOps.filter((op) => {
         if (op.declared_in !== policy.id) return true;
@@ -445,7 +445,9 @@ async function checkPeer(
     }
   } else if (attempt.modified !== null) {
     const protocol = protocolForEndpoint(String(get(options.outer, "endpoint")));
-    const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.receivedBody, protocol, attempt.modified as unknown as readonly RequestModifiedEvent[]) : null;
+    const declared = attempt.modified as unknown as readonly RequestModifiedEvent[];
+    // Under the policy the ops name: v1, or v3 on a Codex route whose string `input` the entry wrapped.
+    const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.receivedBody, protocol, declared, [], textPolicyOf(declared)) : null;
     const ops = attempt.modified.map((op) => `${String(get(op, "op"))} ${String(get(op, "path"))}`).join(", ");
     if (replayed === null) {
       checks.push(fail(`${id}:entry_rewrite`, `the entry's declared op(s) on the hop's body (${ops}) do not replay on the received body under the published rewrite policy`));
@@ -466,6 +468,9 @@ async function checkPeer(
   const outerEvents = get(options.outer, "event_log") as readonly Json[];
   const outerReturned = findEvent(outerEvents, EVENT_RESPONSE_RETURNED);
   const servedAttempt = get(outerReturned, "served_attempt") === attempt.n;
+  // The client got only part of what the stack VM released: it left mid-stream (frames already on the hop never reached
+  // it), or the entry ended the stream with Gray's error. The outer response.returned is not tied to the inner one.
+  const partial = get(outerReturned, "replaced_error") === true ? "replaced_error" : get(outerReturned, "served_as") === "client_left" ? "client_left" : null;
   const inner = await verifyResponseReceipt(receipt, {
     receivedBody: outerExpanded !== null && expandedHopBody !== undefined ? expandedHopBody : hopBody,
     templates: options.templates,
@@ -481,14 +486,14 @@ async function checkPeer(
             ...(validatedEntryModified === undefined ? {} : { modified: validatedEntryModified }),
           },
         }),
-    ...(servedAttempt && options.responseBytes !== undefined
+    ...(servedAttempt && partial === null && options.responseBytes !== undefined
       ? { responseBytes: options.responseBytes, allowKeepAliveComments: true }
       : {}),
   });
   // For the served attempt with responseBytes, stackChecks emits response_events_sha256 / response_body_sha256
   // and response_served_attempt (including undoing declared rewrites) against the customer's bytes; without
-  // responseBytes (or for non-served attempts), suppress the inner response_stack_digest skip because step 6
-  // compares outer and inner digests directly.
+  // responseBytes (or for non-served attempts, or a partial answer, whose bytes the outer receipt alone ties),
+  // suppress the inner response_stack_digest skip because step 6 compares outer and inner digests directly.
   for (const check of inner.checks) if (check.id !== "response_stack_digest") checks.push({ ...check, id: `${id}:${check.id}` });
   summary.stack = inner.stack;
   const document = inner.receiptId === null ? null : receipt;
@@ -570,6 +575,8 @@ async function checkPeer(
     const outerValue = get(outerReturned, member);
     const innerValue = get(innerReturned, member);
     if (typeof outerValue === "string" && outerValue === innerValue) checks.push(pass(`${id}:response_returned`, `the client got what the stack VM released: ${member} ${outerValue}`));
+    else if (partial === "client_left") checks.push(skip(`${id}:response_returned`, `not compared: the client left; partial answer, the outer ${member} ${String(outerValue)} covers what reached it (client_left)`));
+    else if (partial === "replaced_error") checks.push(skip(`${id}:response_returned`, `not compared: the client got this attempt's events, then Gray's error (replaced_error); the outer ${member} is ${String(outerValue)}`));
     else checks.push(fail(`${id}:response_returned`, `the outer response.returned ${member} is ${String(outerValue)}, the inner ${String(innerValue)}`));
   } else {
     checks.push(skip(`${id}:response_returned`, "not compared: this attempt did not serve the answer"));

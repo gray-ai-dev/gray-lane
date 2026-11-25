@@ -82,6 +82,7 @@ const ENTRIES: readonly (readonly [readonly string[], string, Help | null])[] = 
   [["routing_unknown_provider"], "The routing preference names a provider that does not exist. Check the provider ids.", "models"],
   [["routing_filter_excluded_all"], "The routing preference (`only` or `ignore`) excludes every provider that can serve this request.", "models"],
   [["routing_max_price_excluded_all"], "No provider of this model is priced within `max_price`. Raise the limit or choose another model.", "models"],
+  [["routing_mode_required"], "This model is served only by routes that a request uses when it names a routing mode. Send a mode (`interactive`, `autonomous`, `standard` or `flex`) in the `x-gray-routing-params` header.", "docs"],
   [["routing_reference_price_unavailable"], "This model has no reference price yet, so `max_price_multiple` cannot be applied to it. Remove `max_price_multiple`, or choose another model.", "docs"],
   [["verifiable_routes_at_lane"], "The routing preference `verifiable: true` asks for verifiable routes, which are served only at Gray's confidential VM address, not at this one. Send the request to that address; the console shows it.", "docs"],
   [["verifiable_routes_unavailable"], "No verifiable route serves this model on this API. Verifiable routes serve the Messages, Chat Completions and Responses APIs, at Gray's confidential VM address.", "docs"],

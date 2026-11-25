@@ -1,4 +1,5 @@
 import { bridgeCall, entryRoleOf, entryRoleRequestDtoOf, entryRoleTarget, type EntryRole } from "@gray/lane-wire";
+import type { EntryReplica } from "@gray/request-index";
 import { BridgeCallError, BridgeClient, type BridgeClientOptions } from "./remote/client.ts";
 
 export type { EntryRole };
@@ -559,12 +560,13 @@ export class LaneEntryRole {
  * (deploy/tee/bin/entrypoint.mjs `replicaFragments`, rendered from the instance's index beside TLS_REPLICA_DOMAIN), a
  * whole number from 1 to 16; set without a replica name, or malformed, it is a configuration problem.
  */
-export function laneReplicaIndex(env: Readonly<Record<string, unknown>>, replicaDomain: string | null): { readonly index: number | null; readonly problem: string | null } {
+export function laneReplicaIndex(env: Readonly<Record<string, unknown>>, replicaDomain: string | null): { readonly index: EntryReplica | null; readonly problem: string | null } {
   const value = env.LANE_REPLICA;
   if (value === undefined || value === null || value === "") return { index: null, problem: null };
   if (typeof value !== "string" || !/^[1-9][0-9]?$/.test(value) || Number(value) > 16) return { index: null, problem: "LANE_REPLICA is a replica's index, a whole number from 1 to 16" };
   if (replicaDomain === null) return { index: null, problem: "LANE_REPLICA is set without TLS_REPLICA_DOMAIN: a replica's index comes with its name" };
-  return { index: Number(value), problem: null };
+  // 1 to 16 by the two checks above: the replica its rows name (0110).
+  return { index: Number(value) as EntryReplica, problem: null };
 }
 
 /** What an entry knows of itself for `GET /readyz` (docs/design/entry-replicas.md §13, readiness): local facts only. */

@@ -1,13 +1,15 @@
-import { addAttempt, DEFAULT_RECORD_PARAMS, deltaEmpty, emptyDelta, type RecordDelta } from "@gray/routing";
+import { addAttempt, DEFAULT_RECORD_PARAMS, deltaEmpty, emptyDelta, isEstimationPoint, type RecordDelta } from "@gray/routing";
 import { shardName } from "./naming.ts";
 import { RetryBudgets, retryConcurrencyLimit, SecondOpinionGates, type GateLease } from "./retry.ts";
 import { AccountBlockGates } from "./account-blocks.ts";
 import { circuitSuccess, CircuitRuns, ROUTE_CIRCUIT, validMeasure, type KeyOutcomes, type OutcomeMeasure } from "./circuit.ts";
 import { headroom, inDoubtMs, type EndpointSettings } from "./settings.ts";
 import {
+  EST_POINTS_MAX,
   NOT_COUNTED,
   SUPPLIER_FAILURES,
   type AnsweredInput,
+  type EstPoint,
   type AcquireInput,
   type EndedRest,
   type AcquireResult,
@@ -347,6 +349,12 @@ export class EndpointShardCore {
    * counts twice.
    */
   private record: RecordDelta = emptyDelta();
+  /**
+   * The buffered successes released since the last report (r24, `ShardReport.est`), at most `EST_POINTS_MAX`; those after
+   * are dropped and counted (`takeDroppedPoints`), never kept for a later report. Memory only, as `record`.
+   */
+  private points: EstPoint[] = [];
+  private droppedPoints = 0;
   private issued = 0;
   private denied = 0;
   private peak = 0;
@@ -677,6 +685,10 @@ export class EndpointShardCore {
     this.lastActivityAt = now;
     let released = false;
     let real = false;
+    // A first release this storage can prove (r24): a permit it issued, or one of an earlier epoch's pools by its id. A
+    // permit of a storage before this one, or of an epoch whose pool it lost, may be one whose first release was counted
+    // before: its buffered point is skipped (`ShardReport.est`), its outcome counted as below.
+    let provable = false;
     // An answer at a resting key: the rests on it that began no later than the attempt was sent end.
     let answeredAt: { readonly key: string; readonly sentMs: number } | null = null;
     // A repeat as the gateway says, or as the shard knows it: a permit issued on a ticket.
@@ -694,6 +706,7 @@ export class EndpointShardCore {
       if (permit && !permit.held) {
         released = true;
         real = true;
+        provable = true;
         if (input.outcome.kind === "success" && permit.restKey !== undefined && this.restsOn(permit.restKey, now).some((f) => f.sinceMs <= permit.issuedAt)) answeredAt = { key: permit.restKey, sentMs: permit.issuedAt };
         if (permit.repeat !== undefined) repeat = true;
         this.settleRetry(permit, input);
@@ -719,6 +732,7 @@ export class EndpointShardCore {
       if (pool === undefined || !pool.released.includes(token.id)) {
         real = true;
         if (pool !== undefined) {
+          provable = true;
           pool.released.push(token.id);
           this.poolsDirty = true;
           if (!input.upstreamMayStillWork && pool.count > 0) {
@@ -728,6 +742,8 @@ export class EndpointShardCore {
         }
       }
     }
+    // A buffered success's point for the route's estimate, a probe's and a trial's too (r24).
+    if (provable && input.est !== undefined) this.addPoint(input);
     // The account-block view hears each attempt's block once, its first release (the server's gates hear the
     // refusal and the answer as they come).
     if (real && input.accountBlock !== undefined) {
@@ -1381,11 +1397,11 @@ export class EndpointShardCore {
     const now = this.clock();
     this.sweep(now);
     let payload = this.pending;
-    if (payload !== null && payload.record !== undefined && now - this.pendingSentAt > this.settings.idleReturnMs) {
+    if (payload !== null && (payload.record !== undefined || payload.est !== undefined) && now - this.pendingSentAt > this.settings.idleReturnMs) {
       // Unanswered for longer than idleReturnMs: the root may have applied it and dropped the idle lease that says so
       // since (it keeps one twice that long after the shard's last report), and would take the resend as new. Without its
-      // record from here: the increments can be lost, never counted twice.
-      const { record: _record, ...rest } = payload;
+      // record and its buffered points from here: they can be lost, never counted twice.
+      const { record: _record, est: _est, ...rest } = payload;
       payload = rest;
       this.pending = rest;
     }
@@ -1442,6 +1458,7 @@ export class EndpointShardCore {
         abandonedProbes: this.abandoned,
         retryStats: this.retryStats(),
         ...(deltaEmpty(this.record) ? {} : { record: this.record }),
+        ...(this.points.length === 0 ? {} : { est: this.points }),
         // When it was built (`pendingSentAt`), the same in every resend: the root merges no record from an old one.
         builtAt: now,
       };
@@ -1449,6 +1466,7 @@ export class EndpointShardCore {
       this.successes = 0;
       this.failures = zeroFailures();
       this.record = emptyDelta();
+      this.points = [];
       this.issued = 0;
       this.denied = 0;
       this.peak = used;
@@ -1598,8 +1616,36 @@ export class EndpointShardCore {
       this.abandoned.length > 0 ||
       // The long record's increments (r17). Each attempt that adds to them adds to a key's runs too (`observe`), so this
       // says nothing the runs do not today; it keeps the record from waiting on them.
-      !deltaEmpty(this.record)
+      !deltaEmpty(this.record) ||
+      // The buffered points (r24): a probe's or a trial's adds to no runs.
+      this.points.length > 0
     );
+  }
+
+  /**
+   * The point of a release that carries `est` (`ReleaseInput.est`): a success whose measure has output tokens and no
+   * TTFT, its pair and the measure's output tokens and latency a point the estimation takes (@gray/performance
+   * `isEstimationPoint`). Past `EST_POINTS_MAX` in this report it is dropped and counted.
+   */
+  private addPoint(input: ReleaseInput): void {
+    const measure = measureOf(input.measure);
+    const pair = input.est;
+    if (input.outcome.kind !== "success" || measure === undefined || measure[1] !== null || !Array.isArray(pair) || pair.length !== 2) return;
+    const [u, c] = pair;
+    const point = { u, c, o: measure[2], y: measure[0] };
+    if (!isEstimationPoint(point)) return;
+    if (this.points.length >= EST_POINTS_MAX) {
+      this.droppedPoints += 1;
+      return;
+    }
+    this.points.push([point.u, point.c, point.o, point.y]);
+  }
+
+  /** The buffered points dropped past `EST_POINTS_MAX` since the last call: the Durable Object says them in one log line. */
+  takeDroppedPoints(): number {
+    const dropped = this.droppedPoints;
+    this.droppedPoints = 0;
+    return dropped;
   }
 
   private requestReport(kind: "topup" | "check" | "giveback" | "resume"): void {

@@ -27,7 +27,8 @@ export function confidentialRouting(record: RequestRoutingRecord): RequestRoutin
     policy_version: record.policy_version,
     preset: record.preset,
     preset_stated: null,
-    // One of two fixed words: whether the request or its key named the preset, nothing of the request's content.
+    // A fixed word or null: whether the request named the preset (`key`, its key's, only in records r20 wrote), nothing of
+    // the request's content.
     mode_source: record.mode_source,
     explicit: null,
     api: record.api,

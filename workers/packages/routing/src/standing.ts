@@ -6,7 +6,8 @@
 import { tauOf } from "./policy.ts";
 import { band, bandTotal, checkLimit, COST_FLOOR_USD, effectiveMetrics, judged, meterGroups, prepare, unselectedChance, weightBelow } from "./utility.ts";
 import type { Band, Check, Facts, Scored } from "./utility.ts";
-import type { MetricSource, Preset, RoutingPolicy, TtftPercentile, UtilityInput, UtilityRoute } from "./utility-types.ts";
+import { ESTIMATION, type EstimationState } from "@gray/performance";
+import type { MetricSource, Preset, RoutingPolicy, SummaryEstimate, TtftPercentile, UtilityInput, UtilityRoute } from "./utility-types.ts";
 import type { RoutingRequirementName } from "./request-routing.ts";
 
 /** What routing reads of one route, the same for its provider and an operator. */
@@ -15,7 +16,10 @@ export interface RoutingRecordView {
   /** Cumulative TTFT samples, never decayed; null when the reader holds no summary for the route. */
   readonly results: number | null;
   readonly thresholds: { readonly own: number; readonly p99: number };
-  /** The policy's `record.unmeasuredInflight` while `results` is below `thresholds.own`, else null. */
+  /**
+   * The policy's `record.unmeasuredInflight` while `results` is below `thresholds.own` and no buffered estimate is
+   * published, else null.
+   */
   readonly in_flight_cap: number | null;
   readonly availability: number;
   /** The record's decayed `s` and `f` (fractions); null with no summary. */
@@ -28,6 +32,21 @@ export interface RoutingRecordView {
   readonly output_tps: number | null;
   /** The record's `at`; null with no summary. */
   readonly updated_at_ms: number | null;
+  /**
+   * The route's buffered estimate (r24): the points it weighed, its figures while published (else null) and its state;
+   * null with no summary, or a summary without one (no buffered point yet, a root of an earlier release).
+   */
+  readonly estimate: { readonly requests: number; readonly ttft_ms: number | null; readonly output_tps: number | null; readonly state: EstimationState } | null;
+}
+
+/**
+ * The state of a summary's buffered estimate as a reader can tell it: published with its figures; else too few below
+ * the points publication needs; else the phases could not be separated (also what a reader sees with an effective
+ * count under its gate: the summary does not say which).
+ */
+export function estimationStateOf(est: SummaryEstimate): EstimationState {
+  if (est.ttftMs !== null && est.tps !== null) return "published";
+  return est.n < ESTIMATION.publishMin ? "too_few" : "cannot_separate";
 }
 
 /** A requirement of the preset that leaves the route out: its value and the limit. */
@@ -189,7 +208,10 @@ export function recordView(
   const rules = input.policy.start;
   const summary = input.feedAvailable ? route.summary : null;
   const results = summary === null ? null : summary.ttftCount;
-  const unmeasured = (results ?? 0) < rules.threshold;
+  const est = summary?.est;
+  const state = est === undefined ? null : estimationStateOf(est);
+  // The root lifts the cap while the estimate is published (its `ceiling`), as it does at the threshold.
+  const unmeasured = (results ?? 0) < rules.threshold && state !== "published";
   return {
     basis: { ttft: metrics.source.ttft, ttft_p99: metrics.source.ttftP99, output_tps: metrics.source.tps },
     results,
@@ -202,6 +224,7 @@ export function recordView(
     ttft_ms: input.generative ? { p50: metrics.ttftMs.p50, p90: metrics.ttftMs.p90, p99: metrics.ttftMs.p99 } : null,
     output_tps: input.generative ? metrics.tps : null,
     updated_at_ms: summary === null ? null : summary.at,
+    estimate: est === undefined || state === null ? null : { requests: est.n, ttft_ms: est.ttftMs, output_tps: est.tps, state },
   };
 }
 

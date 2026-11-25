@@ -5,6 +5,9 @@ import {
   attemptMeasuresOf,
   CONTENT_STATUSES,
   COLUMNS,
+  ENTRY_REGIONS,
+  isEntryRegion,
+  isTeeEntryNode,
   MAX_ROW_ATTEMPTS,
   ORIGINS,
   OUTCOMES,
@@ -12,7 +15,10 @@ import {
   REQUEST_INDEX_FORMAT,
   RETRY_CLASSES,
   SUPPLIER_OUTCOMES,
+  TEE_ENTRY_NODES,
   TOOL_CALL_CHECKS,
+  type EntryNode,
+  type EntryRegion,
   type RequestIndexMessage,
   type RequestIndexRow,
   type RouteAttempt,
@@ -67,14 +73,31 @@ export const LANE_FORBIDDEN_EVENT_COLUMNS = Object.freeze(["client_app", "client
  * charge's input and output sides and the route's API of a translated request, workers/db/migrations/0076;
  * r14's `routeAttempts`, the route attempts with their two answer checks, workers/db/migrations/0079; r15's five
  * measures on each attempt are later still, docs/live-speed.md, and each attempt's `providerFailure` of 2026-11-23
- * later again; r18's `routing`, the routing record's confidential projection, workers/db/migrations/0101, is the
- * latest, and goes first when a bridge refuses a row, then the provider failure, then the measures):
- * absent from the wire document when null, and taken absent. A bridge that predates one still takes
+ * later again; r18's `routing`, the routing record's confidential projection, workers/db/migrations/0101, and r20's
+ * `mode_source` in it; the serving entry's `entryNode` and `entryRegion`, workers/db/migrations/0110, are the latest,
+ * and go first when a bridge refuses a row, then the preset's source, the routing record, the provider failure, the
+ * measures): absent from the wire document when null, and taken absent. A bridge that predates one still takes
  * every row that does not carry it (every row but a stack relay's), and a bridge that knows it takes
  * the rows of a lane that predates it, so neither deploy order loses rows of the lanes that existed
  * before.
  */
-export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace", "chargedInputMicrousd", "chargedOutputMicrousd", "upstreamProtocol", "routeAttempts", "routing"] as const);
+export const LANE_LATER_ROW_FIELDS = Object.freeze(["relayAccountId", "stackTrace", "chargedInputMicrousd", "chargedOutputMicrousd", "upstreamProtocol", "routeAttempts", "routing", "entryNode", "entryRegion"] as const);
+
+/**
+ * A lane row's serving entry (docs/design/request-logs.md "The serving entry", 0110): one of the TEE's seventeen node
+ * words (@gray/request-index `TEE_ENTRY_NODES`: the replica's validated index, or `tee:single`) and a region word, both
+ * or neither. A Workers gateway's `cf:` word is never a lane row's. The replica's number and its region leave the CVM
+ * with the row (the owner's decision of 2026-11-24); nothing else of where the entry runs does.
+ */
+const laneEntryNodeSchema = z.enum(TEE_ENTRY_NODES as unknown as [EntryNode, ...EntryNode[]]);
+const laneEntryRegionSchema = z.enum(ENTRY_REGIONS);
+
+/** The row's pair as the CVM sends it: both members when they are a TEE's node and a region word, neither otherwise. */
+function laneEntryDtoOf(row: RequestIndexRow): { readonly entryNode: EntryNode; readonly entryRegion: EntryRegion } | Record<string, never> {
+  const node = row.entryNode ?? null;
+  const region = row.entryRegion ?? null;
+  return isTeeEntryNode(node) && isEntryRegion(region) ? { entryNode: node, entryRegion: region } : {};
+}
 
 /**
  * A route's key on the lane's wire, an endpoint id or a model name: 1 to 256 printable ASCII characters without a space.
@@ -378,15 +401,21 @@ function rowColumnSchema(column: (typeof COLUMNS)[number]): z.ZodType {
 /**
  * One `request_logs` row, column for column, with the lane-forbidden columns null; a stack relay's
  * trace (S43, stack-trace.ts), which the strict trace schema holds to its closed words and bounds; and
- * the route attempts (r14), each held to `laneRouteAttemptSchema`.
+ * the route attempts (r14), each held to `laneRouteAttemptSchema`; the serving entry (0110), a TEE's node and a region
+ * word, both or neither.
  */
 const LANE_ROW_SHAPE: Record<string, z.ZodType> = {
   ...Object.fromEntries(COLUMNS.map((column) => [column.key, rowColumnSchema(column)])),
   stackTrace: stackTraceSchema.optional(),
   routeAttempts: routeAttemptsSchema.optional(),
   routing: laneRoutingSchema.optional(),
+  entryNode: laneEntryNodeSchema.optional(),
+  entryRegion: laneEntryRegionSchema.optional(),
 };
-export const laneIndexRowSchema = z.object(LANE_ROW_SHAPE).strict();
+export const laneIndexRowSchema = z
+  .object(LANE_ROW_SHAPE)
+  .strict()
+  .refine((row) => (row.entryNode === undefined) === (row.entryRegion === undefined), { message: "a row names its serving entry's node and region, both or neither" });
 export type LaneIndexRowDto = z.infer<typeof laneIndexRowSchema>;
 
 /** One queue message (`RequestIndexMessage`), its `format` an integer like every integer of the wire. */
@@ -408,12 +437,15 @@ function indexIntegerKind(key: string): "int8" | "int4" | null {
  * The real row as its wire document: forbidden fields null, integers bigint. A trace is sent within S43's
  * bounds (`fitStackTrace`); one the bridge's schema would refuse is left out, so the row it belongs to is
  * never lost with it. The route attempts go as their seven members, their measures and their provider failure
- * (`routeAttemptsDtoOf`), or not at all.
+ * (`routeAttemptsDtoOf`), or not at all. The serving entry goes as a TEE's pair or not at all (`laneEntryDtoOf`): a
+ * pair the bridge would refuse is left out here, since a document the CVM's own check refuses never reaches a bridge
+ * whose 400 would send the row again without it.
  * `routes` and `admitted` are no lane row's (the console's route view reads the row's final route instead).
  */
 export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
   const out: Record<string, unknown> = {};
   for (const column of COLUMNS) {
+    if (column.key === "entryNode" || column.key === "entryRegion") continue;
     const value = row[column.key] ?? null;
     if (LATER_ROW.has(column.key) && value === null) continue;
     if (FORBIDDEN_ROW.has(column.key) || value === null) {
@@ -438,6 +470,7 @@ export function laneIndexRowDtoOf(row: RequestIndexRow): LaneIndexRowDto {
     const routing = routingDtoOf(row.routing);
     if (routing !== null) out.routing = routing;
   }
+  Object.assign(out, laneEntryDtoOf(row));
   return out as LaneIndexRowDto;
 }
 

@@ -37,10 +37,26 @@
  * form `set_form_field model` and `remove_form_field user`, whose path is the field's name. A video create keeps
  * `metadata`, where a provider's own parameters travel. v1 is not changed by it: an event names the document that
  * allows it (`declared_in`), and a verifier that carries v1 alone fails an event that names v2.
+ *
+ * `gray-lane-rewrites-v3` (`gray-lane-rewrites-v3.json`, `GRAY_LANE_REWRITES_V3`) is v2 with one more Responses rule:
+ * `{op: "wrap_input_text", path: "/input"}`, a structural op with no value. It turns an `input` that is a JSON string
+ * into the one user message that string means, keeping the client's string token byte for byte (changes.ts), because
+ * ChatGPT's Codex backend refuses a string `input` (400 "Input must be a list"). The entry names v3 only on a request
+ * that needs the op, a Codex route's Responses request whose `input` is a string, and declares every op of that request
+ * in it; every other request names v1 or v2 as before, so its bytes and events do not change.
  */
 import { toJsonString, type Json } from "@gray/json";
 import type { Protocol } from "@gray/protocol";
-import { REQUEST_MODIFIED_OPS, isFormFieldName, isFormOp, isModifiedValue, type RequestModifiedFormOp, type RequestModifiedMemberOp, type RequestModifiedOp } from "@gray/attest";
+import {
+  REQUEST_MODIFIED_OPS,
+  isFormFieldName,
+  isFormOp,
+  isModifiedValue,
+  type RequestModifiedFormOp,
+  type RequestModifiedMemberOp,
+  type RequestModifiedOp,
+  type RequestModifiedStructuralOp,
+} from "@gray/attest";
 import { parseJsonPointer } from "./pointer.ts";
 import { LaneError } from "./refusal.ts";
 import { LANE_PROTOCOLS, type LaneProtocol } from "./protocol.ts";
@@ -57,11 +73,14 @@ export type RewriteValueRule =
 
 /** One allowed op and path for one protocol. */
 export interface RewriteRule {
-  readonly op: RequestModifiedMemberOp;
+  readonly op: RequestModifiedMemberOp | RequestModifiedStructuralOp;
   readonly path: string;
-  /** Absent exactly for `remove_member`. */
+  /** Absent exactly for `remove_member` and the structural `wrap_input_text`. */
   readonly value?: RewriteValueRule;
 }
+
+/** The one path and API `wrap_input_text` is defined on: a Responses request's `input`. */
+export const WRAP_INPUT_TEXT_PATH = "/input";
 
 /** One allowed form op and field name for one API (gray-lane-rewrites-v2). */
 export interface FormRewriteRule {
@@ -255,6 +274,43 @@ export const GRAY_LANE_REWRITES_V2_TEXT: LaneRewritePolicy = validateRewritePoli
   protocols: Object.fromEntries(LANE_PROTOCOLS.map((protocol) => [protocol, GRAY_LANE_REWRITES_V2.protocols[protocol]])),
 });
 
+const RAW_POLICY_V3: unknown = {
+  id: "gray-lane-rewrites-v3",
+  version: 3,
+  protocols: {
+    ...(RAW_POLICY_V2 as { readonly protocols: Record<string, unknown> }).protocols,
+    open_ai_responses: [
+      ...((RAW_POLICY_V2 as { readonly protocols: Record<string, readonly unknown[]> }).protocols.open_ai_responses ?? []),
+      { op: "wrap_input_text", path: WRAP_INPUT_TEXT_PATH },
+    ],
+  },
+};
+
+/** gray-lane-rewrites-v3: v2, and `wrap_input_text /input` on Responses (a Codex route's string `input`). */
+export const GRAY_LANE_REWRITES_V3: LaneRewritePolicyV2 = validateRewritePolicyV2(RAW_POLICY_V3);
+
+/** `declared_in` of every event v3 allows. */
+export const GRAY_LANE_REWRITES_V3_ID = "gray-lane-rewrites-v3" as const;
+if (GRAY_LANE_REWRITES_V3.id !== GRAY_LANE_REWRITES_V3_ID) throw new LaneError("lane/policy", "gray-lane-rewrites-v3's id");
+
+/** v3's rules for the lane's three text APIs as a policy of v1's shape, as `GRAY_LANE_REWRITES_V2_TEXT` is v2's. */
+export const GRAY_LANE_REWRITES_V3_TEXT: LaneRewritePolicy = validateRewritePolicy({
+  id: GRAY_LANE_REWRITES_V3.id,
+  version: GRAY_LANE_REWRITES_V3.version,
+  protocols: Object.fromEntries(LANE_PROTOCOLS.map((protocol) => [protocol, GRAY_LANE_REWRITES_V3.protocols[protocol]])),
+});
+
+/**
+ * The text-API policy a list of ops is replayed under: the one they all name (v2 or v3), else v1. An op that names
+ * another id than the one chosen fails its replay (`replayForwarded` holds each event to `policy.id`), so a list that
+ * mixes ids, or names an id this package does not carry, fails rather than being read under a guess.
+ */
+export function textPolicyOf(ops: readonly { readonly declared_in: string }[]): LaneRewritePolicy {
+  if (ops.length > 0 && ops.every((op) => op.declared_in === GRAY_LANE_REWRITES_V3_ID)) return GRAY_LANE_REWRITES_V3_TEXT;
+  if (ops.length > 0 && ops.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2_ID)) return GRAY_LANE_REWRITES_V2_TEXT;
+  return GRAY_LANE_REWRITES_V1;
+}
+
 /** The rule of `policy` that allows `op` on `path` for `api`, or undefined. */
 export function apiRewriteRuleFor(
   policy: LaneRewritePolicyV2,
@@ -273,9 +329,9 @@ export function rewriteRuleFor(
   return policy.protocols[protocol].find((rule) => rule.op === op.op && rule.path === op.path);
 }
 
-/** Whether `value` satisfies a rule's value constraint. `remove_member` and `remove_form_field` require `undefined`. */
+/** Whether `value` satisfies a rule's value constraint. `remove_member`, `remove_form_field` and `wrap_input_text` require `undefined`. */
 export function ruleAllowsValue(rule: ApiRewriteRule, value: Json | undefined): boolean {
-  if (rule.op === "remove_member" || rule.op === "remove_form_field") return value === undefined;
+  if (rule.op === "remove_member" || rule.op === "remove_form_field" || rule.op === "wrap_input_text") return value === undefined;
   if (rule.value === undefined || value === undefined) return false;
   switch (rule.value.kind) {
     case "string": {
@@ -380,7 +436,7 @@ function parseFormRule(value: unknown, api: string, seen: Set<string>): FormRewr
 function parseRule(value: unknown, protocol: string, seen: Set<string>): RewriteRule {
   const rule = record(value, `a ${protocol} rule`);
   const op = rule.op;
-  if (op !== "set_member" && op !== "insert_member" && op !== "remove_member") {
+  if (op !== "set_member" && op !== "insert_member" && op !== "remove_member" && op !== "wrap_input_text") {
     throw new LaneError("lane/policy", `unknown rewrite op in ${protocol}`);
   }
   if (typeof rule.path !== "string") throw new LaneError("lane/policy", `a ${protocol} rule has no path`);
@@ -388,6 +444,12 @@ function parseRule(value: unknown, protocol: string, seen: Set<string>): Rewrite
   const identity = `${op} ${rule.path}`;
   if (seen.has(identity)) throw new LaneError("lane/policy", `a ${protocol} rule is repeated`);
   seen.add(identity);
+  if (op === "wrap_input_text") {
+    // The op's bytes are defined for a Responses `input` alone (changes.ts).
+    if (protocol !== "open_ai_responses" || rule.path !== WRAP_INPUT_TEXT_PATH) throw new LaneError("lane/policy", `wrap_input_text is a Responses rule on ${WRAP_INPUT_TEXT_PATH}`);
+    if (rule.value !== undefined) throw new LaneError("lane/policy", `the ${protocol} wrap_input_text rule carries a value`);
+    return { op, path: rule.path };
+  }
   if (op === "remove_member") {
     if (rule.value !== undefined) throw new LaneError("lane/policy", `the ${protocol} removal rule carries a value`);
     return { op, path: rule.path };

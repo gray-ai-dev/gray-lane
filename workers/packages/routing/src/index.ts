@@ -26,7 +26,7 @@ import { PROTOCOLS, type Protocol } from "@gray/protocol";
 import { recordParamsWithinBounds } from "./policy.ts";
 import { addAttempt, emptyDelta, deltaEmpty, emptyRecord, mergeDelta, recordFromJson, summaryOf, type AttemptMeasure } from "./record.ts";
 import { feedColumnSample, feedColumnsCount, SampleColumns, type FeedColumns } from "./samples.ts";
-import { DEFAULT_RECORD_PARAMS, type FeedCircuit, type FeedRecord, type LongRecord, type RecordParams, type RecordSummary } from "./utility-types.ts";
+import { DEFAULT_RECORD_PARAMS, type FeedCircuit, type FeedRecord, type LongRecord, type RecordParams, type RecordSummary, type SummaryEstimate } from "./utility-types.ts";
 
 export { feedColumnSample, feedColumnsCount, SampleColumns, type ColumnSample, type FeedColumns } from "./samples.ts";
 
@@ -1077,6 +1077,24 @@ export function feedKeyValid(value: unknown, config: RankingConfig = DEFAULT_RAN
   return true;
 }
 
+/**
+ * Whether `value` is a summary's buffered estimate (`SummaryEstimate`, r24): `n` and `rev` whole numbers up to 2^53 − 1,
+ * each figure null or a finite number above 0. A reader takes a summary whose estimate is not one without it.
+ */
+export function summaryEstimateValid(value: unknown): value is SummaryEstimate {
+  if (value === null || typeof value !== "object") return false;
+  const e = value as Record<string, unknown>;
+  const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  const figure = (v: unknown) => v === null || (typeof v === "number" && Number.isFinite(v) && v > 0);
+  return count(e.n) && count(e.rev) && figure(e.ttftMs) && figure(e.tps);
+}
+
+/** A summary's estimate copied member by member when it is one (`summaryEstimateValid`), else nothing. */
+export function summaryEstimateOf(value: unknown): { readonly est?: SummaryEstimate } {
+  if (!summaryEstimateValid(value)) return {};
+  return { est: { n: value.n, ttftMs: value.ttftMs, tps: value.tps, rev: value.rev } };
+}
+
 /** Whether `value` is a record summary (`RecordSummary`): every count and sum a finite number of at least 0. */
 export function recordSummaryValid(value: unknown): value is RecordSummary {
   if (value === null || typeof value !== "object") return false;
@@ -1530,6 +1548,18 @@ export class Ranker {
     return this.feedHave;
   }
 
+  /**
+   * Forgets the buffered estimate of every record this ranker holds of the feed (r24): a TEE entry whose bridge no longer
+   * carries the estimates (ranking-base.ts) reads each route without one until a whole answer replaces the records.
+   */
+  dropFeedEstimates(): void {
+    for (const [root, summary] of this.feedRecords) {
+      if (summary.est === undefined) continue;
+      const { est: _est, ...rest } = summary;
+      this.feedRecords.set(root, rest);
+    }
+  }
+
   /** How many roots' records and keys' circuits this ranker holds of the feed (r17; the isolate's base, ranking-base.ts). */
   feedHeld(): { readonly records: number; readonly circuits: number } {
     return { records: this.feedRecords.size, circuits: this.feedCircuits.size };
@@ -1614,7 +1644,8 @@ export class Ranker {
     for (const r of answer.records ?? []) {
       if (!feedRecordValid(r) || (!this.feedRecords.has(r.root) && this.feedRecords.size >= RECORDS_BOUND)) continue;
       const s = r.summary;
-      this.feedRecords.set(r.root, { s: s.s, f: s.f, tokens: s.tokens, decodeMs: s.decodeMs, ttftP50: s.ttftP50, ttftP90: s.ttftP90, ttftP99: s.ttftP99, ttftCount: s.ttftCount, tpsCount: s.tpsCount, at: s.at });
+      // The buffered estimate too (r24), when it is one: a feed of an earlier release carries none.
+      this.feedRecords.set(r.root, { s: s.s, f: s.f, tokens: s.tokens, decodeMs: s.decodeMs, ttftP50: s.ttftP50, ttftP90: s.ttftP90, ttftP99: s.ttftP99, ttftCount: s.ttftCount, tpsCount: s.tpsCount, at: s.at, ...summaryEstimateOf(s.est) });
     }
     this.feedHave = { epoch: answer.epoch, seq: answer.seq };
   }
@@ -2005,13 +2036,13 @@ export {
   parseTagPattern,
   tagSentinel,
   affinityKey,
-  keyDefaultPreset,
 } from "./preferences.ts";
 
 export * from "./utility-types.ts";
-export { overKeyPreset, parseRoutingRequest, resolveRoutingParams, takeRouting, type ModeSource, type RoutingTaken } from "./params.ts";
+export { ESTIMATION, isEstimationPoint, type EstimationPoint, type EstimationState } from "@gray/performance";
+export { modeSourceOf, parseRoutingRequest, resolveRoutingParams, takeRouting, type ModeSource, type RoutingTaken } from "./params.ts";
 export { COST_FLOOR_USD, TPS_FLOOR, TTFT_FLOOR_MS, drawNumber, effectiveMetrics, excludesEveryRankedCandidate, failedConstraint, lnUtility, rankByUtility, workloadCost } from "./utility.ts";
-export { addAttempt, bucketValue, deltaEmpty, emptyDelta, emptyRecord, mergeDelta, recordFromJson, summaryOf, ttftBucket, type AttemptMeasure } from "./record.ts";
+export { addAttempt, addEstimation, bucketValue, deltaEmpty, emptyDelta, emptyRecord, estimateSummary, estimationOf, mergeDelta, recordFromJson, reviseEstimate, summaryOf, ttftBucket, type AttemptMeasure } from "./record.ts";
 export { SessionStore, sessionKey, sessionRedraw, sessionSeed, type SessionRecord, type SessionRouteState } from "./session.ts";
 export { catalogReferencePrice, recordParamsOf, recordParamsWithinBounds, referencePricesOf, routingPolicyDocument, routingPolicyOf, routingPolicyOfText, tauOf, type CatalogPricing, type PolicyRead } from "./policy.ts";
 export * from "./request-routing.ts";

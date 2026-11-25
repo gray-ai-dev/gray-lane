@@ -44,6 +44,13 @@ import { LegacyLatch } from "./legacy.ts";
  *   again as r16's and keeps to that for the records latch's window (`options.records`); its feed answers carry no
  *   records, which the formula reads as no feed (fixed values, evidence `fixed`), and the samples and circuits of r16
  *   keep working. A bridge before r16 refuses that read too, and the read ends at the one of before r16.
+ * - `ranking_est` (r24, docs/utility-routing.md): a read that names `ranking_records` names it too, and the bridge writes
+ *   each record's estimate (`est`). A bridge of r23 refuses the parameter (400): the read goes again as r23's and keeps
+ *   to that for the estimates latch's window (`options.estimates`); the routes are ranked on start values, as before r24.
+ *   Each answer says the form its records were asked in (`SnapshotAnswer.rankingEstimates`), and the isolate's ranking
+ *   base keeps the form it holds (ranking-base.ts `apply`): one source serves one request, the base every request of the
+ *   process. When the form changes the base forgets the estimates it held (a downgrade) and asks for the whole feed until
+ *   it takes a whole answer, so no estimate of the earlier form stays held and every record comes in the new one.
  *
  * The lane snapshot's invariants (`assertLaneSnapshot`, design v2 section B): every route but the lane
  * relays' and the endpoint routes the entry serves (docs/design/lane-provider-routes.md section 2) is
@@ -73,10 +80,15 @@ export interface RemoteSnapshotSourceOptions extends BridgeClientOptions {
   readonly legacy?: LegacyLatch;
   /** The records latch (r17): a bridge that refused `ranking_records` lately is asked as r16 asks; the process's own by default. */
   readonly records?: LegacyLatch;
+  /** The estimates latch (r24): a bridge that refused `ranking_est` lately is asked as r23 asks; the process's own by default. */
+  readonly estimates?: LegacyLatch;
 }
 
 /** The process's records latch (r17), as the endpoint ops' measures latch: one a process, every request's reads behind it. */
 const RECORDS = new LegacyLatch();
+
+/** The process's estimates latch (r24), as the records latch. */
+const ESTIMATES = new LegacyLatch();
 
 /** The remote source: `current(have, run, confirmedAfter, judge, ranking)` over the bridge. */
 export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource {
@@ -87,6 +99,7 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
   readonly #ranking: boolean;
   readonly #legacy: LegacyLatch | undefined;
   readonly #records: LegacyLatch;
+  readonly #estimates: LegacyLatch;
   readonly #now: () => number;
 
   constructor(options: RemoteSnapshotSourceOptions) {
@@ -95,6 +108,7 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
     this.#ranking = options.ranking === true;
     this.#legacy = options.legacy;
     this.#records = options.records ?? RECORDS;
+    this.#estimates = options.estimates ?? ESTIMATES;
     this.#now = options.now ?? (() => Date.now());
   }
 
@@ -111,9 +125,32 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
       judge_age_ms: judge === undefined ? null : BigInt(judge.ageMs),
     };
     if (!this.#ranking || this.#legacy?.legacy(this.#now()) === true) return this.#answer(await run(() => this.#read(request)), false);
-    const ranked: SnapshotCurrentRequest = { ...request, ...snapshotRankingRequestOf(ranking) };
+    const asked: SnapshotCurrentRequest = { ...request, ...snapshotRankingRequestOf(ranking) };
     // The feed's changes come with the records (r17), unless a bridge of r16 refused them lately.
-    const records = ranked.ranking !== "word" && !this.#records.legacy(this.#now());
+    const records = asked.ranking !== "word" && !this.#records.legacy(this.#now());
+    if (!records) return this.#ranked(asked, request, run, false);
+    // And with the estimates (r24), unless a bridge of r23 refused them lately.
+    if (this.#estimates.legacy(this.#now())) return this.#ranked(asked, request, run, true);
+    let dto: SnapshotAnswerDto;
+    try {
+      dto = await run(() => this.#read({ ...asked, ranking_records: "1", ranking_est: "1" }));
+    } catch (error) {
+      if (!(error instanceof BridgeCallError) || error.status !== 400) return this.#before(error, request, run);
+      // A bridge of r23 knows no `ranking_est` (400, `unknown_field`): r23's read, and the latch once it was taken. Its
+      // answer says its form, and the base asks for the whole feed next (ranking-base.ts `apply`).
+      const answer = await this.#ranked(asked, request, run, true);
+      if (!this.#estimates.legacy(this.#now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "snapshot_estimates", window_ms: this.#estimates.retryMs }));
+      this.#estimates.refused(this.#now());
+      return answer;
+    }
+    return this.#answer(dto, true, true);
+  }
+
+  /**
+   * A read of the ranking members without the estimates (r23's): with the records (`records`) unless a bridge of r16
+   * refused them, as r17 reads. Its answer's records are without their estimates (`rankingEstimates` false).
+   */
+  async #ranked(ranked: SnapshotCurrentRequest, request: SnapshotCurrentRequest, run: Runner, records: boolean): Promise<SnapshotAnswer> {
     let dto: SnapshotAnswerDto;
     try {
       dto = await run(() => this.#read(records ? { ...ranked, ranking_records: "1" } : ranked));
@@ -128,9 +165,9 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
       }
       if (!this.#records.legacy(this.#now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "snapshot_records", window_ms: this.#records.retryMs }));
       this.#records.refused(this.#now());
-      return this.#answer(r16, true);
+      return this.#answer(r16, true, false);
     }
-    return this.#answer(dto, true);
+    return this.#answer(dto, true, false);
   }
 
   /**
@@ -155,7 +192,7 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
    * no other), as they came: the base checks the feed answer as the main gateway's checks a replica's (`feedAnswerValid`,
    * each key `feedKeyValid`), and a failure's kind with it.
    */
-  #answer(dto: SnapshotAnswerDto, asked: boolean): SnapshotAnswer {
+  #answer(dto: SnapshotAnswerDto, asked: boolean, estimates?: boolean): SnapshotAnswer {
     const raw = snapshotAnswerOf(dto);
     if (raw.snapshot !== null) this.#onSnapshot?.(raw.snapshot);
     const snapshot = raw.snapshot === null ? null : this.#map(raw.snapshot);
@@ -164,7 +201,7 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
       refreshedAt: raw.refreshedAt,
       confirmedAt: raw.confirmedAt,
       snapshot,
-      ...(asked && raw.ranking !== undefined ? { ranking: raw.ranking as FeedAnswer } : {}),
+      ...(asked && raw.ranking !== undefined ? { ranking: raw.ranking as FeedAnswer, ...(estimates === undefined ? {} : { rankingEstimates: estimates }) } : {}),
       // A ranking member this build could not read goes to the base as no feed answer, which it counts unreadable as the
       // main gateway's base counts a replica's answer it cannot read (`ranking_answer_unreadable`, and `ranking_stale`
       // once that lasts past the alert age); the snapshot is taken all the same (review r16 finding 3).

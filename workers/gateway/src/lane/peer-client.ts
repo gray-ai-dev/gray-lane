@@ -1407,8 +1407,8 @@ export class PeerCall implements LanePeerCall {
    * A committed answer as an upstream `Response`: the `data` bytes as the stack VM released them, read as the request
    * path reads, one frame ahead of its consumer (a stream's default highWaterMark of 1: it pulls again while its queue is
    * empty), which is how an `end` that follows the last frame read lands in `ended` (`endWithin`). The body ends once
-   * `end` is in; a hop that ends without `end`, or with a frame that is not the wire, is a broken body, as a vendor
-   * connection that broke.
+   * `end` is in, and errors on a `cut` one; a hop that ends without `end`, or with a frame that is not the wire, is a
+   * broken body, as a vendor connection that broke.
    */
   #answer(head: PeerHeadDto): Response {
     const reader = this.#reader!;
@@ -1435,7 +1435,11 @@ export class PeerCall implements LanePeerCall {
           }
           this.#took(frame.end);
           this.#resolveEnded(frame.end);
-          controller.close();
+          // A `cut` end says the stack VM stopped the answer short of its end: the body errors, as a vendor connection
+          // that broke does, so no reader takes the bytes released before it for a whole answer, whatever they read as
+          // (a buffered answer's closing brace, a stream's final event). `end` is in first, for `endWithin`.
+          if (frame.end.outcome === "cut") controller.error(new Error(`the stack VM cut the answer (${frame.end.code ?? "no code"})`));
+          else controller.close();
           return;
         }
       },

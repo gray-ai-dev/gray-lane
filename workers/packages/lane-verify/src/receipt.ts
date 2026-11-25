@@ -140,6 +140,7 @@ import {
   rewriteRuleFor,
   ruleAllowsValue,
   stackBodyDigest,
+  textPolicyOf,
   stackVendorBodyDigest,
   stackVendorEventsSha256,
   textSha256Hex,
@@ -660,7 +661,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     const baseBody = options.expandedBody;
     if (baseBody !== undefined) {
       if (modified.length > 0) {
-        const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+        const policy = textPolicyOf(modified);
         if (verifyForwardedWithChanges(baseBody, protocol, modified, forwardedBare, applied, policy)) {
           checks.push(pass("forwarded_body_hash", `${forwardedHash} = SHA-256(${modified.length} declared op(s) then F(expanded, declared appends)); zero-retention continuation expansion applied inside the attested entry TEE`));
         } else {
@@ -686,7 +687,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     } else {
       // Gray's declared changes apply to the expanded body, which stays sealed in the entry: without its bytes nothing
       // is replayed, so nothing is compared. The ops are still held to their policy.
-      const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const policy = textPolicyOf(modified);
       const bad = disallowedOps(policy, protocol, modified);
       const what = [
         ...(modified.length > 0 ? [`${modified.length} declared op(s) (each one ${policy.id} allows)`] : []),
@@ -707,7 +708,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   }
   if (modified.length > 0) {
     // The ops replay under the policy they name: v1, or v2 when every one names it (v2 keeps v1's rules for the text APIs).
-    const policy = modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+    const policy = textPolicyOf(modified);
     if (verifyForwardedWithChanges(options.receivedBody, protocol, modified, forwardedBare, applied, policy)) {
       checks.push(pass("forwarded_body_hash", `${forwardedHash} = SHA-256(${modified.length} declared op(s) then F(received, declared appends))`));
     } else {
@@ -1180,6 +1181,9 @@ function stackChecks(
     }
   } else if (rewrites.length > 0) {
     checks.push(pass("served_attempt", `attempt ${servedAttempt}: its upstream.response's answer with Gray's declared rewrites (gray-lane-response-rewrites-v1: ${rewritesText}); the bytes received tie it (response_served_attempt)`));
+  } else if (served === undefined) {
+    // A peer log (an entry's outer receipt): the attempt is a provider's VM's, whose inner receipt holds its upstream.response.
+    checks.push(skip("served_attempt", `not checked here: a provider's VM answered attempt ${servedAttempt} over the peer hop, and its inner receipt ties the answer (--peers)`));
   } else {
     const member = eventsSha256 !== null ? "events_sha256" : "body_sha256";
     checks.push(pass("served_attempt", `attempt ${servedAttempt}: the client's ${member} and status ${String(status)} are its upstream.response's`));
@@ -1394,7 +1398,7 @@ function receiptChecks(
       }
     } else if (options.expandedBody !== undefined) {
       const protocol = options.protocol ?? protocolForEndpoint(document.endpoint);
-      const policy = outer.modified.every((op) => op.declared_in === GRAY_LANE_REWRITES_V2.id) ? GRAY_LANE_REWRITES_V2_TEXT : GRAY_LANE_REWRITES_V1;
+      const policy = textPolicyOf(outer.modified);
       const replayed = protocol !== null && isLaneProtocol(protocol) ? replayForwarded(options.expandedBody, protocol, outer.modified, [], policy) : null;
       const expected = replayed === null ? null : bodyHash(replayed);
       if (expected !== null && receivedHash === expected) {

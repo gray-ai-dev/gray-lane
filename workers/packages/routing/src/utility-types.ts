@@ -5,6 +5,7 @@
  *
  * Mirrored by crates/gray-gateway/src/utility_types.rs; the server is the reference.
  */
+import type { EstimationSums } from "@gray/performance";
 
 /** The four presets of the routing parameter design (appendix A). */
 export type Preset = "interactive" | "autonomous" | "standard" | "flex";
@@ -156,7 +157,7 @@ export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   tau: null,
   unselectedShare: 0,
   sessionIdleMs: 600_000,
-  start: { discount: 0.8, quantile: 0.5, threshold: 50, thresholdP99: 200, priorRecords: 200, priorFailures: 1, fixed: { ttftP50Ms: 1000, ttftP90Ms: 2000, ttftP99Ms: 4000, tps: 30 } },
+  start: { discount: 1, quantile: 0.5, threshold: 50, thresholdP99: 200, priorRecords: 200, priorFailures: 1, fixed: { ttftP50Ms: 1000, ttftP90Ms: 2000, ttftP99Ms: 4000, tps: 30 } },
   record: { halfLifeTtftMs: 3_600_000, halfLifeTpsMs: 3_600_000, halfLifeAvailMs: 259_200_000, floorTtft: 50, floorTps: 50, floorAvail: 800, maxRateTps: 5000, unmeasuredInflight: 20 },
   presets: DEFAULT_PRESETS,
   referencePrices: {},
@@ -172,6 +173,21 @@ export interface LongRecord {
   readonly ttft: { readonly buckets: readonly (readonly [bucket: number, weight: number])[]; readonly at: number | null };
   readonly ttftCount: number;
   readonly tpsCount: number;
+  /** The buffered estimation's sums (r24, docs "The buffered estimate"); absent until the route's first buffered point. */
+  readonly est?: RecordEstimation;
+}
+
+/**
+ * The buffered estimation in a long record (@gray/performance `EstimationSums`): its eleven sums and clock, and what the
+ * summary publishes, kept with them: `rev` its revision and `ttftMs` and `tps` its figures (both null while withheld or
+ * withdrawn). Each change of the figures (a merge, a new rate cap, another build's figures at a root's start) is the
+ * next revision (`reviseEstimate`), so the summary is read from the record alone and a record on disk says what was
+ * shown from it.
+ */
+export interface RecordEstimation extends EstimationSums {
+  readonly rev: number;
+  readonly ttftMs: number | null;
+  readonly tps: number | null;
 }
 
 /** What attempts add to a record (a shard's increments between reports; one attempt's on the server). */
@@ -196,6 +212,19 @@ export interface RecordSummary {
   readonly ttftCount: number;
   readonly tpsCount: number;
   readonly at: number | null;
+  /** The buffered estimate (r24): absent before the route's first buffered point and from a root of an earlier release. */
+  readonly est?: SummaryEstimate;
+}
+
+/**
+ * A route's buffered estimate as the gateways read it: the points ever weighed, the typical TTFT (ms) and the decode rate
+ * (tok/s), both null unless published (a withdrawal: null figures at a higher `rev`), and the revision.
+ */
+export interface SummaryEstimate {
+  readonly n: number;
+  readonly ttftMs: number | null;
+  readonly tps: number | null;
+  readonly rev: number;
 }
 
 /** A rank key's circuit as the feed carries it: open, the cooldown's end while open, a probe lease out. */
@@ -211,8 +240,8 @@ export interface FeedRecord {
   readonly summary: RecordSummary;
 }
 
-/** Where a route's metric came from. */
-export type MetricSource = "own" | "start" | "fixed";
+/** Where a route's metric came from: its own measured figures, its buffered estimate (r24), start values, the fixed ones. */
+export type MetricSource = "own" | "estimated" | "start" | "fixed";
 
 /** A route's metrics as the formula and the constraints read them (docs "Effective metrics"). */
 export interface EffectiveMetrics {

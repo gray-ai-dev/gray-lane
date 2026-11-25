@@ -15,7 +15,6 @@ import {
   type Constraint,
   type EffectiveMetrics,
   type PreferenceLevel,
-  type ModeSource,
   type ReferencePrice,
   type RequestRoutingRecord,
   type RoutingCandidate,
@@ -165,8 +164,11 @@ export interface RoutingFacts {
   readonly api: "generation" | "other";
   readonly params: RoutingParams;
   readonly stated: StatedRouting;
-  /** Where the preset came from: the request, its API key's default, or neither (`overKeyPreset`). */
-  readonly modeSource: ModeSource | null;
+  /**
+   * Where the preset came from (`modeSourceOf`): the request, or none (the standard preset). Never `key`, which only the
+   * records r20 wrote hold (@gray/routing `ModeSource`): since r21 an API key's default names no mode.
+   */
+  readonly modeSource: "request" | null;
   readonly policy: RecordPolicy;
   readonly reference: ReferencePrice | null;
   readonly contextTokens: number | null;
@@ -674,18 +676,17 @@ export function preferenceLevels(
   protocol: string,
   tag: string | null = null,
 ): PreferenceLevelFacts[] {
-  const stored = (text: string | null | undefined): Preference | null => {
+  // A key's default is read without the mode r20 let it state (`parseKeyDefault`), a workspace's as it is stated.
+  const stored = (text: string | null | undefined, read: (text: string) => Preference | "routing_default_invalid"): Preference | null => {
     if (text === null || text === undefined) return null;
-    const read = Preference.parseDefault(text);
-    return typeof read === "string" ? null : read;
+    const level = read(text);
+    return typeof level === "string" ? null : level;
   };
-  // A key's default also carries its routing mode (`mode`), which the parameters' resolution reads, not layering.
-  const key = keyDefault === null ? null : Preference.parseKeyDefault(keyDefault);
   const stating: [PreferenceLevel, Preference][] = [];
   for (const [source, level] of [
     ["request", own],
-    ["key", key === null || typeof key === "string" ? null : key.preference],
-    ["workspace", stored(snapshot.routingDefaults?.[workspaceId])],
+    ["key", stored(keyDefault, (text) => Preference.parseKeyDefault(text))],
+    ["workspace", stored(snapshot.routingDefaults?.[workspaceId], (text) => Preference.parseDefault(text))],
   ] as const) {
     // A model tag is the request's own selection, beside what its `provider` states.
     if (level !== null && (!level.isDefault() || (source === "request" && tag !== null))) stating.push([source, level]);
@@ -740,7 +741,7 @@ export function routingFactsOf(o: {
   readonly api: RoutingFacts["api"];
   readonly params: RoutingParams;
   readonly stated: StatedRouting;
-  readonly modeSource: ModeSource | null;
+  readonly modeSource: RoutingFacts["modeSource"];
   readonly policy: RoutingPolicy;
   readonly reference: ReferencePrice | null;
   readonly contextTokens: number | null;
@@ -805,7 +806,7 @@ export function preferenceRefusedFacts(o: {
   readonly api: RoutingFacts["api"];
   readonly params: RoutingParams;
   readonly stated: StatedRouting;
-  readonly modeSource: ModeSource | null;
+  readonly modeSource: RoutingFacts["modeSource"];
   readonly policy: RoutingPolicy;
   readonly reference: ReferencePrice | null;
   readonly contextTokens: number | null;

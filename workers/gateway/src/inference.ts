@@ -1,11 +1,12 @@
 import { releaseWithRetry, settleWithRetry, shardName, UNROUTED, type AdmitRefusal, type SettleInput, type HoldToken, type ShardCountTable, type ShardLocator } from "@gray/account";
 import { isLocationHint, type GatewayConfig, type ImageUsageUnsplit, type LocationHint } from "@gray/config";
+import type { ServingEntry } from "@gray/request-index";
 import { workspaceHome } from "./account.ts";
 import type { KeyRevocationCheck } from "./key-lookup.ts";
 import { admissionUnavailable, countKeyRate, countModelCheck, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { endingWith, entryAnswerUsable, entryServesChain, entryUnreachable, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { checkTicket, ticketHeader, ticketUseVerdict, withoutTicket, type ModelCheckTicketStore, type TicketRefusal, type TicketStoreUnavailable } from "./model-check.ts";
-import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
+import { API_FORWARD_HEADER, LANE_BRIDGE_CALL_MS, PEER_GATE_REFUSED, STACK_FAULT_WHYS, type StackFaultWhy, type TicketUseOutcome } from "@gray/lane-wire";
 import {
   CONTINUATION_ERRORS,
   CONTINUATION_STATE_TTL_MS,
@@ -132,14 +133,12 @@ import {
   Preference,
   ROUTING_PARAMS_HEADER,
   affinityKey,
-  keyDefaultPreset,
-  overKeyPreset,
+  modeSourceOf,
   resolveRoutingParams,
   sessionKey,
   sessionRedraw,
   sessionSeed,
   takeRouting,
-  type ModeSource,
   type RestView,
   type RoutingEvidence,
   type RoutingParams,
@@ -157,7 +156,7 @@ import { bodyTooLarge, readBody, spoolReadBack, type Body } from "./body.ts";
 import { RequestBudget, withinPhase } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, ClientStream, errorFrame, keepAliveFrame, platformTimers, type StreamTimers } from "./client.ts";
 import { logWithheld, resolveWithheld, settledBy, withheldBilling, type WithheldEnd } from "./withheld.ts";
-import { type ContentState, type KeylessLimits, RequestContent } from "./content.ts";
+import { type ContentState, type KeylessLimits, RequestContent, confidentialContent } from "./content.ts";
 import { openCredential } from "./crypto.ts";
 import { Dispatcher, attemptCode, countedFailure, failureEnd, noAttemptError, noRouteRetryAfter, servedLater, skipLabel, type AttemptEnd, type BlockGates, type ColdPass, type DispatchEnv, type DispatchPlan, type HeldRefusal, type PassFacts } from "./dispatcher.ts";
 import { accountBlockGauges, accountBlockIsolate, blockGates } from "./account-blocks.ts";
@@ -529,7 +528,13 @@ export interface GatewayDeps {
   readonly fetch: (input: string, init: RequestInit) => Promise<Response>;
   /** The master key, opened once per isolate; null when the secret is not set. */
   readonly master: () => Promise<CryptoKey | null>;
+  /** The request's region: the Durable Object location hint its shards live in (`requestRegion`), not where it is served. */
   readonly region: LocationHint;
+  /**
+   * The entry serving the request, for its record (entry-location.ts, 0110): the Workers gateway's data center
+   * (index.ts `gatewayDeps`) or the TEE entry's replica (lane/deps.ts `laneGatewayDeps`), with its inventory region.
+   */
+  readonly entry: ServingEntry;
   readonly service: { readonly env: string; readonly instance: string; readonly startedAt: number };
   /** The requests in flight in this isolate. */
   readonly load: IsolateLoad;
@@ -609,6 +614,15 @@ export interface Attempt {
   ttftMs?: number;
   /** The output tokens of its answer as charged (`charge`): its ranking sample's (the server's `Some((true, usage.output_tokens))`). */
   outputTokens?: number;
+  /**
+   * The estimation's point (r24, docs/utility-routing.md): `bufferedRead`, its upstream answered buffered (`buffered`,
+   * after the Codex branch: a Codex upstream that streams behind a buffered client is no such read); `readEndMs`, when that
+   * body's read ended, before its settlement, which is its end for its measure and its record (`endedAt`); `estInput`, its
+   * validated usage's uncached input (input less cache reads, cache writes in it) and cache-read input (`answeredUsage`).
+   */
+  bufferedRead?: true;
+  readEndMs?: number;
+  estInput?: readonly [u: number, c: number];
   /**
    * The re-test lease of its supplier's account-block gate, taken as it was sent to a supplier whose gate was
    * unproven (`Dispatcher.passGate`): the supplier's answer or refusal settles the gate; a lease neither settled
@@ -793,6 +807,8 @@ const lenient = new TextDecoder();
 const MODEL_REFUSED = "model_refused";
 /** The ledger's largest amount (i64): what a model check's usage may cost, since nothing was held to bound it. */
 const LEDGER_MAX = (1n << 63n) - 1n;
+/** Whose limit a lane request's 413 names when its body is larger than the lane holds of one request (`bodyTooLarge`). */
+const VM_BODY_LIMIT_SOURCE = "the most Gray's confidential VM holds of one request";
 
 /**
  * Whether a failure at `route` of a lane request files no rest (`restRoute`): a lane relay's route is a pool of the
@@ -1099,8 +1115,8 @@ export class InferenceRun {
   private routingParams: RoutingParams = resolveRoutingParams(null, DEFAULT_ROUTING_POLICY);
   /** What the request stated itself of them, as its routing record tells it apart from its preset (`statedOf`). */
   private routingStated: StatedRouting = statedOf(null);
-  /** Where its preset came from: the request, its API key's default (`overKeyPreset`), or neither. */
-  private routingModeSource: ModeSource | null = null;
+  /** Where its preset came from (`modeSourceOf`): the request, or none (the standard preset). */
+  private routingModeSource: "request" | null = null;
   /** The provider preference by level, as the request's routing record tells it (`preferenceLevels`); none before it was layered. */
   private preferenceLevels: readonly PreferenceLevelFacts[] = [];
   /**
@@ -1272,8 +1288,9 @@ export class InferenceRun {
    * The body an entry sends over the peer hop to each relay's VM (`lane/claude-code-user-id.ts` `peerHopBody`): the
    * client's bytes with Messages' `metadata.user_id` replaced by Gray's stand-in or removed, and `/provider` removed
    * when the client stated its routing preference in the body (docs/design/one-address.md), under the published rewrite
-   * policy, and the ops' `request.modified` events. By relay id, since the stand-in is the relay's own; made at the
-   * first plan for that relay.
+   * policy, and the ops' `request.modified` events; on a Codex route also a string `input` wrapped as a message. By relay
+   * id and vendor, since the stand-in is the relay's own and the wrap the Codex route's alone; made at the first plan for
+   * that relay and vendor.
    */
   private readonly peerHops = new Map<string, PeerHopBody & { readonly base: Uint8Array }>();
   /** The ops each peer call's body carries, which its `peer.forwarded` declares. */
@@ -1290,6 +1307,12 @@ export class InferenceRun {
   private readonly laneStackExpansions = new Map<StackCall, ExpandZeroRetentionResult | null>();
   /** Parsed request body held for Turn 1 sealing on zero-retention Responses routes. */
   private laneZdrRequestBody: Json | null = null;
+  /**
+   * The 413 of the latest route passed over because the body it would be sent is larger than Gray holds of one
+   * request where that route is served (the confidential VM's limit, the client's body after its zero-retention
+   * expansion included, GL-29): what the client is told when every route left was too small for the body.
+   */
+  private bodyLimitRefusal: ApiError | null = null;
   /** At most one zero-retention fallback retry per request (unsupported `include` or `invalid_encrypted_content`). */
   private zdrFallbackUsed = false;
   private zdrSuppressInclude = false;
@@ -1526,7 +1549,8 @@ export class InferenceRun {
   private async openContent(placement: Placement, snapshot: GatewaySnapshot | null): Promise<void> {
     // The confidential lane keeps no request content (design v2 §C.11, M13): its snapshot carries no
     // recipients, its bucket is a stub, and `details()` is never built. Every early return below is
-    // still reached in lane mode, so the guard is here rather than at each of them.
+    // still reached in lane mode, so the guard is here rather than at each of them. No recipient is
+    // looked up, so none is missed or alerted on; the row says `withheld`, `confidential` (`record`).
     if (this.lane !== null) return;
     if (this.content !== null) return;
     this.content = await RequestContent.open(
@@ -1699,6 +1723,7 @@ export class InferenceRun {
       model: this.model,
       stream: this.stream,
       region: this.deps.region,
+      entry: this.deps.entry,
       authResult: this.authResult,
       authScheme: this.authScheme,
       workspaceId: (this.key ?? this.refusedKey)?.workspaceId ?? null,
@@ -1807,7 +1832,10 @@ export class InferenceRun {
       // (`close` is the one `finishStack` awaits; whatever ends first, the feeds are the same).
       const emitted = await this.withStackTrace(endedSafe);
       let result: WriterResult;
-      if (content === null) {
+      if (this.lane !== null) {
+        // The confidential entry opens no writer (`openContent`): its row says the content was not kept, by design.
+        result = confidentialContent();
+      } else if (content === null) {
         result = notWritten("failed", "no_recipient");
       } else if (content.placement.kind === "anonymous" && this.deps.keyless !== null && !(await this.keylessAllowed(this.deps.keyless))) {
         // A keyless request past its sender's or its location's limit: no object, no index row (content.md 9).
@@ -2325,6 +2353,9 @@ export class InferenceRun {
   private endAttempt(attempt: Attempt, outcome: EndpointOutcome, upstreamMayStillWork: boolean, code: string | null, facts: ReleaseFacts & { readonly defer?: boolean; readonly errorBody?: Uint8Array; readonly rejected?: boolean; readonly answered?: boolean; readonly failure?: AttemptFailure } = {}): void {
     if (attempt.ended) return;
     attempt.ended = true;
+    // A buffered attempt ends when its body's read ended, before its settlement (r24): its measure's latency and its
+    // record's duration leave the charge's round trip out, as a stream's first token never waited for it.
+    const endedAt = attempt.readEndMs ?? this.deps.clock();
     if (this.current === attempt) this.current = null;
     // A stack call ends with its attempt: the container's connection, then the rid at egress (S23, S24).
     if (attempt.stack !== undefined) this.ctx.waitUntil(attempt.stack.close());
@@ -2380,7 +2411,7 @@ export class InferenceRun {
       endpointId: record.endpointId,
       operator: record.operator,
       startedAt: attempt.startedAt,
-      durationMs: this.deps.clock() - attempt.startedAt,
+      durationMs: endedAt - attempt.startedAt,
       status: attempt.status,
       outcome: ended,
       code,
@@ -2431,7 +2462,7 @@ export class InferenceRun {
     const released = freed?.outcome ?? outcome;
     const charged = released.kind === "success" && !answered && freed === null;
     const measure: OutcomeMeasure = [
-      Math.max(0, this.deps.clock() - attempt.startedAt),
+      Math.max(0, endedAt - attempt.startedAt),
       attempt.ttftMs ?? null,
       charged ? (attempt.outputTokens ?? 0) : 0,
       released.kind === "supplier_failure" ? (failure ?? "protocol") : null,
@@ -2441,9 +2472,11 @@ export class InferenceRun {
     ];
     // Its record's route attempt carries the same measures (r15, docs/live-speed.md), in its rank key's mode.
     this.attempts[recordAt] = { ...this.attempts[recordAt]!, measures: attemptMeasures(released, measure, charged, this.stream === true) };
+    const est = estimationPoint(attempt, charged);
     const release: ReleaseFacts = {
       ...rest,
       measure,
+      ...(est === null ? {} : { est }),
       // The shard's view of the account-block gates hears the answer too (a refusal's block comes in `facts`).
       ...(outcome.kind === "success" && !answered ? { accountBlock: { kind: "served" as const, model: record.model, pattern: this.pattern } } : {}),
       ...(attempt.committed ? { served: true } : {}),
@@ -2727,7 +2760,7 @@ export class InferenceRun {
         parseMax: cfg.bodyParseMaxBytes,
         rawMax: laneCap ?? cfg.bodyRawMaxBytes,
         waitMs: cfg.requestBodyMs,
-        ...(lane === null ? {} : { limitSource: "the most Gray's confidential VM holds of one request" }),
+        ...(lane === null ? {} : { limitSource: VM_BODY_LIMIT_SOURCE }),
         ...(this.deps.waitTimers === undefined ? {} : { timers: this.deps.waitTimers }),
       },
       lane === null ? this.io.content : undefined,
@@ -2858,13 +2891,11 @@ export class InferenceRun {
         preferenceRefused = true;
         return routingRefused(routed.code, routed.message);
       }
-      // The key's default preset is the base of a request that names none (`overKeyPreset`).
-      const based = overKeyPreset(routed.request, keyDefaultPreset(key.routing ?? null));
-      this.routingParams = resolveRoutingParams(based.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
+      // The request's own parameters alone: an API key's stored default names no mode (r21), whatever r20 stored in it.
+      this.routingParams = resolveRoutingParams(routed.request, snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY);
       this.routingStated = statedOf(routed.request);
-      this.routingModeSource = based.modeSource;
-      // Explicit parameters, the key's preset among them, opt every tiered route in (`tierAdmitted`), marked before the
-      // preference is layered.
+      this.routingModeSource = modeSourceOf(routed.request);
+      // Explicit parameters opt every tiered route in (`tierAdmitted`), marked before the preference is layered.
       this.preference = taken.preference.withRoutingExplicit(this.routingParams.explicit);
       this.stripProvider = stated;
       this.stripRouting = routed.source === "body";
@@ -3228,6 +3259,7 @@ export class InferenceRun {
     this.lanePeerExpansions.clear();
     this.laneStackExpansions.clear();
     this.laneZdrRequestBody = null;
+    this.bodyLimitRefusal = null;
     this.zdrFallbackUsed = false;
     this.zdrSuppressInclude = false;
     this.zdrStripEncryptedReasoning = false;
@@ -3420,7 +3452,7 @@ export class InferenceRun {
       }
       const targets = translationTargets(rules, laneMode || viaEntry ? "off" : cfg.translationFallback, canonical.model, protocol, responsesMapped, live, laneMode ? "entry" : "operator");
       if (targets === null) {
-        return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, rules), "routes");
+        return this.unserved(unrouted(snapshot, canonical, protocol, now, !parsed.whole, rules, this.preference), "routes");
       }
       // A translated request has nothing but Gray's software between the client and the provider's other API, which has
       // no earlier response to continue: refused, whatever the model (`lanePin` left it to this point).
@@ -3430,7 +3462,7 @@ export class InferenceRun {
       // answer it gets without a translation (decisions of 2026-10-23, the critic's finding): the rule never turns
       // that answer into a refusal of its size.
       if (!parsed.whole && targets.rule === "implied") {
-        return this.unserved(unrouted(snapshot, canonical, protocol, now, true, rules), "routes");
+        return this.unserved(unrouted(snapshot, canonical, protocol, now, true, rules, this.preference), "routes");
       }
       // A translated body is made from the parse: only a body read whole can be translated
       // (docs/cloudflare-native.md section 3, tier A).
@@ -3513,7 +3545,7 @@ export class InferenceRun {
           if (constraintsExcludeAll(snapshot, priced.routes, ask, at, canonical.stream === true, rests, this.rankRegionOf)) return { kind: "constrained", value };
           return { kind: "serve", value };
         },
-        unrouted: () => unrouted(snapshot, canonical, protocol, now, false, rules),
+        unrouted: () => unrouted(snapshot, canonical, protocol, now, false, rules, this.preference),
       });
       if (!selected.ok) return this.unserved(selected.error, "translation");
       const cap = admissionOutputCap(canonical.max_output_tokens, selected.translation.outputCap);
@@ -5722,7 +5754,7 @@ export class InferenceRun {
         if (error instanceof ExpandedBodyTooLargeError) {
           if (retest !== null) this.gates.drop(retest);
           this.ctx.waitUntil(releasePermit(this.io.endpoints, this.deps.region, permit, unsentOutcome(permit), false));
-          const label = "lane_zdr_body_over_limit";
+          const label = this.overVmLimit(prepared.protocol, error.limitBytes);
           this.passRoute(d, route, label);
           if (selection === "same_route") d.stallRepeat(route, stopOfSkip(label));
           return { kind: "continue" };
@@ -5737,7 +5769,9 @@ export class InferenceRun {
     if (stackPlan !== null && !stackPlan.ok) {
       if (retest !== null) this.gates.drop(retest);
       this.ctx.waitUntil(releasePermit(this.io.endpoints, this.deps.region, permit, unsentOutcome(permit), false));
-      const label = `lane_stack_unavailable:${stackPlan.code}`;
+      // A body too large for the stack is the request's to change, as at admission (`overRequestLimit`), not a route
+      // that cannot be made now: its pass weighs as any other route's too small for the body (`Tried.skipped`).
+      const label = stackPlan.code === "body_over_stack_limit" ? this.overVmLimit(prepared.protocol, STACK_BODY_MAX_BYTES) : `lane_stack_unavailable:${stackPlan.code}`;
       this.passRoute(d, route, label);
       // The repeat of a route that failed, which cannot be made now (an entry's peer left usable only by a re-pin in
       // the background, L5), keeps only itself from the attempt, as a repeat the dispatcher could not acquire does: a
@@ -6144,22 +6178,30 @@ export class InferenceRun {
     if (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses") return { ok: false, code: "protocol" };
     const usable = lane === undefined || lane === null ? [] : peers.registry.usable(lane.relayId);
     if (usable.length === 0) return { ok: false, code: "peer_unpinned" };
-    if (this.peerHopBody(protocol, lane!.relayId, baseBytes, o?.parsed.value) === null) return { ok: false, code: "stack_rewrite_refused" };
-    return { ok: true, config: null, route: null, vendor: laneVendor(official.vendor), peers: usable, expansion };
+    const vendor = laneVendor(official.vendor);
+    const hop = this.peerHopBody(protocol, lane!.relayId, vendor, baseBytes, o?.parsed.value);
+    if (hop === null) return { ok: false, code: "stack_rewrite_refused" };
+    // The hop carries the entry's declared ops too (a Codex route's `wrap_input_text`), and Entry egress refuses a hop
+    // body past the lane's 4 MiB: the bytes measured are the hop's, as admission measures them (`overStackLimit`).
+    if (hop.bytes.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
+    return { ok: true, config: null, route: null, vendor, peers: usable, expansion };
   }
 
   /**
    * The bytes the peer hop to `relayId`'s VM carries (`lane/claude-code-user-id.ts` `peerHopBody`): `baseBytes` (the
    * client's bytes or the zero-retention expanded bytes) with the entry's declared ops, a Claude Code `metadata.user_id`
-   * replaced by the stand-in for this workspace, key and relay (any other `user_id` removed) and `/provider` removed when
-   * the client stated its routing preference in the body. The ops are declared on each `peer.forwarded` of the outer
+   * replaced by the stand-in for this workspace, key and relay (any other `user_id` removed), `/provider` removed when
+   * the client stated its routing preference in the body, and on a Codex route (`vendor` `chatgpt_codex`) a string
+   * `input` wrapped as a message (`wrap_input_text`). The ops are declared on each `peer.forwarded` of the outer
    * receipt, and the customer's verifier replays them before comparing with the stack VM's inner receipt. Null when they
-   * do not apply (the route is passed over).
+   * do not apply (the route is passed over). Cached per relay and vendor: one relay may serve a Responses model on
+   * api.openai.com and on chatgpt.com, and only the Codex route's hop body carries the wrap.
    */
-  private peerHopBody(protocol: LaneProtocol, relayId: string, baseBytes?: Uint8Array, value?: Json): PeerHopBody | null {
+  private peerHopBody(protocol: LaneProtocol, relayId: string, vendor: LaneStackVendor, baseBytes?: Uint8Array, value?: Json): PeerHopBody | null {
     const base = baseBytes ?? this.laneReceived;
     if (base === null || this.lane === null) return null;
-    const cached = this.peerHops.get(relayId);
+    const cacheKey = `${relayId}\u0000${vendor}`;
+    const cached = this.peerHops.get(cacheKey);
     if (cached !== undefined && cached.base === base) return cached;
     const key = this.key;
     const hop = composePeerHop({
@@ -6170,9 +6212,10 @@ export class InferenceRun {
       key: this.lane.state.affinityKey,
       owner: key === null ? null : { workspaceId: key.workspaceId, keyId: key.keyId },
       relayId,
+      codex: vendor === "chatgpt_codex",
     });
     if (hop === null) return null;
-    this.peerHops.set(relayId, { ...hop, base });
+    this.peerHops.set(cacheKey, { ...hop, base });
     return hop;
   }
 
@@ -6206,7 +6249,7 @@ export class InferenceRun {
     const baseBytes = plan.expansion?.changed ? plan.expansion.expandedBytes : this.laneReceived!;
     const conversation = attempt.route.record.lane === undefined || attempt.route.record.lane === null ? undefined : this.laneConversationFor(attempt.route.record.lane.relayId);
     // `peerPlan` made this relay's hop body (a usable peer of the route's relay), so it is there.
-    const hop = this.peerHopBody(protocol, attempt.route.record.lane!.relayId, baseBytes, o.parsed.value)!;
+    const hop = this.peerHopBody(protocol, attempt.route.record.lane!.relayId, plan.vendor, baseBytes, o.parsed.value)!;
     const url = this.request.url;
     const query = stackRawQuery(url);
     const call = peers.call({
@@ -6426,7 +6469,8 @@ export class InferenceRun {
    * and is the client's answer if none serves (`stackVendorPassedOver`), one that refused the relay's own account does
    * too but is never the client's answer (`relayAccountRefused`: Gray's error), a 400 of a body the relay's software
    * changed lets one other operator's route go (`relayChangeRefused`), and any other (a refusal of the request) ends the
-   * request with it (`passthrough`); anything else is `lane_relay_failed`, no other route, nothing charged.
+   * request with it (`passthrough`); an answer the stack VM's trust gate refused is `upstream_trust_policy_rejected`;
+   * anything else is `lane_relay_failed`; either way no other route, nothing charged.
    */
   private peerFailed(d: Dispatcher, attempt: Attempt, model: string, outcome: PeerOutcome): { readonly kind: "continue" } | Stopped {
     const { clock } = this.deps;
@@ -6486,7 +6530,17 @@ export class InferenceRun {
     // The stack VM's verdict (its trace's fault, else `end.code`): an answer that failed Gray's check is the relay's
     // `upstream_answer_refused`, any other fault of its container `lane_relay_failed`; either counts against its route.
     const fault = attempt.peer?.trace?.calls.at(-1)?.fault ?? null;
-    const code = laneFaultCode(fault, outcome.code) ?? LANE_RELAY_FAILED;
+    const laneCode = laneFaultCode(fault, outcome.code);
+    if (laneCode === null && outcome.code === PEER_GATE_REFUSED) {
+      // The stack VM's trust gate refused the vendor's answer before its commit (GL-23): the request's own error, as
+      // `stackFailed` ends a local stack attempt's, an answer defect of the route and not the relay's transport. A vendor
+      // was dialed, so no other route (S25).
+      this.trustRejected = true;
+      const error = new ApiError(502, PEER_GATE_REFUSED);
+      this.failAttempt(d, attempt, { ...bareOutcome("answer_defect", elapsed), answered: true }, error, PEER_GATE_REFUSED, false);
+      return { kind: "stopped", stop: null, error };
+    }
+    const code = laneCode ?? LANE_RELAY_FAILED;
     const error = laneFaultError(code, fault?.why ?? peerFaultWhy(outcome.code));
     this.failAttempt(d, attempt, bareOutcome("transport", elapsed), error, code, false);
     return { kind: "stopped", stop: null, error };
@@ -6499,19 +6553,26 @@ export class InferenceRun {
    */
   private async peerUncommitted(d: Dispatcher, attempt: Attempt, model: string, failure: Uncommitted): Promise<{ readonly kind: "continue" } | Stopped> {
     const call = attempt.peer!;
-    // What the attempt is closed as follows the `end` that was in when the request path failed the answer, as before.
+    // Not dialed, and a whole answer the request path refused, follow the `end` that was in when the request path failed
+    // the answer, as before.
     const end = call.end;
     // An answer that ended (Gray's error frame) has its `end` on the way, read for the attempt's answer checks alone,
     // within PEER_END_WAIT_MS (review r14 lane-wire finding 10); one still answering is not waited for. The hop, which
     // its priming kept open (`endKept`), is closed after.
-    if (end === null && !failure.upstreamMayStillWork) await call.endWithin(this.deps.clock() + this.budget.preWait(PEER_END_WAIT_MS));
+    const late = end === null && !failure.upstreamMayStillWork ? await call.endWithin(this.deps.clock() + this.budget.preWait(PEER_END_WAIT_MS)) : null;
+    // The stack VM's verdict on a dialed attempt reads the `end` that came in the wait too: a fault of the relay's or its
+    // gate's `cut` (GL-23) is that verdict whenever it arrived. Not dialed, or no verdict, closes as before.
+    const verdict = end ?? (late?.dialed === true ? late : null);
     call.close();
     call.served = false;
     this.answerShare.hold(0, this.deps.cfg.answerHeldMaxBytes);
     if (end !== null && !end.dialed) return this.peerFailed(d, attempt, model, { kind: "not_dialed", code: end.code ?? "peer_invalid" });
     // The stack VM ended an answer it had begun to release for a fault of the relay's (its error frame before the entry's
     // commit): its verdict decides the code, as `peerFailed`'s does, and it counts against the relay's route.
-    if (end !== null && laneFaultCode(call.trace?.calls.at(-1)?.fault ?? null, end.code) !== null) return this.peerFailed(d, attempt, model, { kind: "relay_failed", code: end.code ?? LANE_RELAY_FAILED });
+    if (verdict !== null && laneFaultCode(call.trace?.calls.at(-1)?.fault ?? null, verdict.code) !== null) return this.peerFailed(d, attempt, model, { kind: "relay_failed", code: verdict.code ?? LANE_RELAY_FAILED });
+    // Its trust gate refused a later part of an answer it had begun to release (a `cut` end, GL-23): as one it refused
+    // before its commit, the request's `upstream_trust_policy_rejected` (`peerFailed`).
+    if (verdict !== null && verdict.outcome === "cut" && verdict.code === PEER_GATE_REFUSED) return this.peerFailed(d, attempt, model, { kind: "relay_failed", code: PEER_GATE_REFUSED });
     if (end !== null) {
       // A whole answer the request path refused (its trust gate, its protocol checks): the request's own error, as
       // `stackFailed` ends a released answer the request path failed. The stack VM's attempt is over (`end` is in).
@@ -7350,7 +7411,8 @@ export class InferenceRun {
       // the client's handles, past its API's limit; or routes of a supplier whose upstream account a block holds
       // off were all that was left, and the client is told that block (`no_attempt_error`).
       const none = noAttemptError(s.stop, d.heldOffBy, this.model ?? "", this.upstreamProtocol);
-      if (none.kind === "told") error = none.error;
+      // A route too small for the body in Gray's confidential VM names that limit, not the tool-call handles' (GL-29).
+      if (none.kind === "told") error = s.stop === "request_body_limit" && this.bodyLimitRefusal !== null ? this.bodyLimitRefusal : none.error;
       else if (this.recoveryOnly && this.modelPasses > 0) {
         // Every route was refused by its breaker (cooling down after recent failures, or holding requests
         // for a probe that is out until the request's time ran out): the soonest moment one may serve is
@@ -7536,12 +7598,22 @@ export class InferenceRun {
     // M4): the client's body is never sent as it is, so the length checked is that body's. The bytes
     // are the same object `send` sends, out of the one cache, so the check and the Content-Length
     // cannot disagree.
-    // A stack relay's container is sent the client's own bytes (S23), which admission already measured.
-    if (this.stackRoute(candidate.record)) return false;
+    // A stack relay's container is sent the client's own bytes (S23), or their zero-retention expansion, which
+    // admission did not measure (GL-29).
+    if (this.stackRoute(candidate.record)) return this.overStackLimit(candidate.record, o, prepared.protocol);
     const laneForwards = this.lane === null || (candidate.record.auth !== "lane_relay" && !this.laneEndpointRoute(candidate.record)) ? null : await this.laneForwardedFor(candidate, prepared, o);
     if (laneForwards !== null) {
-      if (!laneForwards.ok) return laneForwards.error.code === "request_body_limit";
-      return laneForwards.bytes.length > Number(requestLimit(prepared.protocol));
+      if (!laneForwards.ok) {
+        if (laneForwards.error.code !== "request_body_limit") return false;
+        this.bodyLimitRefusal = laneForwards.error;
+        return true;
+      }
+      // What the route is sent goes through Gray's confidential VM and its egress, which hold no more than the lane's
+      // cap: a body the declared ops or the appends push past it is too large for the route, as at a stack route.
+      const cap = this.laneVmBodyLimit(prepared.protocol);
+      if (laneForwards.bytes.length <= cap) return false;
+      this.overVmLimit(prepared.protocol, cap);
+      return true;
     }
     const ids = this.toolIds;
     if (ids === null || ids.keys === null || ids.resolution.resolved.size === 0) return false;
@@ -7553,6 +7625,51 @@ export class InferenceRun {
     const change = bodyEdits(prepared.removals, ids.forAttempt(issuer, prepared.protocol));
     const length = this.translation === null && o.body.tier === "C" ? storedBody(this.spoolOpener(o.body), o.body.length, o.parsed.layout!, overlay, change).length : heldBody(prepared.body!, prepared.layout, overlay, undefined, change).length;
     return length > Number(requestLimit(prepared.protocol));
+  }
+
+  /**
+   * Whether a stack route would be sent a body past the lane's 4 MiB (relay standard v1.7 section 4): the client's
+   * bytes, or their zero-retention expansion for the route. `stackPlan` and `peerPlan` refuse the same body; this
+   * passes the route over before it takes a permit, as too small for the body.
+   */
+  private overStackLimit(route: RouteRecord, o: Dispatch, protocol: Protocol): boolean {
+    const received = this.laneReceived;
+    if (received === null) return false;
+    let expansion: ExpandZeroRetentionResult | null;
+    try {
+      expansion = this.laneZdrExpansionFor(route, o.parsed.value, STACK_BODY_MAX_BYTES);
+    } catch (error) {
+      if (!(error instanceof ExpandedBodyTooLargeError)) throw error;
+      this.overVmLimit(protocol, error.limitBytes);
+      return true;
+    }
+    const baseBytes = expansion?.changed ? expansion.expandedBytes : received;
+    if (baseBytes.length <= STACK_BODY_MAX_BYTES && (this.peerHopBytes(route, baseBytes, o.parsed.value)?.length ?? 0) <= STACK_BODY_MAX_BYTES) return false;
+    this.overVmLimit(protocol, STACK_BODY_MAX_BYTES);
+    return true;
+  }
+
+  /**
+   * On an entry, the bytes its hop to `route`'s stack VM would carry for `baseBytes` (`peerHopBody`, out of its cache, so
+   * the attempt sends what admission measured); null on a stack VM, or for a route `peerPlan` passes over for another
+   * reason (no official upstream, a protocol the hop does not serve, ops that do not apply).
+   */
+  private peerHopBytes(route: RouteRecord, baseBytes: Uint8Array, value: Json): Uint8Array | null {
+    const lane = route.lane;
+    if (this.entryPeers() === null || lane === undefined || lane === null) return null;
+    const official = checkOfficialUpstream(route.url);
+    const protocol = route.protocol;
+    if (!official.ok || (protocol !== "anthropic_messages" && protocol !== "open_ai_chat" && protocol !== "open_ai_responses")) return null;
+    return this.peerHopBody(protocol, lane.relayId, laneVendor(official.vendor), baseBytes, value)?.bytes ?? null;
+  }
+
+  /**
+   * Notes the 413 of a route the body is too large for in Gray's confidential VM (`limitBytes`), and gives the label
+   * the route is passed over with: `request_body_limit`, which the request stops with when no other route is left.
+   */
+  private overVmLimit(protocol: Protocol, limitBytes: number): "request_body_limit" {
+    this.bodyLimitRefusal = bodyTooLarge(protocol, limitBytes, VM_BODY_LIMIT_SOURCE);
+    return "request_body_limit";
   }
 
   /**
@@ -7585,7 +7702,7 @@ export class InferenceRun {
       expansion = this.laneZdrExpansionFor(route.record, o.parsed.value);
     } catch (error) {
       if (error instanceof ExpandedBodyTooLargeError) {
-        return { ok: false, error: bodyTooLarge(prepared.protocol, error.limitBytes, "the most Gray's confidential VM holds of one request") };
+        return { ok: false, error: bodyTooLarge(prepared.protocol, error.limitBytes, VM_BODY_LIMIT_SOURCE) };
       }
       throw error;
     }
@@ -8267,10 +8384,19 @@ export class InferenceRun {
     return { ok: true };
   }
 
-  /** What an answer's usage tells the record (`charge`, `checkAnswered`): the usage, the attempt's output tokens, the reasoning tokens. */
+  /**
+   * What an answer's usage tells the record (`charge`, `checkAnswered`): the usage, the attempt's output tokens, the
+   * reasoning tokens; and the estimation's two inputs (r24, `estInput`): the uncached input, the input less its cache
+   * reads (its cache writes are in it, @gray/protocol counters.ts), and the cache reads. None for an answer with image or
+   * audio output, which is no text decode.
+   */
   private answeredUsage(attempt: Attempt, usage: Record<string, number>, rawUsage: Json | null): void {
     this.usage = usage;
     attempt.outputTokens = usage.output_tokens ?? 0;
+    const input = usage.input_tokens ?? 0;
+    const cacheRead = usage.cache_read_input_tokens ?? 0;
+    const media = (usage.image_output_tokens ?? 0) > 0 || (usage.audio_output_tokens ?? 0) > 0;
+    if (!media && Number.isSafeInteger(input) && Number.isSafeInteger(cacheRead) && cacheRead >= 0 && input >= cacheRead) attempt.estInput = [input - cacheRead, cacheRead];
     const reasoning = reasoningTokens(this.upstreamProtocol, rawUsage);
     if (reasoning !== undefined && reasoning <= BigInt(Number.MAX_SAFE_INTEGER)) this.reasoningTokens = Number(reasoning);
   }
@@ -8660,7 +8786,12 @@ export class InferenceRun {
 
   private laneZdrBodyLimit(route: RouteRecord): number {
     if (this.stackRoute(route)) return STACK_BODY_MAX_BYTES;
-    return Math.min(Number(requestLimit(this.protocol)), this.lane!.timing.bodyMaxBytes, this.deps.cfg.bodyParseMaxBytes);
+    return this.laneVmBodyLimit(this.protocol);
+  }
+
+  /** The most a lane route other than a stack route is sent of one request in `protocol`: the API's limit within the lane's cap. */
+  private laneVmBodyLimit(protocol: Protocol): number {
+    return Math.min(Number(requestLimit(protocol)), this.lane!.timing.bodyMaxBytes, this.deps.cfg.bodyParseMaxBytes);
   }
 
   /**
@@ -9033,12 +9164,22 @@ export class InferenceRun {
     // (`upstream_stream_interrupted`), and its verdict comes in the `end` it writes right after that frame, waited for
     // PEER_END_WAIT_MS at most (production, 2026-11-19: a relay that changed its answer was told to the customer as an
     // upstream whose stream broke, inviting a retry that failed the same way).
+    // A stack VM whose gate refused a later part of the answer says so in `end.code` (`PEER_GATE_REFUSED`, GL-23): the
+    // stream ends as a local stack attempt's the entry's own gate refused (relay.ts `drain`), `upstream_trust_policy_rejected`
+    // (the route's `invalid_response`, the request trust-rejected), and not as the upstream's broken stream.
     let laneCode = relayed.kind === "failed" ? laneFaultCode(attempt.stack?.fault ?? null) : null;
+    let gateCut = false;
     if (relayed.kind === "failed" && laneCode === null && attempt.peer !== undefined && relayed.code === "upstream_stream_interrupted") {
       const peerEnd = await attempt.peer.endWithin(clock() + PEER_END_WAIT_MS);
       laneCode = laneFaultCode(attempt.peer.trace?.calls.at(-1)?.fault ?? null, peerEnd?.code ?? null);
+      gateCut = laneCode === null && peerEnd?.outcome === "cut" && peerEnd.code === PEER_GATE_REFUSED;
     }
-    const end: StreamEnd = relayed.kind === "failed" && laneCode !== null ? { ...relayed, code: laneCode, reason: laneCode } : relayed;
+    if (gateCut) this.trustRejected = true;
+    const end: StreamEnd =
+      relayed.kind !== "failed" ? relayed
+      : laneCode !== null ? { ...relayed, code: laneCode, reason: laneCode }
+      : gateCut ? { ...relayed, code: PEER_GATE_REFUSED, reason: PEER_GATE_REFUSED, supplierFailure: "invalid_response" }
+      : relayed;
     // The answer's checks as the relay read them once the stream ended and its end went out.
     attempt.checks = end.checks;
     // What the relay held went with it.
@@ -9148,6 +9289,10 @@ export class InferenceRun {
   private buffered(a: Answering, attempt: Attempt, response: Response, deadline: number, d: Dispatcher): Promise<BufferedResult> {
     attempt.status = response.status;
     if (this.laneCodexBuffered(attempt)) return this.codexAnswer(a, attempt, response, deadline, d);
+    // Its upstream answers buffered: a success with output and no time to first token is an estimation point (r24). A
+    // Codex route's upstream streams whatever its client asked (D129), read to its terminal event here (`codexAnswer`) or
+    // at the stack VM behind a peer attempt: never a buffered read.
+    if (!this.laneCodexRoute(attempt.route.record)) attempt.bufferedRead = true;
     return this.translation === null ? this.nativeAnswer(a, attempt, response, deadline, d) : this.translatedAnswer(a, attempt, response, deadline, d);
   }
 
@@ -9297,6 +9442,8 @@ export class InferenceRun {
         return true;
       };
       const read = await current.read();
+      // The body's read ended: the attempt's end, whatever its settlement adds after (r24).
+      attempt.readEndMs = clock();
       this.heldBytes = Math.max(this.heldBytes, current.heldMost);
       const failed = (
         code: string,
@@ -9350,6 +9497,22 @@ export class InferenceRun {
           return;
         }
         if (uncommitted(this.defect(attempt, read.code, read.upstreamMayStillWork))) return;
+        // A started peer answer whose hop broke: the stack VM's `cut` end errors the body (peer-client `#answer`), and its
+        // verdict is in that `end`, read as a stream's (`relay`): a fault of the relay's is the lane's code, and its trust
+        // gate's refusal of a later part (GL-23) is `upstream_trust_policy_rejected`, the request trust-rejected.
+        if (attempt.peer !== undefined && read.code === "upstream_body_incomplete") {
+          const peerEnd = await attempt.peer.endWithin(clock() + PEER_END_WAIT_MS);
+          const laneCode = laneFaultCode(attempt.peer.trace?.calls.at(-1)?.fault ?? null, peerEnd?.code ?? null);
+          if (laneCode !== null) {
+            failed(laneCode, laneCode, read.why, read.supplierFailure, { upstreamMayStillWork: read.upstreamMayStillWork });
+            return;
+          }
+          if (peerEnd?.outcome === "cut" && peerEnd.code === PEER_GATE_REFUSED) {
+            this.trustRejected = true;
+            failed(PEER_GATE_REFUSED, PEER_GATE_REFUSED, "the stack VM's trust gate refused a later part of the answer", "invalid_response");
+            return;
+          }
+        }
         failed(read.code, read.code, read.why, read.supplierFailure, { upstreamMayStillWork: read.upstreamMayStillWork });
         return;
       }
@@ -9570,6 +9733,8 @@ export class InferenceRun {
     if (response.body === null) return uncommitted(this.defect(attempt, "upstream_body_incomplete", false));
     const memoryLimit = cfg.bodyParseMaxBytes < a.answerLimit;
     const read = await readAnswer(response.body, Math.min(a.answerLimit, cfg.bodyParseMaxBytes), deadline, cfg.upstreamSilenceMs, this.presence, clock, this.retained, { share: this.answerShare, limit: heldLimit });
+    // The body's read ended: the attempt's end, whatever its settlement adds after (r24).
+    attempt.readEndMs = clock();
     if (read.kind === "client_left") {
       // The client left and the answer did not end while the Worker could still read it (relay.ts `UpstreamReader`).
       attempt.controller.abort("client_left_unread");
@@ -10301,6 +10466,17 @@ function newLaneReceiptId(): string {
  */
 function provesImageOutput(route: Route): boolean {
   return route.record.protocol === "gemini" && (route.record.proved ?? []).includes("image_output");
+}
+
+/**
+ * The estimation's point an attempt's release carries (r24, docs/utility-routing.md): its answer's uncached and
+ * cache-read input (`estInput`), for a charged success or a model check's (`charged`: no free delivery, no answer Gray
+ * failed), read from a buffered upstream (`bufferedRead`), with no time to first token and at least one output token. The
+ * endpoint shard adds the measure's output tokens and latency beside it. Null for any other attempt.
+ */
+export function estimationPoint(attempt: Pick<Attempt, "bufferedRead" | "ttftMs" | "outputTokens" | "estInput">, charged: boolean): readonly [u: number, c: number] | null {
+  if (!charged || attempt.bufferedRead !== true || attempt.ttftMs !== undefined || (attempt.outputTokens ?? 0) < 1) return null;
+  return attempt.estInput ?? null;
 }
 
 /**

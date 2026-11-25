@@ -115,7 +115,7 @@ export async function buildLaneReceipt(input: LaneReceiptInput): Promise<SignedR
 function addModified(builder: ReceiptBuilder, event: Readonly<Record<string, unknown>>): void {
   if (event.type !== "request.modified") throw new Error(`a draft's modified event is not request.modified: ${String(event.type)}`);
   const op = event.op;
-  if (op !== "set_member" && op !== "insert_member" && op !== "remove_member") throw new Error(`unknown request.modified op: ${String(op)}`);
+  if (op !== "set_member" && op !== "insert_member" && op !== "remove_member" && op !== "wrap_input_text") throw new Error(`unknown request.modified op: ${String(op)}`);
   const path = event.path;
   const declaredIn = event.declared_in;
   if (typeof path !== "string" || typeof declaredIn !== "string") throw new Error("a request.modified event names its path and declared_in");

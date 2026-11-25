@@ -140,6 +140,13 @@ const measureMembers = [uintSchema, uintSchema.nullable(), uintSchema, z.enum(me
 export const outcomeMeasureSchema = z.union([z.tuple(measureMembers), z.tuple([...measureMembers, z.union([z.literal(0n), z.literal(1n)])])]);
 export type OutcomeMeasureDto = z.infer<typeof outcomeMeasureSchema>;
 
+/**
+ * A buffered success's estimation point (r24, @gray/endpoint `ReleaseInput.est`): its uncached and cache-read input
+ * tokens, two whole numbers. A bridge before r24 refuses the member (strict): the lane sends the release without it then
+ * (gateway lane/remote/endpoint.ts), and the root counts no point of it.
+ */
+export const estimationPointSchema = z.tuple([uintSchema, uintSchema]);
+
 /** A rest an answer at the caller's isolate ended (`AcquireInput.ended`). */
 const endedRestSchema = z.object({ scope_id: restWord, sent_ms: uintSchema }).strict();
 
@@ -238,6 +245,7 @@ export const endpointReleaseInputSchema = z
     refusal: z.enum(["refusal", "final_refusal", "account_request"] satisfies readonly RefusalClass[]).nullable(),
     free_no_usage: z.boolean().nullable(),
     measure: outcomeMeasureSchema.optional(),
+    est: estimationPointSchema.optional(),
   })
   .strict();
 
@@ -518,7 +526,17 @@ export function endpointReleaseInputOf(dto: EndpointReleaseInputDto): ReleaseInp
     ...(dto.refusal === null ? {} : { refusal: dto.refusal }),
     ...(dto.free_no_usage === null ? {} : { freeNoUsage: dto.free_no_usage }),
     ...(dto.measure === undefined ? {} : { measure: outcomeMeasureOf(dto.measure) }),
+    ...(dto.est === undefined ? {} : { est: [asNumber(dto.est[0], "est.u"), asNumber(dto.est[1], "est.c")] as const }),
   };
+}
+
+/**
+ * A release's estimation point as the wire carries it, or nothing when it is not two whole numbers (the root checks the
+ * point again): a malformed point is left out, never the release it rides on.
+ */
+function estMember(est: ReleaseInput["est"]): { est?: [bigint, bigint] } {
+  if (est === undefined || est.length !== 2 || !est.every((n) => Number.isSafeInteger(n) && n >= 0)) return {};
+  return { est: [BigInt(est[0]), BigInt(est[1])] };
 }
 
 export function endpointReleaseInputDtoOf(input: ReleaseInput): EndpointReleaseInputDto {
@@ -533,6 +551,7 @@ export function endpointReleaseInputDtoOf(input: ReleaseInput): EndpointReleaseI
     refusal: input.refusal === undefined ? null : input.refusal,
     free_no_usage: input.freeNoUsage === undefined ? null : input.freeNoUsage,
     ...measureMember(input.measure),
+    ...estMember(input.est),
   };
 }
 

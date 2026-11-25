@@ -386,6 +386,11 @@ export interface ReleaseFacts {
   readonly accountBlock?: AccountBlockNote;
   /** The attempt's measures, which go to its root beside its outcome for ranking (@gray/endpoint `ReleaseInput.measure`). */
   readonly measure?: OutcomeMeasure;
+  /**
+   * A buffered success's estimation point (r24, @gray/endpoint `ReleaseInput.est`): its uncached and cache-read input
+   * tokens, beside the measure's output tokens and latency (inference.ts `estimationPoint`).
+   */
+  readonly est?: readonly [u: number, c: number];
 }
 
 /**

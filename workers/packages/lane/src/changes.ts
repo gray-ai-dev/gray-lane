@@ -30,12 +30,18 @@
  * `value` and the customer can replay; `value_sha256` exists in the event shape for a future op
  * whose value is too large or content-bearing, and the verifier refuses an event that has only the
  * digest because it cannot replay it.
+ *
+ * **The structural op.** `wrap_input_text /input` (gray-lane-rewrites-v3) carries no value at all: it replaces a
+ * Responses `input` whose value is a JSON string token `S` with
+ * `[{"type":"message","role":"user","content":[{"type":"input_text","text":S}]}]`, where `S` is the token exactly as
+ * the client wrote it (its quotes and escapes kept). The receipt holds no prompt text and the replay is a splice of the
+ * customer's own bytes. An `input` that is absent or not a string is refused (`not_found`, `not_a_string`).
  */
 import { toJsonString, type Json } from "@gray/json";
 import { getNodeValue, parseTree, printParseErrorCode, type Node, type ParseError } from "jsonc-parser";
 import { isModifiedValue, requestModifiedEvent, type RequestModifiedEvent } from "@gray/attest";
 import { appendTemplates, type AppendRefusalCode, type AppendedText, type AppliedRecord } from "./append.ts";
-import { GRAY_LANE_REWRITES_V1, rewriteRuleFor, ruleAllowsValue, validateRewritePolicy, type LaneRewritePolicy, type RewriteRule } from "./policy.ts";
+import { GRAY_LANE_REWRITES_V1, WRAP_INPUT_TEXT_PATH, rewriteRuleFor, ruleAllowsValue, validateRewritePolicy, type LaneRewritePolicy, type RewriteRule } from "./policy.ts";
 import { parseJsonPointer } from "./pointer.ts";
 import { isLaneProtocol, type LaneProtocol } from "./protocol.ts";
 import { LaneError, refusal, type Refusal } from "./refusal.ts";
@@ -46,7 +52,12 @@ import { decodeUtf8, encodeUtf8 } from "./utf8.ts";
 export type GrayRewriteOp =
   | { readonly op: "set_member"; readonly path: string; readonly value: Json }
   | { readonly op: "insert_member"; readonly path: string; readonly value: Json }
-  | { readonly op: "remove_member"; readonly path: string };
+  | { readonly op: "remove_member"; readonly path: string }
+  | { readonly op: "wrap_input_text"; readonly path: string };
+
+/** What `wrap_input_text` writes before and after the client's string token. */
+const WRAP_INPUT_TEXT_OPEN = '[{"type":"message","role":"user","content":[{"type":"input_text","text":';
+const WRAP_INPUT_TEXT_CLOSE = "}]}]";
 
 /** What the host hands to `applyDeclaredChanges`. */
 export interface ApplyChangesOptions {
@@ -66,7 +77,7 @@ export interface ApplyChangesOk {
   readonly applied: readonly AppliedRecord[];
 }
 
-export type ChangeRefusalCode = AppendRefusalCode | "op_shape" | "policy" | "path" | "not_found" | "already_exists" | "duplicate_key" | "duplicate_op";
+export type ChangeRefusalCode = AppendRefusalCode | "op_shape" | "policy" | "path" | "not_found" | "already_exists" | "duplicate_key" | "duplicate_op" | "not_a_string";
 
 /**
  * Apply Gray's declared ops and then the relay's appends. Every op is checked against `policy`
@@ -114,7 +125,7 @@ export function applyMemberOps(
     if (shape !== undefined) return shape;
     const rule = ruleFor(op);
     if (rule === undefined) return refusal("policy", "the op is not in the lane rewrite policy for this protocol");
-    const value = op.op === "remove_member" ? undefined : op.value;
+    const value = op.op === "remove_member" || op.op === "wrap_input_text" ? undefined : op.value;
     if (!ruleAllowsValue(rule, value)) return refusal("policy", "the op's value is not allowed by the lane rewrite policy");
     if (seen.has(op.path)) return refusal("duplicate_op", "two ops name the same path");
     seen.add(op.path);
@@ -142,7 +153,7 @@ export function applyMemberOps(
       requestModifiedEvent({
         op: op.op,
         path: op.path,
-        ...(op.op === "remove_member" ? {} : { value: op.value }),
+        ...(op.op === "remove_member" || op.op === "wrap_input_text" ? {} : { value: op.value }),
         declaredIn,
       }) as unknown as RequestModifiedEvent,
     );
@@ -166,13 +177,13 @@ export function changeValueSha256(value: Json): string {
 function checkOpShape(op: unknown): Refusal<ChangeRefusalCode> | undefined {
   if (op === null || typeof op !== "object") return refusal("op_shape", "an op is not an object");
   const candidate = op as { readonly op?: unknown; readonly path?: unknown; readonly value?: unknown };
-  if (candidate.op !== "set_member" && candidate.op !== "insert_member" && candidate.op !== "remove_member") {
-    return refusal("op_shape", "the op is not one of set_member, insert_member, remove_member");
+  if (candidate.op !== "set_member" && candidate.op !== "insert_member" && candidate.op !== "remove_member" && candidate.op !== "wrap_input_text") {
+    return refusal("op_shape", "the op is not one of set_member, insert_member, remove_member, wrap_input_text");
   }
   if (typeof candidate.path !== "string") return refusal("op_shape", "the op has no path");
   if (!parseJsonPointer(candidate.path).ok) return refusal("path", "the op path is not a JSON Pointer the lane accepts");
-  if (candidate.op === "remove_member") {
-    if (candidate.value !== undefined) return refusal("op_shape", "remove_member carries no value");
+  if (candidate.op === "remove_member" || candidate.op === "wrap_input_text") {
+    if (candidate.value !== undefined) return refusal("op_shape", `${candidate.op} carries no value`);
     return undefined;
   }
   if (candidate.value === undefined) return refusal("op_shape", "a set or insert op has no value");
@@ -182,6 +193,7 @@ function checkOpShape(op: unknown): Refusal<ChangeRefusalCode> | undefined {
 
 /** Apply one op to `text`, whose strict parse is `root`. */
 function applyOne(text: string, root: Node, op: GrayRewriteOp): { readonly ok: true; readonly text: string } | Refusal<ChangeRefusalCode> {
+  if (op.op === "wrap_input_text") return wrapInputText(text, root, op.path);
   const pointer = parseJsonPointer(op.path);
   if (!pointer.ok) return pointer;
   const tokens = pointer.pointer.tokens;
@@ -223,6 +235,20 @@ function applyOne(text: string, root: Node, op: GrayRewriteOp): { readonly ok: t
     return { ok: true, text: removed };
   }
   return { ok: true, text: removeFromObject(removed, outer, parentProperty) };
+}
+
+/**
+ * `wrap_input_text`: the top-level `input`'s string token, kept byte for byte, inside the one user message it means
+ * (@gray/protocol reads a string `input` as that message). Any other path, an absent `input` or one that is not a
+ * string is refused, so the op never re-wraps a list.
+ */
+function wrapInputText(text: string, root: Node, path: string): { readonly ok: true; readonly text: string } | Refusal<ChangeRefusalCode> {
+  if (path !== WRAP_INPUT_TEXT_PATH) return refusal("path", `wrap_input_text is defined on ${WRAP_INPUT_TEXT_PATH} alone`);
+  const value = memberValueNode(root, "input");
+  if (value === undefined) return refusal("not_found", "wrap_input_text names an input the body does not have");
+  if (value.type !== "string") return refusal("not_a_string", "wrap_input_text needs input to be a JSON string");
+  const token = text.slice(value.offset, value.offset + value.length);
+  return { ok: true, text: `${text.slice(0, value.offset)}${WRAP_INPUT_TEXT_OPEN}${token}${WRAP_INPUT_TEXT_CLOSE}${text.slice(value.offset + value.length)}` };
 }
 
 function serializeValue(value: Json): string | undefined {

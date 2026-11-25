@@ -44,6 +44,16 @@ export function providerRefOf(operator: string, endpointId: string): string {
 export const CONTENT_CAP = 32 * 1024 * 1024;
 export const KEYLESS_CONTENT_CAP = 64 * 1024;
 
+/**
+ * What became of the content of every request the confidential entry serves (design v2 section C.11, M13): it keeps none
+ * by design, so it opens no writer and looks up no recipient (its snapshot carries none, and a lookup would find none and
+ * alert). `withheld`, kept back on purpose, for the reason `confidential`: never a failure, never `no_recipient`, which
+ * stays the Workers path's failure (a snapshot without the day's recipient) and keeps its alert.
+ */
+export function confidentialContent(): WriterResult {
+  return notWritten("withheld", "confidential");
+}
+
 export type RecipientLookup =
   | { readonly kind: "ok"; readonly record: GatewayRecipient }
   | { readonly kind: "no_recipient" }

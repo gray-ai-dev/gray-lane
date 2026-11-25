@@ -83,6 +83,16 @@ export function tierAdmitted(preference: Preference, route: { readonly operator:
   return (route.tag?.tier ?? null) === null || routingExplicit || preference.optsIn(providerRef(route.operator, route.endpointId));
 }
 
+/**
+ * Whether a routing mode would make `route` a candidate it is not now: it has a tier the request did not opt in to
+ * (`tierAdmitted`), and the request's lists admit it. Any stated routing parameter opts every tiered route in.
+ */
+export function awaitsMode(preference: Preference, route: { readonly operator: string; readonly endpointId: string; readonly tag?: RouteTag }): boolean {
+  if (tierAdmitted(preference, route)) return false;
+  const [provider, supplier] = refsOf(route);
+  return preference.admits(provider, supplier);
+}
+
 /** A route's two references, (route, supplier). */
 export function refsOf(route: { readonly operator: string; readonly endpointId: string }): readonly [string, string] {
   return [providerRef(route.operator, route.endpointId), supplierRef(route.operator)];
@@ -142,10 +152,9 @@ export type Layered = { readonly ok: true; readonly preference: Preference; read
  * level's tag patterns are resolved against that model's routes before the levels are layered.
  */
 export function layeredOver(snapshot: PreferenceSnapshot, keyDefault: string | null, workspaceId: string, preference: Preference, model: string | null = null, tag: string | null = null): Layered {
-  // A key's default also carries its routing mode (`mode`), which the parameters' resolution reads, not layering.
-  const keyRead = keyDefault === null ? null : Preference.parseKeyDefault(keyDefault);
-  if (keyRead === "routing_default_invalid") return { ok: false, code: keyRead };
-  let key = keyRead?.preference ?? null;
+  // A key's default is read without the mode r20 let it state (`parseKeyDefault`): no mode of it refuses the request.
+  let key = keyDefault === null ? null : Preference.parseKeyDefault(keyDefault);
+  if (key === "routing_default_invalid") return { ok: false, code: key };
   const stored = snapshot.routingDefaults?.[workspaceId];
   let workspace = stored === undefined ? null : Preference.parseDefault(stored);
   if (workspace === "routing_default_invalid") return { ok: false, code: workspace };

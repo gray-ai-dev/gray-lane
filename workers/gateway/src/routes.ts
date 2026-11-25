@@ -22,6 +22,7 @@ import {
   type MaxPrice,
   type QuotedPrice,
   type RankingResult,
+  type RecordSummary,
   type ReferencePrice,
   type RestView,
   type RoutePrice,
@@ -717,6 +718,15 @@ export function rankedFeed(snapshot: GatewaySnapshot, nowMs: number): { readonly
   const r = snapshot.ranking;
   const feed = r instanceof RankingBase ? (r.current(nowMs)?.feed() ?? null) : null;
   return feed === null ? null : { epoch: feed.epoch, seq: feed.seq };
+}
+
+/**
+ * The long-record summary of the route of capacity key `capacityKey` as the ranker that ranks `snapshot`'s routes holds it
+ * at `nowMs` (`Ranker.routeSummary`): what `utilityRoutesOf` gives the formula, for the reads beside it (routing-views.ts
+ * `routeEstimates`). Null: none, and none while ranking reads no feed.
+ */
+export function routeSummaryAt(snapshot: GatewaySnapshot, capacityKey: string, nowMs: number): RecordSummary | null {
+  return rankerFor(snapshot, nowMs).routeSummary(capacityKey);
 }
 
 /** The recovery leases of the ranker that ranks `snapshot`'s routes, which settle a plan's head (plan-order.ts `settleHead`). */
