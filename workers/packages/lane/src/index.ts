@@ -14,9 +14,6 @@
  *    APIs a provider's own API serves (embeddings, images, audio, videos, rerank, System One), whose
  *    body is JSON or a `multipart/form-data` form (`applyFormOps`, the two form ops).
  *
- * D. `validateMethod`, `applyMethod` — a relay's registered change method (`gray-relay-method-v1`,
- *    docs/relay-changes-v2.md §2.2–§2.4): the registration checks, and V = apply(m, E, facts) by byte splices.
- *
  * And for a relay stack (S19): `StackEventDigester`, `stackEventDigest`, `stackBodyDigest` — the
  * per-event and body digests the entry compares with the ones Gray's egress computed over the
  * vendor's bytes (`deploy/tee/egress/stack_digest.go`, shared vectors in its testdata).
@@ -175,41 +172,3 @@ export {
   type ChangeRefusalCode,
   type GrayRewriteOp,
 } from "./changes.ts";
-export {
-  METHOD_CLIENT_HEADERS,
-  METHOD_CONTENT_MEMBERS,
-  METHOD_ELEMENT_ARRAYS,
-  METHOD_JSON_TYPES,
-  METHOD_KEPT_ANY_DEPTH,
-  METHOD_KEPT_MEMBERS,
-  METHOD_KEPT_PATHS,
-  METHOD_KEPT_PREFIX,
-  METHOD_LIMITS,
-  METHOD_POSITIONS,
-  METHOD_POSITIONS_BY_PROTOCOL,
-  METHOD_REFUSAL_CODES,
-  METHOD_REFUSED_HEADERS,
-  METHOD_TEXT_SOURCES,
-  METHOD_TOKEN_HEADERS,
-  RELAY_METHOD_FORMAT,
-  isMethodPositionFor,
-  isMethodRefusalCode,
-  type MethodClientHeader,
-  type MethodCondition,
-  type MethodHeaderOp,
-  type MethodHeaderRecord,
-  type MethodJsonType,
-  type MethodMap,
-  type MethodMapFact,
-  type MethodOp,
-  type MethodOpRecord,
-  type MethodPath,
-  type MethodPosition,
-  type MethodRefusalCode,
-  type MethodRule,
-  type MethodValue,
-  type RelayMethod,
-} from "./method/format.ts";
-export { checkMethodFacts, isMethodClientHeader, methodFactsRead, type MethodFacts } from "./method/facts.ts";
-export { methodActiveCountAllowed, methodKeptMembers, validateMethod, type ValidateMethodOptions, type ValidateMethodResult } from "./method/validate.ts";
-export { applyMethod, type ApplyMethodOk, type ApplyMethodOptions, type ApplyMethodRefusalCode } from "./method/apply.ts";

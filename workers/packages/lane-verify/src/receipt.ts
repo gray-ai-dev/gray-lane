@@ -31,7 +31,9 @@
  * events in those bytes, or its `body_sha256` their S19 body digest, and the same value the served
  * attempt's `upstream.response` (a SKIP there for a buffered Codex answer, `codex_terminal_response`,
  * which no digest of the vendor's events determines, and for a stream the client left, `client_left`,
- * a prefix the chain cannot prove). When Gray's record of the relay's calls stopped early, the receipt
+ * a prefix the chain cannot prove). For an answer the client left (1.7.1) the raw `body_hash`, which covers keep-alive
+ * comments, is not compared, and response bytes shorter than what the entry queued that do not end the answer by its
+ * protocol are `partial` (verdict `partial`), not a failure (`response-end.ts`). When Gray's record of the relay's calls stopped early, the receipt
  * says so (`relay_stack.feed_incomplete`, an attempt left open ending `unrecorded`), and the transcript
  * prints it as the `relay_record` line; such a receipt verifies like any other.
  *
@@ -153,6 +155,7 @@ import {
   type RewriteApi,
 } from "@gray/lane";
 import { applyRelayChanges } from "./relay-patch.ts";
+import { isWholeJsonBody, readStreamEnd } from "./response-end.ts";
 
 /** A registered template's text, looked up by the id the receipt names. */
 export interface TemplateText {
@@ -160,7 +163,14 @@ export interface TemplateText {
   readonly text: string;
 }
 
-export type ReceiptCheckStatus = "pass" | "fail" | "skip";
+/**
+ * `expired`: only `verifyPeerReceipts`'s `peer:<n>:fetch`, for a record the entry no longer holds because the outer
+ * receipt is past the entry's retention (`PEER_RECORD_RETENTION_BOUND_SECONDS`). Not a pass, and not a failed check.
+ * `partial`: only `response_events_sha256` or `response_body_sha256` of a receipt whose answer the client left
+ * (`served_as: client_left`), for response bytes shorter than what the entry queued (`PartialResponse`). Not a pass,
+ * and not a failed check.
+ */
+export type ReceiptCheckStatus = "pass" | "fail" | "skip" | "expired" | "partial";
 
 export interface ReceiptCheck {
   readonly id: string;
@@ -233,15 +243,32 @@ export const CLIENT_CONNECTION_CHECK = "client_connection";
 
 /**
  * `pass`: every check passed. `not_end_to_end`: the receipt is valid and every check but `client_connection` passed:
- * the request arrived through Gray's API, so the client's connection did not end in the attested VM. `fail`: any other.
+ * the request arrived through Gray's API, so the client's connection did not end in the attested VM. `partial` (1.7.1):
+ * no check but `client_connection` failed, and the response bytes are shorter than what the entry queued for a client
+ * that left (a `partial` check), so the answer's digest was not recomputed. `fail`: any other. A failed check comes
+ * before `partial`, and `partial` before `not_end_to_end`.
  */
-export type ResponseReceiptVerdict = "pass" | "not_end_to_end" | "fail";
+export type ResponseReceiptVerdict = "pass" | "not_end_to_end" | "partial" | "fail";
 
 /** The verdict of a list of checks (`ResponseReceiptVerdict`). */
 export function receiptVerdictOf(checks: readonly ReceiptCheck[]): ResponseReceiptVerdict {
   const failed = checks.filter((check) => check.status === "fail");
-  if (failed.length === 0) return "pass";
-  return failed.every((check) => check.id === CLIENT_CONNECTION_CHECK) ? "not_end_to_end" : "fail";
+  if (failed.some((check) => check.id !== CLIENT_CONNECTION_CHECK)) return "fail";
+  if (checks.some((check) => check.status === "partial")) return "partial";
+  return failed.length === 0 ? "pass" : "not_end_to_end";
+}
+
+/**
+ * What the response bytes of a `partial` verdict were (1.7.1): the receipt says the client left
+ * (`served_as: client_left`, attempt `served_attempt`), and the bytes held, `bytes_received` long and holding
+ * `events_received` events (null for a buffered answer), do not end the answer and do not reproduce the digest of what
+ * the entry queued.
+ */
+export interface PartialResponse {
+  readonly served_as: "client_left";
+  readonly served_attempt: string;
+  readonly bytes_received: number;
+  readonly events_received: number | null;
 }
 
 export interface ResponseReceiptVerification {
@@ -275,6 +302,8 @@ export interface ResponseReceiptVerification {
    * Null when the receipt carries no such event.
    */
   readonly continuationExpanded: ReceiptContinuationExpanded | null;
+  /** The response bytes were shorter than what the entry queued for a client that left (verdict `partial`), or null. */
+  readonly partialResponse: PartialResponse | null;
 }
 
 /** What a translated receipt's `request.translated` says, as the receipt records it (the checks say whether it replays). */
@@ -417,6 +446,7 @@ export async function verifyResponseReceiptText(text: string, options: VerifyRes
       arrival: null,
       translation: null,
       continuationExpanded: null,
+      partialResponse: null,
     };
   }
   return verifyResponseReceipt(parsed.value, options);
@@ -447,9 +477,10 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     arrival: null as string | null,
     translation: null as ReceiptTranslation | null,
     continuationExpanded: null as ReceiptContinuationExpanded | null,
+    partialResponse: null as PartialResponse | null,
   };
   const result = (): ResponseReceiptVerification => ({
-    ok: checks.every((check) => check.status !== "fail"),
+    ok: checks.every((check) => check.status !== "fail" && check.status !== "partial"),
     verdict: receiptVerdictOf(checks),
     checks,
     ...state,
@@ -493,8 +524,14 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   const returnedEvent = isObject(receipt) && Array.isArray(get(receipt, "event_log"))
     ? findEvent(get(receipt, "event_log") as readonly Json[], EVENT_RESPONSE_RETURNED)
     : undefined;
+  // 1.7.1: an answer the client left (`served_as: client_left`, not replaced) in a stack receipt whose response digest
+  // `stackChecks` compares. `body_hash` is every byte the entry queued, keep-alive comments included, and a client that
+  // left holds fewer, so the raw hash is not compared here (it would fail the receipt before the digest is read);
+  // `events_sha256` or `body_sha256` is compared in its place, and a mismatch there is a failure or `partial`.
+  const clientLeft = clientLeftStackAnswer(receipt, returnedEvent, options.protocol);
   const checkRawResponseBody =
     options.responseBytes !== undefined &&
+    !clientLeft &&
     !(options.allowKeepAliveComments === true && typeof get(returnedEvent, "events_sha256") === "string");
   const verification = await verifyReceipt(receipt, sealed.keyset.receipt_signing_keys, {
     workloadKeysetDigest: keysetDigest,
@@ -514,6 +551,7 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
     state.protocol = options.protocol ?? implied;
   }
   checks.push(...receiptChecks(verification, document, options, checkRawResponseBody));
+  if (document !== null && clientLeft && options.responseBytes !== undefined) checks.push(clientLeftRawCheck(options.responseBytes, state.responseBodyHash));
 
   if (document === null) return result();
 
@@ -573,7 +611,9 @@ export async function verifyResponseReceipt(receipt: Json, options: VerifyRespon
   if (isStackEventLog(document.event_log)) {
     // A stack receipt forwards once per attempt; the single-forward hash fields mean nothing here.
     state.forwardedBodyHash = null;
-    state.stack = stackChecks(document.event_log, protocol, options, checks, continuationExpanded);
+    const stack = stackChecks(document.event_log, protocol, options, checks, continuationExpanded);
+    state.stack = stack.summary;
+    state.partialResponse = stack.partial;
     return result();
   }
 
@@ -1003,7 +1043,7 @@ function stackChecks(
   options: VerifyResponseReceiptOptions,
   checks: ReceiptCheck[],
   continuationExpanded: ReceiptContinuationExpanded | null,
-): StackReceiptSummary {
+): { readonly summary: StackReceiptSummary; readonly partial: PartialResponse | null } {
   const attempts: MutableAttempt[] = [];
   let feedIncomplete: string | null = null;
   for (const event of events) {
@@ -1190,22 +1230,44 @@ function stackChecks(
   }
 
   const response = options.responseBytes;
+  // 1.7.1: the client left mid-answer (an attempt named, not replaced): bytes shorter than what the entry queued are
+  // `partial`, unless they end the answer by its protocol, which a prefix the client was cut off in cannot.
+  const leftMidAnswer = servedAs === "client_left" && replaced === false && servedAttempt !== null;
+  let partial: PartialResponse | null = null;
   if (response === undefined) {
     checks.push(skip("response_stack_digest", "not checked: pass the raw response bytes (--response)"));
     if (rewrites.length > 0) checks.push(skip("response_served_attempt", `not checked: the answer carries Gray's declared rewrites (${rewritesText}), which only the bytes received tie to attempt ${servedAttempt}`));
   } else {
     let received: string | null = null;
+    const shorter = `the entry recorded served_as: client_left (attempt ${String(servedAttempt)}): the client left before it read everything the entry queued, and these ${response.length} bytes are shorter than what the entry queued, so the response digest cannot be recomputed from them alone`;
     if (eventsSha256 !== null) {
       const digester = new StackEventDigester();
       const chain = new StackEventsChain();
       for (const digest of [...digester.write(response), ...digester.close()]) chain.push(digest);
       received = chain.hex();
+      const mismatch = `events_sha256 is ${eventsSha256}, the ${chain.count()} event(s) received chain to ${received}`;
       if (received === eventsSha256) checks.push(pass("response_events_sha256", `${eventsSha256} over ${chain.count()} event(s)`));
-      else checks.push(fail("response_events_sha256", `events_sha256 is ${eventsSha256}, the ${chain.count()} event(s) received chain to ${received}`));
+      else if (!leftMidAnswer) checks.push(fail("response_events_sha256", mismatch));
+      else {
+        const end = readStreamEnd(protocol, response);
+        if (end.terminal !== null) {
+          checks.push(fail("response_events_sha256", `${mismatch}; the bytes end the stream (${end.terminal}), so they are not a part of it the client was cut off in`));
+        } else {
+          checks.push(partialCheck("response_events_sha256", `${shorter}: ${mismatch}, and no ${protocol} terminal event`));
+          partial = { served_as: "client_left", served_attempt: servedAttempt, bytes_received: response.length, events_received: chain.count() };
+        }
+      }
     } else if (bodySha256 !== null) {
       received = stackBodyDigest(response);
+      const mismatch = `body_sha256 is ${bodySha256}, the body received digests to ${received}`;
       if (received === bodySha256) checks.push(pass("response_body_sha256", bodySha256));
-      else checks.push(fail("response_body_sha256", `body_sha256 is ${bodySha256}, the body received digests to ${received}`));
+      else if (!leftMidAnswer) checks.push(fail("response_body_sha256", mismatch));
+      else if (isWholeJsonBody(response)) {
+        checks.push(fail("response_body_sha256", `${mismatch}; the body received is a whole JSON text, so it is not a part of the answer the client was cut off in`));
+      } else {
+        checks.push(partialCheck("response_body_sha256", `${shorter}: ${mismatch}, and it is not a whole JSON text`));
+        partial = { served_as: "client_left", served_attempt: servedAttempt, bytes_received: response.length, events_received: null };
+      }
     }
     if (served !== undefined && replaced === false && received !== null) {
       if (servedAs === "codex_terminal_response") {
@@ -1234,7 +1296,7 @@ function stackChecks(
     }
   }
 
-  return {
+  const summary: StackReceiptSummary = {
     attempts,
     status: typeof status === "bigint" ? status.toString() : null,
     events_sha256: eventsSha256,
@@ -1246,6 +1308,34 @@ function stackChecks(
     rewrites: rewrites.map((rewrite) => ({ seq: rewrite.seq === undefined ? null : String(rewrite.seq), op: rewrite.op, path: rewrite.path })),
     feed_incomplete: feedIncomplete,
   };
+  return { summary, partial };
+}
+
+/**
+ * 1.7.1: the receipt is a relay stack's whose answer the client left (`served_as: client_left`, `replaced_error:
+ * false`) and whose response digest `stackChecks` compares: a lane protocol, the request not translated. Read before the
+ * signature is checked, so it only decides which check compares the response bytes; on any other receipt the raw
+ * `body_hash` is compared as before. A receipt that is not what it says here fails its own checks.
+ */
+function clientLeftStackAnswer(receipt: Json, returned: Json | undefined, override: ReceiptProtocol | undefined): boolean {
+  if (returned === undefined || get(returned, "served_as") !== "client_left" || get(returned, "replaced_error") !== false) return false;
+  const events = get(receipt, "event_log");
+  if (!Array.isArray(events) || !isStackEventLog(events) || events.some((event) => eventType(event) === EVENT_REQUEST_TRANSLATED)) return false;
+  const endpoint = get(receipt, "endpoint");
+  const protocol = override ?? (typeof endpoint === "string" ? protocolForEndpoint(endpoint) : null);
+  return protocol !== null && isLaneProtocol(protocol);
+}
+
+/**
+ * `response_returned_hash` of an answer the client left: a pass when the bytes are exactly what the entry queued, else
+ * not compared, since a client that left holds fewer bytes and keep-alive comments the entry queued are in it.
+ */
+function clientLeftRawCheck(response: Uint8Array, recorded: string | null): ReceiptCheck {
+  if (recorded !== null && bodyHash(response) === recorded) return pass("response_returned_hash", recorded);
+  return skip(
+    "response_returned_hash",
+    `not compared: the client left (client_left), and body_hash ${String(recorded)} is every byte the entry queued for it, keep-alive comments included; the response's events_sha256 or body_sha256 is compared instead`,
+  );
 }
 
 type MutableAttempt = {
@@ -1610,4 +1700,8 @@ function fail(id: string, detail: string): ReceiptCheck {
 
 function skip(id: string, detail: string): ReceiptCheck {
   return { id, status: "skip", detail };
+}
+
+function partialCheck(id: string, detail: string): ReceiptCheck {
+  return { id, status: "partial", detail };
 }

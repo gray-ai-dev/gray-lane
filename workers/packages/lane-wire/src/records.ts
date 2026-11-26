@@ -74,9 +74,9 @@ export const LANE_FORBIDDEN_EVENT_COLUMNS = Object.freeze(["client_app", "client
  * r14's `routeAttempts`, the route attempts with their two answer checks, workers/db/migrations/0079; r15's five
  * measures on each attempt are later still, docs/live-speed.md, and each attempt's `providerFailure` of 2026-11-23
  * later again; r18's `routing`, the routing record's confidential projection, workers/db/migrations/0101, and r20's
- * `mode_source` in it; the serving entry's `entryNode` and `entryRegion`, workers/db/migrations/0110, are the latest,
- * and go first when a bridge refuses a row, then the preset's source, the routing record, the provider failure, the
- * measures): absent from the wire document when null, and taken absent. A bridge that predates one still takes
+ * `mode_source` in it; the serving entry's `entryNode` and `entryRegion`, workers/db/migrations/0110, then the routing
+ * record's `checks` (2026-11-26), the latest of all, which goes first when a bridge refuses a row, then the serving entry,
+ * the preset's source, the routing record, the provider failure, the measures): absent from the wire document when null, and taken absent. A bridge that predates one still takes
  * every row that does not carry it (every row but a stack relay's), and a bridge that knows it takes
  * the rows of a lane that predates it, so neither deploy order loses rows of the lanes that existed
  * before.
@@ -185,6 +185,8 @@ function routeAttemptsDtoOf(attempts: readonly RouteAttempt[]): LaneRouteAttempt
  */
 const ROUTING_PRESETS = ["interactive", "autonomous", "standard", "flex"] as const;
 const ROUTING_MODE_SOURCES = ["request", "key"] as const;
+/** What a record says of the checks that read the feed (@gray/routing `RoutingChecks`): one closed word. */
+const ROUTING_CHECKS = ["unapplied"] as const;
 const ROUTING_PERCENTILES = ["p50", "p90", "p99"] as const;
 const ROUTING_CONSTRAINTS = ["min_availability", "max_ttft_ms", "min_tps", "min_context_tokens", "max_price_multiple"] as const;
 const ROUTING_HEAD_REASONS = ["ranking", "session", "order", "tool_call_issuer", "account_block", "unselected", "recovery_probe", "recovery_trial"] as const;
@@ -266,6 +268,9 @@ const laneRoutingSchema = z
     candidates: z.null(),
     omitted: z.literal(0n),
     refusal: z.object({ exclusion: routingExclusionSchema }).strict().nullable(),
+    // The checks that read the feed were asked for and not made (no current ranking base): one fixed word, nothing of a
+    // route. Optional: a record whose checks were made has none, and an entry before it sends none.
+    checks: z.enum(ROUTING_CHECKS).optional(),
   })
   .strict()
   // A refused request chose no route, kept no session, put no route first and drew from none.
@@ -334,6 +339,7 @@ function routingDtoOf(routing: object): LaneRoutingDto | null {
     candidates: r.candidates ?? null,
     omitted: wireInt(r.omitted),
     refusal: refusal === null ? (r.refusal ?? null) : { exclusion: exclusionDtoOf(membersOf(refusal.exclusion)) },
+    ...(r.checks === undefined ? {} : { checks: r.checks }),
   };
   const parsed = laneRoutingSchema.safeParse(projected);
   if (parsed.success) return parsed.data;

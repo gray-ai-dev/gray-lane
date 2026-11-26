@@ -256,7 +256,11 @@ export interface StreamRelayInput {
   readonly drainMs: number;
   /** The client left before the upstream's final event (the per-key count of answers left unfinished). */
   readonly onLeftBeforeFinal?: () => void;
-  /** The error event a client that stopped reading (`client_read_timeout`) gets as the stream's last frame. */
+  /**
+   * The error event a client that stopped reading (`client_read_timeout`) gets as the stream's last frame, when a frame
+   * of the answer was not queued for it. A client that stopped on the last frame's write has the answer's end queued,
+   * and nothing follows it.
+   */
   readonly stalledEnd?: Uint8Array;
 }
 
@@ -786,6 +790,11 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
   client.deliverBy(input.deadline);
   const sentFrame = new Uint8Array(0);
   let writtenBefore = 0;
+  // A held frame the client's queue never took. Only then may the stall's error frame end the stream: a client that
+  // stalls on the last frame's write already has the stream's end in its queue, and the confidential lane's receipt
+  // chains every event queued (`ClientStream` tap), so an error event after the end would be in the receipt and not
+  // in the bytes of a client that stops at the end.
+  let notQueued = false;
   const delivered = await client.writeAll(
     held,
     async (chunk) => {
@@ -794,7 +803,10 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
       writtenBefore = client.written;
     },
     (chunk, index) => {
-      if (client.written === writtenBefore) unsent += chunk.length;
+      if (client.written === writtenBefore) {
+        unsent += chunk.length;
+        if (chunk.length > 0) notQueued = true;
+      }
       held[index] = sentFrame;
       heldBytes -= chunk.length;
       const weight = streamWeight({ heldBytes, heldFrames: held.length - index - 1, frames, queuedBytes: upstream.queuedBytes, queuedChunks: upstream.queuedChunks, decoder, inspector, stage, repairs });
@@ -810,12 +822,13 @@ async function relayAnswer(input: StreamRelayInput, reached: { finish: boolean }
       if (input.tap !== null) await input.tap.observe(chunk);
       input.sink?.push(chunk);
       unsent += chunk.length;
+      if (chunk.length > 0) notQueued = true;
     }
     held.length = 0;
     heldBytes = 0;
     input.retained?.set("held", 0);
   }
-  client.end(!delivered && presence.reason === "client_read_timeout" ? input.stalledEnd : undefined);
+  client.end(!delivered && notQueued && presence.reason === "client_read_timeout" ? input.stalledEnd : undefined);
   return { kind: "settled", received, delivered, unsent };
 }
 

@@ -302,10 +302,18 @@ export interface LanePeerCall {
    * `untilMs`; then `trace` has it. Nothing to ask when `end` came or the attempt was never sent.
    */
   traceLate(untilMs: number): Promise<void>;
+  /**
+   * The stack VM's inner receipt from the follow-up when its hop ended after `head` without `end`, asked until `untilMs`
+   * while the stack VM reports the attempt registered or dialed; null when none came by then. Not checked: the caller
+   * binds it (`bindInner`) only once it checks (`peer-inner.ts` `checkedInner`).
+   */
+  receiptLate(untilMs: number): Promise<Json | null>;
+  /** Binds a checked late inner receipt: `inner()`, `commitment()` and `stored()` name it as one `end` carried. */
+  bindInner(receipt: Json): void;
   close(): void;
   /** The commitment naming the peer in the outer receipt (`@gray/attest` `peerCommitment`). */
   commitment(): string;
-  /** The inner receipt's id and digest, when `end` carried one. */
+  /** The inner receipt's id and digest, when `end` carried one or a checked late one was bound (`bindInner`). */
   inner(): { readonly receiptId: string; readonly receiptSha256: string } | null;
   /** What the outer receipt keeps of this attempt (section 4.8), or null when nothing was sent to a pinned peer. */
   stored(): StoredPeerAttempt | null;

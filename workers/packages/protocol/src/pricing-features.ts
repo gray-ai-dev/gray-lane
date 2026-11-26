@@ -1,9 +1,8 @@
 /**
- * Request-side and response-side extraction for multi-tier pricing (`service_tier` / `speed`,
- * `long_context` / `context-1m-*`) and per-call billable hosted tools (`web_search`,
- * `google_search`, `code_execution`, `file_search`).
+ * Request-side and response-side extraction for multi-tier pricing (`service_tier` / `speed`) and
+ * per-call billable hosted tools (`web_search`, `google_search`, `code_execution`, `file_search`).
  *
- * Pure code: reads `@gray/json` values and standard `Headers`, never re-serializes client bodies,
+ * Pure code: reads `@gray/json` values, never re-serializes client bodies,
  * and keeps counters exact as `bigint`.
  */
 import { type Json, type JsonObject, asArray, asStr, asU64, get, isObject } from "@gray/json";
@@ -34,15 +33,12 @@ export interface RequestedHostedTool {
 export interface RequestedPricingFeatures {
   /** Requested accelerated tier (`"fast"` on Anthropic, `"priority"` on OpenAI), or null for standard. */
   readonly serviceTier: ServiceTierName | null;
-  /** Whether the client sent Anthropic's `context-1m-*` beta header. */
-  readonly extendedContextBeta: boolean;
   /** Distinct billable hosted tools declared by the request, in canonical `HOSTED_TOOL_NAMES` order. */
   readonly hostedTools: readonly RequestedHostedTool[];
 }
 
 export const NO_PRICING_FEATURES: RequestedPricingFeatures = {
   serviceTier: null,
-  extendedContextBeta: false,
   hostedTools: [],
 };
 
@@ -62,16 +58,6 @@ export interface ResponseBillingMeta {
 
 /** Default conservative invocation bound reserved in holds when a requested hosted tool specifies no `max_uses`. */
 export const DEFAULT_UNBOUNDED_TOOL_USES = 20n;
-
-function betaTokens(headers: Headers | null | undefined, name: string): string[] {
-  if (!headers) return [];
-  const raw = headers.get(name);
-  if (!raw) return [];
-  return raw
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter((s) => s.length > 0);
-}
 
 function positiveCap(value: Json | undefined): number | null {
   const n = asU64(value);
@@ -93,19 +79,14 @@ function recordRequestedTool(map: Map<HostedToolName, number | null>, tool: Host
 }
 
 /**
- * Extracts requested accelerated service tiers, Anthropic extended-context beta flags, and per-call
- * billable hosted tools from the client request body and headers.
+ * Extracts requested accelerated service tiers and per-call billable hosted tools from the client
+ * request body.
  */
-export function extractPricingFeatures(protocol: Protocol, body: Json, headers?: Headers | null): RequestedPricingFeatures {
+export function extractPricingFeatures(protocol: Protocol, body: Json): RequestedPricingFeatures {
   let serviceTier: ServiceTierName | null = null;
-  let extendedContextBeta = false;
   const tools = new Map<HostedToolName, number | null>();
 
   if (protocol === "anthropic_messages") {
-    const betas = betaTokens(headers, "anthropic-beta");
-    for (const token of betas) {
-      if (token.startsWith("context-1m-") || token === "context-1m") extendedContextBeta = true;
-    }
     if (isObject(body)) {
       const speed = asStr(get(body, "speed"))?.toLowerCase();
       if (speed === "fast") serviceTier = "fast";
@@ -174,7 +155,7 @@ export function extractPricingFeatures(protocol: Protocol, body: Json, headers?:
   for (const name of HOSTED_TOOL_NAMES) {
     if (tools.has(name)) hostedTools.push({ tool: name, maxUses: tools.get(name) ?? null });
   }
-  return { serviceTier, extendedContextBeta, hostedTools };
+  return { serviceTier, hostedTools };
 }
 
 /**

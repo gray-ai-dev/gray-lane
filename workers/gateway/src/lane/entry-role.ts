@@ -584,11 +584,13 @@ export interface EntryReadinessFacts {
   /** The stack relays the entry's routes name, and how many of them hold a pinned session. */
   readonly stackRelays: number;
   readonly stackRelaysPinned: number;
+  /** The request path's ranking base can serve (`SnapshotCache.fed`): the boot's first whole feed with the roots' records landed. */
+  readonly rankingFed: boolean;
 }
 
 export interface EntryReadiness {
   readonly ready: boolean;
-  /** Why not ready, or what the bound let through: `stopping`, `routes_unknown`, `routes_cold`, `sessions_missing`. */
+  /** Why not ready, or what the bound let through: `stopping`, `routes_unknown`, `routes_cold`, `sessions_missing`, `ranking_unfed`. */
   readonly reasons: readonly string[];
   /** Ready only because the bound passed (the reasons say what was still missing). */
   readonly failOpen: boolean;
@@ -596,9 +598,10 @@ export interface EntryReadiness {
 
 /**
  * Whether an entry may take new connections from the load balancer (docs/design/entry-replicas.md §13). Ready: not told
- * to stop, routes listed and every one warmed, and every stack relay its routes name holding a pinned session; or, unless
- * told to stop, a boot older than the bound, so a VM that is down or a console that cannot be read never keeps every
- * replica out at once. `draining` is ready: the release tool disables the endpoint itself for a drain.
+ * to stop, routes listed and every one warmed, every stack relay its routes name holding a pinned session, and a ranking
+ * base that can serve (a boot that took traffic before its first whole feed served it without the checks that read the
+ * feed); or, unless told to stop, a boot older than the bound, so a VM that is down, a console that cannot be read or a
+ * ranking plane that does not answer never keeps every replica out at once. `draining` is ready: the release tool disables the endpoint itself for a drain.
  */
 export function entryReadiness(facts: EntryReadinessFacts): EntryReadiness {
   if (facts.stopping) return { ready: false, reasons: ["stopping"], failOpen: false };
@@ -606,6 +609,7 @@ export function entryReadiness(facts: EntryReadinessFacts): EntryReadiness {
   if (!facts.listed) reasons.push("routes_unknown");
   else if (facts.routesWarm < facts.routes) reasons.push("routes_cold");
   if (facts.stackRelaysPinned < facts.stackRelays) reasons.push("sessions_missing");
+  if (!facts.rankingFed) reasons.push("ranking_unfed");
   if (reasons.length === 0) return { ready: true, reasons, failOpen: false };
   if (facts.ageMs >= facts.boundMs) return { ready: true, reasons, failOpen: true };
   return { ready: false, reasons, failOpen: false };

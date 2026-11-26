@@ -47,14 +47,14 @@ import { HandleWatch, type ToolCallIdLocator } from "@gray/tool-ids";
 import { workspaceHome } from "./account.ts";
 import { hasQueryCredentials, keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "./auth.ts";
 import { billedInputOf } from "./billed.ts";
-import { readBody, type Body } from "./body.ts";
+import { bodyTooLarge, readBody, type Body } from "./body.ts";
 import { RequestBudget } from "./budget.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, platformTimers } from "./client.ts";
 import { confidentialContent } from "./content.ts";
 import { openCredential } from "./crypto.ts";
 import { endingWith, entryAnswerUsable, entryServesNative, entryUnreachable, forwardedAnswer, forwardedRequestHeaders, viaEntryOf, type EntryChatForward } from "./entry-forward.ts";
 import { GateCapacity, type GateVerdict } from "./gate.ts";
-import type { GatewayDeps, Served } from "./inference.ts";
+import type { GatewayDeps, Served } from "./inference/types.ts";
 import { checkStaleKey, type KeyLookup } from "./key-lookup.ts";
 import { admissionUnavailable, keyRateRefusal, type KeyRateCount } from "./key-rate.ts";
 import { CONVERSATION_DOMAIN, deriveAffinity } from "./lane/affinity.ts";
@@ -88,9 +88,11 @@ import {
   responseHash,
   type ResponseHash,
 } from "./lane/hooks.ts";
+import { bindLateInners } from "./lane/peer-inner.ts";
 import type { LanePeerCall } from "./lane/peer-model.ts";
 import { RECEIPT_ID_HEADER } from "./lane/receipts.ts";
-import { STACK_BODY_MAX_BYTES } from "./lane/stack-rewrite.ts";
+import { failureNames, laneEntryRequired, newLaneReceiptId } from "./lane/run-common.ts";
+import { laneBodyCap, overStackBody, STACK_BODY_MAX_BYTES, STACK_OVER_LIMIT_SKIP, VM_BODY_LIMIT_SOURCE } from "./lane/body-limits.ts";
 import { newStackRid, stackPeerHeaders, stackRawQuery } from "./lane/stack.ts";
 import { applyGeminiCountModelRewrite } from "./lane/standard-api.ts";
 import type { LaneDeps, LaneEgress, LanePolicyOutcome, LaneReceiptDraft } from "./lane/types.ts";
@@ -206,7 +208,8 @@ type AttemptResult =
   | { readonly kind: "connect" }
   | { readonly kind: "unavailable" }
   | { readonly kind: "pass" }
-  | { readonly kind: "oversized" }
+  /** The body is past what the route takes (`error`, a 413 `request_body_limit`): the client's answer if no route is asked. */
+  | { readonly kind: "oversized"; readonly error: ApiError }
   | { readonly kind: "stop"; readonly error: ApiError; readonly stage: AdmissionStage };
 
 export class CountTokensRun {
@@ -503,8 +506,7 @@ export class CountTokensRun {
   private async receive(snapshot: GatewaySnapshot, key: KeyRecord): Promise<Response> {
     const { cfg, clock } = this.deps;
     this.admission = "body";
-    const apiLimit = Number(requestLimit(this.protocol));
-    const cap = Math.min(apiLimit, cfg.bodyParseMaxBytes, ...(this.lane === null ? [] : [this.lane.timing.bodyMaxBytes]));
+    const cap = this.lane === null ? Math.min(Number(requestLimit(this.protocol)), cfg.bodyParseMaxBytes) : laneBodyCap(this.protocol, this.lane.timing.bodyMaxBytes, cfg.bodyParseMaxBytes);
     const handles = new HandleWatch();
     this.budget.pause();
     const read = await readBody(
@@ -515,7 +517,7 @@ export class CountTokensRun {
         parseMax: cap,
         rawMax: cap,
         waitMs: cfg.requestBodyMs,
-        ...(this.lane === null ? {} : { limitSource: "the most Gray's confidential VM holds of one request" }),
+        ...(this.lane === null ? {} : { limitSource: VM_BODY_LIMIT_SOURCE }),
         ...(this.deps.waitTimers === undefined ? {} : { timers: this.deps.waitTimers }),
       },
       undefined,
@@ -749,7 +751,7 @@ export class CountTokensRun {
     let repeat: Route | null = null;
     let index = 0;
     let spent = 0;
-    let oversized = false;
+    let oversized: ApiError | null = null;
     let uncounted = 0;
     let failed = false;
 
@@ -779,7 +781,7 @@ export class CountTokensRun {
 
       if (result.kind === "pass") continue;
       if (result.kind === "oversized") {
-        oversized = true;
+        oversized ??= result.error;
         continue;
       }
       if (result.kind === "stop") {
@@ -808,14 +810,7 @@ export class CountTokensRun {
       }
     }
 
-    if (index === 0 && oversized) {
-      return this.renderError(
-        new ApiError(413, "request_body_limit")
-          .withMeta("limit_bytes", requestLimit(this.protocol))
-          .withMeta("limit_source", "restored tool-call ids exceeded the API request limit"),
-        "routes",
-      );
-    }
+    if (index === 0 && oversized !== null) return this.renderError(oversized, "routes");
     // Every route asked has no token count, which the provider standard leaves optional: the model cannot be counted, and
     // asking again changes nothing. A route that counts and failed makes it the 502 that says to retry.
     if (uncounted > 0 && !failed) {
@@ -944,7 +939,10 @@ export class CountTokensRun {
     const payloadBytes = encoder.encode(toJsonString(cloned));
     if (restored > 0 && payloadBytes.length > Number(requestLimit(this.protocol))) {
       this.skipRoute(route, "request_body_limit");
-      return { kind: "oversized" };
+      return {
+        kind: "oversized",
+        error: new ApiError(413, "request_body_limit").withMeta("limit_bytes", requestLimit(this.protocol)).withMeta("limit_source", "restored tool-call ids exceeded the API request limit"),
+      };
     }
 
     const headers = upstreamHeaders(this.protocol, route.record, credential, this.request.headers);
@@ -1253,10 +1251,7 @@ export class CountTokensRun {
       this.skipRoute(route, "lane_stack_unavailable:protocol");
       return { kind: "pass" };
     }
-    if (received.length > STACK_BODY_MAX_BYTES) {
-      this.skipRoute(route, "lane_stack_unavailable:body_over_stack_limit");
-      return { kind: "pass" };
-    }
+    if (overStackBody(received.length)) return this.overStackLimit(route);
     const official = checkOfficialUpstream(route.record.url);
     if (!official.ok) {
       this.skipRoute(route, "lane_stack_unavailable:upstream_not_official");
@@ -1273,6 +1268,9 @@ export class CountTokensRun {
       this.skipRoute(route, "lane_stack_unavailable:stack_rewrite_refused");
       return { kind: "pass" };
     }
+    // The hop carries the entry's declared ops too, and Entry egress refuses a hop body past the stack's 4 MiB: the bytes
+    // measured are the hop's, as inference.ts `peerPlan` measures them.
+    if (overStackBody(received.length, hop.bytes.length)) return this.overStackLimit(route);
 
     const startedAt = clock();
     const laneBefore = {
@@ -1723,6 +1721,8 @@ export class CountTokensRun {
       await Promise.all(this.peerCalls.map((call) => call.ended));
       const received = this.laneReceived;
       if (receiptId === null || received === null) return;
+      // An answered count whose hop ended without `end` has its inner receipt from the stack VM, as a request's does.
+      await bindLateInners(this.peerCalls, { receiptId, entryKeysetDigest: lane.state.keysetDigest, requestId: this.requestId }, this.deps.clock() + this.deps.cfg.peerFollowUpMs);
       builder = new ReceiptBuilder({
         receiptId,
         chatId: null,
@@ -2159,6 +2159,15 @@ export class CountTokensRun {
     };
   }
 
+  /**
+   * A stack route too small for the body (relay standard v1.7 section 4): passed over as `request_body_limit`, and the
+   * client's 413 names the VM's limit when no route is asked (inference/body-limits.ts `overVmLimit`).
+   */
+  private overStackLimit(route: Route): AttemptResult {
+    this.skipRoute(route, STACK_OVER_LIMIT_SKIP);
+    return { kind: "oversized", error: bodyTooLarge(this.protocol, STACK_BODY_MAX_BYTES, VM_BODY_LIMIT_SOURCE) };
+  }
+
   private skipRoute(route: Route, reason: string): void {
     this.skippedRoutes.push({ endpointId: route.record.endpointId, reason });
   }
@@ -2421,16 +2430,6 @@ function peerEndedOutcome(end: PeerEndDto, head: PeerHeadDto, body: Uint8Array):
   return { kind: "relay_failed", code: end.code ?? "peer_invalid" };
 }
 
-function laneEntryRequired(): ApiError {
-  return new ApiError(403, "lane_entry_required").withMessage(
-    "This relay is served through Gray's confidential lane, not at its own address. Send your requests to the confidential lane address in your Gray console; it routes them to this relay.",
-  );
-}
-
-function newLaneReceiptId(): string {
-  return `rcpt_${crypto.randomUUID().replaceAll("-", "")}`;
-}
-
 function laneVendor(vendor: OfficialVendor): LaneStackVendor {
   return vendor === "chatgpt" ? "chatgpt_codex" : vendor;
 }
@@ -2449,10 +2448,4 @@ function hostOf(url: string): string | null {
   } catch {
     return null;
   }
-}
-
-function failureNames(error: unknown): { readonly error: string; readonly code?: string } {
-  const name = error instanceof Error ? error.name : typeof error;
-  const code = typeof error === "object" && error !== null ? (error as { readonly code?: unknown }).code : undefined;
-  return typeof code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? { error: name, code } : { error: name };
 }

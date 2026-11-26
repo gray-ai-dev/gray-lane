@@ -1019,6 +1019,8 @@ function warmerOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
  * bring is warmed at the next fetch. The source reads as the request path's does (r16; lead's decision R1, 2026-11-15):
  * with the ranking members and the isolate's snapshot latch (`laneGatewayDeps`), so the boot's first copy brings the
  * D7 check for the whole ranking feed in its background, and the lane's first customer request ranks with samples.
+ * After it, these fetches ask for the ranking at most once per RANKING_AHEAD_MS (`SnapshotCache.rankAhead`; no timer of
+ * its own), so an entry the load balancer probes and no customer reaches keeps a base the next request can use.
  */
 function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, ctx: ExecutionContext, readyRelay?: string, peers: EntryPeers | null = null, videos: EntryVideos | null = null): void {
   const warmer = warmerOf(state, env, cfg);
@@ -1029,7 +1031,6 @@ function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
       ...bridge,
       now: state.now,
       ranking: true,
-      legacy: laneIsolateOnce().legacy.snapshot,
       onSnapshot: (snapshot) => {
         state.registry.refresh(snapshot);
         endpointRoutes?.sync(snapshot.version, endpointRowsOfSnapshot(snapshot));
@@ -1040,6 +1041,9 @@ function warmLane(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConf
     // M15: a route about to lapse is renewed now, on this fetch (a relay's poll, a health probe), not by the next
     // customer request waiting for a check (staging 2026-10-30: 2.1 s after 190 s idle).
     if (snapshot !== null) snapshots.ahead(source, timing, Date.now(), (p) => ctx.waitUntil(p));
+    // The ranking base kept current behind the same fetches (a probe every 10 s, production Z16), when `ahead` did not
+    // start a check that brings it.
+    if (snapshot !== null) snapshots.rankAhead(source, timing, Date.now(), (p) => ctx.waitUntil(p));
     if (snapshot === null) {
       const read = await snapshots.read(source, timing, Date.now(), (p) => ctx.waitUntil(p));
       if (!read.ok) return;
@@ -1418,8 +1422,9 @@ async function route(
 }
 
 /**
- * `GET /healthz`: liveness, the identity class, how many receipts this boot holds, and how many of its lane routes it has
- * warmed (`routes_warm` of `routes`, M13), which a restart script may wait for.
+ * `GET /healthz`: liveness, the identity class, how many receipts this boot holds, how many of its lane routes it has
+ * warmed (`routes_warm` of `routes`, M13), which a restart script may wait for, and whether the request path's ranking
+ * base can serve now (`ranking_fed`, `SnapshotCache.fed`), which a roll reports. Neither changes the status.
  *
  * With `?relay=<relay_id>`, also the version of that relay's sealed credentials this boot holds (`relay.sealed_version`,
  * decimal text, the credential store's last accepted version; null for none), and on a stack VM of that relay the
@@ -1476,6 +1481,7 @@ function health(request: Request, url: URL, identity: LaneIdentity, state: LaneP
       receipts: state.receipts.size,
       routes: warm.routes,
       routes_warm: warm.warm,
+      ranking_fed: snapshots.fed(state.now()),
       ...(relay === null ? {} : { relay }),
       ...(peers === null ? {} : { peers: peers.registry.summary() }),
       // The outbound-only channel (docs/design/relay-outbound-only.md): counts only, the route is public.
@@ -1495,8 +1501,9 @@ const bootTimes = new WeakMap<LaneProcessState, number>();
 /**
  * `GET /readyz` (docs/design/entry-replicas.md §13): 200 when the entry may take new connections from the load balancer,
  * 503 otherwise. Local facts only (`entryReadiness`): not told to stop, its routes warmed (`routes_warm` of `routes`, as
- * the release tool's gate reads them from `/healthz`), and every stack relay its routes name holding a pinned session;
- * or, unless told to stop, a boot older than LANE_ENTRY_READY_BOUND_MS. `/healthz` keeps its meaning (liveness, read by
+ * the release tool's gate reads them from `/healthz`), every stack relay its routes name holding a pinned session, and
+ * the request path's ranking base able to serve (`ranking_fed`: the boot's first whole feed with the roots' records
+ * landed, `SnapshotCache.fed`); or, unless told to stop, a boot older than LANE_ENTRY_READY_BOUND_MS. `/healthz` keeps its meaning (liveness, read by
  * the release tool and dstack's probe). Counts only, as `/healthz`: the route is public and names no relay. The stopped
  * responder (deploy/tee/bin/entrypoint.mjs `stoppedAnswer`) answers this path 503 `entry_stopped`.
  */
@@ -1510,6 +1517,7 @@ function readiness(request: Request, cfg: GatewayConfig, state: LaneProcessState
   const pinned = peers === null ? 0 : relays.filter((relay) => (channel ? peers.registry.hasSession(relay) : peers.registry.usable(relay).length > 0)).length;
   const now = state.now();
   const ageMs = now - (bootTimes.get(state) ?? now);
+  const rankingFed = snapshots.fed(now);
   const verdict = entryReadiness({
     ageMs,
     boundMs: cfg.laneEntryReadyBoundMs,
@@ -1519,6 +1527,7 @@ function readiness(request: Request, cfg: GatewayConfig, state: LaneProcessState
     routesWarm: warm.warm,
     stackRelays: relays.length,
     stackRelaysPinned: pinned,
+    rankingFed,
   });
   return aciJson(
     verdict.ready ? 200 : 503,
@@ -1531,6 +1540,7 @@ function readiness(request: Request, cfg: GatewayConfig, state: LaneProcessState
       routes_warm: warm.warm,
       stack_relays: relays.length,
       stack_relays_pinned: pinned,
+      ranking_fed: rankingFed,
     },
     state.keysetDigest,
   );
@@ -1904,11 +1914,6 @@ async function readIntakeBody(request: Request, cfg: GatewayConfig, state: LaneP
 
 function methodNotAllowed(keysetDigest: string, allow: string): Response {
   return aciJson(405, { error: "METHOD_NOT_ALLOWED" }, keysetDigest, { allow });
-}
-
-/** The 404 body an intake route answers for a path it does not serve: the closed code, never a route table. */
-export function intakeNotFound(keysetDigest: string): Response {
-  return aciJson(404, { error: { code: "not_found", message: "No such intake route." } }, keysetDigest);
 }
 
 export { refusalBody };

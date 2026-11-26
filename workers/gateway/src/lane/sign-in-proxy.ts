@@ -8,8 +8,6 @@ import { sha256BareHex } from "@gray/attest";
  * It is no secret and the URL carries no password (design v3: the listener is the container's alone).
  */
 
-/** Egress's relay listener (`@gray/lane-compose` layout.ts `EGRESS_ADDRESS`, port 8080), where `CONNECT` is answered. */
-export const SIGN_IN_PROXY_ADDRESS = "10.231.11.2:8080";
 const HANDLE_DOMAIN = "gray-sign-in-handle/v1";
 
 /** The vendors whose accounts sign in through the proxy (design §3.5). */

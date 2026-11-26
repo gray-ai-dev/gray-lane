@@ -54,7 +54,7 @@ import { ZERO_COUNTERS } from "@gray/protocol";
 import type { CanonicalRequest, Protocol } from "@gray/protocol";
 import { FREE_DELIVERY, type AccountBlockGates, type BlockLease, type FiledRest, type Outcome as EndpointOutcome, type OutcomeMeasure, type Pattern, type PermitToken } from "@gray/endpoint";
 import { accountBlockIsolate, blockGates } from "./account-blocks.ts";
-import { HeldProbe, NO_ISSUER, orderPlan, settleHead, steering, type ProbeLeases } from "./plan-order.ts";
+import { HeldProbe, NO_ISSUER, orderPlan, planReasons, settleHead, steering, type ProbeLeases } from "./plan-order.ts";
 import { layeredOver, tierAdmitted, untagged, planPreference, preferenceFacts, refsOf, registeredOf, retainAdmitted, routingRefused, unreadableDefault, unreadablePreference, unverifiable, utilityRefusal, verifiableRoute, verifiableUpFront, type PreferenceFacts } from "./preference.ts";
 import {
   DEFAULT_ROUTING_POLICY,
@@ -76,7 +76,8 @@ import { Dispatcher, countedFailure, noRouteRetryAfter, servedLater, skipLabel, 
 import { acquirePermit, notePermit, otherShard, probeAnswered, probeSent, releasePermit, releaseRetry, reserveRetry, settledWithin, shardFor, type ReleaseFacts, type ShardChoice } from "./endpoints.ts";
 import { judgeEvidence, mediaEvidence } from "./evidence.ts";
 import { originsOf } from "./hosts.ts";
-import { type GatewayDeps, planReasons } from "./inference.ts";
+import type { GatewayDeps } from "./inference/types.ts";
+import { newLaneReceiptId } from "./lane/run-common.ts";
 import { checkStaleKey, type KeyLookup } from "./key-lookup.ts";
 import { countLiveKeyRate } from "./key-rate.ts";
 import { verifiableViaApi } from "./lane/api-arrival.ts";
@@ -1825,7 +1826,7 @@ export class ModelApiRun {
         case "answered":
           // The committed attempt's receipt draft is adopted: the receipt describes the bytes this provider was sent.
           this.laneDraft = attempt.laneDraft ?? null;
-          this.laneReceiptId ??= newReceiptId();
+          this.laneReceiptId ??= newLaneReceiptId();
           // The answer commits at its 2xx: it is served, and no other attempt follows (`commit`). A recovery
           // probe's waiters go on as trials.
           d.commit();
@@ -2475,7 +2476,7 @@ export class ModelApiRun {
         taken = true;
         // The body is handed to the provider's fetch: the response names the id its receipt will use, and the last
         // body that really went is the receipt of a request no attempt commits.
-        this.laneReceiptId ??= newReceiptId();
+        this.laneReceiptId ??= newLaneReceiptId();
         this.laneForwardedDraft = attempt.laneDraft ?? null;
       });
       const response = await this.outbound.fetch(entry.fetch)(record.url, { method: "POST", headers, body: stream, signal: attempt.controller.signal, redirect: "manual" }, () => (started = true));
@@ -3034,11 +3035,6 @@ export class ModelApiRun {
     return new Response(body, { status: 200, headers: { "content-type": "application/json", "content-length": String(body.length), "x-request-id": this.requestKey!, "x-gray-attempt": String(attempt.index + 1) } });
   }
 
-}
-
-/** A receipt id of the confidential entry (inference.ts `newLaneReceiptId`). */
-function newReceiptId(): string {
-  return `rcpt_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
 /** An error body, read within ERROR_BODY_LIMIT bytes and until `until` (`upstream_errors::read`). */

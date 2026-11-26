@@ -50,6 +50,7 @@ import {
 } from "@gray/lane";
 import {
   STACK_ATTEMPT_CLASSES,
+  PEER_GATE_REFUSED,
   STACK_FAULT_WHYS,
   STACK_VENDOR_CODES,
   STACK_VIOLATION_BODY_FIELD_PATTERN,
@@ -67,6 +68,7 @@ import { bytesBase64 } from "../crypto.ts";
 import type { StackRelayAppend, StackRelayConfig, StackRelayRoute, StackVendor, StackViolationFound } from "./stack-config.ts";
 import { StackDecodeError, stackDecodedBody } from "./stack-coding.ts";
 import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rewrite.ts";
+import { STACK_BODY_MAX_BYTES } from "./body-limits.ts";
 
 /**
  * The entry's stack mode (docs/confidential-lane-supply-implementation.md S22–S27): one call to the
@@ -192,6 +194,27 @@ export function laneFaultCode(fault: { readonly by: string; readonly why: string
   if (REFUSED_WHYS.has(why)) return UPSTREAM_ANSWER_REFUSED;
   const by = fault?.by ?? (why === "egress_limit" ? "egress" : why.startsWith("relay_") || why === "feed_invalid" || why === "answer_too_large" ? "relay" : null);
   return by === "relay" || by === "egress" ? LANE_RELAY_FAILED : null;
+}
+
+/** What `peerEndVerdict` reads of a peer attempt's end: the lane's own code, its trust gate's refusal, or nothing. */
+export type PeerVerdict =
+  | { readonly kind: "lane"; readonly code: typeof UPSTREAM_ANSWER_REFUSED | typeof LANE_RELAY_FAILED }
+  | { readonly kind: "gate" }
+  | { readonly kind: "none" };
+
+/**
+ * The stack VM's verdict on a peer attempt that ended badly, the one reading of it the entry's paths share (`peerFailed`,
+ * `peerUncommitted`, the stream's relay, a buffered answer): a fault of the relay's or of its answer (`laneFaultCode` of the
+ * trace's last fault, else of `end.code`) is the lane's own code; else `end.code` `PEER_GATE_REFUSED` is its trust gate's
+ * refusal of the vendor's answer (GL-23), on a `cut` end, or on an end the caller already read as a failure before
+ * anything was released (`outcome` absent: a `relay_failed` outcome); anything else is no verdict, and the caller keeps
+ * its own reading. `end` is null when none came.
+ */
+export function peerEndVerdict(fault: { readonly by: string; readonly why: string } | null, end: { readonly outcome?: string; readonly code?: string | null } | null): PeerVerdict {
+  const code = laneFaultCode(fault, end?.code ?? null);
+  if (code !== null) return { kind: "lane", code };
+  if (end !== null && end.code === PEER_GATE_REFUSED && (end.outcome === undefined || end.outcome === "cut")) return { kind: "gate" };
+  return { kind: "none" };
 }
 
 /** The ApiError of `laneFaultCode`'s answer. */
@@ -425,10 +448,10 @@ export interface StackFeedAttempt {
 const LOWER_HEX_32 = /^[0-9a-f]{64}$/;
 
 /**
- * The largest body a `forwarded` record carries: egress's -max-body-bytes, the lane's BODY_PARSE_MAX_BYTES (4 MiB): a
- * body over it is refused before it is forwarded (`egress_body_too_large`).
+ * The largest body a `forwarded` record carries: egress's -max-body-bytes, the stack's 4 MiB (body-limits.ts): a body
+ * over it is refused before it is forwarded (`egress_body_too_large`).
  */
-export const STACK_FORWARDED_MAX_BYTES = 4 * 1024 * 1024;
+export const STACK_FORWARDED_MAX_BYTES = STACK_BODY_MAX_BYTES;
 
 /**
  * The most bytes of one feed line: the largest record is a `forwarded` one, base64 of at most

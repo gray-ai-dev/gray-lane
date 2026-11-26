@@ -1,6 +1,6 @@
-import { EVENT_PEER_ENTRY, eventType, jcsBytes, sha256BareHex, verifyReceipt } from "@gray/attest";
-import { get, toJsonString, type Json } from "@gray/json";
+import { toJsonString, type Json } from "@gray/json";
 import { keyHash } from "../auth.ts";
+import { checkedInner } from "./peer-inner.ts";
 import type { StoredPeerAttempt } from "./peer-model.ts";
 import { aciHeaders, aciJson, receiptNotFound, receiptPending, receiptResponse, receiptUnauthorized } from "./receipts.ts";
 import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
@@ -20,8 +20,9 @@ import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
  * Both have the outer receipt's owner check: no credential is 401; a wrong one, an unknown id and an expired id are
  * all 404 `receipt_not_found`, checked before anything of the attempts is read; an id this boot named for the same key
  * whose receipt is not stored yet is 503 `receipt_pending` with `Retry-After`. Then an attempt the receipt does not
- * have is 404 `peer_attempt_not_found`; a late fetch that got no answer, or a stack VM that no longer holds a receipt
- * the outer one names, 502 `peer_receipt_unavailable`; a late receipt that is not the one the outer receipt names (its
+ * have is 404 `peer_attempt_not_found`; a late fetch that got no answer, a stack VM still on the attempt (registered
+ * or dialed: its receipt is not signed yet), or one that no longer holds a receipt the outer one names, 502
+ * `peer_receipt_unavailable` (the one still on it with `Retry-After`); a late receipt that is not the one the outer receipt names (its
  * JCS SHA-256 or id), does not verify under the stack VM's attested keyset, or whose `peer.entry` names another
  * request, 502 `peer_receipt_mismatch`. A checked late receipt is held for the rest of the outer receipt's lifetime,
  * within the store's byte bound.
@@ -55,6 +56,7 @@ export async function serveReceipt(request: Request, deps: ReceiptRouteDeps, res
   if (peer === undefined) return peerError(404, "peer_attempt_not_found", "This receipt has no peer attempt with this number.", deps.keysetDigest);
   const receipt = peer.receipt !== null ? peer.receipt : await late(entry, peer, deps);
   if (receipt === "unavailable") return peerError(502, "peer_receipt_unavailable", "The relay's VM did not answer for this attempt's receipt; ask again later.", deps.keysetDigest);
+  if (receipt === "running") return peerError(502, "peer_receipt_unavailable", "The VM that served this attempt has not finished it yet; ask again shortly.", deps.keysetDigest, { "retry-after": "1" });
   if (receipt === "mismatch") return peerError(502, "peer_receipt_mismatch", "The relay's VM answered a receipt that is not this attempt's.", deps.keysetDigest);
   return peerAnswer(peer, receipt, deps.keysetDigest);
 }
@@ -67,31 +69,19 @@ function attemptNumber(text: string): number | null {
 }
 
 /**
- * The inner receipt the entry does not hold, from the stack VM: its JCS bytes when it answered one that checks, null
- * when it holds none and the outer receipt names none.
+ * The inner receipt the entry does not hold, from the stack VM: its JCS bytes when it answered one that checks
+ * (`checkedInner`), null when it holds none and the outer receipt names none, `running` while it is still on the
+ * attempt (registered or dialed), whose receipt it signs once the attempt is done.
  */
-export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: Pick<ReceiptRouteDeps, "receipts" | "keysetDigest" | "followUpMs" | "clock">): Promise<Uint8Array | null | "unavailable" | "mismatch"> {
+export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: Pick<ReceiptRouteDeps, "receipts" | "keysetDigest" | "followUpMs" | "clock">): Promise<Uint8Array | null | "unavailable" | "running" | "mismatch"> {
   const answer = await peer.fetchLate(deps.clock() + deps.followUpMs);
   if (answer === null) return "unavailable";
+  if (answer.state === "registered" || answer.state === "dialed") return "running";
   if (answer.state !== "done" || answer.receipt === null) return peer.inner === null ? null : "unavailable";
-  const bytes = jcsBytes(answer.receipt);
-  if (peer.inner !== null && (sha256BareHex(bytes) !== peer.inner.receiptSha256 || get(answer.receipt, "receipt_id") !== peer.inner.receiptId)) return "mismatch";
-  const verified = await verifyReceipt(answer.receipt, peer.receiptKeys, { workloadKeysetDigest: peer.keysetDigest });
-  if (!verified.ok || verified.document === null || !namesThisAttempt(verified.document.event_log, entry, peer, deps.keysetDigest)) return "mismatch";
+  const bytes = await checkedInner(answer.receipt, { peer, receiptId: entry.receipt.receiptId, entryKeysetDigest: deps.keysetDigest });
+  if (bytes === null) return "mismatch";
   deps.receipts.holdPeerReceipt(entry.receipt.receiptId, peer.n, bytes);
   return bytes;
-}
-
-/** The inner receipt's `peer.entry` (the event after `request.received`) names this entry, outer receipt, request and attempt. */
-function namesThisAttempt(events: readonly Json[], entry: StoredReceipt, peer: StoredPeerAttempt, keysetDigest: string): boolean {
-  const named = events[1];
-  if (named === undefined || eventType(named) !== EVENT_PEER_ENTRY) return false;
-  return (
-    get(named, "keyset_digest") === keysetDigest &&
-    get(named, "receipt_id") === entry.receipt.receiptId &&
-    get(named, "rid") === peer.rid &&
-    get(named, "n") === BigInt(peer.n)
-  );
 }
 
 /** The 200 answer: the inner receipt as its JCS bytes, so its SHA-256 is the digest the outer receipt names. */
@@ -106,8 +96,8 @@ function peerAnswer(peer: StoredPeerAttempt, receipt: Uint8Array | null, keysetD
   return new Response(body, { status: 200, headers });
 }
 
-function peerError(status: number, code: string, message: string, keysetDigest: string): Response {
-  return aciJson(status, { error: { type: status === 404 ? "not_found" : "upstream_unavailable", code, message } }, keysetDigest);
+function peerError(status: number, code: string, message: string, keysetDigest: string, headers?: Record<string, string>): Response {
+  return aciJson(status, { error: { type: status === 404 ? "not_found" : "upstream_unavailable", code, message } }, keysetDigest, headers);
 }
 
 /** The token a client presented, in `auth.ts`'s order (`presentedKey`): Bearer, `x-api-key`, `x-goog-api-key`. */

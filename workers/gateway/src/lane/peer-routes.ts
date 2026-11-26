@@ -1,8 +1,8 @@
 import type { GatewayConfig } from "@gray/config";
 import { parseStrict, type Json } from "@gray/json";
-import { requestLimit } from "@gray/limits";
 import { encodePeerAttemptsAnswer, encodePeerDebugAnswer, encodePeerDebugRefusal, PEER_DEBUG_PREFIX, PEER_DEBUG_REFUSAL_STATUS, PEER_HEADER, peerReadsOf, peerRequestIdOf, type PeerDebugRefusalCode } from "@gray/lane-wire";
 import { readBody } from "../body.ts";
+import { laneBodyCap } from "./body-limits.ts";
 import { platformTimers, type StreamTimers } from "../client.ts";
 import { countTokensProtocol, servedProtocol } from "../paths.ts";
 import { trustGate } from "../trust.ts";
@@ -124,7 +124,7 @@ export async function peerRoute(request: Request, env: LaneEnv, cfg: GatewayConf
   if ((checked.envelope.count_tokens === true) !== isCount) return peerRefusal("peer_malformed");
   const protocol = target.protocol;
   // The lane's body cap (as `InferenceRun.receive` reads a lane body): no spool, the bytes held whole.
-  const cap = Math.min(Number(requestLimit(protocol)), state.timing.bodyMaxBytes, cfg.bodyParseMaxBytes);
+  const cap = laneBodyCap(protocol, state.timing.bodyMaxBytes, cfg.bodyParseMaxBytes);
   const read = await readBody(request, { protocol, limit: cap, parseMax: cfg.bodyParseMaxBytes, rawMax: cap, waitMs: cfg.requestBodyMs }, undefined);
   // A body that cannot be read whole is not the one the envelope names.
   if (!read.ok || read.body.tier === "C" || !peer.bodyMatches(checked.envelope, read.body.bytes)) return peerRefusal("peer_body_mismatch");

@@ -414,3 +414,23 @@ export async function settleHead<R extends PlanRoute>(
   if (head === undefined) return null;
   return head === leased || head === claimed || head === named ? head : null;
 }
+
+/**
+ * The plan's reasons for the route at `rankKey` (endpoint `id`) among the record's candidates (docs/utility-routing.md
+ * "Evidence"; inference.rs `plan_reasons`), in this order: `session` (the session's provider the plan went back to),
+ * `probe` (the head's lease), `unselected` (the formula's unselected share moved it first), `order` (the customer's order
+ * names it), `account_block_steered` (a block steered the request away from its supplier).
+ */
+export function planReasons(
+  rankKey: string,
+  id: string,
+  plan: { readonly session: string | null; readonly probe: string | null; readonly unselected: string | null; readonly named: (id: string) => boolean; readonly steered: readonly string[] },
+): string[] {
+  const reasons: string[] = [];
+  if (plan.session === id) reasons.push("session");
+  if (plan.probe === id) reasons.push("probe");
+  if (plan.unselected === rankKey) reasons.push("unselected");
+  if (plan.named(id)) reasons.push("order");
+  if (plan.steered.includes(id)) reasons.push("account_block_steered");
+  return reasons;
+}

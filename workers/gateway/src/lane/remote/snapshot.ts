@@ -34,16 +34,15 @@ import { LegacyLatch } from "./legacy.ts";
  *   gives the answer's `ranking` (the replica's `FeedAnswer`, its columns decoded back to typed arrays) and
  *   `rankingFailingSince` to the cache as they came. The cache's ranking base checks the feed answer as the main
  *   gateway's checks a replica's (`RankingBase.apply`), and the failing-since brings its D7 check after the first copy.
- *   A bridge before r16 refuses the members (400): the read goes again without them and keeps to that for the latch's
- *   window (`options.legacy`, remote/legacy.ts), and the lane ranks as it did before r16, with no samples. The boot's
- *   warm read fills the same cache and reads the same way (`entry.ts` `warmLane`); the registry's boot read and intake's
- *   sources read as before r16 whatever the cache passes.
+ *   Every bridge deployed since release Z12 takes the members. The boot's warm read fills the same cache and reads the
+ *   same way (`entry.ts` `warmLane`); the registry's boot read and intake's sources read without them whatever the
+ *   cache passes.
  * - `ranking_records` (r17, docs/utility-routing.md "The feed"): a read of the feed's changes (`all`, `since`) names it,
  *   and the bridge answers the roots' long records, the roots whose record went and each key's circuit with them; the
  *   base takes them as the main gateway's takes a replica's. A bridge of r16 refuses the parameter (400): the read goes
  *   again as r16's and keeps to that for the records latch's window (`options.records`); its feed answers carry no
  *   records, which the formula reads as no feed (fixed values, evidence `fixed`), and the samples and circuits of r16
- *   keep working. A bridge before r16 refuses that read too, and the read ends at the one of before r16.
+ *   keep working.
  * - `ranking_est` (r24, docs/utility-routing.md): a read that names `ranking_records` names it too, and the bridge writes
  *   each record's estimate (`est`). A bridge of r23 refuses the parameter (400): the read goes again as r23's and keeps
  *   to that for the estimates latch's window (`options.estimates`); the routes are ranked on start values, as before r24.
@@ -76,8 +75,6 @@ export interface RemoteSnapshotSourceOptions extends BridgeClientOptions {
    * Absent (the registry's boot read, intake's): the read of before r16, which no bridge refuses.
    */
   readonly ranking?: boolean;
-  /** The snapshot read's latch (remote/legacy.ts): a bridge that refused the ranking members lately is asked without them. */
-  readonly legacy?: LegacyLatch;
   /** The records latch (r17): a bridge that refused `ranking_records` lately is asked as r16 asks; the process's own by default. */
   readonly records?: LegacyLatch;
   /** The estimates latch (r24): a bridge that refused `ranking_est` lately is asked as r23 asks; the process's own by default. */
@@ -97,7 +94,6 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
 
   readonly #onSnapshot: ((snapshot: Snapshot) => void) | undefined;
   readonly #ranking: boolean;
-  readonly #legacy: LegacyLatch | undefined;
   readonly #records: LegacyLatch;
   readonly #estimates: LegacyLatch;
   readonly #now: () => number;
@@ -106,7 +102,6 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
     super(options);
     this.#onSnapshot = options.onSnapshot;
     this.#ranking = options.ranking === true;
-    this.#legacy = options.legacy;
     this.#records = options.records ?? RECORDS;
     this.#estimates = options.estimates ?? ESTIMATES;
     this.#now = options.now ?? (() => Date.now());
@@ -124,21 +119,21 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
       judge_now: judge === undefined ? null : BigInt(judge.now),
       judge_age_ms: judge === undefined ? null : BigInt(judge.ageMs),
     };
-    if (!this.#ranking || this.#legacy?.legacy(this.#now()) === true) return this.#answer(await run(() => this.#read(request)), false);
+    if (!this.#ranking) return this.#answer(await run(() => this.#read(request)), false);
     const asked: SnapshotCurrentRequest = { ...request, ...snapshotRankingRequestOf(ranking) };
     // The feed's changes come with the records (r17), unless a bridge of r16 refused them lately.
     const records = asked.ranking !== "word" && !this.#records.legacy(this.#now());
-    if (!records) return this.#ranked(asked, request, run, false);
+    if (!records) return this.#ranked(asked, run, false);
     // And with the estimates (r24), unless a bridge of r23 refused them lately.
-    if (this.#estimates.legacy(this.#now())) return this.#ranked(asked, request, run, true);
+    if (this.#estimates.legacy(this.#now())) return this.#ranked(asked, run, true);
     let dto: SnapshotAnswerDto;
     try {
       dto = await run(() => this.#read({ ...asked, ranking_records: "1", ranking_est: "1" }));
     } catch (error) {
-      if (!(error instanceof BridgeCallError) || error.status !== 400) return this.#before(error, request, run);
+      if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
       // A bridge of r23 knows no `ranking_est` (400, `unknown_field`): r23's read, and the latch once it was taken. Its
       // answer says its form, and the base asks for the whole feed next (ranking-base.ts `apply`).
-      const answer = await this.#ranked(asked, request, run, true);
+      const answer = await this.#ranked(asked, run, true);
       if (!this.#estimates.legacy(this.#now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "snapshot_estimates", window_ms: this.#estimates.retryMs }));
       this.#estimates.refused(this.#now());
       return answer;
@@ -150,41 +145,19 @@ export class RemoteSnapshotSource extends BridgeClient implements SnapshotSource
    * A read of the ranking members without the estimates (r23's): with the records (`records`) unless a bridge of r16
    * refused them, as r17 reads. Its answer's records are without their estimates (`rankingEstimates` false).
    */
-  async #ranked(ranked: SnapshotCurrentRequest, request: SnapshotCurrentRequest, run: Runner, records: boolean): Promise<SnapshotAnswer> {
+  async #ranked(ranked: SnapshotCurrentRequest, run: Runner, records: boolean): Promise<SnapshotAnswer> {
     let dto: SnapshotAnswerDto;
     try {
       dto = await run(() => this.#read(records ? { ...ranked, ranking_records: "1" } : ranked));
     } catch (error) {
-      if (!(error instanceof BridgeCallError) || error.status !== 400 || !records) return this.#before(error, request, run);
+      if (!(error instanceof BridgeCallError) || error.status !== 400 || !records) throw error;
       // A bridge of r16 knows no `ranking_records` (400, `unknown_field`): r16's read, and the latch once it was taken.
-      let r16: SnapshotAnswerDto;
-      try {
-        r16 = await run(() => this.#read(ranked));
-      } catch (again) {
-        return this.#before(again, request, run);
-      }
+      const r16 = await run(() => this.#read(ranked));
       if (!this.#records.legacy(this.#now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "snapshot_records", window_ms: this.#records.retryMs }));
       this.#records.refused(this.#now());
       return this.#answer(r16, true, false);
     }
     return this.#answer(dto, true, false);
-  }
-
-  /**
-   * After a read with the ranking members failed with `error`: a 400 is a bridge before r16 (or one refusing them for
-   * another reason, which the read of before r16 gets too): that read, and the latch once it was taken; any other failure
-   * throws as the read's.
-   */
-  async #before(error: unknown, request: SnapshotCurrentRequest, run: Runner): Promise<SnapshotAnswer> {
-    // A bridge before r16 refuses a query parameter it does not know (400, its `snapshotCurrentRequestOf`'s
-    // `unknown_field`), as a new bridge refuses no read this source builds: the read of before r16 once more, and
-    // that one until the latch's window passes (remote/legacy.ts). The latch is set once that read was taken, as the
-    // endpoint ops set theirs (review r16 minor 7): a 400 for another reason, which it gets too, or a failure of it,
-    // throws as before and changes nothing. Any other failure of the first read is the read's, as before.
-    if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
-    const before = await run(() => this.#read(request));
-    this.#legacy?.refused(this.#now());
-    return this.#answer(before, false);
   }
 
   /**

@@ -5,7 +5,7 @@ import { newRequestId } from "@gray/ledger-keys";
 import { workspaceHome } from "../account.ts";
 import { hasQueryCredentials, keyHash, presentedKey } from "../auth.ts";
 import { originsOf } from "../hosts.ts";
-import type { GatewayDeps } from "../inference.ts";
+import type { GatewayDeps } from "../inference/types.ts";
 import { checkStaleKey, lookUpKey, type KeyLookup } from "../key-lookup.ts";
 import { countLiveKeyRate } from "../key-rate.ts";
 import { Outbound } from "../outbound.ts";

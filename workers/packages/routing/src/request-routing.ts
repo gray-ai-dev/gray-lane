@@ -119,7 +119,17 @@ export interface OpsRequestRouting {
   readonly candidates: readonly RoutingCandidate[] | null;
   readonly omitted: number;
   readonly refusal: { readonly exclusion: RoutingExclusion } | null;
+  /**
+   * `unapplied`: the request asked for a check that reads the feed (`min_availability`, `max_ttft_ms`, `min_tps`) and
+   * routing made none, the isolate having no current ranking base; its routes stood on the fixed values. Absent when the
+   * checks were made or none was asked for, and in every record written before it. Written by both entries, a session's
+   * head included; the customer's view never names it.
+   */
+  readonly checks?: RoutingChecks;
 }
+
+/** What the record says of the checks that read the feed (`OpsRequestRouting.checks`): one closed word. */
+export type RoutingChecks = "unapplied";
 
 export interface RequestRoutingRecord extends OpsRequestRouting {
   readonly v: typeof REQUEST_ROUTING_VERSION;
@@ -228,6 +238,7 @@ const STANDINGS = wordsOf<RoutingCandidate["standing"]>({ chosen: true, draw: tr
 const METRIC_SOURCES = wordsOf<MetricSource>({ own: true, estimated: true, start: true, fixed: true });
 const RATES = wordsOf<"input" | "output">({ input: true, output: true });
 const REFERENCE_SOURCES = wordsOf<"catalog" | "override">({ catalog: true, override: true });
+const CHECKS = wordsOf<RoutingChecks>({ unapplied: true });
 
 /** A requirement's or an exclusion's `percentile`: absent, or a percentile (never null); written only when there is one. */
 const percentileOf = (o: JsonObject): { readonly percentile?: TtftPercentile } =>
@@ -362,8 +373,11 @@ const RECORD = [
   "refusal",
 ];
 
-/** The record's members a later release added, which a record written before it lacks: absent reads as null. */
-const RECORD_LATER = ["mode_source"];
+/**
+ * The record's members a later release added, which a record written before it lacks: `mode_source` absent reads as
+ * null; `checks` absent stays absent (never null: the record has it only when the checks were not made).
+ */
+const RECORD_LATER = ["mode_source", "checks"];
 
 /** The members after `v`, in the server's order (`OpsRequestRouting`). */
 function opsMembers(o: JsonObject): OpsRequestRouting {
@@ -391,6 +405,7 @@ function opsMembers(o: JsonObject): OpsRequestRouting {
     candidates: nullable(candidates)(at(o, "candidates")),
     omitted: count(at(o, "omitted")),
     refusal: nullable((r) => ({ exclusion: exclusion(at(object(r, ["exclusion"]), "exclusion")) }))(at(o, "refusal")),
+    ...(Object.hasOwn(o, "checks") ? { checks: word(CHECKS)(at(o, "checks")) } : {}),
   };
 }
 

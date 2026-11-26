@@ -1,5 +1,6 @@
 import { get, isObject, type Json } from "@gray/json";
 import { applyDeclaredChanges, isPositionForProtocol, stackStoreOff, type AppendedText, type GrayRewriteOp, type LaneProtocol } from "@gray/lane";
+import { overStackBody } from "./body-limits.ts";
 import type { StackRelayConfig, StackRelayRoute, StackVendor } from "./stack-config.ts";
 
 /**
@@ -26,14 +27,6 @@ export const STACK_ROUTE_MODEL_HEADER = "x-gray-route-model";
 
 /** The header that names the request's conversation to the container (`affinity.ts` CONVERSATION_DOMAIN). */
 export const STACK_CONVERSATION_HEADER = "x-gray-conversation";
-
-/**
- * The most bytes of a body a stack route is sent: the lane's body cap (`@gray/relay-policy` LANE_BODY_MAX_BYTES,
- * 4 MiB), which egress's stack budget and the policy fuel are sized from (docs/relay-standard-v1.7.md section 4).
- * Written out rather than imported: the request path loads this module, and `@gray/relay-policy` computes its limits
- * when it is loaded; `test/lane-hooks/stack-rewrite.test.ts` pins the two equal.
- */
-export const STACK_BODY_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
  * A Chat stream whose `stream_options` is present, non-null, and not an object: no container may be sent it,
@@ -139,7 +132,7 @@ export function stackRequestBody(input: {
   readonly stripProvider?: boolean;
 }): StackRequestBody {
   const { config, route, protocol, received } = input;
-  if (received.length > STACK_BODY_MAX_BYTES) return { ok: false, code: "body_over_stack_limit" };
+  if (overStackBody(received.length)) return { ok: false, code: "body_over_stack_limit" };
   if (stackStreamOptionsUnusable(protocol, input.stream, input.value)) return { ok: false, code: "stream_options_unusable" };
   const changed = applyDeclaredChanges(received, protocol, {
     grayOps: stackRequiredOps({

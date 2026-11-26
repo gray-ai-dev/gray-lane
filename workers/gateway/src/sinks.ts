@@ -649,6 +649,12 @@ export interface RequestRecord {
    */
   readonly isolateGapMs?: number | null;
   /**
+   * Its ranking made none of the checks that read the feed it asked for (inference/ranking.ts): why (no ranking base, a
+   * stale one, one without the roots' records), and how long it waited for a base first (null: none). Absent when they
+   * were made or none was asked for. Its `routing_checks_unapplied` point counts it (`rankingPoints`).
+   */
+  readonly checksUnapplied?: { readonly reason: "base_missing" | "base_stale" | "records_unsupported"; readonly waitedMs: number | null };
+  /**
    * The refusals of its routes' endpoint shards at acquisition, by their own reason: the route, its rank key in the
    * request's mode, the ranking group of the ranking that asked, when, and whether its permit was still being borrowed
    * (endpoints.ts `borrowing`: a `busy` while the shard's borrow may still come, or a shard that did not answer, is not a
@@ -1526,11 +1532,14 @@ export function unbudgeted(group: string): { readonly group: string; readonly ex
  * (endpoint id), blob 5 its rank key in the request's mode (the `circuit_trip` point's key), blob 6 the ranking group of
  * the ranking that asked; doubles 1 the count, 2 the route was that ranking's exploration (0 since r17), 3 when (ms), 4 its permit
  * was still being borrowed (0/1: endpoints.ts `borrowing`, the shard answered `busy` while a borrow may still come, its
- * `leasePending`, or did not answer; criterion (b2) counts the `busy` of a full route, 0). A request
+ * `leasePending`, or did not answer; criterion (b2) counts the `busy` of a full route, 0). One per request whose ranking
+ * made none of the checks that read the feed it asked for (`checksUnapplied`), `routing_checks_unapplied`: blob 2 why
+ * (`base_missing`, `base_stale`, `records_unsupported`), blob 3 the isolate, blob 4 the ranking group; doubles 1 the
+ * count, 2 how long the request waited for a base first (ms; -1 none). A request
  * makes a handful of attempts and refusals at most (RETRY_MAX_ATTEMPTS), well within the 250 points one invocation may
  * write.
  */
-export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals" | "isolateGapMs">, service: { readonly instance: string }): AnalyticsEngineDataPoint[] {
+export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals" | "isolateGapMs" | "checksUnapplied" | "routingGroup">, service: { readonly instance: string }): AnalyticsEngineDataPoint[] {
   const out: AnalyticsEngineDataPoint[] = [];
   const gap = r.isolateGapMs ?? -1;
   for (const a of r.attempts) {
@@ -1541,6 +1550,8 @@ export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals
   for (const refusal of r.routeRefusals ?? []) {
     out.push({ indexes: ["route_refusal"], blobs: ["route_refusal", refusal.reason, service.instance, refusal.endpointId, refusal.rankKey, refusal.group], doubles: [1, refusal.exploration === true ? 1 : 0, refusal.atMs, refusal.borrowing ? 1 : 0] });
   }
+  const unapplied = r.checksUnapplied;
+  if (unapplied !== undefined) out.push({ indexes: ["routing_checks_unapplied"], blobs: ["routing_checks_unapplied", unapplied.reason, service.instance, r.routingGroup ?? ""], doubles: [1, unapplied.waitedMs ?? -1] });
   return out;
 }
 

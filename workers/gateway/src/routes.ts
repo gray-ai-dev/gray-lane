@@ -512,6 +512,13 @@ export function feedAvailable(snapshot: GatewaySnapshot, nowMs: number): boolean
   return r !== null;
 }
 
+/** Why ranking of `snapshot` at `nowMs` reads no feed (`feedAvailable` false): the base's reason, `base_missing` without one. */
+export function feedUnavailableReason(snapshot: GatewaySnapshot, nowMs: number): "base_missing" | "base_stale" | "records_unsupported" | null {
+  const r = snapshot.ranking;
+  if (r instanceof RankingBase) return r.unfedReason(nowMs);
+  return r === null ? "base_missing" : null;
+}
+
 /** A route's customer price as the formula reads it (docs/utility-routing.md "Score"): per token, or its unit price. */
 export function routePrice(rate: CustomerRate): RoutePrice {
   if (billsUnits(rate)) return { meter: "units", unit: rate.media.unit ?? 0n };

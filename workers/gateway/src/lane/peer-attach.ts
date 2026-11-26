@@ -616,11 +616,6 @@ export function newSessionId(): string {
   return bytesToLowerHex(crypto.getRandomValues(new Uint8Array(16)));
 }
 
-/** Whether `value` is a session id. */
-export function isSessionId(value: string): boolean {
-  return SESSION.test(value);
-}
-
 /** Whether `value` is 64 lowercase hex (an SPKI SHA-256). */
 export function isSpkiHex(value: string): boolean {
   return HEX64.test(value);

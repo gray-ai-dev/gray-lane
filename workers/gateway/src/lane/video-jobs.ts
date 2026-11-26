@@ -5,7 +5,7 @@ import { passedClientHeaders, videoJobClosed, type LaneVideoJob, type LaneVideoJ
 import { accrualId, checkEvidence, customerRates, evidenceHash, parseEvidence, storedEvidence, usageCost } from "@gray/ledger-keys";
 import { VIDEO_POLL_RESPONSE_BYTES, VIDEO_POLL_TIMEOUT_MS, jobUrl, type MediaRoute } from "@gray/media";
 import { withDefaultAccept } from "@gray/protocol";
-import type { GatewayDeps } from "../inference.ts";
+import type { GatewayDeps } from "../inference/types.ts";
 import type { GatewaySnapshot, KeyRecord, RouteRecord } from "../snapshot.ts";
 import { EGRESS_HEADER, egressOwnAnswer } from "./hooks.ts";
 import type { LaneVideoStore } from "./remote/video.ts";
@@ -250,11 +250,6 @@ const FAILURE_REASON: Readonly<Record<VideoJobFailure, "video_failed" | "video_e
 
 function failedVerdict(failure: VideoJobFailure): VideoVerdict {
   return { kind: "release", reason: FAILURE_REASON[failure], state: "failed", failure };
-}
-
-/** What a poll's observation does to an open job's record, short of ending it; null when nothing of the record changes. */
-export interface VideoProgress {
-  readonly change: LaneVideoJobChange;
 }
 
 /**

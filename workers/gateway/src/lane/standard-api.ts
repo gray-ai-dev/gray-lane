@@ -9,6 +9,7 @@ import { type FormPart, formBoundary, partText } from "@gray/media";
 import { OPENAI_LINKING_FIELDS, withDefaultAccept, type Protocol } from "@gray/protocol";
 import { ENTRY_MEDIA_PROTOCOLS } from "@gray/snapshot";
 import { parseInboundCodings, readBody } from "../body.ts";
+import { VM_BODY_LIMIT_SOURCE } from "./body-limits.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
 import { EGRESS_HEADER, addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
@@ -108,7 +109,7 @@ export async function readEntryBody(request: Request, protocol: Protocol, form: 
     // The cap is the lane's (`jsonBytes`), so a 413 names it as the text APIs' lane does (inference.ts `receive`).
     const read = await readBody(
       request,
-      { protocol, limit: limits.jsonBytes, parseMax: limits.jsonBytes, rawMax: limits.jsonBytes, waitMs: limits.waitMs, limitSource: "the most Gray's confidential VM holds of one request" },
+      { protocol, limit: limits.jsonBytes, parseMax: limits.jsonBytes, rawMax: limits.jsonBytes, waitMs: limits.waitMs, limitSource: VM_BODY_LIMIT_SOURCE },
       undefined,
       held,
     );

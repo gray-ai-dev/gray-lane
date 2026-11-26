@@ -31,6 +31,7 @@ import {
 import { answeredFailure, type BlockLease, type BlockPass, type Outcome as EndpointOutcome, type PermitToken, type RefusalClass, type RefusalReason, type RetryRefusal } from "@gray/endpoint";
 import { requestLimit, requestLimitSource } from "@gray/limits";
 import type { Protocol } from "@gray/protocol";
+import { bodyTooLarge } from "./body.ts";
 import type { ShardChoice } from "./endpoints.ts";
 import type { Route } from "./routes.ts";
 import type { Selection } from "./sinks.ts";
@@ -325,9 +326,9 @@ export function noRouteRetryAfter(error: ApiError, d: Dispatcher, cfg: { readonl
  */
 export function restoredBodyRefusal(protocol: Protocol): ApiError {
   const limit = requestLimit(protocol);
-  return new ApiError(413, "request_body_limit")
-    .withMessage(`With the tool-call ids its provider issued in place of their handles, the request body is larger than ${limit} bytes, ${requestLimitSource(protocol)}. Send a smaller request (an agent can compact its conversation).`)
-    .withMeta("limit_bytes", limit);
+  return bodyTooLarge(protocol, Number(limit)).withMessage(
+    `With the tool-call ids its provider issued in place of their handles, the request body is larger than ${limit} bytes, ${requestLimitSource(protocol)}. Send a smaller request (an agent can compact its conversation).`,
+  );
 }
 
 /**

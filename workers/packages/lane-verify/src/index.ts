@@ -24,7 +24,9 @@
  * 4. `verifyPeerReceipts({outer, receivedBody, responseBytes, templates, releaseList, quoteVerifier, nowSecs, answers})` is the
  *    second question for a request the entry forwarded to relay stack VMs (§4.8): per peer attempt, the stack VM's
  *    attestation the entry served, the outer receipt's commitment to it, and the stack VM's inner receipt (what the
- *    relay changed included), tied to the outer receipt by its `peer.entry`.
+ *    relay changed included), tied to the outer receipt by its `peer.entry`. `withPeerTie(outerChecks, peers)` joins
+ *    the two: the outer `served_attempt`, skipped for an attempt a provider's VM answered, passes when that attempt's
+ *    peer checks tie the answer (`tied`).
  *
  * The Intel DCAP adapter is a subpath, so this entry point does not carry dcap-qvl: `@gray/lane-verify/dcap-offline`
  * verifies a quote with the collateral the caller supplies and runs in workerd; `@gray/lane-verify/dcap` is
@@ -124,6 +126,7 @@ export {
   verifyResponseReceipt,
   verifyResponseReceiptText,
   type AppendedTextRecord,
+  type PartialResponse,
   type ReceiptCheck,
   type ReceiptCheckStatus,
   type ReceiptTranslation,
@@ -133,15 +136,21 @@ export {
   type TemplateText,
   type VerifyResponseReceiptOptions,
 } from "./receipt.ts";
+export { isWholeJsonBody, readStreamEnd, type StreamEnd } from "./response-end.ts";
 export { LANE_ORIGIN_HEADER, readLaneOrigin, type LaneOriginRead } from "./lane-origin.ts";
 export {
+  ENTRY_RECEIPT_RETENTION_SECONDS,
+  LONGEST_REQUEST_SECONDS,
+  PEER_RECORD_RETENTION_BOUND_SECONDS,
   PEER_REFUSED_BEFORE_FRAMES,
+  RECEIPT_CLOCK_MARGIN_SECONDS,
   outerPeerAttempts,
   peerNumbersToFetch,
   peerRelayChanges,
   readPeerAnswer,
   readPeerAnswerText,
   verifyPeerReceipts,
+  withPeerTie,
   type OuterPeerAttempt,
   type PeerAnswer,
   type PeerAnswerError,

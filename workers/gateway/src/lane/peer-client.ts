@@ -1164,6 +1164,42 @@ export class PeerCall implements LanePeerCall {
     }
   }
 
+  /** The receipt a follow-up answered once the attempt was done (`followUp`), unchecked; null before. */
+  #lateReceipt: Json | null = null;
+
+  /** A checked late inner receipt (`bindInner`), named as the one `end` would have carried. */
+  #boundReceipt: Json | null = null;
+
+  /**
+   * The stack VM's inner receipt for an answered attempt whose hop ended without `end` (`LanePeerCall.receiptLate`):
+   * asked again every LATE_TRACE_POLL_MS while the stack VM reports the attempt registered or dialed, until `untilMs`.
+   * The follow-up of `traceLate` shares what it learns (`followUp`), so the two waits ask the stack VM nothing twice once
+   * it is done. Null when the stack VM is not reached, does not know the attempt, made no receipt, or is still on it.
+   */
+  async receiptLate(untilMs: number): Promise<Json | null> {
+    const input = this.#input;
+    if (this.end !== null || this.head === null || this.pin === null || this.envelopeSha256 === null) return null;
+    while (this.#lateReceipt === null && this.followed !== "done" && this.followed !== "unknown" && input.clock() < untilMs) {
+      const answer = await this.followUp(untilMs);
+      if (answer === null || answer.state === "unknown" || answer.state === "done") break;
+      const left = untilMs - input.clock();
+      if (left <= 0) break;
+      await new Promise<void>((resolve) => input.timers.setTimeout(resolve, Math.min(LATE_TRACE_POLL_MS, left)));
+    }
+    return this.#lateReceipt;
+  }
+
+  /** Binds a checked late inner receipt (`peer-inner.ts` `bindLateInners`); `end`'s own receipt, when it came, stays. */
+  bindInner(receipt: Json): void {
+    if (this.end === null) this.#boundReceipt = receipt;
+  }
+
+  /** The inner receipt document: `end`'s, else a checked late one (`bindInner`). */
+  #innerReceipt(): Json | null {
+    const receipt = this.end === null ? this.#boundReceipt : this.end.receipt;
+    return receipt === null || receipt === undefined ? null : (receipt as unknown as Json);
+  }
+
   /** Whether a vendor was dialed, as `end` or the follow-up said; null when neither did. */
   get dialed(): boolean | null {
     if (this.end !== null) return this.end.dialed;
@@ -1185,19 +1221,20 @@ export class PeerCall implements LanePeerCall {
     });
   }
 
-  /** The inner receipt's id and digest, when `end` carried one. */
+  /** The inner receipt's id and digest, when `end` carried one or a checked late one was bound (`bindInner`). */
   inner(): { readonly receiptId: string; readonly receiptSha256: string } | null {
-    const receipt = this.end?.receipt;
-    if (receipt === null || receipt === undefined) return null;
+    const receipt = this.#innerReceipt();
+    if (receipt === null) return null;
     const id = (receipt as { readonly receipt_id?: unknown }).receipt_id;
     if (typeof id !== "string" || !/^rcpt_[0-9a-f]{32}$/.test(id)) return null;
-    return { receiptId: id, receiptSha256: sha256BareHex(jcsBytes(receipt as unknown as Json)) };
+    return { receiptId: id, receiptSha256: sha256BareHex(jcsBytes(receipt)) };
   }
 
   /**
    * What the outer receipt keeps of this attempt (section 4.8): the pinned peer's report and boot facts, the inner
-   * receipt `end` carried (its JCS bytes, the ones `inner()` digests), and the late fetch, a closure over the envelope's
-   * facts, the signer and egress alone (never the request's bytes or headers). Null when no envelope went to a pinned peer.
+   * receipt `end` carried or a checked late one (`bindInner`; its JCS bytes, the ones `inner()` digests), and the late
+   * fetch, a closure over the envelope's facts, the signer and egress alone (never the request's bytes or headers). Null
+   * when no envelope went to a pinned peer.
    */
   stored(): StoredPeerAttempt | null {
     const pin = this.pin;
@@ -1213,7 +1250,7 @@ export class PeerCall implements LanePeerCall {
       keysetDigest: pin.keysetDigest,
       receiptKeys: pin.receiptKeys,
       inner,
-      receipt: inner === null ? null : jcsBytes(this.end!.receipt as unknown as Json),
+      receipt: inner === null ? null : jcsBytes(this.#innerReceipt()!),
       fetchLate: (untilMs) => peerFollowUp(target, deps, untilMs, Math.max(1, untilMs - deps.clock())),
       shareDebug: (debug) => peerDebug(target, deps, debug),
     };
@@ -1466,8 +1503,10 @@ export class PeerCall implements LanePeerCall {
       input.budgetMs,
     );
     if (answer !== null) this.followed = answer.state;
-    // A done attempt's trace, whichever follow-up asked (`trace` reads it when no `end` came).
+    // A done attempt's trace and receipt, whichever follow-up asked (`trace` reads the trace when no `end` came,
+    // `receiptLate` the receipt).
     if (answer?.trace !== undefined) this.#lateTrace = answer.trace;
+    if (answer?.state === "done" && answer.receipt !== null) this.#lateReceipt = answer.receipt;
     return answer;
   }
 }

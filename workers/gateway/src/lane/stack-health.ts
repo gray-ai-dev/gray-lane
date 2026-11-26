@@ -315,7 +315,7 @@ const egressCoolingViewSchema = z
  * The credential form's auth headers egress takes for a test (`stackTestCredentialForms`, relay-connector `authHeaders`):
  * an OpenAI-compatible vendor's API key is `authorization`, as OpenAI's.
  */
-const STACK_TEST_CREDENTIAL_FORMS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+export const STACK_TEST_CREDENTIAL_FORMS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "anthropic/api_key": ["x-api-key"],
   "anthropic/oauth_access_token": ["authorization"],
   "openai/api_key": ["authorization"],

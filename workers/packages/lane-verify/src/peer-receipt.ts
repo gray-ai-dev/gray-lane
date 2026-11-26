@@ -229,6 +229,39 @@ export function peerNumbersToFetch(outer: Json): bigint[] {
 /** Why an answer could not be had (the fetch's error, or the entry's error code). */
 export interface PeerAnswerError {
   readonly error: string;
+  /** The HTTP status the entry answered with; absent when nothing was answered (a network error) or it was a 200. */
+  readonly status?: number;
+  /** The `error.code` string of the entry's JSON error body, exactly as sent; null or absent when there is none. */
+  readonly code?: string | null;
+}
+
+/**
+ * How long the entry may still hold an outer receipt and its peer records, counted from the receipt's signed
+ * `served_at` (1.7.1). The entry keeps both in memory (`createReceiptStore` in the gateway's lane/state.ts) for
+ * ENTRY_RECEIPT_RETENTION_SECONDS after it stores them, when the answer ends. The bound adds the longest a request may
+ * run (STREAM_TOTAL_SECONDS at its maximum) so that it holds wherever in the request the entry dates `served_at`, and
+ * RECEIPT_CLOCK_MARGIN_SECONDS for the difference between the customer's clock and the entry's (the same 300 s as
+ * RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS). The gateway's receipt-retention test holds the first two to the entry's.
+ */
+export const LONGEST_REQUEST_SECONDS = 3_600n;
+export const ENTRY_RECEIPT_RETENTION_SECONDS = 3_600n;
+export const RECEIPT_CLOCK_MARGIN_SECONDS = 300n;
+export const PEER_RECORD_RETENTION_BOUND_SECONDS = LONGEST_REQUEST_SECONDS + ENTRY_RECEIPT_RETENTION_SECONDS + RECEIPT_CLOCK_MARGIN_SECONDS;
+
+/**
+ * The last second the entry may hold the records of `outer`, when the entry answered `404 receipt_not_found` for one of
+ * them and `nowSecs` is past it; else null, and the missing record stays a failed check. Only that exact answer counts:
+ * the entry gives it for an id it does not hold (expired, unknown or another key's), while every other answer
+ * (`peer_attempt_not_found`, 502 `peer_receipt_unavailable` or `peer_receipt_mismatch`, a network error) says
+ * something else about a receipt the entry still holds. The time is the outer receipt's own signed `served_at`, which
+ * the caller verified, never a time the entry or the network gave.
+ */
+function retainedUntilPast(answer: PeerAnswerError, outer: Json, nowSecs: bigint): bigint | null {
+  if (answer.status !== 404 || answer.code !== "receipt_not_found") return null;
+  const servedAt = get(outer, "served_at");
+  if (typeof servedAt !== "bigint" || servedAt < 0n) return null;
+  const lastKept = servedAt + PEER_RECORD_RETENTION_BOUND_SECONDS;
+  return nowSecs > lastKept ? lastKept : null;
 }
 
 export interface VerifyPeerReceiptsOptions {
@@ -265,9 +298,17 @@ export interface PeerReceiptSummary {
 }
 
 export interface PeerReceiptsVerification {
+  /** Every check passed or was skipped: false when one failed, and when a record had expired. */
   readonly ok: boolean;
   readonly checks: readonly ReceiptCheck[];
   readonly peers: readonly PeerReceiptSummary[];
+  /** The attempt numbers (decimal text) whose records the entry no longer holds past its retention (`expired`). */
+  readonly expired: readonly string[];
+  /**
+   * The attempt (decimal text) that served the answer, when its peer checks tie it (`tiesServedAttempt`); else null.
+   * `withPeerTie` passes the outer receipt's `served_attempt` on it.
+   */
+  readonly tied: string | null;
 }
 
 /** Check every peer attempt of a verified outer receipt against the entry's answers (the module's comment). */
@@ -277,7 +318,7 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
   const attempts = outerPeerAttempts(options.outer);
   if (attempts.length === 0) {
     checks.push(skip("peers", "the receipt names no peer attempt: no stack VM served any part of the request"));
-    return { ok: true, checks, peers };
+    return { ok: true, checks, peers, expired: [], tied: null };
   }
   const outerEvents = get(options.outer, "event_log");
   const outerExpandedEvents = Array.isArray(outerEvents) ? findEvents(outerEvents as readonly Json[], EVENT_REQUEST_CONTINUATION_EXPANDED) : [];
@@ -292,6 +333,7 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
   }
   const lastOf = new Map<bigint, OuterPeerAttempt>();
   for (const attempt of attempts) lastOf.set(attempt.n, attempt);
+  const expiredNumbers: string[] = [];
   for (const [index, attempt] of attempts.entries()) {
     const id = `peer:${attempt.n}`;
     if (lastOf.get(attempt.n) !== attempt) {
@@ -309,13 +351,54 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
     }
     const answer = options.answers.get(attempt.n.toString());
     if (answer === undefined || "error" in answer) {
-      checks.push(fail(`${id}:fetch`, `the entry served no record of this attempt${answer === undefined ? "" : `: ${answer.error}`}`));
+      const lastKept = answer === undefined ? null : retainedUntilPast(answer, options.outer, options.nowSecs);
+      if (answer !== undefined && lastKept !== null) {
+        expiredNumbers.push(attempt.n.toString());
+        checks.push(expired(`${id}:fetch`, `${answer.error} at ${options.nowSecs}, after ${lastKept}, the last second the entry may hold this receipt's records `
+          + `(served_at + ${LONGEST_REQUEST_SECONDS} s for the longest request + ${ENTRY_RECEIPT_RETENTION_SECONDS} s the entry keeps a receipt + ${RECEIPT_CLOCK_MARGIN_SECONDS} s for clock difference): not checked`));
+      } else {
+        checks.push(fail(`${id}:fetch`, `the entry served no record of this attempt${answer === undefined ? "" : `: ${answer.error}`}`));
+      }
       peers.push(emptySummary(attempt.n));
       continue;
     }
     peers.push(await checkPeer(attempt, answer, options, checks, outerExpanded));
   }
-  return { ok: checks.every((check) => check.status !== "fail"), checks, peers };
+  return { ok: checks.every((check) => check.status === "pass" || check.status === "skip"), checks, peers, expired: expiredNumbers, tied: tiesServedAttempt(options.outer, checks) };
+}
+
+/**
+ * The attempt that served the answer, when a provider's VM answered it and its peer checks tie the answer: no
+ * `peer:<n>` check failed or expired, the inner receipt's signature, `peer_entry` and `served_attempt` passed, and
+ * `response_returned` passed, or was skipped for an answer the client got only part of (`client_left`,
+ * `replaced_error`). Else null.
+ */
+function tiesServedAttempt(outer: Json, checks: readonly ReceiptCheck[]): string | null {
+  const outerEvents = get(outer, "event_log");
+  const returned = Array.isArray(outerEvents) ? findEvent(outerEvents as readonly Json[], EVENT_RESPONSE_RETURNED) : undefined;
+  const served = get(returned, "served_attempt");
+  if (typeof served !== "bigint") return null;
+  const id = `peer:${served}`;
+  const own = checks.filter((check) => check.id === id || check.id.startsWith(`${id}:`));
+  if (own.some((check) => check.status === "fail" || check.status === "expired")) return null;
+  const statusOf = (name: string): string | undefined => own.find((check) => check.id === `${id}:${name}`)?.status;
+  if (statusOf("receipt_signature") !== "pass" || statusOf("peer_entry") !== "pass" || statusOf("served_attempt") !== "pass") return null;
+  const partial = get(returned, "replaced_error") === true || get(returned, "served_as") === "client_left";
+  const response = statusOf("response_returned");
+  return response === "pass" || (response === "skip" && partial) ? served.toString() : null;
+}
+
+/**
+ * The outer receipt's checks with the peer checks joined: an entry's outer receipt holds no upstream.response for an
+ * attempt a provider's VM answered, so `verifyResponseReceipt` skips its `served_attempt`; when `peer:<n>` ties the
+ * answer (`PeerReceiptsVerification.tied`), that check passes and names it. Every other check is as it was.
+ */
+export function withPeerTie(outerChecks: readonly ReceiptCheck[], peers: PeerReceiptsVerification): ReceiptCheck[] {
+  const n = peers.tied;
+  if (n === null) return [...outerChecks];
+  return outerChecks.map((check) => (check.id === "served_attempt" && check.status === "skip"
+    ? pass("served_attempt", `attempt ${n}: a provider's VM answered it over the peer hop, and peer:${n} ties the answer (its inner receipt's signature, peer_entry, served_attempt and response_returned)`)
+    : check));
 }
 
 async function checkPeer(
@@ -611,4 +694,8 @@ function fail(id: string, detail: string): ReceiptCheck {
 
 function skip(id: string, detail: string): ReceiptCheck {
   return { id, status: "skip", detail };
+}
+
+function expired(id: string, detail: string): ReceiptCheck {
+  return { id, status: "expired", detail };
 }

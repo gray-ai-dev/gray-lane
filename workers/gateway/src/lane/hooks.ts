@@ -745,6 +745,7 @@ export const LANE_RECORD_POLICY = Object.freeze({
   routingGroup: "keep",
   rankingBaseAgeMs: "keep",
   isolateGapMs: "keep",
+  checksUnapplied: "keep",
   routeRefusals: "keep",
   freeReason: "keep",
   routingCandidates: "keep",

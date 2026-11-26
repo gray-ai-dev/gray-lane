@@ -453,8 +453,8 @@ class BackendRun {
 
   /**
    * The call's S43 trace for `end`, its offsets from the call's start (the entry moves them to its request's), within
-   * S43's bounds. Null without a call; a trace that cannot be built (a defect of the lane's own) is left out and logged,
-   * as `InferenceRun.withStackTrace` leaves it out of a direct client's row: the trace is diagnostics, `end` is the answer.
+   * S43's bounds. Null without a call; a trace that cannot be built (a defect of the lane's own) is left out and logged:
+   * the trace is diagnostics, `end` is the answer.
    */
   #trace(call: StackCall | null): StackTraceDto | null {
     const relayId = this.#input.config?.relayId ?? null;
@@ -655,9 +655,9 @@ class BackendRun {
    * An answer that failed before it committed (S25): the feed settles first, then decides; nothing of it was written.
    *
    * `gateRefused`: the lane's trust gate refused the vendor's answer. A vendor was dialed, so the request ends here, and
-   * its error is the request's own, `upstream_trust_policy_rejected`, as `InferenceRun.stackFailed` ends a local stack
-   * attempt's: `end.code` says so (`PEER_GATE_REFUSED`) in place of `relay_transport`, which the entry reads as the
-   * relay's failure. A fault of the relay's container or egress's cut at its budget keeps its own code, as it does there.
+   * its error is the request's own, `upstream_trust_policy_rejected`, as the entry's `peerFailed` answers it:
+   * `end.code` says so (`PEER_GATE_REFUSED`) in place of `relay_transport`, which the entry reads as the relay's failure.
+   * A fault of the relay's container or egress's cut at its budget keeps its own code.
    * Only to an entry that reads it (`gate_refused`): an older entry's strict `end` refuses a code it does not know.
    */
   async #uncommitted(call: StackCall, gateRefused = false): Promise<Ended> {
@@ -1010,7 +1010,7 @@ class BackendRun {
     }
   }
 
-  /** What `response.returned` says the client got (S26, S32), as `InferenceRun.stackReturned` says it. */
+  /** What `response.returned` says the client got (S26, S32), as inference/lane-receipt.ts `stackReturned` says it. */
   #returned(call: StackCall, ended: Ended): StackReturned {
     const bodyHash = this.#hash.bodyHash();
     const status = this.#status;

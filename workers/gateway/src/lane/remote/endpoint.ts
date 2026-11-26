@@ -45,15 +45,13 @@ import { LegacyLatch } from "./legacy.ts";
  * Since r16 (workers/lane-bridge IMPLEMENTATION_NOTES.md "Routing like the main gateway") the documents carry what the
  * main gateway's DO calls carry for its routing: the attempt's rank key (acquire, reserve_retry, the permit's key), its
  * measures (release, note), the rests its isolate ended and its snapshot's version (acquire); the answer the rests the
- * shard holds. A bridge of an earlier release refuses a document with any of them (400, its strict schemas): the call
- * goes again as that release's document, and the endpoint ops' latch (`LaneIsolate.legacy.endpoint`, remote/legacy.ts)
- * keeps every endpoint op to those documents for LANE_BRIDGE_LEGACY_RETRY_MS: the lane routes as before r16 meanwhile.
+ * shard holds. Every bridge deployed since release Z12 takes them, so they are always sent.
  *
  * Since r17 a measure has a fifth member, whether the attempt was in its session (docs/utility-routing.md "The long
  * record"). A bridge of r16 refuses it (400): the release or note goes again with the four members of r16, its rank key
  * and measure kept, and the measures' latch (`RemoteEndpointOptions.measures`) keeps the measures to four for
  * LANE_BRIDGE_LEGACY_RETRY_MS. The shard then counts a 429 of the lane's as outside a session: its availability loses
- * nothing else. A bridge before r16 refuses the four members too, and the call ends at the document of before.
+ * nothing else.
  *
  * Since r24 a buffered success's release carries its estimation point (`est`, two integers: docs/utility-routing.md). A
  * bridge before r24 refuses the member (400): the release goes again without it, as `#sendMeasured` sends it, and the
@@ -62,11 +60,9 @@ import { LegacyLatch } from "./legacy.ts";
  * attempt ended (inference.ts `endAttempt`), so the extra call is never on a request's path.
  */
 
-/** What the remote endpoint clients share: the endpoint ops' latch and its clock. */
+/** What the remote endpoint clients share: the latches of the members a bridge may not know yet, and their clock. */
 export interface RemoteEndpointOptions {
-  /** Whether the bridge refused the r16 members lately (`LaneIsolate.legacy.endpoint`); one of the locator's own by default. */
-  readonly legacy?: LegacyLatch;
-  /** The latch's clock; the bridge client's (`BridgeClientOptions.now`, `Date.now`) by default. */
+  /** The latches' clock; the bridge client's (`BridgeClientOptions.now`, `Date.now`) by default. */
   readonly now?: () => number;
   /** Whether the bridge refused a measure of five members lately (r17); the process's own (`MEASURES`) by default. */
   readonly measures?: LegacyLatch;
@@ -84,14 +80,13 @@ const MEASURES = new LegacyLatch();
 const POINTS = new LegacyLatch();
 
 interface Legacy {
-  readonly latch: LegacyLatch;
   readonly measures: LegacyLatch;
   readonly points: LegacyLatch;
   readonly now: () => number;
 }
 
 function legacyOf(options: BridgeClientOptions, endpoint: RemoteEndpointOptions): Legacy {
-  return { latch: endpoint.legacy ?? new LegacyLatch("endpoint"), measures: endpoint.measures ?? MEASURES, points: endpoint.points ?? POINTS, now: endpoint.now ?? options.now ?? Date.now };
+  return { measures: endpoint.measures ?? MEASURES, points: endpoint.points ?? POINTS, now: endpoint.now ?? options.now ?? Date.now };
 }
 
 /** A release as a bridge before r24 takes it: without its estimation point (`est`); null when it carries none. */
@@ -106,36 +101,6 @@ function fourMembers<I extends { readonly measure?: OutcomeMeasure }>(input: I):
   const m = input.measure;
   if (m === undefined || m.length === 4) return null;
   return { ...input, measure: [m[0], m[1], m[2], m[3]] } as I;
-}
-
-/** The input as a lane before r16 sent it: without the rank key, the rests it ended and the snapshot's version. */
-function acquireBefore(input: AcquireInput): AcquireInput | null {
-  if (input.restKey === undefined && input.ended === undefined && input.snapshotVersion === undefined) return null;
-  const { restKey: _key, ended: _ended, snapshotVersion: _version, ...before } = input;
-  return before;
-}
-
-function permitBefore(permit: PermitToken): PermitToken {
-  const { key: _key, ...before } = permit;
-  return before;
-}
-
-function releaseBefore(input: ReleaseInput): ReleaseInput | null {
-  if (input.permit.key === undefined && input.measure === undefined) return null;
-  const { measure: _measure, est: _est, ...before } = input;
-  return { ...before, permit: permitBefore(input.permit) };
-}
-
-function noteBefore(input: NoteInput): NoteInput | null {
-  if (input.permit.key === undefined && input.measure === undefined) return null;
-  const { measure: _measure, ...before } = input;
-  return { ...before, permit: permitBefore(input.permit) };
-}
-
-function reserveBefore(input: RetryReserveInput): RetryReserveInput | null {
-  if (input.restKey === undefined) return null;
-  const { restKey: _key, ...before } = input;
-  return before;
 }
 
 export class RemoteEndpointShard extends BridgeClient implements EndpointShardRpc {
@@ -153,38 +118,19 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   }
 
   /**
-   * `input`'s call, or that of `before`, the document of a lane before r16, when the latch holds or the bridge refuses
-   * the new form (400). The latch is set once the earlier document was taken, so a 400 for another reason, which that
-   * document gets too, throws as before and changes nothing. No `before` (nothing of r16 in it): the one call.
-   */
-  async #send<I, O extends BridgeOp>(op: O, call: BridgeCall, input: I, before: I | null, dto: (input: I) => BridgeRequestOf<O>): Promise<BridgeResponseOf<O>> {
-    if (before === null) return this.call(op, call, dto(input));
-    const { latch, now } = this.#legacy;
-    if (latch.legacy(now())) return this.call(op, call, dto(before));
-    try {
-      return await this.call(op, call, dto(input));
-    } catch (error) {
-      if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
-      const answer = await this.call(op, call, dto(before));
-      latch.refused(now());
-      return answer;
-    }
-  }
-
-  /**
    * A release's or a note's call with its measure of five members (r17), or with the four of r16 (`four`) when the
-   * measures' latch holds or the bridge refuses five (400): then as `#send` sends a document of r16. No `four` (a measure
-   * of four, or none): `#send` as it is.
+   * measures' latch holds or the bridge refuses five (400). The latch is set once that call was taken, so a 400 for
+   * another reason, which it gets too, throws and changes nothing. No `four` (a measure of four, or none): the one call.
    */
-  async #sendMeasured<I, O extends BridgeOp>(op: O, call: BridgeCall, input: I, four: I | null, before: I | null, dto: (input: I) => BridgeRequestOf<O>): Promise<BridgeResponseOf<O>> {
-    if (four === null) return this.#send(op, call, input, before, dto);
-    const { latch, measures, now } = this.#legacy;
-    if (latch.legacy(now()) || measures.legacy(now())) return this.#send(op, call, four, before, dto);
+  async #sendMeasured<I, O extends BridgeOp>(op: O, call: BridgeCall, input: I, four: I | null, dto: (input: I) => BridgeRequestOf<O>): Promise<BridgeResponseOf<O>> {
+    if (four === null) return this.call(op, call, dto(input));
+    const { measures, now } = this.#legacy;
+    if (measures.legacy(now())) return this.call(op, call, dto(four));
     try {
       return await this.call(op, call, dto(input));
     } catch (error) {
       if (!(error instanceof BridgeCallError) || error.status !== 400) throw error;
-      const answer = await this.#send(op, call, four, before, dto);
+      const answer = await this.call(op, call, dto(four));
       if (!measures.legacy(now())) console.warn(JSON.stringify({ level: "warn", event: "lane_bridge_legacy", group: "endpoint_measure", window_ms: measures.retryMs }));
       measures.refused(now());
       return answer;
@@ -192,16 +138,16 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   }
 
   /**
-   * A release with its estimation point (r24), or without it (`without`) when the points' latch holds, the endpoint ops'
-   * latch holds, or the bridge refuses it (400): then as `#sendMeasured` sends a release of r23. The latch is set once that
-   * release was taken, so a 400 for another reason, which it gets too, throws and changes nothing. No point: as r23.
+   * A release with its estimation point (r24), or without it (`without`) when the points' latch holds, the measures'
+   * latch holds, or the bridge refuses it (400): then as `#sendMeasured` sends a release of r23. The latch is set once
+   * that release was taken, so a 400 for another reason, which it gets too, throws and changes nothing. No point: as r23.
    */
   async #sendPoint(call: BridgeCall, input: ReleaseInput): Promise<BridgeResponseOf<"endpoint.release">> {
     const without = releaseWithoutPoint(input);
-    const measured = (i: ReleaseInput) => this.#sendMeasured("endpoint.release", call, i, fourMembers(i), releaseBefore(i), endpointReleaseInputDtoOf);
+    const measured = (i: ReleaseInput) => this.#sendMeasured("endpoint.release", call, i, fourMembers(i), endpointReleaseInputDtoOf);
     if (without === null) return measured(input);
-    const { latch, measures, points, now } = this.#legacy;
-    if (latch.legacy(now()) || measures.legacy(now()) || points.legacy(now())) return measured(without);
+    const { measures, points, now } = this.#legacy;
+    if (measures.legacy(now()) || points.legacy(now())) return measured(without);
     try {
       return await this.call("endpoint.release", call, endpointReleaseInputDtoOf(input));
     } catch (error) {
@@ -214,7 +160,7 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   }
 
   async acquire(input: AcquireInput): Promise<AcquireResult> {
-    return acquireResultOf(await this.#send("endpoint.acquire", bridgeCall("endpoint.acquire", this.#target()), input, acquireBefore(input), acquireInputDtoOf));
+    return acquireResultOf(await this.call("endpoint.acquire", bridgeCall("endpoint.acquire", this.#target()), acquireInputDtoOf(input)));
   }
 
   async release(input: ReleaseInput): Promise<ReleaseResult> {
@@ -222,11 +168,11 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   }
 
   async reserveRetry(input: RetryReserveInput): Promise<RetryReserveResult> {
-    return retryReserveResultOf(await this.#send("endpoint.reserve_retry", bridgeCall("endpoint.reserve_retry", this.#target()), input, reserveBefore(input), retryReserveInputDtoOf));
+    return retryReserveResultOf(await this.call("endpoint.reserve_retry", bridgeCall("endpoint.reserve_retry", this.#target()), retryReserveInputDtoOf(input)));
   }
 
   async note(input: NoteInput): Promise<void> {
-    await this.#sendMeasured("endpoint.note", bridgeCall("endpoint.note", this.#target()), input, fourMembers(input), noteBefore(input), noteInputDtoOf);
+    await this.#sendMeasured("endpoint.note", bridgeCall("endpoint.note", this.#target()), input, fourMembers(input), noteInputDtoOf);
   }
 
   async releaseRetry(input: RetryReleaseInput): Promise<void> {
@@ -235,7 +181,7 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
 
   async probeAnswered(permit: PermitToken): Promise<void> {
     // The signed target is the permit's own shard: the same object the permit came from.
-    await this.#send("endpoint.probe_answered", bridgeCall("endpoint.probe_answered", permit.shard), permit, permit.key === undefined ? null : permitBefore(permit), permitTokenDtoOf);
+    await this.call("endpoint.probe_answered", bridgeCall("endpoint.probe_answered", permit.shard), permitTokenDtoOf(permit));
   }
 
   /**
@@ -256,9 +202,8 @@ export class RemoteEndpointShard extends BridgeClient implements EndpointShardRp
   async probeSent(_permit: PermitToken): Promise<void> {}
 }
 
-/** A fresh shard per name and region (`EndpointLocator`'s contract: a stub that broke is not reused), all on one latch. */
+/** A fresh shard per name and region (`EndpointLocator`'s contract: a stub that broke is not reused), all on the same latches. */
 export function remoteEndpointLocator(options: BridgeClientOptions, endpoint: RemoteEndpointOptions = {}): EndpointLocator {
-  const shared: RemoteEndpointOptions = { ...endpoint, legacy: endpoint.legacy ?? new LegacyLatch("endpoint") };
   return (name: string, _region: LocationHint) => {
     // The shard's name is `endpoint/region/index` (`@gray/endpoint` `shardName`); the bridge takes the
     // three parts so its target is the same Durable Object name the gateway would use.
@@ -267,7 +212,7 @@ export function remoteEndpointLocator(options: BridgeClientOptions, endpoint: Re
     const [endpointId, region, index] = parts as [string, string, string];
     const numeric = Number(index);
     if (!Number.isSafeInteger(numeric) || numeric < 0) throw new Error(`a lane endpoint shard index is a whole number, not ${index}`);
-    return new RemoteEndpointShard(options, endpointId, region, numeric, shared);
+    return new RemoteEndpointShard(options, endpointId, region, numeric, endpoint);
   };
 }
 
@@ -275,29 +220,24 @@ export function remoteEndpointLocator(options: BridgeClientOptions, endpoint: Re
  * An endpoint root over the bridge (r16): the gateway's rests.ts `EndpointRootRests`, so `fileRest` is the main gateway's
  * code, one `endpoint.file_rest` call per root a rest covers, signed for the root's name (`endpointRootTarget`). The
  * rest goes without the upstream's words (`said`): they may quote the customer's request, and nothing of a request's
- * free text leaves the CVM (@gray/lane-wire allow.ts, M13). A bridge before r16 answers an unknown path, which throws
- * as every failure does, and `fileRest` takes it: no rest is filed there, as before r16. While the endpoint ops keep to
- * the earlier documents (the latch), no rest is sent at all: a bridge that refused the new members has no such op.
+ * free text leaves the CVM (@gray/lane-wire allow.ts, M13). A failure throws as every failure does, and `fileRest`
+ * takes it: no rest is filed there.
  */
 export class RemoteEndpointRoot extends BridgeClient implements EndpointRootRests {
   readonly #capacityKey: string;
-  readonly #legacy: Legacy;
 
-  constructor(options: BridgeClientOptions, capacityKey: string, endpoint: RemoteEndpointOptions = {}) {
+  constructor(options: BridgeClientOptions, capacityKey: string) {
     super(options);
     this.#capacityKey = capacityKey;
-    this.#legacy = legacyOf(options, endpoint);
   }
 
   async rest(input: RestInput): Promise<{ readonly filed: boolean }> {
-    if (this.#legacy.latch.legacy(this.#legacy.now())) return { filed: false };
     const answer = await this.call("endpoint.file_rest", bridgeCall("endpoint.file_rest", endpointRootTarget(this.#capacityKey)), fileRestInputDtoOf({ ...input, rest: { ...input.rest, said: null } }));
     return fileRestAnswerOf(answer);
   }
 }
 
-/** A fresh root per capacity key (`EndpointRootLocator`'s contract), on the endpoint ops' latch. */
-export function remoteEndpointRootLocator(options: BridgeClientOptions, endpoint: RemoteEndpointOptions = {}): EndpointRootLocator {
-  const shared: RemoteEndpointOptions = { ...endpoint, legacy: endpoint.legacy ?? new LegacyLatch("endpoint") };
-  return (capacityKey) => new RemoteEndpointRoot(options, capacityKey, shared);
+/** A fresh root per capacity key (`EndpointRootLocator`'s contract). */
+export function remoteEndpointRootLocator(options: BridgeClientOptions): EndpointRootLocator {
+  return (capacityKey) => new RemoteEndpointRoot(options, capacityKey);
 }

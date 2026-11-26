@@ -294,6 +294,17 @@ function requirements(facts: RoutingFacts): RoutingRequirement[] {
   return out;
 }
 
+/**
+ * Whether the request asked for a check that reads the feed (`requirements`): `min_availability`, and on a generation API
+ * `max_ttft_ms` and `min_tps`. Without the feed none of them is made, which the record says (`checks`) and the request
+ * path logs and counts (inference/ranking.ts `routing_checks_unapplied`).
+ */
+export function asksFeedChecks(params: RoutingParams, generation: boolean): boolean {
+  if (params.minAvailability !== null) return true;
+  if (!generation) return false;
+  return params.minTps !== null || ttftLimits(params).some(([, limit]) => limit !== null);
+}
+
 /** The tightest ceiling of each rate the levels state (`ceiling`). */
 function ceiling(levels: readonly PreferenceLevelFacts[]): { readonly input: number | null; readonly output: number | null } {
   const narrowest = (a: number | null, b: number | null) => (a !== null && b !== null ? Math.min(a, b) : (a ?? b));
@@ -621,6 +632,8 @@ export function routingRecord(facts: RoutingFacts): RequestRoutingRecord {
     candidates: listed,
     omitted,
     refusal: exclusion === null ? null : { exclusion },
+    // The checks that read the feed, asked for and not made: the feed was unavailable (no current ranking base).
+    ...(!facts.feedAvailable && asksFeedChecks(params, facts.api === "generation") ? { checks: "unapplied" as const } : {}),
   };
 }
 

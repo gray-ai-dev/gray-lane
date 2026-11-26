@@ -1,5 +1,5 @@
 import { geminiCountModel, geminiPathModel, geminiWithoutModelsSegment } from "@gray/protocol";
-import type { Served } from "./inference.ts";
+import type { Served } from "./inference/types.ts";
 
 /** Percent-decode a Gemini model path segment (falling back to the raw text on malformed escapes). */
 function decodeSegment(raw: string): string {

@@ -200,6 +200,17 @@ export class RankingBase {
     return { keys: this.ranker?.states.size ?? 0, samples, failures, records: held.records, circuits: held.circuits };
   }
 
+  /**
+   * Why ranking reads no feed at `nowMs` (routes.ts `feedAvailable`), or null when it reads the base: none taken yet, one
+   * past CONFIG_ALERT_AGE_MS, or one whose producer carries no roots' records (`recordsSupported`). What the request path
+   * says when the checks that read the feed are not made (inference/ranking.ts `routing_checks_unapplied`).
+   */
+  unfedReason(nowMs: number): "base_missing" | "base_stale" | "records_unsupported" | null {
+    if (this.ranker === null) return "base_missing";
+    if (this.current(nowMs) === null) return "base_stale";
+    return this.records ? null : "records_unsupported";
+  }
+
   /** The ranker to rank with at `nowMs`: the base's while it is within CONFIG_ALERT_AGE_MS, else null (ranking reads no samples). */
   current(nowMs: number): Ranker | null {
     if (this.ranker === null || nowMs - this.asOf > this.alertAgeMs) return null;

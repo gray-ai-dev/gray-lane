@@ -1,6 +1,5 @@
 import {
   ed25519Sign,
-  ed25519Verify,
   lowerHexBytes,
   perBootReceiptKey,
   sealKeyset,
@@ -19,9 +18,8 @@ import {
   SchedulerClient,
   type RelayIntakeKey,
   type RelayKeyRegistry,
-  type Vendor,
 } from "@gray/relay-connector";
-import { refusal, utf8Length, type OfficialVendor, type Refusal, type RelayTemplate } from "@gray/lane";
+import { refusal, utf8Length, type Refusal, type RelayTemplate } from "@gray/lane";
 import { createPolicyStore, policyRunFuel, runPolicy, type PolicyRecord, type PolicyStore, type PolicyStoreOptions, type RelayPolicyBundle, type StoreRefusalCode } from "@gray/relay-policy";
 import type { Snapshot } from "@gray/snapshot";
 import { appendReserveTokens } from "./hooks.ts";
@@ -1180,32 +1178,4 @@ export class MutableRelayRegistry implements LaneRelayRegistry {
  */
 function schedulerRecordChanged(before: LaneRelay, after: LaneRelay): boolean {
   return before.schedulerUrl !== after.schedulerUrl || before.schedulerPublicKey !== after.schedulerPublicKey || before.schedulerKeyId !== after.schedulerKeyId;
-}
-
-/** The relay registry from a raw snapshot (§B, L3); an inconsistent relay is dropped (D8). */
-export function laneRegistryOf(snapshot: Snapshot): LaneRelayRegistry {
-  return laneRelaysOf(snapshot);
-}
-
-/**
- * Whether `signatureHex` verifies under `publicKeyHex` over `message` (the boot's own check of a
- * relay's registry key; a test uses it on a signed bundle).
- */
-export async function relaySignatureVerifies(publicKeyHex: string, message: Uint8Array, signatureHex: string): Promise<boolean> {
-  const key = lowerHexBytes(publicKeyHex);
-  const signature = lowerHexBytes(signatureHex);
-  if (key === null || signature === null) return false;
-  return ed25519Verify(key, message, signature);
-}
-
-/** A registry from a list (tests, and a boot fed from a static list). */
-export function relayRegistryOf(relays: readonly LaneRelay[]): LaneRelayRegistry {
-  const map = new Map<string, LaneRelay>();
-  for (const relay of relays) map.set(relay.relayId, relay);
-  return { get: (relayId: string) => map.get(relayId), relays: [...map.values()] };
-}
-
-/** The vendor name `@gray/lane` uses, as the connector's scheduler names it (one mapping, in one place). */
-export function schedulerVendorOf(vendor: OfficialVendor): Vendor {
-  return vendor === "chatgpt" ? "chatgpt_codex" : vendor;
 }

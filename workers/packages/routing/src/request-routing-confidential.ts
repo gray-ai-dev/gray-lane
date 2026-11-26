@@ -2,7 +2,10 @@
 // entry's record"): only what may leave the CVM, the rest null. lane-wire's index message holds a record of exactly
 // this shape; the server's request_log/routing_build.rs is the same, for the `request-routing` vectors.
 
-import type { RequestRoutingRecord, RoutingExclusion } from "./request-routing.ts";
+import type { RequestRoutingRecord, RoutingChecks, RoutingExclusion } from "./request-routing.ts";
+
+/** `checks` when it is the one word it may be: a fixed word, nothing of the request or a route. */
+const checksOnly = (checks: RoutingChecks | undefined): { readonly checks?: RoutingChecks } => (checks === "unapplied" ? { checks } : {});
 
 /** A refusal's exclusion with its own members and no other: it names a requirement or a list, never a route. */
 function exclusionOnly(e: RoutingExclusion): RoutingExclusion {
@@ -15,8 +18,8 @@ function exclusionOnly(e: RoutingExclusion): RoutingExclusion {
  * The record as the confidential entry writes it (`confidential_routing`): the policy version, the preset, the API, the
  * percentile, the band and the thresholds, the head's reason, the session (never when it was established, which would
  * tie a session's requests together, and its change without costs), the counts, the provider chosen and the refusal;
- * every other member null, `omitted` 0. Each member is copied by name, so a member a later record gains never leaves the
- * CVM through it.
+ * every other member null, `omitted` 0; and `checks` when the checks that read the feed were not made (a fixed word, for
+ * a session's head too). Each member is copied by name, so a member a later record gains never leaves the CVM through it.
  */
 export function confidentialRouting(record: RequestRoutingRecord): RequestRoutingRecord {
   const session = record.session;
@@ -54,5 +57,6 @@ export function confidentialRouting(record: RequestRoutingRecord): RequestRoutin
     candidates: null,
     omitted: 0,
     refusal: record.refusal === null ? null : { exclusion: exclusionOnly(record.refusal.exclusion) },
+    ...checksOnly(record.checks),
   };
 }
