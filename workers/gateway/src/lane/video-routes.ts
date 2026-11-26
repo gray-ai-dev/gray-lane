@@ -269,38 +269,54 @@ async function content(o: EntryVideoRequest, io: VideoJobIo, run: VideoRouteRun,
   if (credential === null) throw sourceUnavailable();
   const address = new URL(target);
   if (variant !== null) address.searchParams.append("variant", variant);
-  // The wait for the provider's headers alone: a fetch's signal also governs its body, so the timer ends with the headers.
+  // The provider's fetch ends with the client: workerd aborts the request's signal when the client disconnects, and
+  // never cancels the answer's body then. The headers timer ends with the headers, since a fetch's signal also governs
+  // its body; the client's signal and the transfer's own end (`ended` below) govern the rest.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("video_content_headers_timeout"), limits.headersMs);
-  let upstream: Response;
+  const client = o.request.signal;
+  const leave = (): void => controller.abort("video_content_client_left");
+  if (client.aborted) leave();
+  else client.addEventListener("abort", leave, { once: true });
+  let streaming = false;
   try {
-    upstream = await io.fetchFor(route)(address.toString(), { method: "GET", headers: videoJobHeaders(credential, o.request.headers), signal: controller.signal, redirect: "manual" });
-  } catch {
-    throw new ApiError(502, "upstream_content_unavailable");
+    const timer = setTimeout(() => controller.abort("video_content_headers_timeout"), limits.headersMs);
+    let upstream: Response;
+    try {
+      upstream = await io.fetchFor(route)(address.toString(), { method: "GET", headers: videoJobHeaders(credential, o.request.headers), signal: controller.signal, redirect: "manual" });
+    } catch {
+      throw new ApiError(502, "upstream_content_unavailable");
+    } finally {
+      clearTimeout(timer);
+    }
+    if (upstream.status < 200 || upstream.status > 299) {
+      // Not the video: an error, or a redirect, which Gray does not follow (the standard's clause 11.11). An answer egress
+      // gave itself (its mark) from before it reached the provider sent the provider nothing.
+      const head = await readWhole(upstream, CONTENT_ERROR_BYTES, io.clock() + limits.idleMs, io.clock);
+      const own = head === null ? null : egressOwnAnswer(upstream.headers, head);
+      if (own === null || !egressSentNothing(own)) run.forwarded(route, job, owner);
+      throw new ApiError(502, "upstream_content_unavailable");
+    }
+    run.forwarded(route, job, owner);
+    const hash = responseHash();
+    let finish!: () => void;
+    const ended = new Promise<void>((resolve) => (finish = resolve));
+    // A HEAD asks the provider as a GET does (a provider need not take HEAD) and hands on its headers alone: the body is
+    // cancelled unread, and the receipt hashes the no bytes the client got.
+    const streamed = streamMedia(upstream, limits, {
+      head: run.head,
+      signal: client,
+      tap: (bytes) => hash.update(bytes),
+      ended: (how) => {
+        client.removeEventListener("abort", leave);
+        // A transfer cut or left closes the provider's connection now, whatever its body's cancel does.
+        if (how !== "complete") controller.abort(`video_content_${how}`);
+        console.log(JSON.stringify({ level: how === "complete" ? "info" : "warn", event: "lane_video_content", request_id: run.requestId, job: job.id, ended: how, bytes: hash.byteLength }));
+        finish();
+      },
+    });
+    streaming = true;
+    return run.streamed(streamed, hash, ended);
   } finally {
-    clearTimeout(timer);
+    if (!streaming) client.removeEventListener("abort", leave);
   }
-  if (upstream.status < 200 || upstream.status > 299) {
-    // Not the video: an error, or a redirect, which Gray does not follow (the standard's clause 11.11). An answer egress
-    // gave itself (its mark) from before it reached the provider sent the provider nothing.
-    const head = await readWhole(upstream, CONTENT_ERROR_BYTES, io.clock() + limits.idleMs, io.clock);
-    const own = head === null ? null : egressOwnAnswer(upstream.headers, head);
-    if (own === null || !egressSentNothing(own)) run.forwarded(route, job, owner);
-    throw new ApiError(502, "upstream_content_unavailable");
-  }
-  run.forwarded(route, job, owner);
-  const hash = responseHash();
-  let finish!: () => void;
-  const ended = new Promise<void>((resolve) => (finish = resolve));
-  // A HEAD asks the provider as a GET does (a provider need not take HEAD) and hands on its headers alone: the body is
-  // cancelled unread, and the receipt hashes the no bytes the client got.
-  const streamed = streamMedia(upstream, limits, {
-    head: run.head,
-    tap: (bytes) => hash.update(bytes),
-    ended: (how) => {
-      console.log(JSON.stringify({ level: how === "complete" ? "info" : "warn", event: "lane_video_content", request_id: run.requestId, job: job.id, ended: how, bytes: hash.byteLength }));
-      finish();
-    },
-  });
-  return run.streamed(streamed, hash, ended);
 }

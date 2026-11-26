@@ -26,6 +26,7 @@ import { type LaneAttemptRun, laneCodexRoute, laneStoreOffRoute, reportLaneNotSe
 import { peerAttemptChecks } from "./peer-end.ts";
 import { estimationPoint } from "./settle-pure.ts";
 import { rankRegion } from "./stack-routes.ts";
+import { rankingFeedAt } from "./state.ts";
 import type { Attempt, Dispatch, Prepared, Release, Uncommitted } from "./types.ts";
 import { releaseRequestBody } from "./request-body.ts";
 import { type ToolCallIdsRun, attemptIds } from "./tool-call-ids.ts";
@@ -377,7 +378,7 @@ export function abandonLease(run: AttemptRun, route: Route): void {
   run.ctx.waitUntil(run.routing.heldProbe.passed(route.record.endpointId));
   const snapshot = run.routing.snapshot;
   const requestKey = run.caller.requestKey;
-  if (snapshot !== null && requestKey !== null) run.ctx.waitUntil(probeLeases(snapshot, run.deps.clock()).abandonRecovery(rankKeyOf(route.record, run.facts.stream === true, rankRegion(run, route.record)), requestKey));
+  if (snapshot !== null && requestKey !== null) run.ctx.waitUntil(probeLeases(snapshot, run.deps.clock(), rankingFeedAt(run)).abandonRecovery(rankKeyOf(route.record, run.facts.stream === true, rankRegion(run, route.record)), requestKey));
 }
 
 /**

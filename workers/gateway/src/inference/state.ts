@@ -250,6 +250,15 @@ export interface RoutingState {
  */
   rankingWaitMs: number | null;
 /**
+ * When intake judged the request's ranking base (intake.ts `refreshedRanking`): the request's one freshness verdict. Every
+ * read of the feed after it (`rankingFeedAt` in ranking.ts: each model's ranking, a refit's, the record's facts and the
+ * leases) judges the base at this time, so a base that crosses CONFIG_ALERT_AGE_MS while the request is under way is
+ * read as intake read it; everything else (rests, circuits, sessions, probes) keeps its own clock. A late refit judges at
+ * this pinned time too, so the base it reads is at most CONFIG_ALERT_AGE_MS plus the time since intake old. Null before
+ * intake.
+ */
+  rankingFeedAt: number | null;
+/**
  * Why its ranking made none of the checks that read the feed it asked for (ranking.ts, `routing_checks_unapplied`): no
  * base, a stale one, or one without the roots' records; null while they were made. Set by the first ranking that met it.
  */
@@ -708,6 +717,14 @@ export function newRequestFacts(): RequestFacts {
   };
 }
 
+/**
+ * The time a request's reads of the ranking feed judge its base at (`RoutingState.rankingFeedAt`): intake's, the one
+ * verdict of the request; the clock now for a read before intake made it.
+ */
+export function rankingFeedAt(run: { readonly routing: Pick<RoutingState, "rankingFeedAt">; readonly deps: { readonly clock: () => number } }): number {
+  return run.routing.rankingFeedAt ?? run.deps.clock();
+}
+
 export function newRoutingState(): RoutingState {
   return {
     snapshot: null,
@@ -719,6 +736,7 @@ export function newRoutingState(): RoutingState {
     ranked: { ageMs: null, spanMs: null },
     isolateGapMs: undefined,
     rankingWaitMs: null,
+    rankingFeedAt: null,
     checksUnapplied: null,
     routingGroup: "",
     preference: Preference.DEFAULT,

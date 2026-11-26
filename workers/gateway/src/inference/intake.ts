@@ -8,7 +8,7 @@ import { ApiError } from "@gray/errors";
 import { type Json, type JsonObject, isObject, readSerdeBytes } from "@gray/json";
 import { API_FORWARD_HEADER, type TicketUseOutcome } from "@gray/lane-wire";
 import { requestLimit } from "@gray/limits";
-import { type CanonicalRequest, outputCandidateCount } from "@gray/protocol";
+import { type CanonicalRequest, outputCandidateCount, unsupportedServiceTier } from "@gray/protocol";
 import { DEFAULT_ROUTING_POLICY, Preference, ROUTING_PARAMS_HEADER, modeSourceOf, resolveRoutingParams, takeRouting } from "@gray/routing";
 import { HandleWatch } from "@gray/tool-ids";
 import { hasQueryCredentials, keyHash, keyRefusal, modelScopeRefusal, presentedKey } from "../auth.ts";
@@ -27,7 +27,7 @@ import { type ParsedRequest, parseHeld, parseStored } from "../parse.ts";
 import { laneServes, layeredOver, modelCheckPinned, modelCheckUnpinned, preferenceFacts, registeredOf, routingRefused, takeTags, unadmitted, unreadableDefault, unreadablePreference, verifiableUpFront } from "../preference.ts";
 import { preferenceLevels, statedOf } from "../request-routing.ts";
 import { turnStart } from "../sinks.ts";
-import { type GatewaySnapshot, type KeyRecord, RANKING_WAIT_MS, snapshotTiming } from "../snapshot.ts";
+import { type GatewaySnapshot, type KeyRecord, RANKING_WAIT_MS, rankingMarginMs, snapshotTiming } from "../snapshot.ts";
 import { spoolPlaintext } from "../spool.ts";
 import { handlesInBody, handlesInSpan, siteMember } from "../tool-ids.ts";
 import { closeRate, flushRecord, refuse } from "./record.ts";
@@ -381,6 +381,16 @@ export async function afterBody(run: IntakeRun, snapshot: GatewaySnapshot, key: 
   } catch {
     return refuse(run, new ApiError(400, "invalid_protocol_request"), "parse");
   }
+  // OpenAI's flex processing is a tier no route offers or prices: refused before anything is routed, held or sent.
+  if (unsupportedServiceTier(protocol, parsed.value) !== null) {
+    return refuse(
+      run,
+      new ApiError(400, "unsupported_service_tier")
+        .withParam("service_tier")
+        .withMessage('Gray does not support the `flex` service tier (`service_tier: "flex"`). Send the request again without `service_tier`, or with `"auto"`, `"default"` or `"priority"`.'),
+      "parse",
+    );
+  }
   // The request's preference layered over the defaults its key and its workspace set (`layered_preference`):
   // a request narrows them and never widens them; a stored default this gateway cannot read refuses the
   // request (503), since an organization's constraint is never silently dropped.
@@ -484,11 +494,17 @@ export async function afterBody(run: IntakeRun, snapshot: GatewaySnapshot, key: 
 async function refreshedRanking(run: IntakeRun): Promise<void> {
   const { cfg, clock } = run.deps;
   const now = clock();
-  if (run.deps.snapshots.fed(now)) return;
+  // The request's one freshness verdict is the base at `now` (state.ts `rankingFeedAt`): every read of the feed after it,
+  // each model's ranking, a refit's and the record's, judges the base at this time, never at a later clock of its own.
+  run.routing.rankingFeedAt = now;
+  // A base that crosses CONFIG_ALERT_AGE_MS within what the pre budget has left is refreshed now, while the request can
+  // still wait for it (Z17, lane-1: a base current at intake was stale 200 ms later, at the ranking, `waited_ms` null).
+  const marginMs = rankingMarginMs(cfg.configAlertAgeMs, run.budget.preLeft());
+  if (run.deps.snapshots.fed(now + marginMs)) return;
   const reserveMs = Math.min(cfg.accountAdmitAttemptMs, cfg.accountAdmitBudgetMs);
   const waitMs = Math.min(RANKING_WAIT_MS, run.budget.preLeft() - reserveMs);
   const timing = run.deps.waitTimers === undefined ? snapshotTiming(cfg) : { ...snapshotTiming(cfg), timers: run.deps.waitTimers };
-  const refreshed = await run.deps.snapshots.refreshRanking(run.deps.source, timing, now, (p) => run.ctx.waitUntil(p), waitMs, (call) => run.outbound.run(call));
+  const refreshed = await run.deps.snapshots.refreshRanking(run.deps.source, timing, now, (p) => run.ctx.waitUntil(p), waitMs, (call) => run.outbound.run(call), marginMs);
   run.routing.rankingWaitMs = refreshed.waited ? Math.max(0, clock() - now) : 0;
 }
 

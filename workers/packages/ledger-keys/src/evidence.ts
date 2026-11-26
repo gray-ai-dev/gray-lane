@@ -539,6 +539,8 @@ const SAFE_TOP = [
   "cache_read_input_tokens",
   "prompt_cache_hit_tokens",
   "prompt_cache_miss_tokens",
+  // Moonshot's top-level cached prompt counter, which billing reads when no other cache counter is reported.
+  "cached_tokens",
   "promptTokenCount",
   "candidatesTokenCount",
   "totalTokenCount",
@@ -649,8 +651,10 @@ const add = (a: bigint, b: bigint) => (a + b > U64_MAX ? refuse("amount") : a + 
 function chat(raw: Json): UsageCounters {
   const detail = nestedCount(raw, "prompt_tokens_details", "cached_tokens");
   const hit = optionalCount(raw, "prompt_cache_hit_tokens");
+  const top = optionalCount(raw, "cached_tokens");
   if (detail !== null && hit !== null && detail !== hit) refuse("transition");
-  const cacheRead = detail ?? hit ?? 0n;
+  if (top !== null && ((detail !== null && top !== detail) || (hit !== null && top !== hit))) refuse("transition");
+  const cacheRead = detail ?? hit ?? top ?? 0n;
   return counters({
     input_tokens: requiredCount(raw, "prompt_tokens"),
     output_tokens: requiredCount(raw, "completion_tokens"),

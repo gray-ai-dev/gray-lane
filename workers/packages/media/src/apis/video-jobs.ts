@@ -404,7 +404,7 @@ const badGateway = (code: string) => new ApiError(502, code);
  * Sends `request` and waits at most `ms` for the response headers (video/content.rs wraps only the
  * send in `HEADERS_TIMEOUT`). The abort timer is cleared once headers arrive: a fetch's signal also
  * governs its body, so `AbortSignal.timeout` would cut every download `ms` after it started. The
- * body is then bounded by `streamMedia` (idle and total), whose cancel reaches the upstream through
+ * body is then bounded by `streamMedia` (idle and total), whose end reaches the upstream through
  * `reader.cancel()`.
  */
 async function headersWithin(fetcher: Fetcher, request: Request, ms: number): Promise<Response> {
@@ -579,6 +579,11 @@ export interface StreamMediaHooks {
   readonly ended?: (how: "complete" | "cut" | "cancelled") => void;
   /** When true, any upstream body is cancelled immediately and a bodyless 200 response carrying sanitized headers is returned. */
   readonly head?: boolean;
+  /**
+   * The customer's request signal. workerd's HTTP server aborts it when the customer disconnects and then stops pulling
+   * the body without calling its `cancel()`; its abort ends the transfer as `cancelled`.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -586,9 +591,12 @@ export interface StreamMediaHooks {
  * `idleMs` between chunks and `totalMs` overall; the stream errors (a truncated transfer) when a bound
  * is crossed. A body announced larger than the limit is 502 `upstream_content_too_large`. One chunk is
  * read from the upstream each time the customer's stream asks for one, so nothing is held beyond the
- * chunk in hand and a customer that reads slowly holds the upstream back. When `hooks.head` is true,
- * any upstream body is cancelled immediately and a bodyless 200 response carrying sanitized headers is
- * returned.
+ * chunk in hand and a customer that reads slowly holds the upstream back. Both bounds run on timers of
+ * their own: a customer that stops reading is cut `idleMs` after the last chunk it was handed, and
+ * every transfer at `totalMs`. The transfer also ends when the customer's stream is cancelled or
+ * `hooks.signal` aborts; however it ends, the upstream body is cancelled, chunks still queued are
+ * dropped and `hooks.ended` is called once. When `hooks.head` is true, any upstream body is cancelled
+ * immediately and a bodyless 200 response carrying sanitized headers is returned.
  */
 export function streamMedia(upstream: Response, limits: ContentLimits, hooks: StreamMediaHooks = {}): Response {
   const length = upstream.headers.get("content-length");
@@ -598,77 +606,81 @@ export function streamMedia(upstream: Response, limits: ContentLimits, hooks: St
   }
   const headers = new Headers({ "content-type": mediaType(upstream.headers.get("content-type")) });
   if (length !== null && /^[0-9]+$/.test(length)) headers.set("content-length", length);
-  let over = false;
-  const ended = (how: "complete" | "cut" | "cancelled"): void => {
-    if (over) return;
-    over = true;
-    hooks.ended?.(how);
-  };
   if (hooks.head === true) {
     void upstream.body?.cancel().catch(() => {});
-    ended("complete");
+    hooks.ended?.("complete");
     return new Response(null, { status: 200, headers });
   }
   const source = upstream.body;
   if (source === null) {
-    ended("complete");
+    hooks.ended?.("complete");
     return new Response(null, { status: 200, headers });
   }
   const reader = source.getReader();
   const deadline = Date.now() + limits.totalMs;
+  const signal = hooks.signal;
   let received = 0;
+  let over = false;
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let totalTimer: ReturnType<typeof setTimeout> | undefined;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const interrupted = (): Error => new Error("video content interrupted");
+  // Ends the transfer once, however it ends: the timers and the signal's listener go, the upstream body is
+  // cancelled, and the customer's stream is closed or errored, which drops any chunk still queued.
+  const finish = (how: "complete" | "cut" | "cancelled", error?: unknown): Promise<void> => {
+    if (over) return Promise.resolve();
+    over = true;
+    if (totalTimer !== undefined) clearTimeout(totalTimer);
+    if (stallTimer !== undefined) clearTimeout(stallTimer);
+    signal?.removeEventListener("abort", leave);
+    try {
+      if (how === "complete") downstream?.close();
+      else downstream?.error(error ?? interrupted());
+    } catch {
+      // The customer's stream is already closed or errored.
+    }
+    const cancelled = how === "complete" ? Promise.resolve() : reader.cancel(error).catch(() => {});
+    hooks.ended?.(how);
+    return cancelled;
+  };
+  const leave = (): void => void finish("cancelled", signal?.reason ?? new DOMException("the client left", "AbortError"));
+  const cut = (): void => void finish("cut");
   const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        await reader.cancel().catch(() => {});
-        ended("cut");
-        controller.error(new Error("video content interrupted"));
-        return;
-      }
-      const wait = Math.min(limits.idleMs, remaining);
-      if (wait <= 0) {
-        await reader.cancel().catch(() => {});
-        ended("cut");
-        controller.error(new Error("video content interrupted"));
-        return;
-      }
+    start(controller) {
+      downstream = controller;
+      if (signal?.aborted === true) return leave();
+      signal?.addEventListener("abort", leave, { once: true });
+      totalTimer = setTimeout(cut, Math.max(1, limits.totalMs));
+    },
+    async pull() {
+      if (stallTimer !== undefined) clearTimeout(stallTimer);
+      if (over) return;
+      const wait = Math.min(limits.idleMs, deadline - Date.now());
+      if (wait <= 0) return finish("cut");
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<"timeout">((resolve) => {
         timer = setTimeout(() => resolve("timeout"), Math.max(1, wait));
       });
       try {
         const next = await Promise.race([reader.read(), timeout]);
-        if (next === "timeout") {
-          await reader.cancel().catch(() => {});
-          ended("cut");
-          controller.error(new Error("video content interrupted"));
-          return;
-        }
-        if (next.done) {
-          ended("complete");
-          controller.close();
-          return;
-        }
+        // The transfer may have ended while the read was pending (the customer left, a timer fired).
+        if (over) return;
+        if (next === "timeout") return finish("cut");
+        if (next.done) return finish("complete");
         received += next.value.length;
-        if (received > limits.bytes) {
-          await reader.cancel().catch(() => {});
-          ended("cut");
-          controller.error(new Error("video content exceeds the limit"));
-          return;
-        }
+        if (received > limits.bytes) return finish("cut", new Error("video content exceeds the limit"));
         hooks.tap?.(next.value);
-        controller.enqueue(next.value);
+        downstream?.enqueue(next.value);
+        // Until the customer asks for the next chunk, the idle bound runs on this timer.
+        stallTimer = setTimeout(cut, Math.max(1, Math.min(limits.idleMs, deadline - Date.now())));
       } catch {
-        ended("cut");
-        controller.error(new Error("video content interrupted"));
+        await finish("cut");
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
     },
     cancel(reason) {
-      ended("cancelled");
-      return reader.cancel(reason);
+      return finish("cancelled", reason);
     },
   });
   return new Response(body, { status: 200, headers });

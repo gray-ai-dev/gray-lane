@@ -359,8 +359,9 @@ function anthropicIterationPass(entry: Json): BilledTokens {
  * gateway's billing, the ledger's evidence check and the verifier's serving contract share. Every
  * refusal names the counters it judged by, with their counts.
  *
- * - OpenAI Chat: `prompt_tokens_details.cached_tokens` and/or DeepSeek's `prompt_cache_hit_tokens`
- *   (+ `prompt_cache_miss_tokens`) within `prompt_tokens`, agreeing when both appear;
+ * - OpenAI Chat: `prompt_tokens_details.cached_tokens`, DeepSeek's `prompt_cache_hit_tokens`
+ *   (+ `prompt_cache_miss_tokens`) and Moonshot's top-level `cached_tokens` within `prompt_tokens`, agreeing
+ *   whenever more than one appears;
  *   `prompt_tokens_details.cache_write_tokens` is the part written to the cache.
  * - OpenAI Responses: `input_tokens_details.cached_tokens` and `.cache_write_tokens`.
  * - Anthropic: `cache_read_input_tokens` and `cache_creation_input_tokens` are added to
@@ -404,7 +405,16 @@ export function billedTokens(protocol: Protocol, usage: Json): BilledUsage {
         if (detail !== undefined && hit !== undefined && detail !== hit) {
           throw new RuleError(`cached prompt counters disagree: prompt_tokens_details.cached_tokens ${detail}, prompt_cache_hit_tokens ${hit}`);
         }
-        cacheRead = detail ?? hit ?? 0n;
+        // Moonshot documents a top-level `cached_tokens` (platform.moonshot.ai); it is read when neither counter
+        // above is reported, and must agree with the one that is.
+        const top = optionalCounter(usage, "cached_tokens");
+        if (top !== undefined && detail !== undefined && top !== detail) {
+          throw new RuleError(`cached prompt counters disagree: prompt_tokens_details.cached_tokens ${detail}, cached_tokens ${top}`);
+        }
+        if (top !== undefined && hit !== undefined && top !== hit) {
+          throw new RuleError(`cached prompt counters disagree: prompt_cache_hit_tokens ${hit}, cached_tokens ${top}`);
+        }
+        cacheRead = detail ?? hit ?? top ?? 0n;
         // Cached reads, cache writes and uncached tokens are three disjoint parts of one prompt.
         cacheWrite = nestedCounter(usage, "prompt_tokens_details", "cache_write_tokens") ?? 0n;
         break;

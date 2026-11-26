@@ -196,6 +196,10 @@ const OVERFLOW = new RegExp(
     "exceeds? (?:the )?context limit",
     // xAI: "This model's maximum prompt length is 131072 but the request contains 150000 tokens."
     "maximum prompt length",
+    // "The input (250000 tokens) exceeds the maximum allowed input length (200000 tokens)."
+    "exceeds the maximum allowed input length",
+    // "Requested tokens (140000) exceed model context limit (131072)."
+    "exceeds? (?:the )?model context limit",
   ].join("|"),
   "iu",
 );

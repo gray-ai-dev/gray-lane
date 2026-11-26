@@ -379,11 +379,13 @@ const UNMEASURED = new Ranker();
 /**
  * The ranker `snapshot`'s routes rank with at `nowMs`: the isolate's ranking base (ranking-base.ts, the endpoint roots'
  * samples from the ranking feed) while it is within CONFIG_ALERT_AGE_MS; a checkpoint the snapshot carries as text (a
- * test's); else none (every route unmeasured, as before the feed).
+ * test's); else none (every route unmeasured, as before the feed). The base's age is judged at `feedAt`: a request's
+ * one freshness verdict (inference/state.ts `rankingFeedAt`), `nowMs` for a caller without one. Every function below
+ * that takes a `feedAt` passes it here, so the reads of one request agree on whether it has a feed.
  */
-function rankerFor(snapshot: GatewaySnapshot, nowMs: number): Ranker {
+function rankerFor(snapshot: GatewaySnapshot, nowMs: number, feedAt = nowMs): Ranker {
   const r = snapshot.ranking;
-  if (r instanceof RankingBase) return r.current(nowMs) ?? UNMEASURED;
+  if (r instanceof RankingBase) return r.current(feedAt) ?? UNMEASURED;
   if (r === null) return UNMEASURED;
   if (restored?.version !== snapshot.version || restored.checkpoint !== r) {
     const fresh = new Ranker();
@@ -474,6 +476,7 @@ export async function rankDetailed(
   stream: boolean,
   probe = true,
   regionOf?: RankRegionOf,
+  feedAt = nowMs,
 ): Promise<{ readonly ordered: Route[]; readonly result: RankingResult }> {
   const byKey = new Map<string, Route>();
   const candidates: Candidate[] = [];
@@ -482,7 +485,7 @@ export async function rankDetailed(
     if (!byKey.has(key)) byKey.set(key, r);
     candidates.push({ endpointId: key, quotedPrice: referencePrice(r.rate), behavioralScore: r.record.behavioralScore });
   }
-  const ranker = rankerFor(snapshot, nowMs);
+  const ranker = rankerFor(snapshot, nowMs, feedAt);
   const ranked = probe ? await ranker.rankWith(candidates, "balanced", requestKey, nowMs, "suppressed", rests) : await ranker.rankWithoutProbe(candidates, "balanced", requestKey, nowMs, "suppressed", rests);
   const idOf = (key: string) => byKey.get(key)?.record.endpointId ?? key;
   const result: RankingResult = {
@@ -558,8 +561,8 @@ const UNPRICED: RoutePrice = { meter: "tokens", input: 0n, output: 0n, cacheRead
  * endpoint routes' circuits under the keys their attempts take permits under; the record is the endpoint root's, one for
  * every region.
  */
-export function utilityRoutesOf(snapshot: GatewaySnapshot, routes: readonly Route[], nowMs: number, stream: boolean, regionOf?: RankRegionOf): UtilityRoutes {
-  const ranker = rankerFor(snapshot, nowMs);
+export function utilityRoutesOf(snapshot: GatewaySnapshot, routes: readonly Route[], nowMs: number, stream: boolean, regionOf?: RankRegionOf, feedAt = nowMs): UtilityRoutes {
+  const ranker = rankerFor(snapshot, nowMs, feedAt);
   const of = (record: RouteRecord, price: RoutePrice): UtilityRoute => {
     const key = rankKeyOf(record, stream, regionOf?.(record));
     return { key, endpointId: record.endpointId, operator: record.operator, protocol: record.protocol, price, summary: ranker.routeSummary(record.capacityKey), open: ranker.circuitOf(key, nowMs)?.open === true };
@@ -571,7 +574,7 @@ export function utilityRoutesOf(snapshot: GatewaySnapshot, routes: readonly Rout
   }
   const model = routes[0]?.record.model;
   const population = model === undefined ? [] : snapshot.routes.filter((r) => r.model === model && routeServes(r.expiresAt, nowMs)).map((r) => keyed.get(rankKeyOf(r, stream, regionOf?.(r))) ?? of(r, UNPRICED));
-  return { routes: [...keyed.values()], population, feedAvailable: feedAvailable(snapshot, nowMs) };
+  return { routes: [...keyed.values()], population, feedAvailable: feedAvailable(snapshot, feedAt) };
 }
 
 /** `route` passes the request's constraints and price cap (`failedConstraint`), as a due probe must (docs "Draw and order"). */
@@ -587,8 +590,8 @@ export function passesConstraints(route: UtilityRoute, ask: UtilityAsk, routes: 
  * every route and names the ones it excludes. When none passes, every route is sized for and the formula's ranking refuses
  * the model, recording what it ranked by (finding 33; the server's `screen_constraints`).
  */
-export function screenConstraints(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, regionOf?: RankRegionOf): { readonly passing: Route[]; readonly excluded: Route[] } {
-  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf);
+export function screenConstraints(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, regionOf?: RankRegionOf, feedAt = nowMs): { readonly passing: Route[]; readonly excluded: Route[] } {
+  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf, feedAt);
   const passing: Route[] = [];
   const excluded: Route[] = [];
   for (const r of routes) {
@@ -605,8 +608,8 @@ export function screenConstraints(snapshot: GatewaySnapshot, routes: readonly Ro
  * target whose ranking would refuse the model or keep nothing, so the selection tries the next target first (the server's
  * `constraints_exclude_all`; docs/utility-routing.md "Constraints and the price cap").
  */
-export function constraintsExcludeAll(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, rests: RestView, regionOf?: RankRegionOf): boolean {
-  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf);
+export function constraintsExcludeAll(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, rests: RestView, regionOf?: RankRegionOf, feedAt = nowMs): boolean {
+  const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf, feedAt);
   const input = { params: ask.params, policy: ask.policy, seed: ask.seed, sessionHit: ask.sessionHit, candidates: u.routes, population: u.population, feedAvailable: u.feedAvailable, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative };
   return excludesEveryRankedCandidate(input, (key) => rests(key, nowMs) !== undefined);
 }
@@ -627,7 +630,8 @@ export type UtilityRanking =
  * probe it leases when nothing else serves, the trials), with the open routes that pass the request's constraints and
  * price cap behind them, whose due probes the plan may carry, and the resting ones that pass them, which it leaves out and
  * dates. A route the constraints excluded is no candidate; a refusal of the formula (`utilityRefusal`) leaves none.
- * `regionOf`: each route's keys' egress region, as `u` was read with (`utilityRoutesOf`).
+ * `regionOf`: each route's keys' egress region, and `feedAt` the time the base is judged at, as `u` was read with
+ * (`utilityRoutesOf`).
  */
 export async function rankUtility(
   snapshot: GatewaySnapshot,
@@ -640,6 +644,7 @@ export async function rankUtility(
   stream: boolean,
   probe = true,
   regionOf?: RankRegionOf,
+  feedAt = nowMs,
 ): Promise<UtilityRanking> {
   const free = u.routes.filter((r) => rests(r.key, nowMs) === undefined);
   let closed = free.filter((r) => !r.open);
@@ -665,7 +670,7 @@ export async function rankUtility(
   // combined-r1 blocker 1): one that fails them is no candidate once its rest ends, and its rest dates no refusal.
   const keys = [...(utility?.order ?? []), ...(closed.length > 0 ? u.routes.filter((r) => r.open && rests(r.key, nowMs) === undefined && passesConstraints(r, ask, u)).map((r) => r.key) : []), ...u.routes.filter((r) => rests(r.key, nowMs) !== undefined && passesConstraints(r, ask, u)).map((r) => r.key)];
   const kept = new Set(keys);
-  const ranked = await rankDetailed(snapshot, keys.map((key) => byKey.get(key)!), requestKey, nowMs, rests, stream, probe, regionOf);
+  const ranked = await rankDetailed(snapshot, keys.map((key) => byKey.get(key)!), requestKey, nowMs, rests, stream, probe, regionOf, feedAt);
   return { ok: true, ...ranked, utility, routes: u, kept: routes.filter((r) => kept.has(rankKeyOf(r.record, stream, regionOf?.(r.record)))) };
 }
 
@@ -701,9 +706,9 @@ export function orderedOf(result: Pick<RankingResult, "orderedIds" | "evidence" 
  * ranking-base.ts), or null when ranking reads none (no base, or one past CONFIG_ALERT_AGE_MS: unmeasured): the soak's
  * base age at ranking (criterion (b), endpoint.md section 12).
  */
-export function rankingBaseAge(snapshot: GatewaySnapshot, nowMs: number): number | null {
+export function rankingBaseAge(snapshot: GatewaySnapshot, nowMs: number, feedAt = nowMs): number | null {
   const r = snapshot.ranking;
-  return r instanceof RankingBase ? r.ageAt(nowMs) : null;
+  return r instanceof RankingBase ? r.ageAt(nowMs, feedAt) : null;
 }
 
 /**
@@ -711,9 +716,9 @@ export function rankingBaseAge(snapshot: GatewaySnapshot, nowMs: number): number
  * endpoint.md section 12.2): the base's age (`rankingBaseAge`) and the base's span (ranking-base.ts `spanAt`: since the
  * start of the check before the last one that brought it a ranking answer, both from one replica), each null when none.
  */
-export function rankedWith(snapshot: GatewaySnapshot, nowMs: number): { readonly ageMs: number | null; readonly spanMs: number | null } {
+export function rankedWith(snapshot: GatewaySnapshot, nowMs: number, feedAt = nowMs): { readonly ageMs: number | null; readonly spanMs: number | null } {
   const r = snapshot.ranking;
-  return r instanceof RankingBase ? { ageMs: r.ageAt(nowMs), spanMs: r.spanAt(nowMs) } : { ageMs: null, spanMs: null };
+  return r instanceof RankingBase ? { ageMs: r.ageAt(nowMs, feedAt), spanMs: r.spanAt(nowMs, feedAt) } : { ageMs: null, spanMs: null };
 }
 
 /**
@@ -737,8 +742,8 @@ export function routeSummaryAt(snapshot: GatewaySnapshot, capacityKey: string, n
 }
 
 /** The recovery leases of the ranker that ranks `snapshot`'s routes, which settle a plan's head (plan-order.ts `settleHead`). */
-export function probeLeases(snapshot: GatewaySnapshot, nowMs: number): ProbeLeases {
-  return rankerFor(snapshot, nowMs);
+export function probeLeases(snapshot: GatewaySnapshot, nowMs: number, feedAt = nowMs): ProbeLeases {
+  return rankerFor(snapshot, nowMs, feedAt);
 }
 
 /**
@@ -746,10 +751,10 @@ export function probeLeases(snapshot: GatewaySnapshot, nowMs: number): ProbeLeas
  * each id as its route's rank key in the request's mode (`stream`), the ranker's own keys (plan-order.ts
  * `rankKeyLeases`).
  */
-export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, routes: Iterable<Route>, stream: boolean, regionOf?: RankRegionOf): ProbeLeases {
+export function routeProbeLeases(snapshot: GatewaySnapshot, nowMs: number, routes: Iterable<Route>, stream: boolean, regionOf?: RankRegionOf, feedAt = nowMs): ProbeLeases {
   const records = new Map<string, RouteRecord>();
   for (const r of routes) records.set(r.record.endpointId, r.record);
-  return rankKeyLeases(rankerFor(snapshot, nowMs), (id) => {
+  return rankKeyLeases(rankerFor(snapshot, nowMs, feedAt), (id) => {
     const record = records.get(id);
     return record === undefined ? id : rankKeyOf(record, stream, regionOf?.(record));
   });

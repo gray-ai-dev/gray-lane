@@ -76,7 +76,10 @@ import type { LaneState, StackTransport } from "./types.ts";
  * limit is ANSWER_HELD_MAX_BYTES (the hold that sizes it is the entry's), and the client is the hop: no keep-alive is
  * written into the bytes, the hop has its own comment from the moment the answer opens (egress's silence bound runs
  * from the connection, PR 3), and a hop that closes is a client that left with no read-on window (the entry has gone,
- * so nothing is read on for it).
+ * so nothing is read on for it). The hop closing is the request's signal aborting: the workerd HTTP server does not
+ * cancel a Worker's answer stream when its client's connection closes, it only stops reading it (the case B repro of
+ * 2026-11-26). A hop the entry stops reading for STREAM_CLIENT_STALL_MS has left too (`HopStream`), so every path of
+ * the attempt reaches the rid's DELETE, the inner receipt and the attempts table's `done`.
  *
  * The inner receipt is the S26 v2 receipt of the attempt with `peer.entry` right after `request.received` (section
  * 4.8), signed with this boot's receipt key; it goes in `end` and stays in the attempts table for the late follow-up.
@@ -153,7 +156,7 @@ export function serveBackend(input: BackendInput): Response {
   if (config !== null && route === null) return peerRefusal("route_unconfigured");
   const key = PeerAttempts.key(envelope);
   input.peer.attempts.take(key, input.clock());
-  const hop = new HopStream(input.timers, input.clock);
+  const hop = new HopStream(input.timers, input.clock, input.cfg.streamClientStallMs);
   const run = new BackendRun(input, route, key, hop);
   input.waitUntil(run.run());
   return new Response(hop.readable, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
@@ -161,22 +164,29 @@ export function serveBackend(input: BackendInput): Response {
 
 /**
  * The hop's answer stream: frames as they come, `PEER_COMMENT` while nothing was written for PEER_COMMENT_MS, the
- * comment first of all so egress's silence bound starts its count at once. Its cancel is the entry leaving.
+ * comment first of all so egress's silence bound starts its count at once.
+ *
+ * The entry leaves (`leave`) when the request's signal aborts (`BackendRun`), when the stream is cancelled or refuses a
+ * frame, and when a frame waits `stallMs` for the entry to read (`client_read_timeout`). Leaving errors the stream, so
+ * its queued frames go, and lets a waiting `write` return false at once: a write never waits on a hop nobody reads.
  */
 class HopStream {
   readonly readable: ReadableStream<Uint8Array>;
   #controller!: ReadableStreamDefaultController<Uint8Array>;
   #closed = false;
+  #gone = false;
   #lastWrite: number;
   #interval: unknown;
   #pulled: (() => void) | null = null;
-  readonly #left = new Set<() => void>();
+  readonly #left = new Set<(why: string) => void>();
   readonly #timers: StreamTimers;
   readonly #clock: () => number;
+  readonly #stallMs: number;
 
-  constructor(timers: StreamTimers, clock: () => number) {
+  constructor(timers: StreamTimers, clock: () => number, stallMs: number) {
     this.#timers = timers;
     this.#clock = clock;
+    this.#stallMs = stallMs;
     this.#lastWrite = clock();
     this.readable = new ReadableStream<Uint8Array>(
       {
@@ -188,7 +198,7 @@ class HopStream {
           this.#pulled = null;
           resolve?.();
         },
-        cancel: () => this.#leave(),
+        cancel: () => this.leave("client_left"),
       },
       { highWaterMark: 4 * PEER_FRAME_MAX_BYTES, size: (chunk: Uint8Array) => chunk.byteLength },
     );
@@ -199,14 +209,25 @@ class HopStream {
     }, PEER_COMMENT_MS / 3);
   }
 
-  /** Calls `listener` when the entry leaves (the hop closed under the answer). */
-  onLeave(listener: () => void): void {
+  /** Calls `listener` with why when the entry leaves (the hop closed under the answer). */
+  onLeave(listener: (why: string) => void): void {
     this.#left.add(listener);
   }
 
-  #leave(): void {
+  /** The entry left (`client_left`) or stopped reading (`client_read_timeout`): no frame goes after it. Idempotent. */
+  leave(why: string): void {
+    if (this.#gone) return;
+    this.#gone = true;
+    const open = !this.#closed;
     this.#finish();
-    for (const listener of [...this.#left]) listener();
+    if (open) {
+      try {
+        this.#controller.error(new Error(why));
+      } catch {
+        // Already cancelled by the entry.
+      }
+    }
+    for (const listener of [...this.#left]) listener(why);
     this.#left.clear();
   }
 
@@ -217,16 +238,27 @@ class HopStream {
       this.#lastWrite = this.#clock();
       return true;
     } catch {
-      this.#leave();
+      this.leave("client_left");
       return false;
     }
   }
 
-  /** One frame, waiting while the hop's queue is full (the entry reads at its client's pace). */
+  /**
+   * One frame, waiting while the hop's queue is full (the entry reads at its client's pace), at most `stallMs`: a hop
+   * not read for that long has left (`client_read_timeout`). False once the entry left, at once when it leaves.
+   */
   async write(frame: Uint8Array): Promise<boolean> {
     if (!this.#enqueue(frame)) return false;
     const size = this.#controller.desiredSize;
-    if (size !== null && size <= 0 && !this.#closed) await new Promise<void>((resolve) => (this.#pulled = resolve));
+    if (size !== null && size <= 0 && !this.#closed) {
+      let timer: unknown = null;
+      const read = await new Promise<boolean>((resolve) => {
+        this.#pulled = () => resolve(true);
+        timer = this.#timers.setTimeout(() => resolve(false), this.#stallMs);
+      });
+      this.#timers.clearTimeout(timer);
+      if (!read) this.leave("client_read_timeout");
+    }
     return !this.#closed;
   }
 
@@ -254,7 +286,10 @@ class BackendRun {
   readonly #route: StackRelayRoute | null;
   readonly #key: string;
   readonly #hop: HopStream;
-  /** The entry left (the hop closed): the attempt's client is gone, with nothing read on for it. */
+  /**
+   * The entry left: the request's signal aborted (the hop's connection closed), or the hop left (`HopStream`). The
+   * attempt's client is gone, with nothing read on for it, and the hop with it.
+   */
   readonly #presence: ClientPresence;
   readonly #retained = new Retained();
   /** What the client was written: every byte for `body_hash`, a stream's S19 chain or a body's bytes (S26). */
@@ -318,10 +353,13 @@ class BackendRun {
     this.#readsRelayStatus = reads.has("relay_status");
     this.#readsGateRefused = reads.has("gate_refused");
     this.#readsGateCut = reads.has("gate_cut");
-    this.#presence = new ClientPresence(null, input.clock, 0);
-    hop.onLeave(() => this.#presence.leave("client_left"));
-    this.#presence.onLeave(() => {
+    // workerd aborts the signal when the hop's connection closes and never cancels the hop's stream (case B, 2026-11-26).
+    this.#presence = new ClientPresence(input.request.signal, input.clock, 0);
+    hop.onLeave((why) => this.#presence.leave(why));
+    this.#presence.onLeave((why) => {
       this.#leftAnswered ??= this.#chain.count() > 0 || this.#body.some((chunk) => chunk.length > 0);
+      // A frame waiting for the hop (`#pump`, `#data`, `#head`, the `end` frame) returns at once.
+      hop.leave(why);
     });
   }
 

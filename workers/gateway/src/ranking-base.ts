@@ -148,9 +148,17 @@ export class RankingBase {
     });
   }
 
-  /** The base's age at `nowMs` (since the collector's word on it), or null when ranking reads none (`current`). */
-  ageAt(nowMs: number): number | null {
-    return this.current(nowMs) === null ? null : nowMs - this.asOf;
+  /** The collector's word the base holds (`asOf`), whether or not ranking may read it now; 0 before its first answer. */
+  heldAsOf(): number {
+    return this.ranker === null ? 0 : this.asOf;
+  }
+
+  /**
+   * The base's age at `nowMs` (since the collector's word on it), or null when ranking reads none (`current`), judged at
+   * `feedAt` (a request's verdict, inference/state.ts `rankingFeedAt`; `nowMs` by default).
+   */
+  ageAt(nowMs: number, feedAt = nowMs): number | null {
+    return this.current(feedAt) === null ? null : nowMs - this.asOf;
   }
 
   /**
@@ -180,8 +188,8 @@ export class RankingBase {
    * the copy it gave the last check was refreshed no earlier than that much before the check before it: the base's age
    * less this span is at most CONFIG_REPLICA_CHECK_MS plus one sync.
    */
-  spanAt(nowMs: number): number | null {
-    if (this.answered.length < 2 || this.current(nowMs) === null) return null;
+  spanAt(nowMs: number, feedAt = nowMs): number | null {
+    if (this.answered.length < 2 || this.current(feedAt) === null) return null;
     return nowMs - this.answered[0]!.startedAt;
   }
 
@@ -211,7 +219,10 @@ export class RankingBase {
     return this.records ? null : "records_unsupported";
   }
 
-  /** The ranker to rank with at `nowMs`: the base's while it is within CONFIG_ALERT_AGE_MS, else null (ranking reads no samples). */
+  /**
+   * The ranker to rank with at `nowMs`: the base's while it is within CONFIG_ALERT_AGE_MS, else null (ranking reads no
+   * samples). A request asks at its verdict's time (inference/state.ts `rankingFeedAt`, routes.ts `rankerFor`).
+   */
   current(nowMs: number): Ranker | null {
     if (this.ranker === null || nowMs - this.asOf > this.alertAgeMs) return null;
     return this.ranker;

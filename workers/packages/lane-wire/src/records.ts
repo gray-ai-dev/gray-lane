@@ -845,7 +845,11 @@ export const LANE_FORBIDDEN_SERVICE_EVENT_FIELDS = Object.freeze([
   "retry_signature",
 ] as const);
 
-/** `safe_usage_counters`' top-level counters (`@gray/ledger-keys` `supply::safe_usage_counters`). */
+/**
+ * `safe_usage_counters`' top-level counters (`@gray/ledger-keys` `supply::safe_usage_counters`), except Moonshot's
+ * top-level `cached_tokens` (2026-11-26): settlement evidence keeps it, this closed wire does not, so a stack VM and an
+ * entry of different releases still report the same `end.usage` (the projection drops it on both sides).
+ */
 const USAGE_COUNTER_FIELDS = Object.freeze([
   "prompt_tokens",
   "completion_tokens",

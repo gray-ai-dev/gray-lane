@@ -999,6 +999,11 @@ export class SnapshotCache {
   private feedFailing = false;
   /** When a request's wait for a ranking base last ended without one (`refreshRanking`); cleared once a check brings one. */
   private rankingGaveUpAt = -Infinity;
+  /**
+   * The collector's word the base held when that wait ended (`RankingBase.heldAsOf`): only a check that brings a later
+   * one ends the cooldown. A base that still serves inside a request's margin (`refreshRanking`'s `marginMs`) is not one.
+   */
+  private rankingGaveUpAsOf = 0;
   /** The confirmation in flight (`confirm`), and when the last one started. */
   private confirming: Promise<void> | null = null;
   private confirmStartedAt = -Infinity;
@@ -1089,14 +1094,22 @@ export class SnapshotCache {
    * `refreshedRanking` gives it what the request's pre budget can spare). A check still running when the wait ends goes
    * on in `background`; the request ranks with the base as it is then. No wait (`waited` false, no call) when the isolate
    * has a base it can use, or when a wait cannot bring one (`waitsForRanking`). `fed`: the base can serve now.
+   *
+   * `marginMs` (`rankingMarginMs`): a base that serves at `now` but not at `now + marginMs` (it crosses CONFIG_ALERT_AGE_MS
+   * within the request's pre budget) is refreshed as one that cannot serve is, within the same wait and the same rules. A
+   * wait that brings none it can use through the margin counts as one that ended without a base (`rankingGaveUpAt`), so
+   * the next requests within RANKING_AHEAD_MS do not wait for it again; `fed` stays the verdict at `now`.
    */
-  async refreshRanking(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, waitMs: number, run?: Runner): Promise<{ readonly fed: boolean; readonly waited: boolean }> {
-    if (this.fed(now)) return { fed: true, waited: false };
-    if (waitMs <= 0 || !this.waitsForRanking(timing, now)) return { fed: false, waited: false };
-    await this.awaitFeed(source, timing, now, background, waitMs, run);
-    const fed = this.fed(now);
-    if (!fed) this.rankingGaveUpAt = now;
-    return { fed, waited: true };
+  async refreshRanking(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, waitMs: number, run?: Runner, marginMs = 0): Promise<{ readonly fed: boolean; readonly waited: boolean }> {
+    const through = now + Math.max(0, marginMs);
+    if (this.fed(through)) return { fed: true, waited: false };
+    if (waitMs <= 0 || !this.waitsForRanking(timing, now)) return { fed: this.fed(now), waited: false };
+    await this.awaitFeed(source, timing, now, background, waitMs, run, through);
+    if (!this.fed(through)) {
+      this.rankingGaveUpAt = now;
+      this.rankingGaveUpAsOf = this.base.heldAsOf();
+    }
+    return { fed: this.fed(now), waited: true };
   }
 
   /**
@@ -1114,11 +1127,11 @@ export class SnapshotCache {
     return now - this.rankingGaveUpAt >= RANKING_AHEAD_MS;
   }
 
-  /** The wait of `readRanked` and `refreshRanking`, at most `waitMs`. */
-  private async awaitFeed(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, waitMs: number, run?: Runner): Promise<void> {
+  /** The wait of `readRanked` and `refreshRanking`, at most `waitMs`, for a base that serves through `through` (`now` by default). */
+  private async awaitFeed(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, waitMs: number, run?: Runner, through = now): Promise<void> {
     const deadline = sleep(waitMs, timing.timers);
     try {
-      while (!this.fed(now) && !deadline.fired()) {
+      while (!this.fed(through) && !deadline.fired()) {
         const underWay = this.pending(timing, now);
         if (underWay !== null && this.checkingRanks) {
           await Promise.race([underWay, deadline.done]);
@@ -1127,7 +1140,7 @@ export class SnapshotCache {
         const asked = this.check(source, now, timing, run, undefined, true, background);
         background(asked);
         await Promise.race([asked, deadline.done]);
-        if (this.fed(now) || deadline.fired() || this.keepsFeed !== true) break;
+        if (this.fed(through) || deadline.fired() || this.keepsFeed !== true) break;
         const pause = sleep(RANKED_RETRY_MS, timing.timers);
         try {
           await Promise.race([pause.done, deadline.done]);
@@ -1281,11 +1294,29 @@ export class SnapshotCache {
    * when the last ranking check started, not from the base's `asOf`: a replica answers its copy as it is and refreshes it
    * in the background, so a check gets the copy of the check before it, and keying on the copy's age would ask twice per
    * cycle.
+   *
+   * While the base cannot serve (`fed` false: a boot not yet fed, or a fed base gone past CONFIG_ALERT_AGE_MS) it asks
+   * every CONFIG_VERSION_CHECK_MS instead, as long as a feed is coming (`feedComing`). Staging
+   * Z17: a boot's D7 read found its replica's copy empty (the replica refreshes it in the background of
+   * that read), and the base came with the third 20 s check after it, 51.5 s to `/readyz` 200.
    */
   rankAhead(source: SnapshotSource, timing: SnapshotTiming, now: number, background: (p: Promise<unknown>) => void, run?: Runner): boolean {
-    if (!this.usable(timing, now) || this.pending(timing, now) !== null || now - this.rankingCheckedAt < RANKING_AHEAD_MS) return false;
+    const every = !this.fed(now) && this.feedComing(timing, now) ? timing.checkMs : RANKING_AHEAD_MS;
+    if (!this.usable(timing, now) || this.pending(timing, now) !== null || now - this.rankingCheckedAt < every) return false;
     background(this.check(source, now, timing, run, undefined, true));
     return true;
+  }
+
+  /**
+   * The next ranking check may bring a base that serves (`fed`): the source keeps a copy of the collector and says its
+   * syncs work (an empty copy of a replica that has just started, or of a collector that is still asking the roots for
+   * their keys, gives no failing-since), and the base's producer carries the roots' records, or no answer told yet. A
+   * source that keeps no copy, syncs that fail, or a bridge before r17 cannot bring one sooner: `rankAhead` keeps to
+   * RANKING_AHEAD_MS for them, as `waitsForRanking` keeps the requests from waiting.
+   */
+  private feedComing(timing: SnapshotTiming, now: number): boolean {
+    if (!this.usable(timing, now) || this.keepsFeed !== true || this.feedFailing) return false;
+    return this.base.have() === null || this.base.recordsSupported();
   }
 
   /** What a request reads: the copy while it is within CONFIG_MAX_AGE_MS. Says nothing (`watch` follows the checks). */
@@ -1423,8 +1454,9 @@ export class SnapshotCache {
           this.feedFailing = answer.rankingFailingSince !== undefined && answer.rankingFailingSince !== null;
         }
         const took = this.take(answer, generation, timing);
-        // A base the requests can use again ends the requests' cooldown at once (`waitsForRanking`).
-        if (generation === this.generation && this.fed(gatewayNow())) this.rankingGaveUpAt = -Infinity;
+        // A base the requests can use again, newer than the one the last wait gave up on, ends the requests' cooldown at once
+        // (`waitsForRanking`). The same copy again (a slow check that settles after the wait, inside the margin) does not.
+        if (generation === this.generation && this.fed(gatewayNow()) && (this.copy?.ranking !== this.base || this.base.heldAsOf() > this.rankingGaveUpAsOf)) this.rankingGaveUpAt = -Infinity;
         if (asked !== undefined && generation === this.generation) {
           const at = gatewayNow();
           // A ranking answer the base took, by the source that gave it: the span of (b1) (ranking-base.ts `spanAt`).
@@ -1521,6 +1553,7 @@ export class SnapshotCache {
     this.keepsFeed = null;
     this.feedFailing = false;
     this.rankingGaveUpAt = -Infinity;
+    this.rankingGaveUpAsOf = 0;
     this.confirming = null;
     this.confirmStartedAt = -Infinity;
     this.storing = null;
@@ -1547,6 +1580,19 @@ export const RANKING_AHEAD_MS = 20_000;
 
 /** The most a request waits for a ranking base before it ranks (`refreshRanking`, inference/intake.ts `refreshedRanking`). */
 export const RANKING_WAIT_MS = 500;
+
+/**
+ * How far ahead of `now` intake judges its ranking base (inference/intake.ts `refreshedRanking`, `refreshRanking`'s
+ * `marginMs`): what the request's pre budget has left (`preLeftMs`), the time it may still spend on Gray's own
+ * dependencies before its first upstream byte and so before its ranking, and never more than a sixth of
+ * CONFIG_ALERT_AGE_MS (10 s at 60 s), so a large REQUEST_PRE_BUDGET_MS does not have every request refresh a base well
+ * within its age. In production (REQUEST_PRE_BUDGET_MS 3 s) it is at most 3 s. gray-jobs' replicas keep an entry's base
+ * younger than X + RANKING_AHEAD_MS, 40 s (ConfigReplicaDO `rankingWaitAgeMs`), so in steady state no base is inside
+ * the margin and no request waits for one.
+ */
+export function rankingMarginMs(alertAgeMs: number, preLeftMs: number): number {
+  return Math.max(0, Math.min(preLeftMs, Math.floor(alertAgeMs / 6)));
+}
 
 /** A wait of `ms` on `timers` (the platform's when absent): `done` resolves then, unless `cancel` came first. */
 function sleep(ms: number, timers?: CheckTimers): { readonly done: Promise<void>; fired(): boolean; cancel(): void } {

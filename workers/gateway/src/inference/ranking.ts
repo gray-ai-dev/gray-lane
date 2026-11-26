@@ -18,6 +18,7 @@ import { type GatewaySnapshot, type KeyRecord, routeServes } from "../snapshot.t
 import { agentThinking, opencodeAgent } from "../traffic-evidence.ts";
 import { type DispatchEnvRun, acquire, modelBlockGates } from "./dispatch-env.ts";
 import { unserved } from "./record.ts";
+import { rankingFeedAt } from "./state.ts";
 import { requestDeadline } from "./request-body.ts";
 import { rankRegion } from "./stack-routes.ts";
 import { issuerRoutes } from "./tool-call-ids.ts";
@@ -83,10 +84,13 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   // `shardRestView`; gateway.md 13 #22), as the server's ranking passes a resting route over.
   const rests = await shardRestView(run.deps.shardRests, routes, run.facts.stream === true, clock(), cfg.endpointReportMs, snapshot.version, run.rankRegionOf);
   const rankedAt = clock();
+  // Whether the request has a feed is intake's verdict (`rankingFeedAt`), never this ranking's own clock: a base current
+  // at intake that crossed CONFIG_ALERT_AGE_MS since is still read (Z17, lane-1: `base_stale`, `waited_ms` null).
+  const feedAt = rankingFeedAt(run);
   const stream = run.facts.stream === true;
   const policy = snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY;
-  const utilityRoutes = utilityRoutesOf(snapshot, routes, rankedAt, stream, run.rankRegionOf);
-  if (!utilityRoutes.feedAvailable && run.routing.checksUnapplied === null && asksFeedChecks(run.routing.routingParams, true)) checksUnapplied(run, snapshot, rankedAt);
+  const utilityRoutes = utilityRoutesOf(snapshot, routes, rankedAt, stream, run.rankRegionOf, feedAt);
+  if (!utilityRoutes.feedAvailable && run.routing.checksUnapplied === null && asksFeedChecks(run.routing.routingParams, true)) checksUnapplied(run, snapshot, feedAt);
   // The session's live record in the isolate's store (docs/utility-routing.md "Sessions"), and its provider's route
   // as this request sees it: a candidate of the model at all, through the customer's filters, its circuit, its rest,
   // the constraints and the price cap, and its price against the record's.
@@ -112,7 +116,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   run.routing.sessionHit = session.kind === "hit";
   if (run.routing.sessionHit && run.routing.session !== null) sessions.touch(key.workspaceId, run.routing.session.key, rankedAt, policy.sessionIdleMs);
   run.routing.utilityAsk = { ...ask, sessionHit: run.routing.sessionHit };
-  const ranking = await rankUtility(snapshot, routes, utilityRoutes, run.routing.utilityAsk, requestKey, rankedAt, rests, stream, true, run.rankRegionOf);
+  const ranking = await rankUtility(snapshot, routes, utilityRoutes, run.routing.utilityAsk, requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt);
   const endpointOf = (rankKey: string) => utilityRoutes.routes.find((r) => r.key === rankKey)?.endpointId ?? rankKey;
   // The formula left no route (a constraint, the price cap, no reference price): this model fails as the customer's
   // filters fail it, and a model listed next may still serve (docs "Constraints and the price cap", T21). The record
@@ -124,7 +128,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
       preset: run.routing.routingParams.preset,
       policyVersion: policy.version,
       snapshotVersion: snapshot.version,
-      feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, rankedAt) : null,
+      feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, feedAt) : null,
       session,
       sessionKeyPresent: run.routing.session !== null,
       sessionEndpoint: record?.endpointId ?? null,
@@ -140,8 +144,8 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
     run.routing.routingFacts = modelRoutingFacts(run, snapshot, canonical.model, routes, utilityRoutes, stream, { refused: formulaRefusal(ranking.utility) });
     return unserved(run, utilityRefusal(ranking.utility, canonical.model)!, "ranking");
   }
-  run.routing.rankingBaseAgeMs = rankingBaseAge(snapshot, rankedAt);
-  run.routing.ranked = rankedWith(snapshot, rankedAt);
+  run.routing.rankingBaseAgeMs = rankingBaseAge(snapshot, rankedAt, feedAt);
+  run.routing.ranked = rankedWith(snapshot, rankedAt, feedAt);
   // The head the formula's unselected share moved first is named so (review r17-gateway-5 finding 34).
   const order = { ...orderedOf(ranking.result), unselected: unselectedOf(ranking.utility, utilityRoutes) };
   // The group the dispatches' points name (`rankingPoints`): lane inference tags `lane-<env>`, as apis.ts does, so
@@ -150,7 +154,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   run.routing.routingGroup = JSON.stringify([canonical.model, protocol, routingRegion, run.facts.stream === true, run.deps.region]);
   // The due probe goes first for a request that could choose it; the one permitted failover goes to an independent
   // operator, never a steered supplier's; a recovery probe goes only at the head.
-  const leases = routeProbeLeases(snapshot, clock(), routes, run.facts.stream === true, run.rankRegionOf);
+  const leases = routeProbeLeases(snapshot, clock(), routes, run.facts.stream === true, run.rankRegionOf, feedAt);
   const ordered = await orderPlan(order, new Map(routes.map((r) => [r.record.endpointId, r])), steered, preference, leases, clock(), requestKey);
   await run.routing.heldProbe.hold(ordered.leased, leases, requestKey);
   // Why the plan's head is first and the probe it leased, for the record (docs/utility-routing.md "Evidence"), as the
@@ -171,7 +175,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
     preset: run.routing.routingParams.preset,
     policyVersion: policy.version,
     snapshotVersion: snapshot.version,
-    feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, rankedAt) : null,
+    feed: utilityRoutes.feedAvailable ? rankedFeed(snapshot, feedAt) : null,
     session,
     sessionKeyPresent: run.routing.session !== null,
     sessionEndpoint: record?.endpointId ?? null,
@@ -279,7 +283,7 @@ export function preferenceRefusedFactsOf(run: RankingRun, snapshot: GatewaySnaps
     policy: snapshot.routing?.policy ?? DEFAULT_ROUTING_POLICY,
     reference: snapshot.routing?.referencePrices.get(model) ?? null,
     contextTokens: snapshot.models[model]?.window ?? null,
-    feedAvailable: feedAvailable(snapshot, run.deps.clock()),
+    feedAvailable: feedAvailable(snapshot, rankingFeedAt(run)),
     filtered,
   });
 }

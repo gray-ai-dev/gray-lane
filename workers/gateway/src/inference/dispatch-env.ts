@@ -19,6 +19,7 @@ import { type BodyLimitsRun, overRequestLimit } from "./body-limits.ts";
 import { laneAccountPool, lanePolicyStep } from "./lane-attempt.ts";
 import { unsentOutcome } from "./settle-pure.ts";
 import { rankRegion } from "./stack-routes.ts";
+import { rankingFeedAt } from "./state.ts";
 import type { Acquired, Dispatch, HeadPermit, Prepared, RepeatTicket } from "./types.ts";
 import { requestDeadline } from "./request-body.ts";
 
@@ -241,13 +242,15 @@ export function dispatchEnv(run: DispatchEnvRun, d: Dispatcher, o: Dispatch, pre
       // routes it names go first, in its order
       // (inference.rs `rerank`: `settle_head` with the plan's preference; the dispatch replay's `rerank` does the same).
       const rankedAt = clock();
+      // The feed as intake judged it (ranking.ts `rankingFeedAt`): a refit reads it as the plan it refits did.
+      const feedAt = rankingFeedAt(run);
       const stream = run.facts.stream === true;
       const ask = run.routing.utilityAsk;
       const ranking =
         ask === null
-          ? { ok: true as const, ...(await rankDetailed(o.snapshot, remaining, requestKey, rankedAt, rests, stream, true, run.rankRegionOf)) }
-          : await rankUtility(o.snapshot, remaining, utilityRoutesOf(o.snapshot, remaining, rankedAt, stream, run.rankRegionOf), ask, requestKey, rankedAt, rests, stream, true, run.rankRegionOf);
-      run.routing.ranked = rankedWith(o.snapshot, rankedAt);
+          ? { ok: true as const, ...(await rankDetailed(o.snapshot, remaining, requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt)) }
+          : await rankUtility(o.snapshot, remaining, utilityRoutesOf(o.snapshot, remaining, rankedAt, stream, run.rankRegionOf, feedAt), ask, requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt);
+      run.routing.ranked = rankedWith(o.snapshot, rankedAt, feedAt);
       // The formula excluded every route left: nothing more to try, and none of them is a candidate any more, so that no
       // tier ranks them again (review r17-gateway-5 blocker 25; the server's `rerank` alike).
       if (!ranking.ok) return { head: null, leftOut: remaining };
@@ -259,7 +262,7 @@ export function dispatchEnv(run: DispatchEnvRun, d: Dispatcher, o: Dispatch, pre
       // The issuer's routes left hold another route's probe back, and take the one the ranking leased when every route
       // left is open, as at admission.
       const issuer = { routes: new Set(remaining.filter((r) => run.facts.issuedRoutes.has(r.record.endpointId)).map((r) => r.record.endpointId)), away: (r: Route) => run.routing.steeredAway.has(r.record.operator) };
-      const leases = routeProbeLeases(o.snapshot, clock(), remaining, run.facts.stream === true, run.rankRegionOf);
+      const leases = routeProbeLeases(o.snapshot, clock(), remaining, run.facts.stream === true, run.rankRegionOf, feedAt);
       const leased = await settleHead(leases, planPreference<Route>(run.routing.preference), order.leased, null, order.due, false, issuer, left, ranked, requestKey, clock());
       // The re-ranked head's lease is the request's until its attempt goes, as the plan's head's (review r17-gateway-2
       // finding 11): a request that ends first gives it back.

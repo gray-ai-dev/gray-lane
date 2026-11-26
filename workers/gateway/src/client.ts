@@ -9,8 +9,9 @@ import type { Protocol } from "@gray/protocol";
  * `readOnMs` after the client left and charged by the upstream's usage when it ends in that time, as the
  * server reads it to its end (crates/gray-gateway/src/inference.rs `feed_client`, docs/prepaid-billing.md
  * item 4; docs/cloudflare-native.md 5.6). No new attempt starts once the client is gone. The runtime
- * aborts `request.signal` (compatibility flag `enable_request_signal`) and cancels the response body;
- * either one counts.
+ * aborts `request.signal` (compatibility flag `enable_request_signal`), and either that or the response
+ * body's cancel counts. The workerd HTTP server the TEE lane runs under aborts the signal and never
+ * cancels the body (it stops reading it), so a lane path must pass the signal here (lane/backend.ts).
  */
 export class ClientPresence {
   private leftAt: number | null = null;

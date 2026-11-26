@@ -57,6 +57,7 @@ export {
   isHostedToolName,
   isServiceTierName,
   resolveAppliedServiceTier,
+  unsupportedServiceTier,
   type HostedToolCalls,
   type HostedToolName,
   type RequestedHostedTool,

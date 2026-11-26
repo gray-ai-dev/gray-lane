@@ -30,6 +30,7 @@ import { refuse, unserved } from "./record.ts";
 import { promptUnits } from "./request-body.ts";
 import { pricingOptionsFor } from "./sizing.ts";
 import { entryPeers, laneRoutes, rankRegion, stackRoute } from "./stack-routes.ts";
+import { rankingFeedAt } from "./state.ts";
 import { resolveToolIds } from "./tool-call-ids.ts";
 import type { ModelResult } from "./types.ts";
 import { laneDecryptSealedContinuation, lanePin, laneZeroRetentionRoute } from "./zdr.ts";
@@ -344,7 +345,7 @@ export async function serveModel(run: ServeModelRun, snapshot: GatewaySnapshot, 
         // The routes admission ranks: those whose endpoint shard holds no rest (`rankUtility`).
         const at = run.deps.clock();
         const rests = await shardRestView(run.deps.shardRests, priced.routes, canonical.stream === true, at, cfg.endpointReportMs, snapshot.version, run.rankRegionOf);
-        if (constraintsExcludeAll(snapshot, priced.routes, ask, at, canonical.stream === true, rests, run.rankRegionOf)) return { kind: "constrained", value };
+        if (constraintsExcludeAll(snapshot, priced.routes, ask, at, canonical.stream === true, rests, run.rankRegionOf, rankingFeedAt(run))) return { kind: "constrained", value };
         return { kind: "serve", value };
       },
       unrouted: () => unrouted(snapshot, canonical, protocol, now, false, rules, run.routing.preference),

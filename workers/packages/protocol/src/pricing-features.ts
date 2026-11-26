@@ -160,16 +160,24 @@ export function extractPricingFeatures(protocol: Protocol, body: Json): Requeste
 
 /**
  * Resolves the billed service tier given what the client requested and what the upstream response reported.
- * If the upstream explicitly downgraded (e.g. `"standard"`, `"default"`, `"flex"`), bills standard (`null`)
- * so customers are never overcharged when priority/fast capacity falls back.
+ * The accelerated tier is billed only when the answer confirms it (`usage.speed: "fast"` on Anthropic,
+ * `service_tier: "priority"` on OpenAI). An answer that reports another tier (`"standard"`, `"default"`, `"flex"`
+ * or a word Gray does not know) or none at all, as when a relay strips the field, bills standard (`null`), so a
+ * customer is never charged for a tier nobody confirmed.
  */
 export function resolveAppliedServiceTier(requested: ServiceTierName | null, reportedTier: string | null): ServiceTierName | null {
-  if (requested === null) return null;
-  if (reportedTier === null) return requested;
-  const norm = reportedTier.trim().toLowerCase();
-  if (norm === "standard" || norm === "default" || norm === "flex") return null;
-  if (norm === "fast" || norm === "priority") return norm === requested ? requested : null;
-  return requested;
+  if (requested === null || reportedTier === null) return null;
+  return reportedTier.trim().toLowerCase() === requested ? requested : null;
+}
+
+/**
+ * The `service_tier` a request names that Gray refuses: OpenAI's `flex` processing, which no Gray route offers
+ * or prices. `"auto"`, `"default"`, `"priority"` and an absent field are served as before.
+ */
+export function unsupportedServiceTier(protocol: Protocol, body: Json): "flex" | null {
+  if (protocol !== "open_ai_chat" && protocol !== "open_ai_responses") return null;
+  if (!isObject(body)) return null;
+  return asStr(get(body, "service_tier"))?.trim().toLowerCase() === "flex" ? "flex" : null;
 }
 
 const U64_MAX = 0xffff_ffff_ffff_ffffn;

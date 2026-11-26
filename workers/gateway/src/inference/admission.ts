@@ -30,6 +30,7 @@ import { upstreamPromptUnits } from "./request-body.ts";
 import { type SizingRun, admitRefusal, pricingOptionsFor, size } from "./sizing.ts";
 import { stackPlan } from "./stack-peer.ts";
 import { rankRegion, stackRoute } from "./stack-routes.ts";
+import { rankingFeedAt } from "./state.ts";
 import type { ModelResult } from "./types.ts";
 
 const encoder = new TextEncoder();
@@ -258,6 +259,7 @@ function pricedRoutes(
     clock(),
     run.facts.stream === true,
     run.rankRegionOf,
+    rankingFeedAt(run),
   );
   const excluded = screened.excluded;
   if (excluded.length > 0) {
