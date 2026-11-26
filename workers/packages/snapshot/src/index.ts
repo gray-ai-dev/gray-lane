@@ -15,8 +15,6 @@ export * from "./age.ts";
 export * from "./cache.ts";
 export * from "./capabilities.ts";
 export * from "./control.ts";
-export * from "./credential.ts";
-export * from "./debt.ts";
 export * from "./endpoint-route.ts";
 export * from "./evidence.ts";
 export * from "./expiry.ts";
@@ -24,13 +22,19 @@ export * from "./facts.ts";
 export * from "./gateway.ts";
 export * from "./image-gate.ts";
 export * from "./keys.ts";
-export * from "./model-check-keys.ts";
 export * from "./offers.ts";
-export * from "./publish.ts";
-export * from "./reference-catalog.ts";
 export * from "./rests.ts";
 export * from "./signed.ts";
 export * from "./snapshot.ts";
 export * from "./storage.ts";
 export * from "./stored.ts";
-export * from "./writer.ts";
+
+// What gray-jobs and gray-console use around the snapshot they write: its values come from
+// `@gray/snapshot/publisher`, so that a bundle that only reads the snapshot (the lane's) does not
+// load it. Its types stay here.
+export type * from "./credential.ts";
+export type * from "./debt.ts";
+export type * from "./model-check-keys.ts";
+export type * from "./publish.ts";
+export type * from "./reference-catalog.ts";
+export type * from "./writer.ts";

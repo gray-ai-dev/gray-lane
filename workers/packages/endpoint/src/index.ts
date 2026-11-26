@@ -15,36 +15,35 @@ export const PACKAGE = "@gray/endpoint";
 export * from "./types.ts";
 export { rootName, shardIndex, shardName, shardRegion } from "./naming.ts";
 export { circuitSettings, endpointSettings, feedLimits, headroom, inDoubtMs, rankingConfigOf, type EndpointSettings } from "./settings.ts";
-export {
-  CIRCUIT_KEYS_BOUND,
-  circuitSuccess,
+export { validMeasure, type OutcomeMeasure } from "./measure.ts";
+
+// The Durable Objects' cores, the circuit and the ranking feed: their values come from
+// `@gray/endpoint/objects`, so that a bundle that needs only the shared types, names and settings
+// (the lane's) does not load them. Their types stay here.
+export type {
   CircuitRuns,
   Circuits,
-  decodeRuns,
-  modeFailing,
-  ROUTE_CIRCUIT,
-  validMeasure,
-  type OutcomeMeasure,
-  type RankingStateJson,
-  type RootRankingKey,
-  type TrialDurable,
-  type Admission,
-  type CircuitDurable,
-  type CircuitHealth,
-  type CircuitObservation,
-  type CircuitSettings,
-  type CircuitsSnapshot,
-  type CircuitState,
-  type CircuitView,
-  type KeyOutcomes,
-  type ModeFailing,
-  type ProbeLease,
+  RankingStateJson,
+  RootRankingKey,
+  TrialDurable,
+  Admission,
+  CircuitDurable,
+  CircuitHealth,
+  CircuitObservation,
+  CircuitSettings,
+  CircuitsSnapshot,
+  CircuitState,
+  CircuitView,
+  KeyOutcomes,
+  ModeFailing,
+  ProbeLease,
 } from "./circuit.ts";
-export { RankingFeed, type RankingFeedLimits, type RankingPush, type RankingPushAck } from "./ranking-feed.ts";
-export { collectorSettings, PUSH_RATE_ALERT_PER_SECOND, PUSH_RATE_WINDOW_MS, RankingCollectorCore, type RankingCollectorSettings, type RankingCollectorStore } from "./ranking-collector.ts";
-export { circuitOf, EndpointRootCore, type Behind, type CircuitTrip, type LeaseRow, type Orphaned, type ProbeClaimKey, type RootDurable, type RootHealth, type RootState, type RootStore, type StartedOver } from "./root.ts";
-export { opsAccountBlock, opsCircuit, opsRefusedShare, opsRest, restOn, type OpsObservation } from "./ops-health.ts";
-export { GATE_BASE_PAUSE_MS, GATE_DECAY_MS, GATE_MAX_PAUSE_MS, RetryBudgets, retryConcurrencyLimit, SecondOpinionGates, type GateLease, type GateRow } from "./retry.ts";
+export type { RankingFeed, RankingFeedLimits, RankingPush, RankingPushAck } from "./ranking-feed.ts";
+export type { RankingCollectorCore, RankingCollectorSettings, RankingCollectorStore } from "./ranking-collector.ts";
+export type { EndpointRootCore, Behind, CircuitTrip, LeaseRow, Orphaned, ProbeClaimKey, RootDurable, RootHealth, RootState, RootStore, StartedOver } from "./root.ts";
+export type { OpsObservation } from "./ops-health.ts";
+export type { RetryBudgets, SecondOpinionGates, GateLease, GateRow } from "./retry.ts";
+export type { EndpointShardCore, InDoubtPool, RootPort, ShardDurable, ShardState, ShardStore, Wait } from "./shard.ts";
+
 export { Breaker, Gates, type GateState } from "./gates.ts";
 export { AccountBlockGates, mergeAccountBlockViews, type AccountBlockRow, type BlockLease, type BlockPass, type Pattern } from "./account-blocks.ts";
-export { EndpointShardCore, validOutcome, type InDoubtPool, type RootPort, type ShardDurable, type ShardState, type ShardStore, type Wait } from "./shard.ts";

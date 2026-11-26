@@ -9,6 +9,7 @@ import { platformTimers } from "../client.ts";
 import { confidentialContent } from "../content.ts";
 import { addReceiptEvents, bodyHashOf, laneSafeRecord } from "../lane/hooks.ts";
 import { bindLateInners } from "../lane/peer-inner.ts";
+import { persistReceipts, retentionOf } from "../lane/receipts.ts";
 import { failureNames } from "../lane/run-common.ts";
 import type { LaneDeps } from "../lane/types.ts";
 import { emitRecord, recordDelivery, type RequestRecord } from "../sinks.ts";
@@ -67,6 +68,7 @@ export async function signLaneReceipt(run: CountRunCore, lane: LaneDeps, receipt
       chatId: null,
       model: run.model,
       workloadKeysetDigest: lane.state.keysetDigest,
+      ...retentionOf(lane.state.receipts),
       endpoint: run.path,
       method: run.request.method,
       servedAt: BigInt(Math.floor(run.deps.clock() / 1000)),
@@ -80,6 +82,7 @@ export async function signLaneReceipt(run: CountRunCore, lane: LaneDeps, receipt
     const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
     if (run.laneOwner === null) throw new Error("a lane receipt without a key hash");
     lane.state.receipts.put(signed, run.laneOwner);
+    persistReceipts(lane.state.receipts, run.ctx);
   } catch (error) {
     console.error(JSON.stringify({ level: "error", event: "lane_finish_failed", request_id: run.requestId, receipt_id: receiptId, ...failureNames(error) }));
   }
@@ -101,6 +104,7 @@ export async function finishPeer(run: CountRunCore, lane: LaneDeps, receiptId: s
       chatId: null,
       model: run.model,
       workloadKeysetDigest: lane.state.keysetDigest,
+      ...retentionOf(lane.state.receipts),
       endpoint: run.path,
       method: run.request.method,
       servedAt: BigInt(Math.floor(run.deps.clock() / 1000)),
@@ -140,6 +144,7 @@ export async function finishPeer(run: CountRunCore, lane: LaneDeps, receiptId: s
     const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
     if (run.laneOwner === null) throw new Error("a lane receipt without a key hash");
     lane.state.receipts.put(signed, run.laneOwner, peers, { requestId: run.requestId, workspaceId: run.key?.workspaceId ?? null });
+    persistReceipts(lane.state.receipts, run.ctx);
   } catch (error) {
     const issues = builder === null ? [] : [...new Set(checkEventLog(builder.events()).map((issue) => issue.code))];
     console.error(

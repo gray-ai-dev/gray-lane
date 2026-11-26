@@ -6,6 +6,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./peer": "./src/peer.ts",
     "./dcap": "./src/node/dcap.ts",
     "./dcap-offline": {
       "types": "./src/dcap-offline.d.ts",

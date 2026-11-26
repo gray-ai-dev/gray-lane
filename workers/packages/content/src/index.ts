@@ -8,7 +8,6 @@ export { recordJson } from "./record-json.ts";
 export * from "./format.ts";
 export * from "./keys.ts";
 export * from "./recipients.ts";
-export { QUEUE_DELETION_SQL, baseKeyOf, objectRequest } from "./deletions.ts";
 export { ContentBudget, TIGHT_SHARE, type Relievable } from "./budget.ts";
 export { PIPELINE_BYTES, SEAL_PULL_BYTES, SealPipeline, encodeRecord, openStream, sealedSize } from "./seal.ts";
 export {
@@ -30,6 +29,10 @@ export {
   boundedDetails,
   notWritten,
 } from "./writer.ts";
-export { type ContentEvent, type ContentLocator, type ContentSource, MissingContent, readContent } from "./open.ts";
 export { identityFromString, newIdentity, recipientOf, unwrapIdentity, wrapIdentity, identityAad } from "./identity.ts";
-export { FRAME_HEAD_BYTES, FRAME_MAX_BYTES, Frame, type FrameKind, WireError, type WireEvent, eventFrame, readFrames } from "./wire.ts";
+
+// The content Worker's reading side and the deletion queue's SQL: their values come from
+// `@gray/content/reader` and `@gray/content/deletions`, so that a bundle that only writes content
+// (the lane's) does not load them. Their types stay here.
+export type { ContentEvent, ContentLocator, MissingContent, ContentSource } from "./open.ts";
+export type { Frame, FrameKind, WireError, WireEvent } from "./wire.ts";

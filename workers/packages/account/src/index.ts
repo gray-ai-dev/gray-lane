@@ -15,16 +15,22 @@ export const PACKAGE = "@gray/account";
 
 export * from "./address.ts";
 export * from "./client.ts";
-export * from "./periods.ts";
-export * from "./pools.ts";
-export * from "./projection.ts";
-export * from "./protocol.ts";
-export * from "./root.ts";
-export * from "./rules.ts";
-export * from "./segments.ts";
+export * from "./rpm-window.ts";
 export * from "./settings.ts";
-export * from "./shard.ts";
-export * from "./timeout.ts";
 export * from "./token.ts";
-export * from "./tuning.ts";
+export * from "./unrouted.ts";
 export * from "./validate.ts";
+
+// The Durable Objects' code, the ledger's rules and the wire's parsers: their values come from
+// `@gray/account/objects`, so that a bundle that needs only the client side (the lane's) does not
+// load them. Their types stay here.
+export type * from "./periods.ts";
+export type * from "./pools.ts";
+export type * from "./projection.ts";
+export type * from "./protocol.ts";
+export type * from "./root.ts";
+export type * from "./rules.ts";
+export type * from "./segments.ts";
+export type * from "./shard.ts";
+export type * from "./timeout.ts";
+export type * from "./tuning.ts";

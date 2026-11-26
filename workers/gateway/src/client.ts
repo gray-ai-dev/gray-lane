@@ -10,8 +10,10 @@ import type { Protocol } from "@gray/protocol";
  * server reads it to its end (crates/gray-gateway/src/inference.rs `feed_client`, docs/prepaid-billing.md
  * item 4; docs/cloudflare-native.md 5.6). No new attempt starts once the client is gone. The runtime
  * aborts `request.signal` (compatibility flag `enable_request_signal`), and either that or the response
- * body's cancel counts. The workerd HTTP server the TEE lane runs under aborts the signal and never
- * cancels the body (it stops reading it), so a lane path must pass the signal here (lane/backend.ts).
+ * body's cancel counts. Under the workerd HTTP server the TEE lane runs under, only the signal is reliable:
+ * workerd cancels the body when a write to the closed connection fails while it is still pulling, and does
+ * not once it has stopped pulling (a full queue, as in case B, 2026-11-26), so a lane path must pass the
+ * signal here (lane/backend.ts).
  */
 export class ClientPresence {
   private leftAt: number | null = null;

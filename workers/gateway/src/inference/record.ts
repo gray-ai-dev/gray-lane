@@ -151,6 +151,22 @@ export function droppedNull(run: RecordRun, attempt: Attempt, member: string): v
 }
 
 /**
+ * The model being served joins (`relaxable` true: its preset's own floor alone refused it, inference/ranking.ts and the
+ * translation's judge in serve-model.ts) or leaves (false: it was admitted, admission.ts) the models the relaxed floor's
+ * pass tries (intake.ts). A model admitted in the first pass is never served again, so no admission takes an id twice.
+ * The last model of the first pass holds its refusal only while some model is left to try, so a request with none
+ * answers as before (a stack relay's vendor error as it is, S24). Nothing changes in the relaxed pass itself.
+ */
+export function noteRelaxable(run: RecordRun, relaxable: boolean): void {
+  if (run.routing.relaxFloor) return;
+  const list = run.routing.relaxable;
+  const at = list.indexOf(run.admitting.modelIndex);
+  if (relaxable && at < 0) list.push(run.admitting.modelIndex);
+  if (!relaxable && at >= 0) list.splice(at, 1);
+  if (run.routing.lastOfPass) run.log.deferRecord = list.length > 0;
+}
+
+/**
  * Whether a refusal's record and error body wait: a later model the customer listed may still serve the request
  * (`deferRecord`), or the request's count may still answer the key's 429 in its place (`rateOpen`).
  */
@@ -257,6 +273,7 @@ export function record(run: RecordRun, status: number, outcome: RequestOutcome, 
     routeRefusals: [...run.routing.routeRefusals],
     ...(run.routing.isolateGapMs === undefined ? {} : { isolateGapMs: run.routing.isolateGapMs }),
     ...(run.routing.checksUnapplied === null ? {} : { checksUnapplied: { reason: run.routing.checksUnapplied, waitedMs: run.routing.rankingWaitMs } }),
+    ...(run.routing.floorRelaxed === null ? {} : { floorRelaxed: { preset: run.routing.routingParams.preset, ...run.routing.floorRelaxed } }),
     ...(relayAccountId === null ? {} : { relayAccountId }),
     retry: {
       attemptsAllowed: run.admitting.attemptsAllowedCount,

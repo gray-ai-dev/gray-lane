@@ -6,6 +6,8 @@
  * integer types, held to the conformance fixtures of area `holds`.
  */
 export * from "./hold.ts";
-export * from "./prompt.ts";
+// The prompt-size bound: its values come from `@gray/holds/prompt`, so that the lane bundle,
+// which does not read it, does not load it. Its types stay here.
+export type * from "./prompt.ts";
 export * from "./rates.ts";
 export * from "./refusals.ts";

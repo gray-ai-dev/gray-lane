@@ -124,12 +124,17 @@ export interface OpsRequestRouting {
    * routing made none, the isolate having no current ranking base; its routes stood on the fixed values. Absent when the
    * checks were made or none was asked for, and in every record written before it. Written by both entries, a session's
    * head included; the customer's view never names it.
+   *
+   * `relaxed` (2026-11-26): the preset's own `min_availability` alone left the request no route, so routing served the
+   * most available routes that pass every other check (docs/utility-routing.md "Constraints and the price cap"); the
+   * requirement keeps the preset's limit, and the chosen route's availability is below it. Never with `unapplied`: a
+   * floor is relaxed only where it was checked.
    */
   readonly checks?: RoutingChecks;
 }
 
 /** What the record says of the checks that read the feed (`OpsRequestRouting.checks`): one closed word. */
-export type RoutingChecks = "unapplied";
+export type RoutingChecks = "unapplied" | "relaxed";
 
 export interface RequestRoutingRecord extends OpsRequestRouting {
   readonly v: typeof REQUEST_ROUTING_VERSION;
@@ -238,7 +243,7 @@ const STANDINGS = wordsOf<RoutingCandidate["standing"]>({ chosen: true, draw: tr
 const METRIC_SOURCES = wordsOf<MetricSource>({ own: true, estimated: true, start: true, fixed: true });
 const RATES = wordsOf<"input" | "output">({ input: true, output: true });
 const REFERENCE_SOURCES = wordsOf<"catalog" | "override">({ catalog: true, override: true });
-const CHECKS = wordsOf<RoutingChecks>({ unapplied: true });
+const CHECKS = wordsOf<RoutingChecks>({ unapplied: true, relaxed: true });
 
 /** A requirement's or an exclusion's `percentile`: absent, or a percentile (never null); written only when there is one. */
 const percentileOf = (o: JsonObject): { readonly percentile?: TtftPercentile } =>

@@ -3,7 +3,7 @@ import { classFailure, type AttemptFailure, type Class } from "@gray/errors";
 import { get, isObject, parseSerde, type Json } from "@gray/json";
 import { geminiOutputImageTokens, isGeneration, reasoningRequested, rustTrim, utf8Length, type CanonicalEvent, type CanonicalRequest, type CanonicalResponse, type Protocol } from "@gray/protocol";
 import { compileAllowance, schemaValidator, withCompileAllowance } from "@gray/trust";
-import { matchesShape, thinkingOf } from "@gray/verifier/coding-agent";
+import { matchesShape, thinkingOf } from "@gray/verifier/coding-agent-shape";
 import { geminiImages } from "./image-usage.ts";
 
 /**

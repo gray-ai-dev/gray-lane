@@ -21,7 +21,7 @@
 import { lowerHexBytes } from "@gray/attest";
 import type { Json } from "@gray/json";
 import { verifyAttestation, type AttestationVerification, type QuoteVerifier, type VerifyCheck } from "./attestation.ts";
-import { osImageProvenance, readReleaseListText } from "./release-list.ts";
+import { osImageProvenance, readReleaseListText, releaseListAt } from "./release-list.ts";
 
 /** Which compose a peer runs: `deploy/tee/compose.yaml` (an entry) or `compose.stack.yaml` (a stack VM). */
 export type PeerLayout = "default" | "stack";
@@ -46,6 +46,17 @@ export interface VerifyPeerAttestationOptions {
   /** The host the verifier connected to; a stack peer's identity must name it as its TLS domain. */
   readonly host: string;
   readonly nowSecs: bigint;
+  /**
+   * 1.8.0: the time the list's releases are taken at (`releaseListAt`): a receipt's signed `served_at` when the report
+   * is a stack VM's record of a request, so a release superseded since then still counts. Absent (an entry attesting
+   * a peer now), only the list's current releases count, as before.
+   */
+  readonly releaseAt?: bigint;
+  /**
+   * 1.8.0: the time the peer's keyset `not_after` is held to: a receipt's signed `served_at` for a stack VM's record of
+   * a request (the keyset signed then). Absent, `nowSecs`, as before.
+   */
+  readonly keysetAt?: bigint;
   /** A stack peer: the relay the route names (the identity's `relay_id`). */
   readonly expectedRelayId?: string;
   /** A stack peer: the relay's signing key the lane record names (the identity's `public_key`, 64 hex). */
@@ -92,7 +103,7 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
     checks.push(fail("release_list", `${read.code}: ${read.staleness === undefined ? "" : `${read.staleness}: `}${read.message}`));
     return refused();
   }
-  const list = read.list;
+  const list = options.releaseAt === undefined ? read.list : releaseListAt(read.list, options.releaseAt);
   const missing = list.osImages.findIndex((entry) => entry.measurements === null);
   if (list.osImages.length === 0 || missing >= 0) {
     checks.push(fail("release_list", list.osImages.length === 0 ? "the list pins no OS image" : `os_images[${missing}] has no mrtd/rtmr0/rtmr1/rtmr2 (D20)`));
@@ -108,7 +119,7 @@ export async function verifyPeerAttestation(report: Json, options: VerifyPeerAtt
     osImageProvenance: Object.fromEntries(list.osImages.map((entry) => [entry.os_image_hash, osImageProvenance(entry)])),
     tlsSpkiSha256: options.tlsSpkiSha256,
     host: options.host,
-    nowSecs: options.nowSecs,
+    nowSecs: options.keysetAt ?? options.nowSecs,
     ...(options.expectedRelayId === undefined ? {} : { expectedRelayId: options.expectedRelayId }),
     ...(options.layout === "stack" && options.allowEmptySlot === true ? { allowEmptySlot: true } : {}),
     quoteVerifier: options.quoteVerifier,

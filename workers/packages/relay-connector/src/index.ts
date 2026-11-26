@@ -60,7 +60,9 @@ export {
   requireIntakeKey,
   type RelayIntakeKey,
 } from "./intake-key.ts";
-export * from "./seal.ts";
+// The relay's sealing side: its values come from `@gray/relay-connector/seal`, so that the lane
+// bundle, which opens what a relay sealed, does not load it. Its types stay here.
+export type * from "./seal.ts";
 export * from "./signature.ts";
 export * from "./store.ts";
 export * from "./vault-state.ts";

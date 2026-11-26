@@ -12,6 +12,7 @@ import {
   PEER_COMMENT,
   PEER_FRAME_MAX_BYTES,
   PEER_GATE_REFUSED,
+  PEER_HOSTED_TOOL_WORDS,
   PEER_REFUSAL_STATUS,
   peerErrorHeadersOf,
   peerReadsOf,
@@ -23,7 +24,7 @@ import {
   type StackTraceDto,
 } from "@gray/lane-wire";
 import { safeUsageCounters } from "@gray/ledger-keys";
-import { type AnswerChecks, bufferedUsage, COUNT_REPLY_LIMIT, countReply, countTarget, inspectedCountRequest, parseResponse, UNCOUNTED_CHECKS } from "@gray/protocol";
+import { type AnswerChecks, bufferedUsage, COUNT_REPLY_LIMIT, countReply, countTarget, type HostedToolCalls, inspectedCountRequest, parseResponse, StreamBillingObserver, UNCOUNTED_CHECKS } from "@gray/protocol";
 import { AnswerRelay, keepsAnswerText } from "../answer.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientPresence, ClientStream, errorFrame, type StreamTimers } from "../client.ts";
 import type { FragmentUse, StreamInspector, ToolGate } from "../gate.ts";
@@ -52,6 +53,7 @@ import {
 import type { StackRelayConfig, StackRelayRoute, StackViolationFound } from "./stack-config.ts";
 import { DEBUG_ANSWER_CAPTURE_MAX_BYTES } from "./stack-debug.ts";
 import type { CapturedCall } from "./stack-debug-record.ts";
+import { grayOwnsEnding, relayFaulted } from "./stack-fault.ts";
 import { stackRequestBody } from "./stack-rewrite.ts";
 import type { LaneState, StackTransport } from "./types.ts";
 
@@ -69,15 +71,17 @@ import type { LaneState, StackTransport } from "./types.ts";
  * - a stream is primed to its commit (`primeStream`) and relayed (`relayStream`) through a `ClientStream`, with the
  *   lane's trust gate, the null rule and the terminal check; Gray's error frame ends a stream cut after release;
  * - a buffered answer passes through `AnswerRelay`; a buffered Codex request is answered the terminal event's
- *   `response` (`completedResponse`, D129).
+ *   `response` (`completedResponse`, D129), and the hosted tool calls its stream reported go in `end.hosted_tool_calls`
+ *   to an entry that reads them, since the entry gets that response alone.
  *
  * What differs from the direct path is only what is not the attempt's: the stream relay's `settle` records the usage
  * the vendor reported instead of charging it (the `end` frame's `usage`, `safe_usage_counters`' counters), the answer
  * limit is ANSWER_HELD_MAX_BYTES (the hold that sizes it is the entry's), and the client is the hop: no keep-alive is
  * written into the bytes, the hop has its own comment from the moment the answer opens (egress's silence bound runs
  * from the connection, PR 3), and a hop that closes is a client that left with no read-on window (the entry has gone,
- * so nothing is read on for it). The hop closing is the request's signal aborting: the workerd HTTP server does not
- * cancel a Worker's answer stream when its client's connection closes, it only stops reading it (the case B repro of
+ * so nothing is read on for it). The hop closing is the request's signal aborting, which is reliable; the stream's
+ * cancel is not: the workerd HTTP server cancels a Worker's answer stream when a write to the closed connection fails
+ * while it is still pulling, and does not once it has stopped pulling (a full queue, as in the case B repro of
  * 2026-11-26). A hop the entry stops reading for STREAM_CLIENT_STALL_MS has left too (`HopStream`), so every path of
  * the attempt reaches the rid's DELETE, the inner receipt and the attempts table's `done`.
  *
@@ -330,6 +334,10 @@ class BackendRun {
   readonly #readsGateRefused: boolean;
   /** The entry named `gate_cut`: it reads `PEER_GATE_REFUSED` as the code of an answer the gate refused after the commit. */
   readonly #readsGateCut: boolean;
+  /** The entry named `hosted_tools`: it bills a served answer's hosted tool calls from `end.hosted_tool_calls`. */
+  readonly #readsHostedTools: boolean;
+  /** A buffered Codex answer's hosted tool calls, counted from its stream (`#codex`): none for any other answer. */
+  #hostedTools: HostedToolCalls = {};
   /** The vendor's own error event that ended its stream before the commit (`primeStream`'s `event`), as it came. */
   #vendorEvent: Json | null = null;
   /** Why the receipt was not signed (a closed word, `receiptProblem`), once `#receipt` failed. */
@@ -353,7 +361,9 @@ class BackendRun {
     this.#readsRelayStatus = reads.has("relay_status");
     this.#readsGateRefused = reads.has("gate_refused");
     this.#readsGateCut = reads.has("gate_cut");
-    // workerd aborts the signal when the hop's connection closes and never cancels the hop's stream (case B, 2026-11-26).
+    this.#readsHostedTools = reads.has("hosted_tools");
+    // workerd aborts the signal when the hop's connection closes; it cancels the hop's stream only while still pulling
+    // it, not once a full queue stopped it (case B, 2026-11-26), so the signal is what tells the hop left.
     this.#presence = new ClientPresence(input.request.signal, input.clock, 0);
     hop.onLeave((why) => this.#presence.leave(why));
     this.#presence.onLeave((why) => {
@@ -465,6 +475,8 @@ class BackendRun {
       ...(this.#input.countTokens === true && ended.outcome === "not_dialed" && ended.code === "relay_error_status" && call?.relayStatus !== null && call?.relayStatus !== undefined && this.#readsRelayStatus
         ? { relay_status: BigInt(call.relayStatus) }
         : {}),
+      // A served buffered Codex answer's hosted tool calls, counted from its stream, to an entry that reads them.
+      ...(ended.outcome === "served" && this.#readsHostedTools ? peerHostedToolsOf(this.#hostedTools) : {}),
     };
   }
 
@@ -476,10 +488,9 @@ class BackendRun {
   #endChecks(ended: Ended): NonNullable<PeerEndDto["checks"]> {
     // Egress is Gray's process: an answer it cut at its budget (`feed.limited`, a fault by egress) is Gray's hold limit, and
     // a fault of Gray's own (its ending of the rid: `timeout`, `entry_closed`) is Gray's too, on every path alike (review
-    // r14 blocker 7). A fault of the relay's container stands as the main gateway counts a stack route's.
+    // r14 blocker 7). A fault of the relay's container stands as the main gateway counts a stack route's (stack-fault.ts).
     const call = this.#call;
-    const fault = call?.fault ?? null;
-    const gray = (call !== null && call.feed.limited !== null) || fault?.by === "egress" || fault?.by === "gray";
+    const gray = call !== null && grayOwnsEnding(call.fault, call.feed.limited !== null);
     const counted = countedChecks(this.#checks, { outcome: gray ? "gray_error" : (this.#ownEnd ?? ended.outcome), code: ended.code, rejected: false, deadlineCut: this.#deadlineCut });
     const tool = counted.toolCallCheck;
     const output = counted.outputCheck;
@@ -702,8 +713,7 @@ class BackendRun {
     const outcome = await call.failedAfterAnswer();
     if (outcome.kind !== "vendor_error") call.served = null;
     const ended = await this.#failed(call, outcome, false);
-    const fault = call.fault;
-    const relayFault = fault?.by === "relay" || fault?.by === "egress" || call.feed.limited !== null;
+    const relayFault = relayFaulted(call.fault, call.feed.limited !== null);
     return gateRefused && this.#readsGateRefused && ended.outcome === "relay_failed" && !relayFault ? { ...ended, code: PEER_GATE_REFUSED } : ended;
   }
 
@@ -711,11 +721,12 @@ class BackendRun {
    * An answer cut after its commit, part of it released: `code` its own (`entry_internal` when none). `gateRefused`: the
    * lane's trust gate refused a later part of it, which the entry ends the client's stream with as a local stack attempt's
    * (`upstream_trust_policy_rejected`), not as the upstream's broken stream: `end.code` says so (`PEER_GATE_REFUSED`)
-   * when no fault of the call (the relay's container, egress, its budget) has a word of its own, which stands.
+   * when no fault of the call (the relay's container, egress, its budget) has a word of its own, which stands; a fault
+   * of Gray's own or the vendor's does not stand over it, as in `#uncommitted` (stack-fault.ts `relayFaulted`).
    * Only to an entry that reads it (`gate_cut`): an entry before it refuses that code on a `cut` end.
    */
   #cut(call: StackCall, gateRefused: boolean, code: Ended["code"] = call.fault?.why ?? "entry_internal"): Ended {
-    const faulted = call.fault !== null || call.feed.limited !== null;
+    const faulted = relayFaulted(call.fault, call.feed.limited !== null);
     return { outcome: "cut", code: gateRefused && this.#readsGateCut && !faulted ? PEER_GATE_REFUSED : code };
   }
 
@@ -814,8 +825,7 @@ class BackendRun {
     if (end.cutByDeadline === true) this.#deadlineCut = true;
     // S24: a container whose answer stopped matching the feed, or egress's cut at its budget, ends the stream with
     // the lane's own error; a vendor stream that was cut keeps the relay's own code.
-    const fault = call.fault;
-    const code = fault !== null && (fault.by === "relay" || fault.by === "egress") ? LANE_RELAY_FAILED : end.code;
+    const code = relayFaulted(call.fault, call.feed.limited !== null) ? LANE_RELAY_FAILED : end.code;
     client.end(errorFrame(protocol, code, 0n));
     this.#replacedError = true;
     await pumped;
@@ -925,6 +935,9 @@ class BackendRun {
     } catch {
       inspector = PASS_THROUGH.stream(contract, Number.MAX_SAFE_INTEGER, false);
     }
+    // The hosted tool calls its stream reports, as `InferenceRun.codexAnswer` counts them (P4-2): the entry gets the
+    // terminal response alone, whose output may be empty, and bills them from `end.hosted_tool_calls`.
+    const billing = new StreamBillingObserver(protocol);
     const read = await completedResponse({
       response,
       presence: this.#presence,
@@ -938,6 +951,7 @@ class BackendRun {
       isolate: this.#input.share,
       heldLimit: cfg.answerHeldMaxBytes,
       inspector,
+      billing,
     });
     if (read.kind === "left") {
       this.#ownEnd = "client_left";
@@ -962,6 +976,7 @@ class BackendRun {
     }
     const raw = bufferedUsage(protocol, read.response) ?? null;
     this.#rawUsage = isObject(raw) ? raw : null;
+    this.#hostedTools = billing.finish(this.#rawUsage).toolCalls;
     await this.#head(200, false);
     await this.#data(read.bytes);
     return { outcome: "served", code: null };
@@ -1162,6 +1177,20 @@ function receiptProblem(error: unknown): string {
  */
 function receiptDocument(receipt: SignedReceipt): Json {
   return receipt.value;
+}
+
+/**
+ * `end.hosted_tool_calls` of `calls`: the tools of `PEER_HOSTED_TOOL_WORDS` called at least once, as bigints, or nothing
+ * when none was (an `end` without a hosted tool call stays the bytes it was). A tool outside those words, one the gateway
+ * learned after the read word was frozen, is left out: the entry's strict `end` refuses it.
+ */
+function peerHostedToolsOf(calls: HostedToolCalls): Pick<PeerEndDto, "hosted_tool_calls"> {
+  const out: Partial<Record<(typeof PEER_HOSTED_TOOL_WORDS)[number], bigint>> = {};
+  for (const tool of PEER_HOSTED_TOOL_WORDS) {
+    const count = calls[tool];
+    if (count !== undefined && count > 0n) out[tool] = count;
+  }
+  return Object.keys(out).length === 0 ? {} : { hosted_tool_calls: out };
 }
 
 /**

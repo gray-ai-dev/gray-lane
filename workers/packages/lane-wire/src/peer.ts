@@ -22,9 +22,10 @@ import { stackTraceSchema } from "./stack-trace.ts";
  *   for the late-facts follow-up (`GET /v1/peer/attempts/<rid>`), so neither can be presented as the other.
  * - **The frames** of the answer, `text/event-stream`: `head` once (`{status, stream, headers?}`), `data` (standard
  *   base64 of the next released bytes), `end` once and last (`{outcome, dialed, served_attempt, attempts,
- *   relay_account_id, usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?, relay_status?}`). Between
- *   them the stack VM writes `PEER_COMMENT`, which is not a frame. `checks`, `receipt_refused`, `vendor_event`,
- *   `relay_status` and `head.headers` (`error_headers`) go only to an entry that named them in `PEER_READS_HEADER`.
+ *   relay_account_id, usage, code, receipt, trace?, checks?, receipt_refused?, vendor_event?, relay_status?,
+ *   hosted_tool_calls?}`). Between them the stack VM writes `PEER_COMMENT`, which is not a frame. `checks`,
+ *   `receipt_refused`, `vendor_event`, `relay_status`, `hosted_tool_calls` (`hosted_tools`) and `head.headers`
+ *   (`error_headers`) go only to an entry that named them in `PEER_READS_HEADER`.
  * - **A refusal** of checks 1 to 6 (`peer_*`, `route_unconfigured`, `foreign_relay`): an HTTP 4xx whose body is
  *   `{code, dialed: false}`, before any frame; the status is `PEER_REFUSAL_STATUS`'s.
  * - **The attempts answer**: `{state, receipt, trace?}` from the stack VM's memory (`trace` once done, to an entry
@@ -96,8 +97,13 @@ export const PEER_READS_HEADER = "x-gray-peer-reads";
  * stream with `upstream_trust_policy_rejected`, as a local stack attempt's, and not as the upstream's broken stream. A
  * word of its own: an entry that named `gate_refused` alone refuses that code on a `cut` end, and gets `entry_internal`
  * there, as before.
+ *
+ * `hosted_tools`: a served answer's hosted tool calls (`hosted_tool_calls`) as the stack VM counted them from the stream
+ * it read, for a buffered Codex request (D129), whose terminal response the entry gets alone and whose output may be empty
+ * though the stream reported each call (P4-2). In the words of `PEER_HOSTED_TOOL_WORDS`. An entry that did not name it
+ * gets no such member and counts the terminal response's output, as before.
  */
-export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers", "relay_status", "gate_refused", "gate_cut"] as const;
+export const PEER_END_READS = ["checks", "receipt_refused", "vendor_event", "attempts_trace", "error_headers", "relay_status", "gate_refused", "gate_cut", "hosted_tools"] as const;
 export type PeerEndRead = (typeof PEER_END_READS)[number];
 
 /**
@@ -109,6 +115,17 @@ export const PEER_CHECKS_WORDS = Object.freeze({
   tool_call_check: Object.freeze(["none", "ok", "invalid_json", "schema_mismatch", "undeclared", "missing_name", "refused", "truncated"] as const),
   output_check: Object.freeze(["not_requested", "ok", "invalid_json", "schema_mismatch_strict", "schema_mismatch_loose", "excluded", "unknown"] as const),
 });
+
+/**
+ * The hosted tools the `hosted_tools` read names, frozen with it: `@gray/protocol`'s HOSTED_TOOL_NAMES when it was added.
+ * `end.hosted_tool_calls` is read in these, whatever the gateway's list holds later (test/peer.test.ts fails when it
+ * changes, so a new tool comes with its read word); a stack VM leaves out a tool outside them.
+ */
+export const PEER_HOSTED_TOOL_WORDS = Object.freeze(["web_search", "google_search", "code_execution", "file_search"] as const);
+export type PeerHostedToolWord = (typeof PEER_HOSTED_TOOL_WORDS)[number];
+
+/** One tool's count in `end.hosted_tool_calls`: at least one (a tool not called is left out), a safe integer. */
+const hostedToolCount = uintSchema.min(1n);
 
 /** The longest PEER_READS_HEADER value read: every word of a few generations, with room. */
 const PEER_READS_MAX_LENGTH = 256;
@@ -478,6 +495,17 @@ export const peerEndSchema = z
      * `relay_error_status`). Sent only to an entry that named `relay_status` in PEER_READS_HEADER.
      */
     relay_status: uintSchema.min(100n).max(599n).optional(),
+    /**
+     * A served answer's hosted tool calls, as the stack VM counted them from the stream it read (`StreamBillingObserver`,
+     * the terminal response among the events): a buffered Codex request's, whose terminal output may be empty. Each tool of
+     * `PEER_HOSTED_TOOL_WORDS` called at least once, absent when none was. The entry bills these in place of what it reads
+     * in the response it got, never beside it. Sent only to an entry that named `hosted_tools` in PEER_READS_HEADER.
+     */
+    hosted_tool_calls: z
+      .object({ web_search: hostedToolCount.optional(), google_search: hostedToolCount.optional(), code_execution: hostedToolCount.optional(), file_search: hostedToolCount.optional() })
+      .strict()
+      .refine((calls) => Object.keys(calls).length > 0, { message: "hosted_tool_calls names at least one tool" })
+      .optional(),
   })
   .strict()
   .superRefine((end, ctx) => {
@@ -494,6 +522,7 @@ export const peerEndSchema = z
     if (end.vendor_event !== undefined && end.outcome !== "relay_failed") issue("vendor_event", "vendor_event names the vendor's error that ended an answer nothing of which was released");
     if (end.relay_status !== undefined && (end.outcome !== "not_dialed" || end.code !== "relay_error_status")) issue("relay_status", "relay_status names the container's error before any vendor call");
     if (end.code === PEER_GATE_REFUSED && end.outcome !== "relay_failed" && end.outcome !== "cut") issue("code", "a gate refusal is of a dialed answer");
+    if (end.hosted_tool_calls !== undefined && end.outcome !== "served") issue("hosted_tool_calls", "hosted tool calls are billed on a served answer alone");
   });
 export type PeerEndDto = z.infer<typeof peerEndSchema>;
 

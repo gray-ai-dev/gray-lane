@@ -117,6 +117,7 @@ class VideoRouteRun {
     try {
       if (this.draft !== null && receiptId !== null && this.owner !== null) {
         await signEntryReceipt(lane, {
+          ctx: this.o.ctx,
           receiptId,
           model: this.model,
           path: this.o.path,
@@ -269,9 +270,11 @@ async function content(o: EntryVideoRequest, io: VideoJobIo, run: VideoRouteRun,
   if (credential === null) throw sourceUnavailable();
   const address = new URL(target);
   if (variant !== null) address.searchParams.append("variant", variant);
-  // The provider's fetch ends with the client: workerd aborts the request's signal when the client disconnects, and
-  // never cancels the answer's body then. The headers timer ends with the headers, since a fetch's signal also governs
-  // its body; the client's signal and the transfer's own end (`ended` below) govern the rest.
+  // The provider's fetch ends with the client: workerd aborts the request's signal when the client disconnects, which
+  // is reliable. The answer body's cancel is not: workerd cancels it when a write to the closed connection fails while
+  // it is still pulling, and does not once it has stopped pulling (a full queue, as in case B, 2026-11-26). The headers
+  // timer ends with the headers, since a fetch's signal also governs its body; the client's signal and the transfer's
+  // own end (`ended` below) govern the rest.
   const controller = new AbortController();
   const client = o.request.signal;
   const leave = (): void => controller.abort("video_content_client_left");

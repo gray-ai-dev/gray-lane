@@ -4,8 +4,8 @@
 
 import type { RequestRoutingRecord, RoutingChecks, RoutingExclusion } from "./request-routing.ts";
 
-/** `checks` when it is the one word it may be: a fixed word, nothing of the request or a route. */
-const checksOnly = (checks: RoutingChecks | undefined): { readonly checks?: RoutingChecks } => (checks === "unapplied" ? { checks } : {});
+/** `checks` when it is one of the words it may be: a fixed word, nothing of the request or a route. */
+const checksOnly = (checks: RoutingChecks | undefined): { readonly checks?: RoutingChecks } => (checks === "unapplied" || checks === "relaxed" ? { checks } : {});
 
 /** A refusal's exclusion with its own members and no other: it names a requirement or a list, never a route. */
 function exclusionOnly(e: RoutingExclusion): RoutingExclusion {

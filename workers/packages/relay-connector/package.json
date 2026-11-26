@@ -5,6 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./scheduler/refresh": "./src/scheduler/refresh.ts",
+    "./seal": "./src/seal.ts",
     "./lease": "./src/lease.ts",
     "./egress": "./src/egress.ts",
     "./vault": "./src/vault.ts",

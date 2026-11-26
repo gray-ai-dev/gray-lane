@@ -2,6 +2,16 @@ import { ReceiptBuilder, type ReceiptKeyProvider, type SignedReceipt } from "@gr
 import { toJsonString } from "@gray/json";
 import type { LanePolicyOutcome, LaneReceiptDraft } from "./types.ts";
 import type { StoredReceipt } from "./state.ts";
+import type { LaneReceiptStore } from "./types.ts";
+
+/**
+ * The `retention_seconds` member a receipt put into `store` is signed with (docs/design/persisted-receipts.md section
+ * 3): the persisted copy's 30 days while the entry keeps one, nothing otherwise. Spread into a `ReceiptBuilder`'s
+ * metadata at every site that signs a receipt the store will hold.
+ */
+export function retentionOf(store: Pick<LaneReceiptStore, "retentionSeconds">): { readonly retentionSeconds?: bigint } {
+  return store.retentionSeconds === null ? {} : { retentionSeconds: store.retentionSeconds };
+}
 
 /**
  * The lane's receipts: the ACI headers (§7.1, §7.3), the document built from a request's bytes and
@@ -58,6 +68,15 @@ export function aciJson(status: number, value: Record<string, unknown>, keysetDi
   return new Response(toJsonString(value as never), { status, headers });
 }
 
+/**
+ * After a `put`: the persisted copy's flush in the putting request's `waitUntil`, so the receipt is written while that
+ * request still runs (docs/design/persisted-receipts.md section 5). Nothing for a store that keeps memory alone.
+ */
+export function persistReceipts(store: Pick<LaneReceiptStore, "settle">, ctx: Pick<ExecutionContext, "waitUntil">): void {
+  if (store.settle === undefined) return;
+  ctx.waitUntil(store.settle().catch(() => undefined));
+}
+
 /** What finalizing a receipt needs, besides the request's own bytes and the attempt's draft. */
 export interface LaneReceiptInput {
   readonly receiptId: string;
@@ -80,6 +99,8 @@ export interface LaneReceiptInput {
   readonly draft: LaneReceiptDraft | null;
   readonly keys: ReceiptKeyProvider;
   readonly keyId: string;
+  /** `retentionOf(store)`'s value: the signed `retention_seconds`, absent when the receipt is kept in memory alone. */
+  readonly retentionSeconds?: bigint;
 }
 
 /**
@@ -98,6 +119,7 @@ export async function buildLaneReceipt(input: LaneReceiptInput): Promise<SignedR
     endpoint: input.endpoint,
     method: input.method,
     servedAt: input.servedAt,
+    ...(input.retentionSeconds === undefined ? {} : { retentionSeconds: input.retentionSeconds }),
   });
   builder.addRequestReceived(input.received);
   for (const event of input.draft?.modifiedEvents ?? []) addModified(builder, event);
@@ -172,6 +194,20 @@ export function receiptPending(keysetDigest: string): Response {
   return aciJson(
     503,
     { error: { type: "not_ready", code: "receipt_pending", message: "This receipt is not stored yet: the answer it covers is still being sent, or ended a moment ago. Ask again after Retry-After seconds." } },
+    keysetDigest,
+    { "retry-after": String(RECEIPT_PENDING_RETRY_AFTER_S) },
+  );
+}
+
+/**
+ * A receipt this replica does not hold whose sealed copy could not be read now: the bridge or the bucket failed or
+ * timed out, or this replica is past its lookups a second (docs/design/persisted-receipts.md section 6). Retryable, and
+ * never the 404 of an unknown id.
+ */
+export function receiptLookupUnavailable(keysetDigest: string): Response {
+  return aciJson(
+    503,
+    { error: { type: "not_ready", code: "receipt_lookup_unavailable", message: "This receipt's stored copy could not be read just now. Ask again after Retry-After seconds." } },
     keysetDigest,
     { "retry-after": String(RECEIPT_PENDING_RETRY_AFTER_S) },
   );

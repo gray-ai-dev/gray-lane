@@ -20,23 +20,10 @@ export {
   replyReferences,
   storesContinuation,
 } from "./references.ts";
-export {
-  type BindAnswer,
-  type BindInput,
-  CONTINUATION_STATE_MAX_TTL_MS,
-  CONTINUATION_STATE_TTL_MS,
-  CONTINUATION_TTL_MS,
-  ContinuationStore,
-  type LookupAnswer,
-  type LookupInput,
-  MAX_ENDPOINT_ID_BYTES,
-  MAX_MODEL_BYTES,
-  MAX_SEALED_STATE_BYTES,
-  PURGE_BATCH,
-  PURGE_INTERVAL_MS,
-  type Refused,
-  type StoreDeps,
-} from "./store.ts";
+export { CONTINUATION_STATE_MAX_TTL_MS, CONTINUATION_STATE_TTL_MS, CONTINUATION_TTL_MS, MAX_SEALED_STATE_BYTES } from "./limits.ts";
+// The store's Durable Object core: its values come from `@gray/continuation/store`, so that a bundle
+// that only binds and pins (the lane's) does not load it. Its types stay here.
+export type { ContinuationStore, BindAnswer, BindInput, LookupAnswer, LookupInput, Refused, StoreDeps } from "./store.ts";
 export {
   CONTINUATION_ERRORS,
   type BindOptions,

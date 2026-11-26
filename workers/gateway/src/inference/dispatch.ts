@@ -510,6 +510,7 @@ export async function unroutedResult(run: DispatchRun, error: ApiError): Promise
   run.settlement.heldMicrousd = null;
   run.admitting.admissions.pop();
   run.admitting.reserved = run.admitting.beforeAdmission.reserved;
+  if (!run.admitting.reserved) run.admitting.baseKeyModel = null;
   run.admitting.firstAdmittedAt = run.admitting.beforeAdmission.firstAdmittedAt;
   return unserved(run, error, "ranking");
 }

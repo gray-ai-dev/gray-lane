@@ -84,13 +84,10 @@ export {
   type PolicyCause,
   type PolicyResult,
 } from "./outcome.ts";
-export {
-  appliedPolicyEvent,
-  policyOutcomeEvent,
-  policyReceiptRecord,
-  refusedPolicyEvent,
-  type PolicyReceiptRecord,
-} from "./receipt.ts";
+// The policy receipt record and events: their values come from `@gray/relay-policy/receipt`, so
+// that the lane bundle, which builds them through `@gray/attest`, does not load them. Their types
+// stay here.
+export type { PolicyReceiptRecord } from "./receipt.ts";
 export {
   initInterpreter,
   interpreterReady,

@@ -30,6 +30,7 @@ import { bytesToLowerHex, reportDataSlot } from "@gray/attest";
 import { get, isObject, parseStrict, type Json } from "@gray/json";
 import { Quote, intel, verify, type Collateral, type VerifiedReport } from "@phala/dcap-qvl";
 import type { QuoteAppraisal, QuoteMeasurements, QuoteVerifier } from "./attestation.ts";
+import type { StoredCollateral } from "./stored-attestation.ts";
 
 export type { Collateral } from "@phala/dcap-qvl";
 
@@ -78,6 +79,15 @@ export function collateralQuoteVerifier(options: CollateralQuoteVerifierOptions)
     }
     return appraisal;
   };
+}
+
+/**
+ * 1.8.0: the verifier of an entry boot's stored report (stored-attestation.ts): dcap-qvl with the collateral the boot
+ * stored, at its `collateral_check.checked_at`. The collateral is Intel-signed, so this checks it is Intel's; when it
+ * was checked is the caller's to bound (gray-lane-verify's `collateral_window`).
+ */
+export function storedCollateralQuoteVerifier(collateral: StoredCollateral, checkedAt: bigint): QuoteVerifier {
+  return collateralQuoteVerifier({ collateral: () => collateral as unknown as Collateral, nowSecs: () => Number(checkedAt) });
 }
 
 /**

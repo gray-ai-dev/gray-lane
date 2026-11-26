@@ -2041,7 +2041,7 @@ export {
 export * from "./utility-types.ts";
 export { ESTIMATION, isEstimationPoint, type EstimationPoint, type EstimationState } from "@gray/performance";
 export { modeSourceOf, parseRoutingRequest, resolveRoutingParams, takeRouting, type ModeSource, type RoutingTaken } from "./params.ts";
-export { COST_FLOOR_USD, TPS_FLOOR, TTFT_FLOOR_MS, drawNumber, effectiveMetrics, excludesEveryRankedCandidate, failedConstraint, lnUtility, rankByUtility, workloadCost } from "./utility.ts";
+export { COST_FLOOR_USD, TPS_FLOOR, TTFT_FLOOR_MS, drawNumber, effectiveMetrics, excludesEveryRankedCandidate, failedConstraint, lnUtility, rankByUtility, relaxedFloor, workloadCost } from "./utility.ts";
 export { addAttempt, addEstimation, bucketValue, deltaEmpty, emptyDelta, emptyRecord, estimateSummary, estimationOf, mergeDelta, recordFromJson, reviseEstimate, summaryOf, ttftBucket, type AttemptMeasure } from "./record.ts";
 export { SessionStore, sessionKey, sessionRedraw, sessionSeed, type SessionRecord, type SessionRouteState } from "./session.ts";
 export { catalogReferencePrice, recordParamsOf, recordParamsWithinBounds, referencePricesOf, routingPolicyDocument, routingPolicyOf, routingPolicyOfText, tauOf, type CatalogPricing, type PolicyRead } from "./policy.ts";

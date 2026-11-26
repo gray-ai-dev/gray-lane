@@ -1,6 +1,7 @@
 import { bytesToLowerHex, isValidNonce, lowerHexBytes, sha256BareHex, verifyReportBinding } from "@gray/attest";
 import type { Json } from "@gray/json";
-import { verifyPeerAttestation, type PeerReleaseList, type QuoteVerifier } from "@gray/lane-verify";
+import type { PeerReleaseList, QuoteVerifier } from "@gray/lane-verify";
+import { verifyPeerAttestation } from "@gray/lane-verify/peer";
 import { collateralQuoteVerifier, collateralWithChain, quoteCollateralKey, type Collateral } from "@gray/lane-verify/dcap-offline";
 import {
   checkPeerDebugEnvelope,

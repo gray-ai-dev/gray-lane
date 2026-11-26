@@ -3,12 +3,13 @@
  * open for its `end`, the answer checks and outcome that `end` carries, and what a vendor's error over the hop means for
  * the next route.
  */
-import { STACK_FAULT_WHYS, type StackFaultWhy, type PeerEndDto, type PeerHeadDto } from "@gray/lane-wire";
+import type { PeerEndDto, PeerHeadDto } from "@gray/lane-wire";
 import { classDisposition, type Outcome as RetryOutcome } from "@gray/errors";
 import type { Json } from "@gray/json";
-import { type AnswerChecks, UNCOUNTED_CHECKS } from "@gray/protocol";
+import { type AnswerChecks, type Protocol, type ResponseBillingMeta, UNCOUNTED_CHECKS } from "@gray/protocol";
 import type { StreamTimers } from "../client.ts";
 import { countedChecks } from "../sinks.ts";
+import { codexBackend } from "../lane/plan.ts";
 import { receiptChangedBody } from "../lane/stack.ts";
 import type { Attempt, PeerOutcome } from "./types.ts";
 
@@ -33,11 +34,6 @@ export function stackVmEnded(attempt: Attempt, ended: string, rejected: boolean)
 export function peerAttemptChecks(attempt: Attempt, ended: string, code: string | null, rejected: boolean): AnswerChecks {
   const classified = peerChecks(attempt.peer?.end ?? null);
   return stackVmEnded(attempt, ended, rejected) ? classified : countedChecks(classified, { outcome: ended, code, rejected, deadlineCut: attempt.deadlineCut === true });
-}
-
-/** The fault word an `end.code` names (`STACK_FAULT_WHYS`), or null for a plan code. */
-export function peerFaultWhy(code: string | null): StackFaultWhy | null {
-  return code !== null && (STACK_FAULT_WHYS as readonly string[]).includes(code) ? (code as StackFaultWhy) : null;
 }
 
 /**
@@ -140,6 +136,20 @@ export function endKept(response: Response, timers: StreamTimers, abort: (reason
 export function peerChecks(end: PeerEndDto | null): AnswerChecks {
   const checks = end?.checks;
   return checks === undefined ? UNCOUNTED_CHECKS : { toolCallCheck: checks.tool_call_check, outputCheck: checks.output_check };
+}
+
+/**
+ * A peer attempt's billing meta: `read`, what the entry read in the answer it got, with the hosted tool calls in place
+ * of its own when the stack VM counted them (`end.hosted_tool_calls`, a buffered Codex answer read from its stream there,
+ * whose terminal output may be empty). The stack VM's count heard that output too, so it is never added to the entry's.
+ * Only a Responses answer of a Codex route takes it: that is the one answer the stack VM reads from a stream the hop
+ * does not carry (D129). Any other answer's hosted tool calls are in the bytes the entry got, so a count in `end` there
+ * is ignored, as is one from a stack VM before it: `read` as it is, as before.
+ */
+export function peerBillingMeta(attempt: Attempt, protocol: Protocol, read: ResponseBillingMeta): ResponseBillingMeta {
+  const counted = attempt.peer?.end?.hosted_tool_calls;
+  if (counted === undefined || protocol !== "open_ai_responses" || !codexBackend(attempt.route.record.url)) return read;
+  return { ...read, toolCalls: counted };
 }
 
 /**

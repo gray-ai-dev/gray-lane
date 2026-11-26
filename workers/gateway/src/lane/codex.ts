@@ -1,5 +1,5 @@
 import { asStr, get, type Json } from "@gray/json";
-import { type CanonicalEvent, ProtocolError, ProtocolStreamDecoder, SseFrames, jsonHeapBytes, jsonValueBytes, keepAlive, sseData } from "@gray/protocol";
+import { type CanonicalEvent, ProtocolError, ProtocolStreamDecoder, SseFrames, type StreamBillingObserver, jsonHeapBytes, jsonValueBytes, keepAlive, sseData } from "@gray/protocol";
 import { wholeAnswerWeight } from "../answer.ts";
 import type { ClientPresence } from "../client.ts";
 import type { StreamInspector } from "../gate.ts";
@@ -79,6 +79,12 @@ export interface CompletedInput {
    * nothing: the gate's verdict is on the response object the client gets. What it keeps is weighed with the read.
    */
   readonly inspector?: StreamInspector;
+  /**
+   * What the answer is billed for beside its tokens (`StreamBillingObserver`): it hears every event the read decodes,
+   * the terminal event's among them, so the hosted tool calls the stream reported stay counted when that event's output
+   * is empty (P4-2). The caller reads it with the usage (`finish`), as a stream's is read.
+   */
+  readonly billing?: Pick<StreamBillingObserver, "observe">;
 }
 
 /** The terminal events of a Responses stream, each carrying the whole response object. */
@@ -168,6 +174,7 @@ async function readCompleted(input: CompletedInput, fed: { failed: boolean }): P
     }
     answer += frame.length;
     if (answer > limit) return overLimit("upstream_stream_limit", limit, `the answer passed its limit of ${limit} bytes`);
+    input.billing?.observe(events);
     for (const event of events) {
       if (event.type !== "native" || !TERMINAL.has(asStr(get(event.payload, "type")) ?? "")) continue;
       const response = get(event.payload, "response");

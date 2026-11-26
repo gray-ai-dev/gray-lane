@@ -132,6 +132,21 @@ export interface ReceiptDocument {
    * written again is the one that was signed. [`verifyReceipt`] refuses any other value.
    */
   readonly arrival?: string;
+  /**
+   * How long the producer keeps the receipt for its key to fetch, in seconds (docs/design/persisted-receipts.md section
+   * 3): set by an entry that stores an encrypted copy, absent on every other receipt. A verifier
+   * that predates the member ignores it and still verifies the document. Absent from the parsed document too, so a
+   * document parsed and written again is the one that was signed.
+   */
+  readonly retention_seconds?: bigint;
+}
+
+/** The largest `retention_seconds` a receipt carries: 2^32 - 1 seconds, about 136 years. */
+export const RECEIPT_RETENTION_SECONDS_MAX = 0xffff_ffffn;
+
+/** Whether `value` is a `retention_seconds` a receipt may carry: 1 ..= 2^32 - 1. */
+export function isReceiptRetentionSeconds(value: unknown): value is bigint {
+  return typeof value === "bigint" && value >= 1n && value <= RECEIPT_RETENTION_SECONDS_MAX;
 }
 
 /** What the producer knows when it opens a receipt. */
@@ -152,6 +167,8 @@ export interface ReceiptMetadata {
    * `aci/1+gray-api` and `arrival: "gray_api"`; absent, the document is exactly what it was before.
    */
   readonly arrival?: typeof RECEIPT_ARRIVAL_GRAY_API;
+  /** How long the producer keeps the receipt, in seconds (`retention_seconds`); absent, the document has no such member. */
+  readonly retentionSeconds?: bigint;
 }
 
 /** A finalized receipt: the served document bytes and the ids a store needs without parsing it. */
@@ -216,6 +233,9 @@ export const receiptDocumentSchema = z.object({
     .nullish()
     .transform((value) => value ?? null),
   arrival: z.string().optional(),
+  // Optional and never filled in: a document parsed and written again (a peer hop's inner receipt) must be the one
+  // that was signed, so an absent member stays absent, as `arrival`.
+  retention_seconds: z.bigint().refine(isReceiptRetentionSeconds, "retention_seconds is an integer, 1 ..= 2^32 - 1").optional(),
 });
 
 export type ParseReceiptResult =
@@ -527,6 +547,9 @@ export class ReceiptBuilder {
     if (metadata.arrival !== undefined && metadata.arrival !== RECEIPT_ARRIVAL_GRAY_API) {
       throw new ReceiptError("invalid_metadata", `arrival is ${RECEIPT_ARRIVAL_GRAY_API} or absent`);
     }
+    if (metadata.retentionSeconds !== undefined && !isReceiptRetentionSeconds(metadata.retentionSeconds)) {
+      throw new ReceiptError("invalid_metadata", "retention_seconds is 1 ..= 2^32 - 1 seconds");
+    }
     if (this.#events.length === 0) throw new ReceiptError("empty_receipt", "cannot finalize a receipt with no events");
     const first = this.#events[0];
     if (first === undefined || eventType(first) !== EVENT_REQUEST_RECEIVED) {
@@ -552,6 +575,7 @@ export class ReceiptBuilder {
       key_id: key.key_id,
       ...(metadata.relayImage === undefined ? {} : { relay_image: metadata.relayImage }),
       ...(metadata.arrival === undefined ? {} : { arrival: metadata.arrival }),
+      ...(metadata.retentionSeconds === undefined ? {} : { retention_seconds: metadata.retentionSeconds }),
     };
     const signature = await keys.signReceipt(key.key_id, jcsBytes(payload));
     const signatureHex = bytesToLowerHex(signature);

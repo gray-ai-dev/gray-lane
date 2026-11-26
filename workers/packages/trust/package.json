@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./gate": "./src/gate.ts",
     "./workerd": "./src/workerd.ts"
   },
   "scripts": {

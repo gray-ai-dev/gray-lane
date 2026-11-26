@@ -264,6 +264,27 @@ export interface RoutingState {
  */
   checksUnapplied: "base_missing" | "base_stale" | "records_unsupported" | null;
 /**
+ * The request may relax its preset's own `min_availability` (docs/utility-routing.md "Constraints and the price cap"):
+ * set for the second pass over the models the first pass refused on that floor alone (intake.ts), so a model or a
+ * translation target that passes as it is always serves first. False for the first pass.
+ */
+  relaxFloor: boolean;
+/**
+ * The models of the customer's list (their index) whose ranking the preset's own floor alone refused in the first pass
+ * while some route passes every other check (`relaxedFloor`): the second pass tries them, in the list's order.
+ */
+  relaxable: number[];
+/**
+ * The model being served is the last of the first pass (intake.ts): its refusal waits only while `relaxable` names a
+ * model, for the relaxed pass may then still serve the request (`noteRelaxable`).
+ */
+  lastOfPass: boolean;
+/**
+ * The floor the model being served was ranked with in place of its preset's (`relaxedFloor`), and the preset's: the
+ * `routing_floor_relaxed` line and point and the record's `checks: "relaxed"`. Null while it was ranked as it is.
+ */
+  floorRelaxed: { readonly floor: number; readonly limit: number } | null;
+/**
  * The ranking group of the model being served (model, protocol, egress, mode, region): what its dispatches' and its
  * routes' refusals' points are grouped by (sinks.ts `rankingPoints`, blob 2). No budget counts it any more (r17).
  */
@@ -332,6 +353,12 @@ export interface AdmissionState {
   admissionDegraded: boolean;
 /** An earlier model of the request was admitted: a later model is a request of its own. */
   reserved: boolean;
+/**
+ * The position of the model admitted under the request's own id (the first one admitted), null before: its position's
+ * id (`<base>-<position>`) is then free, and it is the one the first model of the list takes when the relaxed floor's
+ * pass serves it after a later model was admitted (admission.ts `requestKeys`).
+ */
+  baseKeyModel: number | null;
 /** The position of the model being served in the customer's list, and the list (empty when it listed none). */
   modelIndex: number;
   listedModels: readonly string[];
@@ -738,6 +765,10 @@ export function newRoutingState(): RoutingState {
     rankingWaitMs: null,
     rankingFeedAt: null,
     checksUnapplied: null,
+    relaxFloor: false,
+    relaxable: [],
+    lastOfPass: false,
+    floorRelaxed: null,
     routingGroup: "",
     preference: Preference.DEFAULT,
     preferenceRecord: null,
@@ -767,6 +798,7 @@ export function newAdmissionState(): AdmissionState {
     admissions: [],
     admissionDegraded: false,
     reserved: false,
+    baseKeyModel: null,
     modelIndex: 0,
     listedModels: [],
     laneServed: false,

@@ -26,7 +26,7 @@ import { preferenceRefusedFactsOf } from "./ranking.ts";
 import { settleHeld } from "./attempt.ts";
 import { continuationStoreTiming } from "./hold.ts";
 import { restartLaneResponse } from "./lane-receipt.ts";
-import { refuse, unserved } from "./record.ts";
+import { noteRelaxable, refuse, unserved } from "./record.ts";
 import { promptUnits } from "./request-body.ts";
 import { pricingOptionsFor } from "./sizing.ts";
 import { entryPeers, laneRoutes, rankRegion, stackRoute } from "./stack-routes.ts";
@@ -44,13 +44,15 @@ export interface ServeModelRun extends AdmissionRun {}
  * attempts, its admission's first moment). While a later model may follow, a failure's record waits
  * (`record`), since the request goes on.
  */
-export function beginModel(run: ServeModelRun, index: number, model: string, last: boolean): void {
+export function beginModel(run: ServeModelRun, index: number, model: string, last: boolean, again = false): void {
   run.admitting.modelIndex = index;
   run.facts.model = model;
   run.log.deferRecord = !last;
   run.log.pendingRecord = null;
   run.admitting.pinned = false;
-  if (index === 0) return;
+  // The first model starts from the request's own state; a model served again (the relaxed floor's pass, intake.ts)
+  // starts afresh like any later one.
+  if (index === 0 && !again) return;
   run.facts.translation = null;
   run.facts.translationCap = null;
   // What the model before this one dropped of its native body is not this model's (`next_model` starts the log's
@@ -345,7 +347,14 @@ export async function serveModel(run: ServeModelRun, snapshot: GatewaySnapshot, 
         // The routes admission ranks: those whose endpoint shard holds no rest (`rankUtility`).
         const at = run.deps.clock();
         const rests = await shardRestView(run.deps.shardRests, priced.routes, canonical.stream === true, at, cfg.endpointReportMs, snapshot.version, run.rankRegionOf);
-        if (constraintsExcludeAll(snapshot, priced.routes, ask, at, canonical.stream === true, rests, run.rankRegionOf, rankingFeedAt(run))) return { kind: "constrained", value };
+        // The relaxed floor's pass (intake.ts): a target its preset's own floor alone excludes is served relaxed.
+        const own = !run.routing.routingStated.minAvailability;
+        const excludesAll = (relax: boolean) => constraintsExcludeAll(snapshot, priced.routes, ask, at, canonical.stream === true, rests, run.rankRegionOf, rankingFeedAt(run), relax);
+        if (excludesAll(run.routing.relaxFloor && own)) {
+          // The first pass: a target its preset's own floor alone excludes makes the model one the second pass tries.
+          if (!run.routing.relaxFloor && own && !excludesAll(true)) noteRelaxable(run, true);
+          return { kind: "constrained", value };
+        }
         return { kind: "serve", value };
       },
       unrouted: () => unrouted(snapshot, canonical, protocol, now, false, rules, run.routing.preference),

@@ -50,6 +50,24 @@
  * and S11b's members it sits inside the entry, so a reader that predates it ignores it, and the schema
  * stays `/1`. A text that does not hash (SHA-256 of its UTF-8 bytes) to its entry's `compose_hash` is a
  * malformed list: the signer never writes one.
+ *
+ * 1.8.0 (docs/design/persisted-receipts.md section 7): a release the tooling replaced leaves `releases` and is listed
+ * in the top-level `superseded` array, each entry a release's members plus `superseded_at` (Unix seconds, the
+ * `issued_at` of the list that replaced it), for at least `RELEASE_SUPERSEDED_RETENTION_SECONDS` (31 days):
+ *
+ *     "superseded": [{ "compose_hash": "<64 hex>", "git_tag": "v1.3.0", "git_commit": "<40 hex>", "superseded_at": 1790000000 }]
+ *
+ * A reader that predates it ignores the unknown top-level member, so to it the release left the list at once, as
+ * before (a relay withdraws from a compose the list stops carrying, D37/D77). `releases` and `composeHashes` stay
+ * the current releases; a live attestation is held to them only. `releaseListAt` adds a superseded release for a
+ * time no later than its `superseded_at` plus the clock margin: an older entry boot's report and a stack VM's record,
+ * checked at the receipt's signed `served_at`. `signReleaseList` keeps the entries their 31 days (`supersessionProblem`).
+ *
+ * OS images the same way: an image that leaves `os_images` (its `retire_after` passed, D35) moves to the top-level
+ * `retired_os_images` array, each entry an OS image's members plus `retired_at` (the `issued_at` of the list that
+ * retired it), for at least 31 days. Relays and live attestations read `os_images` only, so retirement is as before for
+ * them; `releaseListAt` adds a retired image for a time no later than its `retired_at` plus the clock margin
+ * (`retirementProblem` keeps the entries).
  */
 import { bytesToLowerHex, ed25519PublicKey, ed25519Sign, ed25519Verify, jcsBytes, jcsText, lowerHexBytes, sha256BareHex, utf8Bytes } from "@gray/attest";
 import { get, isObject, parseSerde, parseStrict, type Json } from "@gray/json";
@@ -100,6 +118,12 @@ export interface ReleaseEntry {
   readonly min_kit?: string | null;
 }
 
+/** 1.8.0: a release the list keeps in its `superseded` array, with when it was replaced. */
+export interface SupersededRelease extends ReleaseEntry {
+  /** Unix seconds: the `issued_at` of the list that took the release out of `releases`. */
+  readonly superseded_at: bigint;
+}
+
 export interface OsImageEntry {
   readonly os_image_hash: string;
   readonly description: string | null;
@@ -112,8 +136,19 @@ export interface OsImageEntry {
   readonly metadata_json: string | null;
 }
 
+/** 1.8.0: an OS image the list keeps in its `retired_os_images` array, with when it left `os_images`. */
+export interface RetiredOsImage extends OsImageEntry {
+  /** Unix seconds: the `issued_at` of the list that took the image out of `os_images`. */
+  readonly retired_at: bigint;
+}
+
 export interface ReleaseList {
+  /** The current releases, the only ones a live attestation is held to. */
   readonly releases: readonly ReleaseEntry[];
+  /** 1.8.0: the releases replaced within the last 31 days (absent or empty on a list without any). */
+  readonly superseded?: readonly SupersededRelease[];
+  /** 1.8.0: the OS images retired within the last 31 days (absent or empty on a list without any). */
+  readonly retiredOsImages?: readonly RetiredOsImage[];
   readonly osImages: readonly OsImageEntry[];
   readonly composeHashes: readonly string[];
   readonly osImageHashes: readonly string[];
@@ -139,8 +174,12 @@ export function parseReleaseList(value: Json): ParseReleaseListResult {
     problems.push({ path: "schema", message: `expected ${RELEASE_LIST_SCHEMA}` });
   }
   const releasesValue = get(value, "releases");
-  const releases = parseReleases(releasesValue, problems);
-  const osImages = parseOsImages(get(value, "os_images"), problems);
+  const seen = new Set<string>();
+  const releases = parseReleases(releasesValue, problems, seen);
+  const superseded = parseSuperseded(get(value, "superseded"), problems, seen);
+  const seenImages = new Set<string>();
+  const osImages = parseOsImages(get(value, "os_images"), problems, seenImages);
+  const retiredOsImages = parseRetiredOsImages(get(value, "retired_os_images"), problems, seenImages);
   if (releases.length === 0) problems.push({ path: "releases", message: "the release list has no compose hashes" });
   if (problems.length > 0) return { ok: false, problems };
 
@@ -152,7 +191,9 @@ export function parseReleaseList(value: Json): ParseReleaseListResult {
     ok: true,
     list: {
       releases,
+      superseded,
       osImages,
+      retiredOsImages,
       composeHashes: releases.map((entry) => entry.compose_hash),
       osImageHashes: osImages.map((entry) => entry.os_image_hash),
       osImageMeasurements,
@@ -160,56 +201,103 @@ export function parseReleaseList(value: Json): ParseReleaseListResult {
   };
 }
 
-function parseReleases(value: Json | undefined, problems: ReleaseListProblem[]): ReleaseEntry[] {
+function parseReleases(value: Json | undefined, problems: ReleaseListProblem[], seen: Set<string>): ReleaseEntry[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
     problems.push({ path: "releases", message: "releases is not an array" });
     return [];
   }
   const out: ReleaseEntry[] = [];
-  const seen = new Set<string>();
   for (let index = 0; index < value.length; index += 1) {
-    const entry = value[index];
-    const path = `releases[${index}]`;
-    if (!isObject(entry)) {
-      problems.push({ path, message: "not an object" });
-      continue;
-    }
-    const composeHash = get(entry, "compose_hash");
-    if (typeof composeHash !== "string" || !HASH_HEX.test(composeHash)) {
-      problems.push({ path: `${path}.compose_hash`, message: "not 32 bytes as lower-case hex" });
-      continue;
-    }
-    if (seen.has(composeHash)) {
-      problems.push({ path: `${path}.compose_hash`, message: "duplicate compose_hash" });
-      continue;
-    }
-    const gitTag = optionalString(entry, "git_tag", path, problems);
-    const gitCommit = optionalString(entry, "git_commit", path, problems);
-    const publishedAt = optionalString(entry, "published_at", path, problems);
-    if (gitCommit !== null && !COMMIT_HEX.test(gitCommit)) {
-      problems.push({ path: `${path}.git_commit`, message: "not a full commit id: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits" });
-    }
-    if (gitTag === null && gitCommit === null) {
-      problems.push({ path, message: "a release names a git_tag, a git_commit, or both" });
-    }
-    const stack = optionalStack(entry, path, problems);
-    const appCompose = optionalString(entry, "app_compose", path, problems);
-    if (appCompose !== null && sha256BareHex(utf8Bytes(appCompose)) !== composeHash) {
-      problems.push({ path: `${path}.app_compose`, message: "its SHA-256 is not compose_hash" });
-    }
-    const minStandard = optionalString(entry, "min_standard", path, problems);
-    if (minStandard !== null && !STANDARD_VERSION.test(minStandard)) {
-      problems.push({ path: `${path}.min_standard`, message: "not a standard version (<major>.<minor>)" });
-    }
-    const minKit = optionalString(entry, "min_kit", path, problems);
-    if (minKit !== null && (minKit.length > 80 || !KIT_VERSION.test(minKit))) {
-      problems.push({ path: `${path}.min_kit`, message: "not a kit semver (<major>.<minor>.<patch>)" });
-    }
-    seen.add(composeHash);
-    out.push({ compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack, app_compose: appCompose, min_standard: minStandard, min_kit: minKit });
+    const entry = parseReleaseEntry(value[index], `releases[${index}]`, problems, seen);
+    if (entry !== null) out.push(entry);
   }
   return out;
+}
+
+/** 1.8.0: the top-level `superseded` array: absent for none; each entry a release with its `superseded_at`. */
+function parseSuperseded(value: Json | undefined, problems: ReleaseListProblem[], seen: Set<string>): SupersededRelease[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    problems.push({ path: "superseded", message: "superseded is not an array" });
+    return [];
+  }
+  const out: SupersededRelease[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const path = `superseded[${index}]`;
+    const at = isObject(value[index]) ? get(value[index] as Json, "superseded_at") : undefined;
+    const entry = parseReleaseEntry(value[index], path, problems, seen);
+    if (typeof at !== "bigint" || at < 0n) {
+      problems.push({ path: `${path}.superseded_at`, message: "not Unix seconds (a non-negative integer)" });
+      continue;
+    }
+    if (entry !== null) out.push({ ...entry, superseded_at: at });
+  }
+  return out;
+}
+
+/** One release entry of `releases` or `superseded`; null (with a problem) when it is not one. */
+function parseReleaseEntry(entry: Json | undefined, path: string, problems: ReleaseListProblem[], seen: Set<string>): ReleaseEntry | null {
+  if (!isObject(entry)) {
+    problems.push({ path, message: "not an object" });
+    return null;
+  }
+  const composeHash = get(entry, "compose_hash");
+  if (typeof composeHash !== "string" || !HASH_HEX.test(composeHash)) {
+    problems.push({ path: `${path}.compose_hash`, message: "not 32 bytes as lower-case hex" });
+    return null;
+  }
+  if (seen.has(composeHash)) {
+    problems.push({ path: `${path}.compose_hash`, message: "duplicate compose_hash" });
+    return null;
+  }
+  const gitTag = optionalString(entry, "git_tag", path, problems);
+  const gitCommit = optionalString(entry, "git_commit", path, problems);
+  const publishedAt = optionalString(entry, "published_at", path, problems);
+  if (gitCommit !== null && !COMMIT_HEX.test(gitCommit)) {
+    problems.push({ path: `${path}.git_commit`, message: "not a full commit id: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits" });
+  }
+  if (gitTag === null && gitCommit === null) {
+    problems.push({ path, message: "a release names a git_tag, a git_commit, or both" });
+  }
+  const stack = optionalStack(entry, path, problems);
+  const appCompose = optionalString(entry, "app_compose", path, problems);
+  if (appCompose !== null && sha256BareHex(utf8Bytes(appCompose)) !== composeHash) {
+    problems.push({ path: `${path}.app_compose`, message: "its SHA-256 is not compose_hash" });
+  }
+  const minStandard = optionalString(entry, "min_standard", path, problems);
+  if (minStandard !== null && !STANDARD_VERSION.test(minStandard)) {
+    problems.push({ path: `${path}.min_standard`, message: "not a standard version (<major>.<minor>)" });
+  }
+  const minKit = optionalString(entry, "min_kit", path, problems);
+  if (minKit !== null && (minKit.length > 80 || !KIT_VERSION.test(minKit))) {
+    problems.push({ path: `${path}.min_kit`, message: "not a kit semver (<major>.<minor>.<patch>)" });
+  }
+  seen.add(composeHash);
+  return { compose_hash: composeHash, git_tag: gitTag, git_commit: gitCommit, published_at: publishedAt, stack, app_compose: appCompose, min_standard: minStandard, min_kit: minKit };
+}
+
+/**
+ * 1.8.0: the list as a check at time `t` takes it: the current releases, and each superseded release whose window
+ * covers `t` (`t <= superseded_at + RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS`, the clock margin a list's own times get).
+ * `t` is a receipt's signed `served_at`: an older entry boot's stored report, or a stack VM's record of a request.
+ * A live attestation is held to `list` itself, never to this.
+ */
+export function releaseListAt(list: ReleaseList, t: bigint): ReleaseList {
+  const accepted = (list.superseded ?? []).filter((entry) => t <= entry.superseded_at + RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS);
+  // The same rule for an OS image in `retired_os_images`: taken while t <= retired_at + the margin.
+  const images = (list.retiredOsImages ?? []).filter((entry) => t <= entry.retired_at + RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS);
+  if (accepted.length === 0 && images.length === 0) return list;
+  const osImageMeasurements: Record<string, QuoteMeasurements> = { ...list.osImageMeasurements };
+  for (const entry of images) if (entry.measurements !== null) osImageMeasurements[entry.os_image_hash] = entry.measurements;
+  return {
+    ...list,
+    releases: [...list.releases, ...accepted],
+    composeHashes: [...list.composeHashes, ...accepted.map((entry) => entry.compose_hash)],
+    osImages: [...list.osImages, ...images],
+    osImageHashes: [...list.osImageHashes, ...images.map((entry) => entry.os_image_hash)],
+    osImageMeasurements,
+  };
 }
 
 /**
@@ -237,39 +325,63 @@ function optionalStack(entry: Json, path: string, problems: ReleaseListProblem[]
   return { gray_image: grayImage as string, pre_launch_sha256: preLaunch as string };
 }
 
-function parseOsImages(value: Json | undefined, problems: ReleaseListProblem[]): OsImageEntry[] {
+function parseOsImages(value: Json | undefined, problems: ReleaseListProblem[], seen: Set<string>): OsImageEntry[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
     problems.push({ path: "os_images", message: "os_images is not an array" });
     return [];
   }
   const out: OsImageEntry[] = [];
-  const seen = new Set<string>();
   for (let index = 0; index < value.length; index += 1) {
-    const entry = value[index];
-    const path = `os_images[${index}]`;
-    if (!isObject(entry)) {
-      problems.push({ path, message: "not an object" });
-      continue;
-    }
-    const osImageHash = get(entry, "os_image_hash");
-    if (typeof osImageHash !== "string" || !HASH_HEX.test(osImageHash)) {
-      problems.push({ path: `${path}.os_image_hash`, message: "not 32 bytes as lower-case hex" });
-      continue;
-    }
-    if (seen.has(osImageHash)) {
-      problems.push({ path: `${path}.os_image_hash`, message: "duplicate os_image_hash" });
-      continue;
-    }
-    const description = optionalString(entry, "description", path, problems);
-    const measurements = parseMeasurements(entry, path, problems);
-    const retireAfter = optionalRetireAfter(entry, path, problems);
-    const sha256sumTxt = optionalString(entry, "sha256sum_txt", path, problems);
-    const metadataJson = optionalString(entry, "metadata_json", path, problems);
-    seen.add(osImageHash);
-    out.push({ os_image_hash: osImageHash, description, measurements, retire_after: retireAfter, sha256sum_txt: sha256sumTxt, metadata_json: metadataJson });
+    const entry = parseOsImageEntry(value[index], `os_images[${index}]`, problems, seen);
+    if (entry !== null) out.push(entry);
   }
   return out;
+}
+
+/** 1.8.0: the top-level `retired_os_images` array: absent for none; each entry an OS image with its `retired_at`. */
+function parseRetiredOsImages(value: Json | undefined, problems: ReleaseListProblem[], seen: Set<string>): RetiredOsImage[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    problems.push({ path: "retired_os_images", message: "retired_os_images is not an array" });
+    return [];
+  }
+  const out: RetiredOsImage[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const path = `retired_os_images[${index}]`;
+    const at = isObject(value[index]) ? get(value[index] as Json, "retired_at") : undefined;
+    const entry = parseOsImageEntry(value[index], path, problems, seen);
+    if (typeof at !== "bigint" || at < 0n) {
+      problems.push({ path: `${path}.retired_at`, message: "not Unix seconds (a non-negative integer)" });
+      continue;
+    }
+    if (entry !== null) out.push({ ...entry, retired_at: at });
+  }
+  return out;
+}
+
+/** One OS image entry of `os_images` or `retired_os_images`; null (with a problem) when it is not one. */
+function parseOsImageEntry(entry: Json | undefined, path: string, problems: ReleaseListProblem[], seen: Set<string>): OsImageEntry | null {
+  if (!isObject(entry)) {
+    problems.push({ path, message: "not an object" });
+    return null;
+  }
+  const osImageHash = get(entry, "os_image_hash");
+  if (typeof osImageHash !== "string" || !HASH_HEX.test(osImageHash)) {
+    problems.push({ path: `${path}.os_image_hash`, message: "not 32 bytes as lower-case hex" });
+    return null;
+  }
+  if (seen.has(osImageHash)) {
+    problems.push({ path: `${path}.os_image_hash`, message: "duplicate os_image_hash" });
+    return null;
+  }
+  const description = optionalString(entry, "description", path, problems);
+  const measurements = parseMeasurements(entry, path, problems);
+  const retireAfter = optionalRetireAfter(entry, path, problems);
+  const sha256sumTxt = optionalString(entry, "sha256sum_txt", path, problems);
+  const metadataJson = optionalString(entry, "metadata_json", path, problems);
+  seen.add(osImageHash);
+  return { os_image_hash: osImageHash, description, measurements, retire_after: retireAfter, sha256sum_txt: sha256sumTxt, metadata_json: metadataJson };
 }
 
 export type OsImageProvenanceCode =
@@ -502,6 +614,11 @@ export const RELEASE_LIST_MAX_HORIZON_SECONDS = 31n * 86_400n;
 export const MAX_RELEASE_LIST_BYTES = 4 * 1024 * 1024;
 /** D136: the horizon `sign-release-list.mjs` writes unless `--expires-in-days` says otherwise. */
 export const RELEASE_LIST_DEFAULT_HORIZON_SECONDS = 30n * 86_400n;
+/**
+ * 1.8.0: how long a release stays in `superseded` after its `superseded_at` before the signer lets it go: the 30 days
+ * an entry keeps a persisted receipt (its signed `retention_seconds`) and a day for the longest request and the clocks.
+ */
+export const RELEASE_SUPERSEDED_RETENTION_SECONDS = 31n * 86_400n;
 
 const SIGNATURE_MEMBERS = ["algo", "key_id", "signature"] as const;
 const SIGNATURE_HEX = /^[0-9a-f]{128}$/;
@@ -538,6 +655,9 @@ export type ReleaseListRefusalCode =
   | "missing_os_measurements"
   | "retire_after_too_soon"
   | "os_image_dropped_early"
+  | "release_dropped_early"
+  | "bad_superseded_at"
+  | "bad_retired_at"
   | "os_image_provenance"
   | "os_image_dev"
   | "expired"
@@ -619,6 +739,16 @@ export interface SignReleaseListOptions {
    * whole-relay revoke before it is dropped. Omit it only for the first list Gray ever publishes.
    */
   readonly previous?: ReleaseList;
+  /**
+   * 1.8.0: compose hashes the caller revokes (sign-release-list.mjs `--revoke`, an emergency): each may leave
+   * `releases` and `superseded` at once, without its 31 days in `superseded`.
+   */
+  readonly revoked?: readonly string[];
+  /**
+   * 1.8.0: OS image hashes the caller revokes (sign-release-list.mjs `--revoke-os-image`, an emergency): each may leave
+   * `os_images` and `retired_os_images` at once, whatever its `retire_after`, without its 31 days in `retired_os_images`.
+   */
+  readonly revokedOsImages?: readonly string[];
 }
 
 export interface VerifyReleaseListOptions {
@@ -690,8 +820,10 @@ export async function signReleaseList(document: Json, options: SignReleaseListOp
   if (missing !== null) return { ok: false, code: "missing_git_commit", message: missing };
   const unmeasured = missingOsMeasurements(parsed.list);
   if (unmeasured !== null) return { ok: false, code: "missing_os_measurements", message: unmeasured };
-  const retirement = retirementProblem(parsed.list, options.previous, issued);
+  const retirement = retirementProblem(parsed.list, options.previous, issued, options.revokedOsImages ?? []);
   if (retirement !== null) return { ok: false, code: retirement.code, message: retirement.message };
+  const supersession = supersessionProblem(parsed.list, options.previous, issued, options.revoked ?? []);
+  if (supersession !== null) return { ok: false, code: supersession.code, message: supersession.message };
   const provenance = osImageTextProblem(parsed.list);
   if (provenance !== null) return { ok: false, code: provenance.code, message: provenance.message };
   let signedBytes: Uint8Array;
@@ -1171,6 +1303,10 @@ function missingOsMeasurements(list: ReleaseList): string | null {
       return `os_images[${index}].mrtd/rtmr0/rtmr1/rtmr2 are required in a signed release list`;
     }
   }
+  const retired = list.retiredOsImages ?? [];
+  for (let index = 0; index < retired.length; index += 1) {
+    if (retired[index]!.measurements === null) return `retired_os_images[${index}].mrtd/rtmr0/rtmr1/rtmr2 are required in a signed release list`;
+  }
   return null;
 }
 
@@ -1179,24 +1315,54 @@ function missingOsMeasurements(list: ReleaseList): string | null {
  *
  * - an image that leaves the list must have carried `retire_after` in the previous list and reached it
  *   (`os_image_dropped_early`), so a relay still running it can attest it (the customer's allowlist
- *   holds it) and send its whole-relay revoke first;
+ *   holds it) and send its whole-relay revoke first; and (1.8.0) it moves to `retired_os_images`;
+ * - (1.8.0) a `retired_at` the previous list did not carry for that image is this list's `issued_at`, and only an
+ *   image of the previous list's `os_images` is newly retired (`bad_retired_at`); without a previous list it is at
+ *   most `issued_at`;
+ * - (1.8.0) an entry of the previous list's `retired_os_images` leaves it only RELEASE_SUPERSEDED_RETENTION_SECONDS
+ *   after its `retired_at` (`os_image_dropped_early`), unless it is in `os_images` again;
+ * - a revoked image (`revokedOsImages`) may leave both arrays at once, whatever its dates;
  * - a `retire_after` the previous list did not already carry is at least
  *   `MAX_CREDENTIAL_LEASE_SECONDS` after this list's `issued_at` (`retire_after_too_soon`), so the
  *   window it announces covers at least one full credential lease. A value carried forward unchanged
  *   is not re-checked: after the date passes, the image stays listed until an operator drops it.
  */
-function retirementProblem(list: ReleaseList, previous: ReleaseList | undefined, now: bigint): { code: ReleaseListRefusalCode; message: string } | null {
+function retirementProblem(list: ReleaseList, previous: ReleaseList | undefined, now: bigint, revoked: readonly string[]): { code: ReleaseListRefusalCode; message: string } | null {
   const present = new Set(list.osImages.map((entry) => entry.os_image_hash));
+  const retiredNow = new Map((list.retiredOsImages ?? []).map((entry) => [entry.os_image_hash, entry] as const));
   const previousImages = previous?.osImages ?? [];
   const before = new Map(previousImages.map((entry) => [entry.os_image_hash, entry] as const));
+  const retiredBefore = new Map((previous?.retiredOsImages ?? []).map((entry) => [entry.os_image_hash, entry] as const));
   for (let index = 0; index < previousImages.length; index += 1) {
     const entry = previousImages[index]!;
-    if (present.has(entry.os_image_hash)) continue;
+    if (present.has(entry.os_image_hash) || revoked.includes(entry.os_image_hash)) continue;
     if (entry.retire_after === null) {
       return { code: "os_image_dropped_early", message: `os_images[${index}] (${entry.os_image_hash}) leaves the list without a retire_after in the previous list` };
     }
     if (entry.retire_after > now) {
       return { code: "os_image_dropped_early", message: `os_images[${index}] (${entry.os_image_hash}) retires at ${entry.retire_after}, after ${now}` };
+    }
+    if (!retiredNow.has(entry.os_image_hash)) {
+      return {
+        code: "os_image_dropped_early",
+        message: `os_images[${index}] (${entry.os_image_hash}) leaves os_images without a retired_os_images entry (retired_at ${now}); a receipt of a boot on it is checked against it for ${RELEASE_SUPERSEDED_RETENTION_SECONDS} s`,
+      };
+    }
+  }
+  for (const [index, entry] of (list.retiredOsImages ?? []).entries()) {
+    if (retiredBefore.get(entry.os_image_hash)?.retired_at === entry.retired_at) continue;
+    if (previous === undefined ? entry.retired_at > now : entry.retired_at !== now) {
+      return { code: "bad_retired_at", message: `retired_os_images[${index}] (${entry.os_image_hash}) is retired at ${entry.retired_at}; an image this list retires is retired at its issued_at ${now}` };
+    }
+    if (previous !== undefined && !before.has(entry.os_image_hash)) {
+      return { code: "bad_retired_at", message: `retired_os_images[${index}] (${entry.os_image_hash}) was not in the previous list's os_images; only a listed image is retired` };
+    }
+  }
+  for (const entry of previous?.retiredOsImages ?? []) {
+    if (present.has(entry.os_image_hash) || retiredNow.has(entry.os_image_hash) || revoked.includes(entry.os_image_hash)) continue;
+    const until = entry.retired_at + RELEASE_SUPERSEDED_RETENTION_SECONDS;
+    if (until > now) {
+      return { code: "os_image_dropped_early", message: `retired OS image ${entry.os_image_hash} (retired at ${entry.retired_at}) stays in retired_os_images until ${until}, after this list's issued_at ${now}` };
     }
   }
   const earliest = now + MAX_CREDENTIAL_LEASE_SECONDS;
@@ -1216,13 +1382,59 @@ function retirementProblem(list: ReleaseList, previous: ReleaseList | undefined,
 }
 
 /**
+ * 1.8.0's rules for one list against its predecessor (docs/design/persisted-receipts.md section 7), like D35's for
+ * OS images:
+ *
+ * - a release that leaves `releases` is listed in `superseded` (`release_dropped_early` otherwise), unless revoked;
+ * - a `superseded_at` the previous list did not carry for that release is this list's `issued_at`
+ *   (`bad_superseded_at`): a supersession is dated by the list that makes it, never earlier (which would shorten the
+ *   window of the receipts its boots signed) or later. Without a previous list it is at most `issued_at`;
+ * - an entry of the previous list's `superseded` leaves it only `RELEASE_SUPERSEDED_RETENTION_SECONDS` after its
+ *   `superseded_at` (`release_dropped_early`), unless it is a current release again or revoked.
+ */
+function supersessionProblem(list: ReleaseList, previous: ReleaseList | undefined, issued: bigint, revoked: readonly string[]): { code: ReleaseListRefusalCode; message: string } | null {
+  const current = new Set(list.composeHashes);
+  const superseded = new Map((list.superseded ?? []).map((entry) => [entry.compose_hash, entry] as const));
+  const before = new Map((previous?.superseded ?? []).map((entry) => [entry.compose_hash, entry] as const));
+  for (const [index, entry] of (list.superseded ?? []).entries()) {
+    if (before.get(entry.compose_hash)?.superseded_at === entry.superseded_at) continue;
+    if (previous === undefined ? entry.superseded_at > issued : entry.superseded_at !== issued) {
+      return {
+        code: "bad_superseded_at",
+        message: `superseded[${index}] (${entry.compose_hash}) is superseded at ${entry.superseded_at}; a release this list supersedes is superseded at its issued_at ${issued}`,
+      };
+    }
+  }
+  if (previous === undefined) return null;
+  for (const entry of previous.releases) {
+    if (current.has(entry.compose_hash) || superseded.has(entry.compose_hash) || revoked.includes(entry.compose_hash)) continue;
+    return {
+      code: "release_dropped_early",
+      message: `release ${entry.compose_hash} leaves releases without a superseded entry (superseded_at ${issued}); a receipt its boots signed is checked against it for ${RELEASE_SUPERSEDED_RETENTION_SECONDS} s`,
+    };
+  }
+  for (const entry of previous.superseded ?? []) {
+    if (current.has(entry.compose_hash) || superseded.has(entry.compose_hash) || revoked.includes(entry.compose_hash)) continue;
+    const until = entry.superseded_at + RELEASE_SUPERSEDED_RETENTION_SECONDS;
+    if (until > issued) {
+      return {
+        code: "release_dropped_early",
+        message: `superseded release ${entry.compose_hash} (superseded at ${entry.superseded_at}) stays listed until ${until}, after this list's issued_at ${issued}`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * S11b at signing: an OS image that carries its texts must be bound by them (`osImageProvenance`) and
  * must not be a dstack dev image. An entry without either text is the release tooling's to refuse
  * (it requires them for every image it adds) and the reader's to judge.
  */
 function osImageTextProblem(list: ReleaseList): { code: ReleaseListRefusalCode; message: string } | null {
-  for (let index = 0; index < list.osImages.length; index += 1) {
-    const entry = list.osImages[index]!;
+  const images = [...list.osImages, ...(list.retiredOsImages ?? [])];
+  for (let index = 0; index < images.length; index += 1) {
+    const entry = images[index]!;
     if (entry.sha256sum_txt === null && entry.metadata_json === null) continue;
     const provenance = osImageProvenance(entry);
     if (!provenance.ok) {
@@ -1239,6 +1451,10 @@ function osImageTextProblem(list: ReleaseList): { code: ReleaseListRefusalCode; 
 function missingGitCommit(list: ReleaseList): string | null {
   for (let index = 0; index < list.releases.length; index += 1) {
     if (list.releases[index]!.git_commit === null) return `releases[${index}].git_commit is required in a signed release list`;
+  }
+  const superseded = list.superseded ?? [];
+  for (let index = 0; index < superseded.length; index += 1) {
+    if (superseded[index]!.git_commit === null) return `superseded[${index}].git_commit is required in a signed release list`;
   }
   return null;
 }

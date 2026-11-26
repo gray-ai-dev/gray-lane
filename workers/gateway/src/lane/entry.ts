@@ -14,7 +14,6 @@ import { ModelApiRun, modelApi } from "../apis.ts";
 import { CountTokensRun } from "../count-tokens.ts";
 import { entryStandardApi } from "./standard-api.ts";
 import { InferenceRun } from "../inference.ts";
-import { livez } from "../health.ts";
 import "./policy-interpreter.ts";
 import { attestationFor } from "./attestation.ts";
 import { calibrateLaneStep, calibrationLogLine, LaneCalibrationError } from "./calibration.ts";
@@ -34,6 +33,11 @@ import { EntryEndpointRoutes, endpointRowsOfSnapshot, endpointRowsOfView } from 
 import { remoteEndpointCredentials } from "./remote/endpoint-credential.ts";
 import { remoteKeyRevoked, remoteShardLocator } from "./remote/account.ts";
 import { remoteVideoStore } from "./remote/video.ts";
+import { RemoteReceiptObjects } from "./remote/receipts.ts";
+import { BootAttestation, bootCollateral } from "./receipt-boot.ts";
+import { ReceiptPersister } from "./receipt-persist.ts";
+import { lookUpKey } from "../key-lookup.ts";
+import { Outbound } from "../outbound.ts";
 import { VideoJobPolls, videoJobIo } from "./video-jobs.ts";
 import { entryVideoRoute, serveEntryVideo } from "./video-routes.ts";
 import { backendOf, isPeerRequest, peerRoute } from "./peer-routes.ts";
@@ -648,7 +652,8 @@ function boot(env: LaneGatewayEnv, cfg: GatewayConfig): Promise<LaneProcessState
       // P2e: the relay's accounts come from its vault and every change goes there.
       ...(vault === null ? {} : { vault }),
       // ER7: one bounded GetKey before the first answer; a failure serves on a random key and retries (`LaneAffinityKey`).
-      ...(affinity === null ? {} : { affinity, continuation: affinity }),
+      // The persisted receipts' key comes from the same guest agent (docs/design/persisted-receipts.md section 2).
+      ...(affinity === null ? {} : { affinity, continuation: affinity, receiptsKey: affinity }),
     }).catch((thrown) => {
       if (booted === next) {
         booted = null;
@@ -709,6 +714,96 @@ export function laneBootState(): Promise<LaneProcessState> | null {
  * stack list with. Off otherwise, and then the lane routes no stack route, as before. A value it cannot use is logged
  * once by name, never by value, and leaves it off.
  */
+/**
+ * The entry's persisted receipts (docs/design/persisted-receipts.md), one persister per boot state, attached to the
+ * boot's receipt store on the first fetch that has its bindings. The entry layout alone: a relay stack VM keeps its
+ * receipts in memory. Without the app's receipts key (`LaneReceiptKey`) the persister stores and reads nothing, and the
+ * receipts carry no `retention_seconds`.
+ */
+const receiptPersisters = new WeakMap<LaneProcessState, ReceiptPersister | null>();
+
+function receiptPersisterOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayConfig, identity: LaneIdentity): ReceiptPersister | null {
+  if (receiptPersisters.has(state)) return receiptPersisters.get(state) ?? null;
+  if (state.stack !== null) {
+    receiptPersisters.set(state, null);
+    return null;
+  }
+  const bridge = { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv), now: state.now };
+  const boot = new BootAttestation({
+    keysetDigest: state.keysetDigest,
+    // The report the attestation route serves, under the nonce derived from the keyset: its exact JSON.
+    report: async (nonce) => parseSerde((await attestationFor(state.keyset, { teeType: identity.teeType, provenance: identity.provenance }, nonce, quoter(env, identity))).json),
+    collateral: bootCollateral(new BackgroundClient(bridge), () => Math.floor(state.now() / 1000)),
+    now: state.now,
+  });
+  const persister = new ReceiptPersister({
+    keys: () => state.receiptsKey.keys,
+    keyPending: () => state.receiptsKey.pending,
+    objects: new RemoteReceiptObjects(bridge),
+    boot: () => boot.record(),
+    now: state.now,
+  });
+  state.persistingReceipts.attach(persister);
+  receiptPersisters.set(state, persister);
+  return persister;
+}
+
+/**
+ * docs/design/persisted-receipts.md section 6: whether the presented key is one the entry knows, as the request path and
+ * the video routes look a key up (`lookUpKey`: the snapshot's keys, a revoked, disabled or expired one refused), asked
+ * before a stored copy is looked up. `unavailable` when no current snapshot can be read (503 `auth_snapshot_expired`).
+ */
+function receiptKeyCheck(request: Request, env: LaneGatewayEnv, cfg: GatewayConfig, state: LaneProcessState, ctx: ExecutionContext, peers: EntryPeers | null, entryReplica: EntryReplica | null): () => Promise<"known" | "unknown" | "unavailable"> {
+  return async () => {
+    const lane: LaneRequestState = {
+      cfg,
+      env,
+      state,
+      bridge: { baseUrl: state.bridgeUrl, keyId: state.laneKeyId, signingKey: state.bridgeSigner, fetch: bridgeFetch(env.LANE_BRIDGE, cfg.deployEnv) },
+      ...(peers === null ? {} : { peers }),
+      entryReplica,
+    };
+    const deps = laneGatewayDeps(request, env, lane, laneIsolateOnce(), egressBindingOf(env));
+    try {
+      await lookUpKey(request.headers, { cfg, snapshots: deps.snapshots, source: deps.source, background: (p) => ctx.waitUntil(p), outbound: new Outbound(), lane: true }, false);
+      return "known";
+    } catch (error) {
+      return error instanceof ApiError && error.status === 503 ? "unavailable" : "unknown";
+    }
+  };
+}
+
+/** /healthz's `receipt_store`: the persister's counters as integers, absent on a lane that keeps no copies. */
+function receiptStoreField(persister: ReceiptPersister | null): { readonly receipt_store?: Record<string, bigint | null> } {
+  if (persister === null) return {};
+  const counters = persister.counters();
+  return { receipt_store: Object.fromEntries(Object.entries(counters).map(([name, value]) => [name, value === null ? null : BigInt(value)])) };
+}
+
+/**
+ * `ctx` with the persisted receipts' flush behind each piece of work: a receipt is put at the end of the request's own
+ * `waitUntil` (its record), so the flush that writes it runs after that work, in the same request's life. Settling
+ * returns at once when nothing waits.
+ */
+function persistingContext(ctx: ExecutionContext, persister: ReceiptPersister | null): ExecutionContext {
+  if (persister === null) return ctx;
+  const held: Pick<ExecutionContext, "waitUntil" | "passThroughOnException" | "props"> = {
+    waitUntil: (work: Promise<unknown>) => {
+      ctx.waitUntil(work);
+      ctx.waitUntil(
+        Promise.resolve(work)
+          .catch(() => undefined)
+          .then(() => persister.settle()),
+      );
+    },
+    passThroughOnException: () => ctx.passThroughOnException(),
+    get props() {
+      return ctx.props;
+    },
+  };
+  return held as ExecutionContext;
+}
+
 const peerClients = new WeakMap<LaneProcessState, EntryPeers | null>();
 
 /**
@@ -849,6 +944,8 @@ function entryRoleOf(state: LaneProcessState, env: LaneGatewayEnv, cfg: GatewayC
           // "Review fixes, 2026-11-17 night": the entrypoint's stop socket (ENTRY_STOP, rendered with the replica index).
           // Bounded (ENTRY_STOP_CALL_MS): a call that never answers would otherwise hold the watch's step to its own bound.
           ...(stopBinding === null ? {} : { requestStop: async () => (await stopBinding.fetch(new Request(ENTRY_STOP_URL, { method: "POST", signal: AbortSignal.timeout(ENTRY_STOP_CALL_MS) }))).status }),
+          // docs/design/persisted-receipts.md section 5: a stop waits for the receipts announced and not yet persisted.
+          receiptsPending: () => receiptPersisters.get(state)?.counters().pending ?? 0,
         });
   entryRoles.set(state, role);
   return role;
@@ -1209,6 +1306,9 @@ async function serveLane(request: Request, env: LaneGatewayEnv, ctx: ExecutionCo
   // ER7: an affinity key whose GetKey failed at boot is derived again behind requests when its retry is due.
   if (state.affinity.source === "boot") ctx.waitUntil(state.affinity.tick());
   if (state.continuation.source === "boot") ctx.waitUntil(state.continuation.tick());
+  // The persisted receipts' key, when its GetKey failed at boot, the same way (`LaneReceiptKey`).
+  if (state.receiptsKey.source === "none") ctx.waitUntil(state.receiptsKey.tick());
+  const persister = missing.length === 0 ? receiptPersisterOf(state, env, cfg, identity) : null;
   // ER9 as revised: an entry replica reads its role behind requests when its poll is due.
   const replica = missing.length === 0 ? entryRoleOf(state, env, cfg, replicaIndex) : null;
   if (replica !== null) {
@@ -1236,9 +1336,14 @@ async function serveLane(request: Request, env: LaneGatewayEnv, ctx: ExecutionCo
       answer = misconfigured(request, url, state, missing);
     } else {
       // The replica index as the boot validated it, 1 to 16 (`laneReplicaIndex`): the rows' node (0110).
-      const routed = route(request, env, cfg, state, identity, url, end === null ? ctx : heldContext(ctx, end.hold), origin, peers, replica, api.forward, videos, replicaIndex);
+      const work = persistingContext(ctx, persister);
+      const routed = route(request, env, cfg, state, identity, url, end === null ? work : heldContext(work, end.hold), origin, peers, replica, api.forward, videos, replicaIndex);
       end?.hold(routed);
       answer = await routed;
+      // The request stays counted until the receipt its answer names is persisted (or counted lost): a planned stop's
+      // drain then never ends before that write (docs/design/persisted-receipts.md section 5).
+      const receiptId = answer.headers.get(RECEIPT_ID_HEADER);
+      if (end !== null && persister !== null && receiptId !== null) end.hold(persister.settled(receiptId));
     }
   } catch (thrown) {
     end?.();
@@ -1312,7 +1417,11 @@ async function route(
   if (path === HEALTH_PATH) return health(request, url, identity, state, warmerOf(state, env, cfg), peers, replica);
   if (path === READY_PATH) return readiness(request, cfg, state, warmerOf(state, env, cfg), peers, replica);
   if (path === ATTESTATION_PATH) return attestation(request, env, url, state, identity);
-  if (path.startsWith(RECEIPTS_PATH)) return serveReceipt(request, { receipts: state.receipts, keysetDigest: state.keysetDigest, followUpMs: cfg.peerFollowUpMs, clock: state.now }, path.slice(RECEIPTS_PATH.length));
+  if (path.startsWith(RECEIPTS_PATH)) {
+    const persisted = receiptPersisters.get(state) ?? null;
+    const knownKey = receiptKeyCheck(request, env, cfg, state, ctx, peers, entryReplica);
+    return serveReceipt(request, { receipts: state.receipts, keysetDigest: state.keysetDigest, followUpMs: cfg.peerFollowUpMs, clock: state.now, persisted, knownKey, ctx }, path.slice(RECEIPTS_PATH.length));
+  }
   if (path.startsWith(DEBUG_REQUESTS_PREFIX)) {
     const requestId = debugRequestIdOf(path.slice(DEBUG_REQUESTS_PREFIX.length));
     if (requestId === null) return unmatched(request, cfg, url, path);
@@ -1479,6 +1588,8 @@ function health(request: Request, url: URL, identity: LaneIdentity, state: LaneP
       tee_type: identity.teeType,
       receipt_key_id: state.receiptKeyId,
       receipts: state.receipts.size,
+      // docs/design/persisted-receipts.md section 5: the persisted copies' counters since boot (gray-lane-watch reads them).
+      ...receiptStoreField(receiptPersisters.get(state) ?? null),
       routes: warm.routes,
       routes_warm: warm.warm,
       ranking_fed: snapshots.fed(state.now()),

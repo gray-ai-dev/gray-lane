@@ -95,20 +95,10 @@ export {
   type AppliedRecord,
   type Insertion,
 } from "./append.ts";
-export {
-  RELAY_POLICY_APPLIED,
-  RELAY_POLICY_REFUSED,
-  relayPolicyAppliedEvent,
-  relayPolicyRefusedEvent,
-  replayForwarded,
-  verifyForwarded,
-  verifyForwardedWithChanges,
-  type AppliedAppend,
-  type AppliedEventInput,
-  type RefusedEventInput,
-  type RelayPolicyAppliedEvent,
-  type RelayPolicyRefusedEvent,
-} from "./receipt.ts";
+// The relay policy events and the customer's check of a receipt's forwarded bytes, which
+// `@gray/lane-verify` runs: their values come from `@gray/lane/receipt`. The lane bundle builds its
+// receipt events through `@gray/attest` and does not load them. Their types stay here.
+export type { AppliedAppend, AppliedEventInput, RefusedEventInput, RelayPolicyAppliedEvent, RelayPolicyRefusedEvent } from "./receipt.ts";
 export { isRelayPolicyReasonCode, type RelayPolicyReasonCode } from "@gray/attest";
 export { MAX_POINTER_LENGTH, MAX_POINTER_TOKENS, parseJsonPointer, type JsonPointer, type PointerRefusalCode } from "./pointer.ts";
 export {

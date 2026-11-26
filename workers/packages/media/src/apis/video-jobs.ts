@@ -580,8 +580,9 @@ export interface StreamMediaHooks {
   /** When true, any upstream body is cancelled immediately and a bodyless 200 response carrying sanitized headers is returned. */
   readonly head?: boolean;
   /**
-   * The customer's request signal. workerd's HTTP server aborts it when the customer disconnects and then stops pulling
-   * the body without calling its `cancel()`; its abort ends the transfer as `cancelled`.
+   * The customer's request signal. workerd's HTTP server aborts it whenever the customer disconnects; the body's
+   * `cancel()` comes only when a write to the closed connection fails while it is still pulling, not once it has
+   * stopped pulling (a full queue). Its abort ends the transfer as `cancelled`.
    */
   readonly signal?: AbortSignal;
 }

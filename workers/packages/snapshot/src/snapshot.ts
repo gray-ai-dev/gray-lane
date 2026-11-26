@@ -973,9 +973,9 @@ export function routeCapabilities(e: ProviderEndpoint, protocol: Protocol, recor
  * `streaming` or `stream` claim says nothing for such a route, and is left out of its configuration.
  *
  * Every entry sends a streamed request of these APIs only to a route whose configuration claims `streaming` (gateway
- * apis.ts `streams`, which reads the route's `config.capabilities`, in every lane release since the standard APIs), so
- * the rule takes effect with the snapshot, whatever release an entry runs. The route's configuration fingerprint is
- * the endpoint's, computed from what is stored.
+ * apis/pure.ts `streams`, which reads the route's `config.capabilities`, in every lane release since the standard
+ * APIs), so the rule takes effect with the snapshot, whatever release an entry runs. The route's configuration
+ * fingerprint is the endpoint's, computed from what is stored.
  */
 export function routeConfig(config: EndpointConfig, mapping: ModelMapping, capabilities: Pick<RouteCapabilities, "streaming">): EndpointConfig {
   if (!streamsMedia(mapping.protocol)) return config;

@@ -17,6 +17,7 @@ import {
   failedConstraint,
   measurementKeySync,
   rankByUtility,
+  relaxedFloor,
   Ranker,
   type Candidate,
   type MaxPrice,
@@ -28,6 +29,7 @@ import {
   type RoutePrice,
   type RoutingParams,
   type RoutingPolicy,
+  type UtilityInput,
   type UtilityResult,
   type UtilityRoute,
 } from "@gray/routing";
@@ -608,10 +610,44 @@ export function screenConstraints(snapshot: GatewaySnapshot, routes: readonly Ro
  * target whose ranking would refuse the model or keep nothing, so the selection tries the next target first (the server's
  * `constraints_exclude_all`; docs/utility-routing.md "Constraints and the price cap").
  */
-export function constraintsExcludeAll(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, rests: RestView, regionOf?: RankRegionOf, feedAt = nowMs): boolean {
+export function constraintsExcludeAll(snapshot: GatewaySnapshot, routes: readonly Route[], ask: UtilityAsk, nowMs: number, stream: boolean, rests: RestView, regionOf?: RankRegionOf, feedAt = nowMs, relax = false): boolean {
   const u = utilityRoutesOf(snapshot, routes, nowMs, stream, regionOf, feedAt);
-  const input = { params: ask.params, policy: ask.policy, seed: ask.seed, sessionHit: ask.sessionHit, candidates: u.routes, population: u.population, feedAvailable: u.feedAvailable, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative };
-  return excludesEveryRankedCandidate(input, (key) => rests(key, nowMs) !== undefined);
+  const input = utilityInputOf(ask, u);
+  const resting = (key: string) => rests(key, nowMs) !== undefined;
+  // A request that may relax its preset's floor (`relax`) is not excluded by that floor alone (`relaxedAsk`).
+  return excludesEveryRankedCandidate(input, resting) && !(relax && relaxedFloor(input, resting) !== null);
+}
+
+/** What the formula reads of `ask` over `u` (@gray/routing `UtilityInput`). */
+function utilityInputOf(ask: UtilityAsk, u: UtilityRoutes): UtilityInput {
+  return { params: ask.params, policy: ask.policy, seed: ask.seed, sessionHit: ask.sessionHit, candidates: u.routes, population: u.population, feedAvailable: u.feedAvailable, reference: ask.reference, contextTokens: ask.contextTokens, generative: ask.generative };
+}
+
+/**
+ * `ask` with its preset's own `min_availability` relaxed (@gray/routing `relaxedFloor`, docs/utility-routing.md
+ * "Constraints and the price cap") when that floor alone leaves the routes a ranking of `u` judges with `rests` none:
+ * the floor becomes the highest availability among those that pass every other check, so every later read of the ask
+ * (the formula, the open routes kept behind it, a session's route, a refit) judges the same routes. Null when nothing
+ * relaxes. The caller passes the preset's floor only: a floor the request states is never relaxed.
+ */
+export function relaxedAsk(ask: UtilityAsk, u: UtilityRoutes, rests: RestView, nowMs: number): UtilityAsk | null {
+  const floor = relaxedFloor(utilityInputOf(ask, u), (key) => rests(key, nowMs) !== undefined);
+  return floor === null ? null : { ...ask, params: { ...ask.params, minAvailability: floor } };
+}
+
+/**
+ * Whether a refusal of `ranking` is its preset's own floor's while no route passes the other checks either (a relaxed
+ * floor would serve none, `relaxedAsk` null): the request is then refused for the constraint that left nothing besides
+ * the floor, the one its customer can change, and the caller ranks again without the floor (`unflooredAsk`) for that
+ * refusal (docs/utility-routing.md "Constraints and the price cap").
+ */
+export function floorHidesRefusal(ranking: UtilityRanking, relaxed: UtilityAsk | null, stated: boolean): boolean {
+  return !ranking.ok && !stated && relaxed === null && ranking.utility.ok === false && ranking.utility.constraint === "min_availability";
+}
+
+/** `ask` without its `min_availability` (`floorHidesRefusal`). */
+export function unflooredAsk(ask: UtilityAsk): UtilityAsk {
+  return { ...ask, params: { ...ask.params, minAvailability: null } };
 }
 
 /**

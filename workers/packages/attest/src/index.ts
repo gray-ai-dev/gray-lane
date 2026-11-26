@@ -42,4 +42,6 @@ export * from "./quote.ts";
 export * from "./receipt.ts";
 export * from "./report.ts";
 export * from "./stack-hash.ts";
-export * from "./stream-hash.ts";
+// Streaming hashing: its values come from `@gray/attest/stream-hash`, so that the lane bundle,
+// which does not hash streams with it, does not load it. Its types stay here.
+export type * from "./stream-hash.ts";

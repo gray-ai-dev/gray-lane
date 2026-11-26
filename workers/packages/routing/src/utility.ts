@@ -589,6 +589,32 @@ export function excludesEveryRankedCandidate(input: UtilityInput, resting: (key:
   return judged.length > 0 && judged.every((route) => failedConstraint(route, effectiveMetrics(route, input.population, input.policy, input.feedAvailable), input) !== null);
 }
 
+/**
+ * The floor a preset's `min_availability` relaxes to when it alone leaves the request no route (docs/utility-routing.md
+ * "Constraints and the price cap", the preset's floor): the highest effective availability among the routes its ranking
+ * judges (those of `input.candidates` that do not rest, or all of them when every one rests, as
+ * `excludesEveryRankedCandidate` judges them) that pass every other check. Routing with this floor in place of the
+ * preset's keeps those routes, ties included, and leaves out the rest. Null when there is nothing to relax: no floor, the
+ * feed unavailable (no check reads the record then), a judged route that passes every check as it is, or none that passes
+ * the others (that constraint refuses the model, as before). The caller decides whether the floor is the preset's own
+ * and whether the request may relax it: a floor the request states is never relaxed.
+ */
+export function relaxedFloor(input: UtilityInput, resting: (key: string) => boolean): number | null {
+  const params = input.params;
+  if (params.minAvailability === null || !input.feedAvailable) return null;
+  if (params.maxPriceMultiple !== null && input.reference === null) return null;
+  const free = input.candidates.filter((route) => !resting(route.key));
+  const judged = free.length > 0 ? free : input.candidates;
+  const others = { ...input, params: { ...params, minAvailability: null } };
+  let best: number | null = null;
+  for (const route of judged) {
+    const metrics = effectiveMetrics(route, input.population, input.policy, input.feedAvailable);
+    if (failedConstraint(route, metrics, input) === null) return null;
+    if (failedConstraint(route, metrics, others) === null) best = best === null ? metrics.availability : Math.max(best, metrics.availability);
+  }
+  return best;
+}
+
 export function rankByUtility(input: UtilityInput): UtilityResult {
   const params = input.params;
   const { scored, excluded: exclusions, outcome } = prepare(input);

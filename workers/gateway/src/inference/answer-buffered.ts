@@ -8,7 +8,7 @@ import { ApiError, isErrorBody } from "@gray/errors";
 import { type Json, cloneJson, isObject, parseStrictBytes } from "@gray/json";
 import { PEER_GATE_REFUSED } from "@gray/lane-wire";
 import { generatedIdSeed } from "@gray/ledger-keys";
-import { type AnswerChecks, ProtocolError, UNCOUNTED_CHECKS, bufferedSettlement, bufferedUsage, extractBufferedBillingMeta, parseResponse } from "@gray/protocol";
+import { type AnswerChecks, ProtocolError, StreamBillingObserver, UNCOUNTED_CHECKS, bufferedSettlement, bufferedUsage, extractBufferedBillingMeta, parseResponse } from "@gray/protocol";
 import { TranslationFailure } from "@gray/translation";
 import { AnswerRelay, keepsAnswerText, wholeAnswerWeight } from "../answer.ts";
 import { AFTER_CLIENT_LEFT_MS, ClientStream } from "../client.ts";
@@ -25,7 +25,7 @@ import { UPSTREAM_BODY_CHUNK_BYTES } from "../upstream.ts";
 import { type AnswerRun, answerFailed, defect, errorAnswer, recordCharged, streamFailure } from "./answer.ts";
 import { cutByDeadline, providerRef } from "./attempt-pure.ts";
 import { capacityError } from "./errors.ts";
-import { PEER_END_WAIT_MS } from "./peer-end.ts";
+import { PEER_END_WAIT_MS, peerBillingMeta } from "./peer-end.ts";
 import { bufferedEnd, grayAfterCheck, outputLimit, refusedOf, unreported } from "./settle-pure.ts";
 // `settle` is a local of the buffered answer paths: the settlement step is imported under another name.
 import { settle as settleAnswer, settleRefused } from "./settle.ts";
@@ -295,7 +295,7 @@ export function nativeAnswer(run: BufferedAnswerRun, a: Answering, attempt: Atte
         reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, outputLimit(a, route)) : unreported(upstream, rawUsage),
         rawUsage,
         bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
-        extractBufferedBillingMeta(upstream, payload, rawUsage, run.settlement.pricingFeatures),
+        peerBillingMeta(attempt, upstream, extractBufferedBillingMeta(upstream, payload, rawUsage, run.settlement.pricingFeatures)),
       );
       if (!settled.ok) {
         // A usage the gateway would not bill charged nothing: another attempt may serve the request. A
@@ -549,7 +549,7 @@ export async function translatedAnswer(run: BufferedAnswerRun, a: Answering, att
       reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, outputLimit(a, route)) : unreported(upstream, rawUsage),
       rawUsage,
       bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
-      extractBufferedBillingMeta(upstream, payload, rawUsage, run.settlement.pricingFeatures),
+      peerBillingMeta(attempt, upstream, extractBufferedBillingMeta(upstream, payload, rawUsage, run.settlement.pricingFeatures)),
     );
     if (!settled.ok) {
       if (!grayAfterCheck(settled)) return uncommitted({ ...defect(run, attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });
@@ -622,6 +622,7 @@ export async function translatedAnswer(run: BufferedAnswerRun, a: Answering, att
 export async function codexAnswer(run: BufferedAnswerRun, a: Answering, attempt: Attempt, response: Response, deadline: number, d: Dispatcher): Promise<BufferedResult> {
   const { cfg, clock } = run.deps;
   const route = attempt.route;
+  const upstream = a.protocol;
   let handed: Response | null = null;
   const handOver = (r: Response) => (handed = r);
   const failed = (code: string, reason: string, why: string, supplier: "timeout" | "upstream_error" | "invalid_response" | null, extra: { upstreamMayStillWork?: boolean; error?: ApiError; limitSource?: LimitSource } = {}): BufferedResult => {
@@ -643,6 +644,8 @@ export async function codexAnswer(run: BufferedAnswerRun, a: Answering, attempt:
   } catch {
     inspector = PASS_THROUGH.stream(a.contract, a.answerLimit, false);
   }
+  // The hosted tool calls the stream reports, kept when its terminal output is empty (P4-2), as a stream's are.
+  const billing = new StreamBillingObserver(upstream, run.settlement.pricingFeatures);
   const read = await completedResponse({
     response,
     presence: run.presence,
@@ -657,6 +660,7 @@ export async function codexAnswer(run: BufferedAnswerRun, a: Answering, attempt:
     isolate: run.answerShare,
     heldLimit,
     inspector,
+    billing,
   });
   switch (read.kind) {
     case "left": {
@@ -684,7 +688,6 @@ export async function codexAnswer(run: BufferedAnswerRun, a: Answering, attempt:
     case "completed":
       break;
   }
-  const upstream = a.protocol;
   const payload = read.response;
   const bytes = read.bytes;
   // The object's parse and its bytes stay held through the checks and the settlement (lane/codex.ts `keptWeight`).
@@ -723,7 +726,8 @@ export async function codexAnswer(run: BufferedAnswerRun, a: Answering, attempt:
     reported ? bufferedSettlement(upstream, parsedAnswer.usage!, rawUsage, outputLimit(a, route)) : unreported(upstream, rawUsage),
     rawUsage,
     bufferedEnd(upstream, payload, parsedAnswer.finish_reason),
-    extractBufferedBillingMeta(upstream, payload, rawUsage, run.settlement.pricingFeatures),
+    // The stream's events, its terminal event's `response` (this answer) the last of them: read as a stream's are.
+    billing.finish(rawUsage),
   );
   if (!settled.ok) {
     if (!grayAfterCheck(settled)) return uncommitted({ ...defect(run, attempt, settled.code, false), error: new ApiError(502, settled.code), reason: settled.reason });

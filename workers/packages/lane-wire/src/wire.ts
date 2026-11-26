@@ -25,6 +25,7 @@ import {
 } from "./endpoint.ts";
 import { BridgeWireError } from "./error.ts";
 import { laneAcmeFailedAnswerSchema, laneAcmeFailedSchema } from "./lane-acme.ts";
+import { RECEIPTS_PUT_MAX_BYTES, receiptsGetAnswerSchema, receiptsGetRequestSchema, receiptsPutAnswerSchema, receiptsPutRequestSchema } from "./receipts.ts";
 import { BRIDGE_METHODS, type BridgeOp } from "./ops.ts";
 import { laneEventsSchema, laneIndexMessageSchema, lanePointsSchema, laneServiceEventsSchema, recordsAcceptedSchema } from "./records.ts";
 import { SCHEDULER_FORWARD_REQUEST_MAX_BYTES, schedulerForwardAnswerSchema, schedulerForwardRequestSchema, schedulerForwardRequestV1Schema } from "./scheduler.ts";
@@ -93,7 +94,8 @@ export const BRIDGE_SMALL_REQUEST_MAX_BYTES = 64 * 1024;
  * (`STACK_VAULT_SHARE_MAX_BYTES`); `endpoint.file_rest` a rest over as many keys and roots as a root's rests cover
  * (`ENDPOINT_FILE_REST_MAX_BYTES`); `video.put` a job's record, its hold token, evidence and projection columns
  * (`VIDEO_PUT_MAX_BYTES`); `continuation.bind` references with optional sealed zero-retention state
- * (`CONTINUATION_BIND_MAX_BYTES`); every other op's document is a few KB.
+ * (`CONTINUATION_BIND_MAX_BYTES`); `receipts.put` up to 64 sealed objects (`RECEIPTS_PUT_MAX_BYTES`); every other op's
+ * document is a few KB.
  */
 export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "scheduler.forward") return SCHEDULER_FORWARD_REQUEST_MAX_BYTES;
@@ -103,6 +105,7 @@ export function bridgeRequestMaxBytes(op: BridgeOp): number {
   if (op === "stack.vault.share") return STACK_VAULT_SHARE_MAX_BYTES;
   if (op === "video.put") return VIDEO_PUT_MAX_BYTES;
   if (op === "continuation.bind") return CONTINUATION_BIND_MAX_BYTES;
+  if (op === "receipts.put") return RECEIPTS_PUT_MAX_BYTES;
   return op.startsWith("records.") ? BRIDGE_REQUEST_MAX_BYTES : BRIDGE_SMALL_REQUEST_MAX_BYTES;
 }
 
@@ -191,6 +194,8 @@ export const BRIDGE_REQUEST_SCHEMAS = {
   "video.due": videoDueRequestSchema,
   "continuation.pin": continuationPinRequestSchema,
   "continuation.bind": continuationBindRequestSchema,
+  "receipts.put": receiptsPutRequestSchema,
+  "receipts.get": receiptsGetRequestSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 export const BRIDGE_RESPONSE_SCHEMAS = {
@@ -237,6 +242,8 @@ export const BRIDGE_RESPONSE_SCHEMAS = {
   "video.due": videoDueAnswerSchema,
   "continuation.pin": continuationPinAnswerSchema,
   "continuation.bind": continuationBindAnswerSchema,
+  "receipts.put": receiptsPutAnswerSchema,
+  "receipts.get": receiptsGetAnswerSchema,
 } as const satisfies Record<BridgeOp, z.ZodType>;
 
 /**

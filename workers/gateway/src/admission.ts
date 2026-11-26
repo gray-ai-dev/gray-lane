@@ -33,7 +33,7 @@ import { LRUCache } from "lru-cache";
  * between them and neither gives it back. So a late-admitted attempt superseded by another admitted
  * attempt counts once (r31, the product lead's item 2 of part A), also when both answered late from
  * one shard. And the request's end must not count it again
- * (inference.ts and apis.ts `closeRate`): `mayHaveCounted` says whether an attempt the gateway
+ * (inference.ts and apis/record.ts `closeRate`): `mayHaveCounted` says whether an attempt the gateway
  * stopped waiting for admitted after all, or has not answered yet (it still may; the shard counts
  * its wait from the call's arrival).
  */

@@ -655,6 +655,12 @@ export interface RequestRecord {
    */
   readonly checksUnapplied?: { readonly reason: "base_missing" | "base_stale" | "records_unsupported"; readonly waitedMs: number | null };
   /**
+   * Its ranking relaxed its preset's own `min_availability`, which alone left it no route (inference/ranking.ts
+   * `relaxedAsk`): the preset, the floor it was ranked with (the highest availability among the routes that pass every
+   * other check) and the preset's. Absent otherwise. Its `routing_floor_relaxed` point counts it (`rankingPoints`).
+   */
+  readonly floorRelaxed?: { readonly preset: string; readonly floor: number; readonly limit: number };
+  /**
    * The refusals of its routes' endpoint shards at acquisition, by their own reason: the route, its rank key in the
    * request's mode, the ranking group of the ranking that asked, when, and whether its permit was still being borrowed
    * (endpoints.ts `borrowing`: a `busy` while the shard's borrow may still come, or a shard that did not answer, is not a
@@ -1535,11 +1541,13 @@ export function unbudgeted(group: string): { readonly group: string; readonly ex
  * `leasePending`, or did not answer; criterion (b2) counts the `busy` of a full route, 0). One per request whose ranking
  * made none of the checks that read the feed it asked for (`checksUnapplied`), `routing_checks_unapplied`: blob 2 why
  * (`base_missing`, `base_stale`, `records_unsupported`), blob 3 the isolate, blob 4 the ranking group; doubles 1 the
- * count, 2 how long the request waited for a base first (ms; -1 none). A request
+ * count, 2 how long the request waited for a base first (ms; -1 none). One per request whose ranking relaxed its
+ * preset's own floor (`floorRelaxed`), `routing_floor_relaxed`: blob 2 the preset, blob 3 the isolate, blob 4 the ranking
+ * group; doubles 1 the count, 2 the floor it was ranked with, 3 the preset's. A request
  * makes a handful of attempts and refusals at most (RETRY_MAX_ATTEMPTS), well within the 250 points one invocation may
  * write.
  */
-export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals" | "isolateGapMs" | "checksUnapplied" | "routingGroup">, service: { readonly instance: string }): AnalyticsEngineDataPoint[] {
+export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals" | "isolateGapMs" | "checksUnapplied" | "floorRelaxed" | "routingGroup">, service: { readonly instance: string }): AnalyticsEngineDataPoint[] {
   const out: AnalyticsEngineDataPoint[] = [];
   const gap = r.isolateGapMs ?? -1;
   for (const a of r.attempts) {
@@ -1552,6 +1560,8 @@ export function rankingPoints(r: Pick<RequestRecord, "attempts" | "routeRefusals
   }
   const unapplied = r.checksUnapplied;
   if (unapplied !== undefined) out.push({ indexes: ["routing_checks_unapplied"], blobs: ["routing_checks_unapplied", unapplied.reason, service.instance, r.routingGroup ?? ""], doubles: [1, unapplied.waitedMs ?? -1] });
+  const relaxed = r.floorRelaxed;
+  if (relaxed !== undefined) out.push({ indexes: ["routing_floor_relaxed"], blobs: ["routing_floor_relaxed", relaxed.preset, service.instance, r.routingGroup ?? ""], doubles: [1, relaxed.floor, relaxed.limit] });
   return out;
 }
 

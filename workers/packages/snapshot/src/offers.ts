@@ -1,4 +1,4 @@
-import { isProtocol, type Protocol } from "@gray/protocol";
+import { HOSTED_TOOL_NAMES, SERVICE_TIER_NAMES, isProtocol, type HostedToolName, type Protocol, type ServiceTierName } from "@gray/protocol";
 import { parsePlain } from "@gray/json";
 import { mappingFingerprint, type ProviderEndpoint, type VerificationRecord } from "./control.ts";
 import type { ProbeCost } from "./evidence.ts";
@@ -18,10 +18,11 @@ export const MAX_UNIT_PRICE_MICROUSD_PER_MILLION = 100_000_000_000_000;
 export const MAX_TOOL_PRICE_MICROUSD = 100_000_000;
 export const MIN_LONG_CONTEXT_THRESHOLD = 1_000;
 export const MAX_LONG_CONTEXT_THRESHOLD = 100_000_000;
-export const SERVICE_TIER_NAMES = ["fast", "priority"] as const;
-export type ServiceTierName = (typeof SERVICE_TIER_NAMES)[number];
-export const HOSTED_TOOL_NAMES = ["web_search", "google_search", "code_execution", "file_search"] as const;
-export type HostedToolName = (typeof HOSTED_TOOL_NAMES)[number];
+/**
+ * The service tiers an offer may price and the hosted tools it may price per call: the gateway's own lists
+ * (@gray/protocol pricing-features.ts), which decide what an answer is billed for.
+ */
+export { HOSTED_TOOL_NAMES, SERVICE_TIER_NAMES, type HostedToolName, type ServiceTierName } from "@gray/protocol";
 export const MAX_UNIT_PRICES = 32;
 export const MAX_CONCURRENCY = 100_000;
 /** 9999-12-31T23:59:59Z, the latest end date an offer may set (LATEST_END_DATE). */

@@ -446,12 +446,17 @@ export async function afterBody(run: IntakeRun, snapshot: GatewaySnapshot, key: 
   // the answer, and none is tried once the request's time has run out: a later model has what is left of it.
   const deadline = requestDeadline(run, bodyRead);
   let refused: Response | null = null;
-  let turn: { readonly parsed: ParsedRequest; readonly canonical: CanonicalRequest } = { parsed, canonical };
+  const first: { readonly parsed: ParsedRequest; readonly canonical: CanonicalRequest } = { parsed, canonical };
+  let turn = first;
   for (let index = 0; index < chain.length; index++) {
     if (index > 0 && run.deps.clock() >= deadline) break;
     const last = index === chain.length - 1;
     const model = chain[index]!;
-    beginModel(run, index, model, last);
+    // The last model's refusal waits too while a model the floor alone refused is left for the relaxed pass below, so that
+    // the request writes one record and releases what it holds once, whichever pass ends it (`flushRecord`); a model that
+    // joins or leaves those models while it is served moves its wait with it (record.ts `noteRelaxable`).
+    beginModel(run, index, model, last && run.routing.relaxable.length === 0);
+    run.routing.lastOfPass = last;
     run.routing.preference = preferences[index] ?? run.routing.preference;
     run.routing.preferenceLevels = levelsOf(index);
     if (index > 0) {
@@ -465,14 +470,50 @@ export async function afterBody(run: IntakeRun, snapshot: GatewaySnapshot, key: 
     const served = await serveModel(run, snapshot, key, turn.parsed, body, turn.canonical, candidates, bodyRead);
     // A model pinned to the endpoint that holds a Responses continuation failed there: the continuation
     // stays with that endpoint, and the request ends. A model with no route there was never pinned.
-    if (served.kind === "response" || run.admitting.pinned || last) {
+    if (served.kind === "response" || run.admitting.pinned) {
       flushRecord(run);
       return served.response;
     }
     refused = served.response;
+    if (last) break;
     endModel(run);
   }
-  // The request's time ran out before the next model: the last refusal is the answer.
+  // Every model the request lists was refused (or its time ran out before the next one). The models whose ranking the
+  // preset's own `min_availability` alone refused are tried again, in the list's order, with that floor relaxed
+  // (docs/utility-routing.md "Constraints and the price cap"): a model or a translation target that passed as it is has
+  // already been served by now, so a relaxed floor serves only a request that would otherwise be refused.
+  const relaxable = [...run.routing.relaxable];
+  if (relaxable.length > 0 && run.deps.clock() < deadline) {
+    run.routing.relaxFloor = true;
+    run.routing.lastOfPass = false;
+    for (let i = 0; i < relaxable.length; i++) {
+      if (i > 0 && run.deps.clock() >= deadline) break;
+      const index = relaxable[i]!;
+      const last = i === relaxable.length - 1;
+      const model = chain[index]!;
+      endModel(run);
+      beginModel(run, index, model, last, true);
+      run.routing.preference = preferences[index] ?? run.routing.preference;
+      run.routing.preferenceLevels = levelsOf(index);
+      if (index === 0) {
+        turn = first;
+      } else {
+        const again = await forModel(run, body, model);
+        if (again instanceof ApiError) {
+          run.log.deferRecord = false;
+          return refuse(run, again, "parse");
+        }
+        turn = again;
+      }
+      const served = await serveModel(run, snapshot, key, turn.parsed, body, turn.canonical, candidates, bodyRead);
+      if (served.kind === "response" || run.admitting.pinned) {
+        flushRecord(run);
+        return served.response;
+      }
+      refused = served.response;
+    }
+  }
+  // The last refusal is the answer.
   flushRecord(run);
   return refused!;
 }

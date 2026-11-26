@@ -31,6 +31,8 @@ import { StackConfigClient } from "./remote/stack.ts";
 import { guestGetKey, LaneVault, VAULT_PREV_DISK_URL, VAULT_RETRY_FIRST_MS, VAULT_RETRY_MAX_MS, vaultDiskClient, vaultKeys } from "./vault.ts";
 import { AFFINITY_KEY_PATH, affinityKeyFromMaterial } from "./affinity.ts";
 import { CONTINUATION_KEY_PATH, continuationKeyFromMaterial } from "./responses-continuation.ts";
+import { persistingReceiptStore, type PersistingReceiptStore } from "./receipt-persist.ts";
+import { RECEIPTS_KEY_PATH, receiptSealKeysFromMaterial, type ReceiptSealKeys } from "./receipt-seal.ts";
 import { LANE_ROLE_TTL_MS, LaneInstanceRole } from "./instance-role.ts";
 import { keepRequestAlive } from "./background.ts";
 import { bootDiskClient, LaneBootBox } from "./boot-intake.ts";
@@ -161,6 +163,11 @@ export interface LaneStateOptions {
   readonly continuation?: LaneAffinitySettings;
   /** Test injection for a fixed 32-byte zero-retention continuation sealing key. */
   readonly continuationKey?: Uint8Array;
+  /**
+   * The guest agent the entry's receipts key comes from (`GetKey("gray-lane/v1/receipts")`, docs/design/persisted-
+   * receipts.md section 2). Absent (the relay-stack layout, local dev): no key, and no receipt is persisted.
+   */
+  readonly receiptsKey?: LaneAffinitySettings;
 }
 
 /** ER7: the guest agent (`GUEST_AGENT`) the entry's affinity key comes from, its base URL and the bound on one call. */
@@ -334,6 +341,77 @@ export class LaneContinuationKey {
   }
 }
 
+/**
+ * The entry's receipts keys (docs/design/persisted-receipts.md section 2): derived from the app's `GetKey` of
+ * RECEIPTS_KEY_PATH, the same on every replica and every boot of the app. Unlike the continuation key there is no
+ * random stand-in: a copy sealed under a key no later boot can derive would be lost, so while the key is not the app's
+ * (no guest agent, or `GetKey` failed and is retried behind requests on the vault's schedule) `keys` is null and
+ * nothing is persisted or read back. The `GetKey` answer is zeroed after use.
+ */
+export class LaneReceiptKey {
+  #keys: ReceiptSealKeys | null = null;
+  #failures = 0;
+  #nextAt = 0;
+  #deriving: Promise<void> | null = null;
+  readonly #settings: LaneAffinitySettings | null;
+  readonly #now: () => number;
+  readonly #log: (line: Record<string, unknown>) => void;
+
+  private constructor(settings: LaneAffinitySettings | null, now: () => number, log: (line: Record<string, unknown>) => void) {
+    this.#settings = settings;
+    this.#now = now;
+    this.#log = log;
+  }
+
+  static async boot(options: { readonly settings: LaneAffinitySettings | null; readonly now: () => number; readonly log?: (line: Record<string, unknown>) => void }): Promise<LaneReceiptKey> {
+    const holder = new LaneReceiptKey(options.settings, options.now, options.log ?? ((line) => console.log(JSON.stringify(line))));
+    if (options.settings !== null) await holder.#derive();
+    return holder;
+  }
+
+  /** The keys once derived from the app's key, else null. Never logged. */
+  get keys(): ReceiptSealKeys | null {
+    return this.#keys;
+  }
+
+  /** `app` once derived, `none` before (or without a guest agent). */
+  get source(): "app" | "none" {
+    return this.#keys === null ? "none" : "app";
+  }
+
+  /** Whether the key is still to come: a guest agent is there and its `GetKey` has not answered yet (retried). */
+  get pending(): boolean {
+    return this.#keys === null && this.#settings !== null;
+  }
+
+  /** Retries `GetKey` behind requests while the key is not derived and the backoff has passed. */
+  async tick(): Promise<void> {
+    if (this.#keys !== null || this.#settings === null || this.#now() < this.#nextAt) return;
+    this.#deriving ??= this.#derive().finally(() => {
+      this.#deriving = null;
+    });
+    await this.#deriving;
+  }
+
+  async #derive(): Promise<void> {
+    const settings = this.#settings as LaneAffinitySettings;
+    let material: Uint8Array | null = null;
+    try {
+      material = await guestGetKey({ guest: settings.guest, guestUrl: settings.guestUrl, timeoutMs: settings.guestTimeoutMs }, RECEIPTS_KEY_PATH);
+      this.#keys = await receiptSealKeysFromMaterial(material);
+      this.#log({ level: "info", event: "lane_receipts_key", source: "app", kid: this.#keys.kid, failures: this.#failures });
+    } catch (error) {
+      this.#failures += 1;
+      const wait = Math.min(VAULT_RETRY_FIRST_MS * 2 ** Math.min(this.#failures - 1, 10), VAULT_RETRY_MAX_MS);
+      this.#nextAt = this.#now() + wait;
+      const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : error instanceof Error ? error.name : "error";
+      this.#log({ level: "warn", event: "lane_receipts_key_failed", code, failures: this.#failures, retry_ms: wait });
+    } finally {
+      material?.fill(0);
+    }
+  }
+}
+
 /** What the vault needs beyond the stack's settings: the measured relay key, the app id and its two sockets. */
 export interface LaneVaultSettings {
   /** LANE_STACK_RELAY_KEY: the measured relay key, 64 lower hex. */
@@ -490,6 +568,8 @@ export function createReceiptStore(
       sweep(now());
       return peerBytes;
     },
+    // Memory alone: no member (`persistingReceiptStore` signs the persisted copy's).
+    retentionSeconds: null,
   };
 }
 
@@ -549,6 +629,10 @@ export interface LaneProcessState extends LaneState {
   readonly affinity: LaneAffinityKey;
   /** Where `continuationKey` comes from, and the retry of a boot-time `GetKey` that failed (`tick`, behind requests). */
   readonly continuation: LaneContinuationKey;
+  /** The receipts keys of the persisted copies, and the retry of a `GetKey` that failed (`tick`, behind requests). */
+  readonly receiptsKey: LaneReceiptKey;
+  /** The memory store with its persisted copy (`receipts` is the same object): the entry attaches the persister. */
+  readonly persistingReceipts: PersistingReceiptStore;
 }
 
 /** A boot's TLS identity: its one SPKI, the name it is scoped to, and an entry replica's own name beside it. */
@@ -615,6 +699,7 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
     reason: options.stack === undefined ? "no_guest_agent" : "stack_layout",
     now: options.now ?? (() => Date.now()),
   });
+  const receiptsKey = await LaneReceiptKey.boot({ settings: options.receiptsKey ?? null, now: options.now ?? (() => Date.now()) });
   const continuation = await LaneContinuationKey.boot({
     settings: options.continuation ?? null,
     ...(options.continuationKey === undefined ? {} : { fixedKey: options.continuationKey }),
@@ -653,11 +738,13 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
   const credentials = new RelayCredentialStore({ intakeKey, keys: relayKeys, keysetDigest: keyset.digest, ...(vaultSettings === null ? {} : { leaseGated: true }) });
   const policies = createLanePolicyStore();
   const now = options.now ?? (() => Date.now());
-  const receipts = createReceiptStore({
-    ...(options.receiptTtlMs === undefined ? {} : { ttlMs: options.receiptTtlMs }),
-    ...(options.receiptMaxEntries === undefined ? {} : { maxEntries: options.receiptMaxEntries }),
-    now,
-  });
+  const receipts = persistingReceiptStore(
+    createReceiptStore({
+      ...(options.receiptTtlMs === undefined ? {} : { ttlMs: options.receiptTtlMs }),
+      ...(options.receiptMaxEntries === undefined ? {} : { maxEntries: options.receiptMaxEntries }),
+      now,
+    }),
+  );
   const signer = { sign: (message: Uint8Array) => receiptKey.signReceipt(receiptKeyId, message) };
   // D17: bridge calls are signed with the provisioned lane key, a key the bridge knows before this
   // boot (LANE_BRIDGE_PUBLIC_KEYS). The per-boot receipt key cannot work there: the bridge has no way
@@ -849,6 +936,8 @@ export async function createLaneState(options: LaneStateOptions): Promise<LanePr
       return continuation.key;
     },
     continuation,
+    receiptsKey,
+    persistingReceipts: receipts,
     receiptKeyId,
     keysetDigest: keyset.digest,
     relays: registry,

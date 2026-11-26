@@ -18,10 +18,11 @@ import { type ExpandZeroRetentionResult, ExpandedBodyTooLargeError } from "../la
 import { newLaneReceiptId } from "../lane/run-common.ts";
 import { stackStreamOptionsUnusable } from "../lane/stack-rewrite.ts";
 import { LANE_RELAY_FAILED, RELAY_DECLINED, laneFaultError, newStackRid, peerEndVerdict, stackPeerHeaders, stackRawQuery } from "../lane/stack.ts";
+import { stackFaultWhy } from "../lane/stack-fault.ts";
 import type { Route } from "../routes.ts";
 import type { RequestOutcome } from "../sinks.ts";
 import { laneVendor, permitKey } from "./attempt-pure.ts";
-import { PEER_END_WAIT_MS, passesToNextRoute, peerEndedOutcome, peerFaultWhy, refusedTheRelaysAccount } from "./peer-end.ts";
+import { PEER_END_WAIT_MS, passesToNextRoute, peerEndedOutcome, refusedTheRelaysAccount } from "./peer-end.ts";
 import { unsentOutcome } from "./settle-pure.ts";
 import { entryPeers } from "./stack-routes.ts";
 import type { Attempt, Dispatch, PeerOutcome, SendResult, Sent, StackPassthrough, StackPlan, Stopped, Uncommitted } from "./types.ts";
@@ -324,7 +325,7 @@ export function peerFailed(run: StackPeerRun, d: Dispatcher, attempt: Attempt, m
     return { kind: "stopped", stop: null, error };
   }
   const code = verdict.kind === "lane" ? verdict.code : LANE_RELAY_FAILED;
-  const error = laneFaultError(code, fault?.why ?? peerFaultWhy(outcome.code));
+  const error = laneFaultError(code, fault?.why ?? stackFaultWhy(outcome.code));
   failAttempt(run, d, attempt, bareOutcome("transport", elapsed), error, code, false);
   return { kind: "stopped", stop: null, error };
 }

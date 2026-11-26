@@ -75,6 +75,10 @@ import { BridgeWireError } from "./error.ts";
  * `continuation.pin` and `continuation.bind` (continuation.ts) read and write which endpoint issued a Responses reply,
  * by the hash of its id, so a request that continues it goes back to that endpoint from any lane VM that admits
  * requests. The rows are in objects of the bridge's own, and the target is the workspace (`continuation/<workspace id>`).
+ *
+ * `receipts.put` and `receipts.get` (receipts.ts; docs/design/persisted-receipts.md section 4) write and read the entry's
+ * sealed receipt objects in the bridge's R2 bucket, by names the bridge cannot map back to a receipt. Only an entry's key
+ * may call them, and their target is `receipts`.
  */
 export const BRIDGE_OPS = [
   "account.admit",
@@ -120,6 +124,8 @@ export const BRIDGE_OPS = [
   "video.due",
   "continuation.pin",
   "continuation.bind",
+  "receipts.put",
+  "receipts.get",
 ] as const;
 
 export type BridgeOp = (typeof BRIDGE_OPS)[number];
@@ -169,6 +175,8 @@ export const BRIDGE_METHODS: Readonly<Record<BridgeOp, "GET" | "POST">> = Object
   "video.due": "POST",
   "continuation.pin": "POST",
   "continuation.bind": "POST",
+  "receipts.put": "POST",
+  "receipts.get": "POST",
 });
 
 /** The base request target of each op; the snapshot read appends its two parameters (snapshot.ts). */
@@ -216,6 +224,8 @@ export const BRIDGE_PATHS: Readonly<Record<BridgeOp, string>> = Object.freeze({
   "video.due": "/v1/lane-bridge/video/due",
   "continuation.pin": "/v1/lane-bridge/continuation/pin",
   "continuation.bind": "/v1/lane-bridge/continuation/bind",
+  "receipts.put": "/v1/lane-bridge/receipts/put",
+  "receipts.get": "/v1/lane-bridge/receipts/get",
 });
 
 /**

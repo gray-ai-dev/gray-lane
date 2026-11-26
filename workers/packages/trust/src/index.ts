@@ -38,16 +38,9 @@ export {
   regexPendingMaxBytes,
   withCompileAllowance,
 } from "./engine.ts";
-export {
-  type Finding,
-  type GateEnd,
-  type GateFailure,
-  type GateOptions,
-  type GateStep,
-  OpenGate,
-  type StreamStage,
-  ToolGate,
-} from "./gate.ts";
+// The tool-call gates: their values come from `@gray/trust/gate`, so that the lane bundle,
+// which does not gate, does not load them. Their types stay here.
+export type { OpenGate, ToolGate, Finding, GateEnd, GateFailure, GateOptions, GateStep, StreamStage } from "./gate.ts";
 export { AnswerCallCheck } from "./answer.ts";
 export { type OutputAnswer, OutputObserver, asksForStructuredOutput, outputCheck } from "./output.ts";
 export { StreamToolInspector } from "./inspector.ts";

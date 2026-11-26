@@ -22,7 +22,7 @@ function failLaneMedia(): never {
 /**
  * A snapshot route as the model APIs read it (@gray/media `MediaRoute`): the capabilities its endpoint states and has
  * proved, and whether its price for the request bills units (`billsUnits`; undefined: unpriced). It carries no key: an
- * attempt takes its provider's key from the entry's own table (apis.ts `entryKey`).
+ * attempt takes its provider's key from the entry's own table (apis/send.ts `entryKey`).
  */
 export function mediaRouteOf(record: RouteRecord, billsUnits: boolean | undefined): MediaRoute {
   return {

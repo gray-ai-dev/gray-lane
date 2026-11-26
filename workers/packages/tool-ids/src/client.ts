@@ -7,7 +7,8 @@
  * connections, outbound.ts; a deletion's own calls).
  */
 import { durableObjectReset, type LocationHint } from "@gray/config";
-import { FIND_MAX_BYTES, type FindAnswer, type IssueAnswer, type IssuedRow } from "./shard.ts";
+import { FIND_MAX_BYTES } from "./find.ts";
+import type { FindAnswer, IssueAnswer, IssuedRow } from "./shard.ts";
 import { everyShard, type ShardPlace } from "./shards.ts";
 import type { DeleteAnswer, StoredRow } from "./store.ts";
 

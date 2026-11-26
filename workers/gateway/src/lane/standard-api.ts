@@ -13,6 +13,7 @@ import { VM_BODY_LIMIT_SOURCE } from "./body-limits.ts";
 import { readForm } from "../form.ts";
 import type { AnswerShare } from "../retained.ts";
 import { EGRESS_HEADER, addReceiptEvents, laneDuplicateKey } from "./hooks.ts";
+import { persistReceipts, retentionOf } from "./receipts.ts";
 import type { LaneDeps, LaneReceiptDraft } from "./types.ts";
 
 /**
@@ -397,6 +398,8 @@ export function entryUpstreamHeaders(protocol: Protocol, body: EntryBody, client
 
 /** What a standard API's receipt is signed from. */
 export interface EntryReceiptInput {
+  /** The request's context: the persisted copy's flush goes in its `waitUntil` (`persistReceipts`). Required, so no caller can skip it. */
+  readonly ctx: Pick<ExecutionContext, "waitUntil">;
   readonly receiptId: string;
   readonly model: string | null;
   readonly path: string;
@@ -422,6 +425,7 @@ export async function signEntryReceipt(lane: LaneDeps, input: EntryReceiptInput)
     chatId: null,
     model: input.model,
     workloadKeysetDigest: lane.state.keysetDigest,
+    ...retentionOf(lane.state.receipts),
     endpoint: input.path,
     method: input.method,
     servedAt: BigInt(Math.floor(input.servedAtMs / 1000)),
@@ -430,6 +434,7 @@ export async function signEntryReceipt(lane: LaneDeps, input: EntryReceiptInput)
   addReceiptEvents(builder, { receivedHash: input.receivedHash, draft: input.draft, responseHash: input.responseHash });
   const signed = await builder.finalize(lane.state.receiptKey, lane.state.receiptKeyId);
   lane.state.receipts.put(signed, input.owner);
+  persistReceipts(lane.state.receipts, input.ctx);
 }
 
 /**

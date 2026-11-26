@@ -20,12 +20,18 @@ export { HANDLE_CHARS, HANDLE_PREFIX, type Handle, formatHandle, isHandle, parse
 export { HandleKeys, type Kind, REPLAY_KEY_AAD, deriveKeys, digest, fromHex, open, seal, toHex } from "./keys.ts";
 export { ReleaseScan, Watched, releasesReplaced } from "./release.ts";
 export { type ByteSite, type ItemId, type ScannedSites, SiteScanner, scanSites, siteMember } from "./scan.ts";
-export { type ContentRow, CONTENT_PIECE_BYTES, DELETE_CHUNK, type DeleteAnswer, type ImportedContent, type ImportedLabel, type LabelRow, type LookupAnswer, type Refused, type StoredRow, ToolCallIdStore, rowBytes, type WriteAnswer, type WriteInput } from "./store.ts";
+export { FIND_MAX_BYTES } from "./find.ts";
+
+// The Durable Objects' code (the tool call id shards, their store and cache, and the deletion
+// pass): its values come from `@gray/tool-ids/objects`, so that a bundle that only maps ids (the
+// lane's) does not load it. Its types stay here.
+export type { ConversationCache } from "./cache.ts";
+export type { ToolCallIdStore, ContentRow, DeleteAnswer, ImportedContent, ImportedLabel, LabelRow, LookupAnswer, Refused, StoredRow, WriteAnswer, WriteInput } from "./store.ts";
+export type { ToolCallIdShard, FindAnswer, FindInput, HomeShardRpc, IssueAnswer, IssueInput, IssuedRow, ShardLocator } from "./shard.ts";
+export type { ToolCallIdDeletion, DeletionRequest, DeletionStatus } from "./deletion.ts";
+
 export { REGION_CODES, SHARDS, type ShardPlace, entryOf, everyShard, hintOfCode, homeOf, homeOfText, shardName, shardOf } from "./shards.ts";
 export { type CallTimers, type DeletionLocator, type DeletionResult, type LookupResult, type RowsToWrite, type ToolCallIdDeletions, type ToolCallIdLocator, type ToolCallIdRpc, type WriteResult, deleteToolCallIds, entryTimeout, lookupRows, writeRows } from "./client.ts";
-export { CACHE_ENTRY_MAX_BYTES, CACHE_ISOLATE_MAX_BYTES, CACHE_OBJECT_MAX_BYTES, CACHE_TTL_MS, ConversationCache, isolateCacheBytes } from "./cache.ts";
-export { FIND_MAX_BYTES, type FindAnswer, type FindInput, type HomeShardRpc, type IssueAnswer, type IssueInput, type IssuedRow, type ShardLocator, ToolCallIdShard } from "./shard.ts";
-export { type DeletionRequest, type DeletionStatus, PASS_MS, ToolCallIdDeletion } from "./deletion.ts";
 export { CODES, IdMapper, type MapperContext, type MintedEntry, type PendingWrite, ToolIdFailure, answerLimit, monthOf, visibleAnchor } from "./mapper.ts";
 export { type AttemptIds, type ByteEdit, Resolution, type ResolutionCounts, type ResolvedHandle, type RowAlert, attemptIdsEmpty, emptyAttemptIds, openRow, unvouched } from "./resolution.ts";
 export { type AnswerSite, AnswerSites } from "./answer-sites.ts";

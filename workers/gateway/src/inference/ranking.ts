@@ -12,12 +12,12 @@ import { isolateSessions, planPreference, tierAdmitted, utilityRefusal } from ".
 import { laneSafeLog } from "../lane/hooks.ts";
 import { type RoutingFacts, asksFeedChecks, formulaRefusal, preferenceRefusedFacts, routingFactsOf, sessionFactsOf, sharesOf } from "../request-routing.ts";
 import { REST_EGRESS_REGION, recoveryRefusal, shardRestView } from "../rests.ts";
-import { type Route, type UtilityAsk, type UtilityRoutes, feedAvailable, feedUnavailableReason, orderedOf, passesConstraints, rankKeyOf, rankUtility, rankedFeed, rankedWith, rankingBaseAge, routeProbeLeases, unselectedOf, utilityRoutesOf } from "../routes.ts";
+import { type Route, type UtilityAsk, type UtilityRoutes, feedAvailable, feedUnavailableReason, orderedOf, passesConstraints, rankKeyOf, rankUtility, rankedFeed, rankedWith, rankingBaseAge, relaxedAsk, floorHidesRefusal, unflooredAsk, routeProbeLeases, unselectedOf, utilityRoutesOf } from "../routes.ts";
 import { candidatesOf, constraintSkips, utilityCandidates } from "../sinks.ts";
 import { type GatewaySnapshot, type KeyRecord, routeServes } from "../snapshot.ts";
 import { agentThinking, opencodeAgent } from "../traffic-evidence.ts";
 import { type DispatchEnvRun, acquire, modelBlockGates } from "./dispatch-env.ts";
-import { unserved } from "./record.ts";
+import { noteRelaxable, unserved } from "./record.ts";
 import { rankingFeedAt } from "./state.ts";
 import { requestDeadline } from "./request-body.ts";
 import { rankRegion } from "./stack-routes.ts";
@@ -96,7 +96,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   // the constraints and the price cap, and its price against the record's.
   const sessions = run.deps.sessions ?? isolateSessions(cfg);
   const record = run.routing.session === null ? null : sessions.get(key.workspaceId, run.routing.session.key, rankedAt, policy.sessionIdleMs);
-  const ask: UtilityAsk = {
+  const strict: UtilityAsk = {
     params: run.routing.routingParams,
     policy,
     seed: run.routing.session === null ? requestKey : sessionSeed(run.routing.session.key),
@@ -105,6 +105,14 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
     contextTokens: snapshot.models[canonical.model]?.window ?? null,
     generative: true,
   };
+  // The preset's own floor alone leaves this model no route (`relaxedAsk`; a floor the request states never relaxes): the
+  // first pass refuses the model as before and notes it, and the second pass, which runs only when the whole request
+  // would otherwise be refused, ranks it with the floor relaxed (intake.ts; docs/utility-routing.md "Constraints and the
+  // price cap"). Every read of the ask below, the session's route, the formula, the shares and a refit's, judges alike.
+  const relaxed = run.routing.routingStated.minAvailability ? null : relaxedAsk(strict, utilityRoutes, rests, rankedAt);
+  const ask = run.routing.relaxFloor && relaxed !== null ? relaxed : strict;
+  run.routing.floorRelaxed = ask === relaxed && relaxed !== null ? { floor: relaxed.params.minAvailability!, limit: strict.params.minAvailability! } : null;
+  if (run.routing.floorRelaxed !== null) floorRelaxedLine(run, canonical.model, run.routing.floorRelaxed);
   const route = record === null ? null : sessionRoute(run, snapshot, canonical.model, record, routes, utilityRoutes, ask, rests, rankedAt);
   const hitTarget = record !== null && route !== null && sessionRedraw(record, route, run.routing.routingParams.workload) === null ? record.endpointId : null;
   // The session's provider goes back in the session's place (cache affinity's before r17); the steering skips it when
@@ -116,7 +124,12 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   run.routing.sessionHit = session.kind === "hit";
   if (run.routing.sessionHit && run.routing.session !== null) sessions.touch(key.workspaceId, run.routing.session.key, rankedAt, policy.sessionIdleMs);
   run.routing.utilityAsk = { ...ask, sessionHit: run.routing.sessionHit };
-  const ranking = await rankUtility(snapshot, routes, utilityRoutes, run.routing.utilityAsk, requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt);
+  let ranking = await rankUtility(snapshot, routes, utilityRoutes, run.routing.utilityAsk, requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt);
+  // The preset's own floor and another constraint both leave no route: the refusal names the other one (`floorHidesRefusal`).
+  if (floorHidesRefusal(ranking, relaxed, run.routing.routingStated.minAvailability)) {
+    const again = await rankUtility(snapshot, routes, utilityRoutes, unflooredAsk(run.routing.utilityAsk), requestKey, rankedAt, rests, stream, true, run.rankRegionOf, feedAt);
+    if (!again.ok) ranking = again;
+  }
   const endpointOf = (rankKey: string) => utilityRoutes.routes.find((r) => r.key === rankKey)?.endpointId ?? rankKey;
   // The formula left no route (a constraint, the price cap, no reference price): this model fails as the customer's
   // filters fail it, and a model listed next may still serve (docs "Constraints and the price cap", T21). The record
@@ -124,6 +137,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
   // formula ranked, and keeps nothing of an earlier model's ranking (the server's `ranking_refused`; review
   // r17-gateway-5 finding 33).
   if (!ranking.ok) {
+    if (relaxed !== null) noteRelaxable(run, true);
     run.routing.routingEvidence = {
       preset: run.routing.routingParams.preset,
       policyVersion: policy.version,
@@ -208,6 +222,7 @@ export async function rankPlan(run: RankingRun, a: RankInput, sizedRoutes: Route
     plan: plan.map((r) => rankKeyOf(r.record, stream, rankRegion(run, r.record))),
     session: record === null ? null : sessionFactsOf(record, sessionOperator, route?.prices ?? null),
     shares: formula === null ? new Map() : sharesOf(ask, utilityRoutes, formula.evidence),
+    relaxed: run.routing.floorRelaxed !== null,
   });
   // Every route rests or cools down (ranking left them all out for it): the client is told the soonest one may
   // serve, as the server's admission tells it when ranking leaves no route (`recovery_refusal`).
@@ -241,6 +256,16 @@ function checksUnapplied(run: RankingRun, snapshot: GatewaySnapshot, nowMs: numb
 }
 
 /**
+ * The model's ranking relaxed its preset's own floor (`relaxedAsk`): said once per ranking that did, as a `notify` alert
+ * (workers/alerts catalog: requests are served, below the floor the preset asks for), beside its point (sinks.ts
+ * `rankingPoints`) and the record's `checks: "relaxed"` (request-routing.ts `routingRecord`).
+ */
+function floorRelaxedLine(run: RankingRun, model: string, relaxed: { readonly floor: number; readonly limit: number }): void {
+  const line = { level: "alert", event: "routing_floor_relaxed", request_id: run.requestId, model, preset: run.routing.routingParams.preset, floor: relaxed.floor, limit: relaxed.limit };
+  console.error(JSON.stringify(run.lane === null ? line : laneSafeLog(line)));
+}
+
+/**
  * The routing record's facts of the model being served (request-routing.ts `routingFactsOf`; the server's
  * `record_facts`): a generation API's, its routes as the formula read them (`u`) with their offers' regions.
  */
@@ -251,7 +276,7 @@ export function modelRoutingFacts(
   routes: readonly Route[],
   u: UtilityRoutes,
   stream: boolean,
-  outcome: Pick<Parameters<typeof routingFactsOf>[0], "plan" | "session" | "shares" | "refused">,
+  outcome: Pick<Parameters<typeof routingFactsOf>[0], "plan" | "session" | "shares" | "refused" | "relaxed">,
 ): RoutingFacts {
   return routingFactsOf({
     api: "generation",

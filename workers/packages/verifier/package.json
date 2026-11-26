@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./coding-agent": "./src/coding-agent.ts",
+    "./coding-agent-shape": "./src/coding-agent-shape.ts",
     "./model-check-ticket": "./src/model-check-ticket.ts",
     "./workerd": "./src/workerd.ts"
   },

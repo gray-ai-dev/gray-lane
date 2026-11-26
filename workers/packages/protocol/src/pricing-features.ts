@@ -217,16 +217,18 @@ function responsesItemTool(itemType: string | undefined): HostedToolName | null 
 }
 
 /**
- * Records one OpenAI Responses output item under its id (or, without one, its type and position) with
- * the hosted tool it bills, or null when it bills none (not a hosted tool call, or `status: "failed"`).
- * A later record of the same item replaces the earlier one, so each item counts at most once and its
- * latest status decides.
+ * Records one OpenAI Responses output item with the hosted tool it bills, or null when it bills none
+ * (not a hosted tool call, or `status: "failed"`). The item is keyed by its id, or, without one, by its
+ * type and position; the two kinds of key never meet (`id:` and `at:`), so an id that reads like a
+ * position can never stand for another item (P4-4). A later record of the same item replaces the
+ * earlier one, so each item counts at most once and its latest status decides.
  */
 function recordResponsesItem(items: Map<string, HostedToolName | null>, item: Json | undefined, position: string): void {
   if (!isObject(item)) return;
   const itemType = asStr(get(item, "type"))?.toLowerCase();
   const failed = asStr(get(item, "status"))?.toLowerCase() === "failed";
-  const key = asStr(get(item, "id")) ?? `${itemType ?? ""}:${position}`;
+  const id = asStr(get(item, "id"));
+  const key = id !== undefined ? `id:${id}` : `at:${itemType ?? ""}:${position}`;
   items.set(key, failed ? null : responsesItemTool(itemType));
 }
 
@@ -234,72 +236,22 @@ function countResponsesItems(items: Map<string, HostedToolName | null>, counts: 
   for (const tool of items.values()) if (tool !== null) addCount(counts, tool, 1n);
 }
 
-function responsesOutputToolCounts(output: Json | undefined, counts: Map<HostedToolName, bigint>): void {
-  const list = asArray(output);
-  if (!list) return;
-  const items = new Map<string, HostedToolName | null>();
-  list.forEach((item, i) => recordResponsesItem(items, item, String(i)));
-  countResponsesItems(items, counts);
-}
-
-function geminiCandidateToolCounts(candidates: Json | undefined, counts: Map<HostedToolName, bigint>): void {
-  const list = asArray(candidates);
-  if (!list) return;
-  for (const cand of list) {
-    if (!isObject(cand)) continue;
-    const gm = get(cand, "groundingMetadata");
-    if (isObject(gm)) {
-      const queries = asArray(get(gm, "webSearchQueries"));
-      if (queries && queries.length > 0) addCount(counts, "google_search", 1n);
-    }
-    const parts = asArray(get(get(cand, "content"), "parts"));
-    if (parts) {
-      for (const part of parts) {
-        if (!isObject(part)) continue;
-        if (get(part, "executableCode") !== undefined && get(part, "executableCode") !== null) {
-          addCount(counts, "code_execution", 1n);
-        }
-      }
-    }
-  }
-}
-
 /**
- * Extracts reported service tier and actual hosted tool invocations from a buffered upstream answer.
+ * Extracts reported service tier and actual hosted tool invocations from a buffered upstream answer:
+ * the answer read as the final state of a stream that reported nothing before it
+ * (`StreamBillingObserver.observeFinal`), so a buffered answer and a stream are counted by one rule.
  */
 export function extractBufferedBillingMeta(protocol: Protocol, body: Json, rawUsage: Json | null, requested?: RequestedPricingFeatures): ResponseBillingMeta {
-  let reportedTier: string | null = null;
-  const counts = new Map<HostedToolName, bigint>();
-
-  if (protocol === "anthropic_messages") {
-    const speed = asStr(get(rawUsage, "speed")) ?? asStr(get(body, "speed"));
-    if (speed) reportedTier = speed;
-    anthropicServerToolCounts(rawUsage, counts);
-  } else if (protocol === "open_ai_responses") {
-    const tier = asStr(get(body, "service_tier"));
-    if (tier) reportedTier = tier;
-    responsesOutputToolCounts(get(body, "output"), counts);
-  } else if (protocol === "open_ai_chat") {
-    const tier = asStr(get(body, "service_tier"));
-    if (tier) reportedTier = tier;
-    if (requested?.hostedTools.some((t) => t.tool === "web_search")) {
-      const choices = asArray(get(body, "choices"));
-      const hasAnnotation = choices?.some((c) => {
-        const anns = asArray(get(get(c, "message"), "annotations"));
-        return anns !== undefined && anns.length > 0;
-      });
-      if (hasAnnotation) addCount(counts, "web_search", 1n);
-    }
-  } else if (protocol === "gemini") {
-    geminiCandidateToolCounts(get(body, "candidates"), counts);
-  }
-
-  return { reportedTier, toolCalls: mapToHostedToolCalls(counts) };
+  const observer = new StreamBillingObserver(protocol, requested);
+  observer.observeFinal(body);
+  return observer.finish(rawUsage);
 }
 
 /**
  * Observes decoded streaming events to capture the reported service tier and actual hosted tool
- * invocations across Anthropic, OpenAI Responses, OpenAI Chat, and Gemini streams.
+ * invocations across Anthropic, OpenAI Responses, OpenAI Chat, and Gemini streams. A buffered answer
+ * is its stream's final state (`observeFinal`), and an answer read from a stream into one object (a
+ * Codex request's, D129) is both: its events, then the object.
  */
 export class StreamBillingObserver {
   private readonly protocol: Protocol;
@@ -328,28 +280,51 @@ export class StreamBillingObserver {
     }
   }
 
+  /**
+   * The answer's whole object, as a buffered request gets it or a stream's terminal event carries it
+   * (a Responses `response`): a Messages message, a Responses response, a Chat completion or a Gemini
+   * response. A Responses object updates the items its stream reported before it and never erases
+   * them (an empty or partial terminal output keeps them). A Chat completion or a Gemini response is
+   * read as one chunk of its stream, so an observer is given that stream or that object, not both.
+   */
+  observeFinal(body: Json): void {
+    if (!isObject(body)) return;
+    if (this.protocol === "anthropic_messages") {
+      this.anthropicTier(body);
+    } else if (this.protocol === "open_ai_responses") {
+      this.responsesFinal(body);
+    } else {
+      // A Chat completion and a Gemini response read as one chunk of their stream would.
+      this.observePayload(body);
+    }
+  }
+
+  /** A Messages message's tier (`message_start`'s `message`, or a buffered answer): its usage's `speed`, else its own. */
+  private anthropicTier(msg: Json | undefined): void {
+    const speed = asStr(get(get(msg, "usage"), "speed")) ?? asStr(get(msg, "speed"));
+    if (speed) this.reportedTier = speed;
+  }
+
+  /** A Responses response object: its tier, and each output item merged into those seen (`recordResponsesItem`). */
+  private responsesFinal(resp: Json | undefined): void {
+    const tier = asStr(get(resp, "service_tier"));
+    if (tier) this.reportedTier = tier;
+    asArray(get(resp, "output"))?.forEach((item, i) => recordResponsesItem(this.responsesItems, item, String(i)));
+  }
+
   observePayload(payload: Json): void {
     if (!isObject(payload)) return;
     if (this.protocol === "anthropic_messages") {
       const typ = asStr(get(payload, "type"));
-      if (typ === "message_start") {
-        const msg = get(payload, "message");
-        const speed = asStr(get(get(msg, "usage"), "speed")) ?? asStr(get(msg, "speed"));
-        if (speed) this.reportedTier = speed;
-      } else if (typ === "message_delta") {
-        const speed = asStr(get(get(payload, "usage"), "speed")) ?? asStr(get(payload, "speed"));
-        if (speed) this.reportedTier = speed;
-      }
+      if (typ === "message_start") this.anthropicTier(get(payload, "message"));
+      else if (typ === "message_delta") this.anthropicTier(payload);
     } else if (this.protocol === "open_ai_responses") {
       const typ = asStr(get(payload, "type"));
-      if (typ === "response.completed" || typ === "response.incomplete" || typ === "response.created") {
-        const resp = get(payload, "response");
-        const tier = asStr(get(resp, "service_tier"));
+      if (typ === "response.completed" || typ === "response.incomplete") {
+        this.responsesFinal(get(payload, "response"));
+      } else if (typ === "response.created") {
+        const tier = asStr(get(get(payload, "response"), "service_tier"));
         if (tier) this.reportedTier = tier;
-        if (typ === "response.completed" || typ === "response.incomplete") {
-          const out = asArray(get(resp, "output"));
-          out?.forEach((item, i) => recordResponsesItem(this.responsesItems, item, String(i)));
-        }
       } else if (typ === "response.output_item.done") {
         const index = asU64(get(payload, "output_index"));
         recordResponsesItem(this.responsesItems, get(payload, "item"), index !== undefined ? String(index) : `done-${this.responsesUnindexedDone++}`);

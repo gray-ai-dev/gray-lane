@@ -186,7 +186,7 @@ function routeAttemptsDtoOf(attempts: readonly RouteAttempt[]): LaneRouteAttempt
 const ROUTING_PRESETS = ["interactive", "autonomous", "standard", "flex"] as const;
 const ROUTING_MODE_SOURCES = ["request", "key"] as const;
 /** What a record says of the checks that read the feed (@gray/routing `RoutingChecks`): one closed word. */
-const ROUTING_CHECKS = ["unapplied"] as const;
+const ROUTING_CHECKS = ["unapplied", "relaxed"] as const;
 const ROUTING_PERCENTILES = ["p50", "p90", "p99"] as const;
 const ROUTING_CONSTRAINTS = ["min_availability", "max_ttft_ms", "min_tps", "min_context_tokens", "max_price_multiple"] as const;
 const ROUTING_HEAD_REASONS = ["ranking", "session", "order", "tool_call_issuer", "account_block", "unselected", "recovery_probe", "recovery_trial"] as const;
@@ -268,8 +268,9 @@ const laneRoutingSchema = z
     candidates: z.null(),
     omitted: z.literal(0n),
     refusal: z.object({ exclusion: routingExclusionSchema }).strict().nullable(),
-    // The checks that read the feed were asked for and not made (no current ranking base): one fixed word, nothing of a
-    // route. Optional: a record whose checks were made has none, and an entry before it sends none.
+    // The checks that read the feed were asked for and not made (no current ranking base), or the preset's own floor was
+    // relaxed: one fixed word, nothing of a route. Optional: a record whose checks were made as they are has none, and an
+    // entry before it sends none.
     checks: z.enum(ROUTING_CHECKS).optional(),
   })
   .strict()

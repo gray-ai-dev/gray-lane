@@ -24,7 +24,7 @@ import { hexDigest, provesImageOutput } from "./attempt-pure.ts";
 import { type DispatchRun, dispatchAndRelay } from "./dispatch.ts";
 import { geminiCapRequired, stackCapRequired } from "./errors.ts";
 import { admissionTiming, releaseDetail, timing } from "./hold.ts";
-import { inspected, rateCount, refuse, unserved } from "./record.ts";
+import { inspected, noteRelaxable, rateCount, refuse, unserved } from "./record.ts";
 import { type RankInput, type RankedPlan, preferenceRefusedFactsOf, rankPlan } from "./ranking.ts";
 import { upstreamPromptUnits } from "./request-body.ts";
 import { type SizingRun, admitRefusal, pricingOptionsFor, size } from "./sizing.ts";
@@ -139,7 +139,10 @@ export async function admitPlanned(
   const { sized, ranked } = held;
   // A model tried after this one is a request of its own: this one's record stays as it ends.
   run.admitting.beforeAdmission = { reserved: run.admitting.reserved, firstAdmittedAt: run.admitting.firstAdmittedAt };
+  if (!run.admitting.reserved) run.admitting.baseKeyModel = run.admitting.modelIndex;
   run.admitting.reserved = true;
+  // Admitted: never served again by the relaxed floor's pass, whatever another translation target of it was (intake.ts).
+  noteRelaxable(run, false);
   run.admitting.admission = "admitted";
   for (const block of run.routing.steeredKinds) run.admitting.retryEvents.push({ kind: "account_block_steer", block });
   const admittedAt = clock();
@@ -178,7 +181,11 @@ async function requestKeys(run: AdmissionRun, key: KeyRecord): Promise<Pick<Admi
     }
   }
   const clientKey = run.caller.clientKey;
-  run.caller.requestKey = run.admitting.reserved ? fallbackRequestId(run.caller.baseRequestKey, run.admitting.modelIndex) : run.caller.baseRequestKey;
+  // A model after one already admitted is a request of its own, `<base>-<position>`. The first model of the list is only
+  // admitted after another when the relaxed floor's pass serves it (intake.ts): it takes the position of the model admitted
+  // under the base id, whose own position's id no admission has used.
+  const position = run.admitting.modelIndex > 0 ? run.admitting.modelIndex : (run.admitting.baseKeyModel ?? 0);
+  run.caller.requestKey = run.admitting.reserved ? fallbackRequestId(run.caller.baseRequestKey, position) : run.caller.baseRequestKey;
   const requestKey: string = run.caller.requestKey;
   // The shards key a request as the ledger does (`request_key`), so the projection finds the same row.
   const accountKey = ledgerRequestKey(key.workspaceId, requestKey);

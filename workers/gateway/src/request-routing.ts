@@ -192,6 +192,11 @@ export interface RoutingFacts {
    */
   readonly feedAvailable: boolean;
   /**
+   * The ranking relaxed the preset's own `min_availability`, which alone left the model no route (inference/ranking.ts
+   * `relaxedAsk`): the record says `checks: "relaxed"`, and its requirement and exclusions keep the preset's limit.
+   */
+  readonly relaxed?: boolean;
+  /**
    * The order layering settled (`Preference.layered`), as references: what the most specific order still names once a
    * refused fallback's pins applied (`order_in_force`). Read only to tell which level's list left a route out, never
    * written in the record.
@@ -634,6 +639,9 @@ export function routingRecord(facts: RoutingFacts): RequestRoutingRecord {
     refusal: exclusion === null ? null : { exclusion },
     // The checks that read the feed, asked for and not made: the feed was unavailable (no current ranking base).
     ...(!facts.feedAvailable && asksFeedChecks(params, facts.api === "generation") ? { checks: "unapplied" as const } : {}),
+    // The preset's own floor, relaxed: the chosen route is below the requirement's limit (never with `unapplied`, since a
+    // floor relaxes only where it was checked).
+    ...(facts.relaxed === true && facts.feedAvailable ? { checks: "relaxed" as const } : {}),
   };
 }
 
@@ -766,6 +774,7 @@ export function routingFactsOf(o: {
   readonly session?: SessionFacts | null;
   readonly shares?: ReadonlyMap<string, number>;
   readonly refused?: RoutingRefused | null;
+  readonly relaxed?: boolean;
 }): RoutingFacts {
   return {
     api: o.api,
@@ -795,6 +804,7 @@ export function routingFactsOf(o: {
     shares: o.shares ?? new Map(),
     refused: o.refused ?? null,
     feedAvailable: o.feedAvailable,
+    ...(o.relaxed === true ? { relaxed: true } : {}),
     // The layered preference's (`recordOfFacts`), when the row is written.
     orderInForce: [],
   };

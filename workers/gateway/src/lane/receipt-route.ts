@@ -2,7 +2,9 @@ import { toJsonString, type Json } from "@gray/json";
 import { keyHash } from "../auth.ts";
 import { checkedInner } from "./peer-inner.ts";
 import type { StoredPeerAttempt } from "./peer-model.ts";
-import { aciHeaders, aciJson, receiptNotFound, receiptPending, receiptResponse, receiptUnauthorized } from "./receipts.ts";
+import type { PersistedReceipts, RecalledPeer } from "./receipt-persist.ts";
+import type { BootAttestationRecord } from "./receipt-seal.ts";
+import { aciHeaders, aciJson, persistReceipts, receiptLookupUnavailable, receiptNotFound, receiptPending, receiptResponse, receiptUnauthorized } from "./receipts.ts";
 import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
 
 /**
@@ -17,7 +19,16 @@ import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
  *   VM (`GET /v1/peer/attempts/<rid>`, section 4.5), or null when the stack VM holds none (it made none, or the
  *   attempt never reached it). A number that repeats answers for its last attempt.
  *
- * Both have the outer receipt's owner check: no credential is 401; a wrong one, an unknown id and an expired id are
+ * - `GET /v1/aci/receipts/{id}/attestation`: the report of the entry boot that signed the receipt, under the nonce derived
+ *   from its keyset, with the Intel collateral it checked its quote with (docs/design/persisted-receipts.md section 6).
+ *
+ * A receipt this replica does not hold in memory is read from its sealed copy (`persisted`, the same section): a copy
+ * that is not there, is another key's, is past its 30 days or does not open is the same 404 as an unknown id; a lookup
+ * the bridge could not answer is 503 `receipt_lookup_unavailable` with `Retry-After`. A stored copy's peer attempt
+ * answers from the copy; one whose inner receipt the outer one names and the copy lacks is 502 `peer_receipt_unavailable`
+ * without `Retry-After` (nothing holds it any more).
+ *
+ * All of them have the outer receipt's owner check: no credential is 401; a wrong one, an unknown id and an expired id are
  * all 404 `receipt_not_found`, checked before anything of the attempts is read; an id this boot named for the same key
  * whose receipt is not stored yet is 503 `receipt_pending` with `Retry-After`. Then an attempt the receipt does not
  * have is 404 `peer_attempt_not_found`; a late fetch that got no answer, a stack VM still on the attempt (registered
@@ -29,6 +40,9 @@ import type { LaneReceiptStore, StoredReceipt } from "./types.ts";
  */
 
 export const PEERS_SEGMENT = "/peers/";
+export const ATTESTATION_SEGMENT = "/attestation";
+/** The one form of a receipt id this lane names (`rcpt_` and 32 hex): anything else is never looked up. */
+const RECEIPT_ID_FORM = /^rcpt_[0-9a-f]{32}$/;
 
 export interface ReceiptRouteDeps {
   readonly receipts: LaneReceiptStore;
@@ -37,6 +51,16 @@ export interface ReceiptRouteDeps {
   /** PEER_FOLLOW_UP_MS (`@gray/config`): the bound of one late fetch. */
   readonly followUpMs: number;
   readonly clock: () => number;
+  /** The sealed copies and this boot's report (`ReceiptPersister`); absent on a lane that keeps none. */
+  readonly persisted?: PersistedReceipts | null;
+  /**
+   * Whether the presented key is one the entry knows (its snapshot's, not revoked), asked before a stored copy is looked
+   * up: a key it does not know reads the one 404 and costs no lookup, so nobody without a key can use up the lookups the
+   * owners need. `unavailable` when the entry cannot tell (no current snapshot). Absent: every key may look up (tests).
+   */
+  readonly knownKey?: () => Promise<"known" | "unknown" | "unavailable">;
+  /** The request's context: a late inner receipt's write to the persisted copy goes in its `waitUntil`. */
+  readonly ctx?: Pick<ExecutionContext, "waitUntil">;
 }
 
 /** `rest` is the path after `/v1/aci/receipts/`. */
@@ -45,11 +69,34 @@ export async function serveReceipt(request: Request, deps: ReceiptRouteDeps, res
   const presented = presentedToken(request.headers);
   if (presented === null) return receiptUnauthorized(deps.keysetDigest);
   const split = rest.indexOf(PEERS_SEGMENT);
-  const id = split < 0 ? rest : rest.slice(0, split);
+  const attestation = split < 0 && rest.endsWith(ATTESTATION_SEGMENT);
+  const id = split >= 0 ? rest.slice(0, split) : attestation ? rest.slice(0, -ATTESTATION_SEGMENT.length) : rest;
   const owner = await keyHash(presented);
   const entry = deps.receipts.get(id, owner);
-  // An id this boot named for this key whose receipt is not stored yet is retryable, not unknown.
-  if (entry === null) return deps.receipts.pending(id, owner) ? receiptPending(deps.keysetDigest) : receiptNotFound(deps.keysetDigest);
+  if (entry === null) {
+    // An id this boot named for this key whose receipt is not stored yet is retryable, not unknown.
+    if (deps.receipts.pending(id, owner)) return receiptPending(deps.keysetDigest);
+    const persisted = deps.persisted ?? null;
+    if (persisted === null || !RECEIPT_ID_FORM.test(id)) return receiptNotFound(deps.keysetDigest);
+    const known = deps.knownKey === undefined ? "known" : await deps.knownKey();
+    if (known === "unknown") return receiptNotFound(deps.keysetDigest);
+    if (known === "unavailable") return receiptLookupUnavailable(deps.keysetDigest);
+    const recalled = await persisted.recall(id, owner);
+    if (recalled.outcome === "missing") return receiptNotFound(deps.keysetDigest);
+    if (recalled.outcome === "unavailable") return receiptLookupUnavailable(deps.keysetDigest);
+    if (attestation) return attestationAnswer(id, recalled.boot, deps.keysetDigest);
+    if (split < 0) return documentAnswer(recalled.receipt, deps.keysetDigest);
+    const n = attemptNumber(rest.slice(split + PEERS_SEGMENT.length));
+    const peer = n === null ? undefined : recalled.peers.get(n);
+    if (peer === undefined) return peerError(404, "peer_attempt_not_found", "This receipt has no peer attempt with this number.", deps.keysetDigest);
+    return recalledPeerAnswer(peer, deps.keysetDigest);
+  }
+  if (attestation) {
+    const persisted = deps.persisted ?? null;
+    if (persisted === null) return receiptNotFound(deps.keysetDigest);
+    const boot = await persisted.boot();
+    return boot === null ? receiptLookupUnavailable(deps.keysetDigest) : attestationAnswer(id, boot, deps.keysetDigest);
+  }
   if (split < 0) return receiptResponse(entry, deps.keysetDigest);
   const n = attemptNumber(rest.slice(split + PEERS_SEGMENT.length));
   const peer = n === null ? undefined : entry.peers.get(n);
@@ -59,6 +106,38 @@ export async function serveReceipt(request: Request, deps: ReceiptRouteDeps, res
   if (receipt === "running") return peerError(502, "peer_receipt_unavailable", "The VM that served this attempt has not finished it yet; ask again shortly.", deps.keysetDigest, { "retry-after": "1" });
   if (receipt === "mismatch") return peerError(502, "peer_receipt_mismatch", "The relay's VM answered a receipt that is not this attempt's.", deps.keysetDigest);
   return peerAnswer(peer, receipt, deps.keysetDigest);
+}
+
+/** A stored copy's peer attempt: its inner receipt, null when the outer receipt named none, 502 when the copy lacks it. */
+function recalledPeerAnswer(peer: RecalledPeer, keysetDigest: string): Response {
+  if (peer.receipt !== null || peer.inner === null) return peerAnswer(peer, peer.receipt, keysetDigest);
+  return peerError(502, "peer_receipt_unavailable", "The stored copy of this receipt does not hold this attempt's inner receipt.", keysetDigest);
+}
+
+/** A receipt document's bytes, as signed (a stored copy's, which `receiptResponse` serves from memory). */
+function documentAnswer(document: Uint8Array, keysetDigest: string): Response {
+  const headers = new Headers(aciHeaders(keysetDigest));
+  headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("cache-control", "no-store");
+  return new Response(document, { status: 200, headers });
+}
+
+/** `/attestation`'s body: the boot's report, its derived nonce and the collateral it checked its quote with. */
+function attestationAnswer(receiptId: string, boot: BootAttestationRecord, keysetDigest: string): Response {
+  const check = boot.collateralCheck;
+  const value: Json = {
+    receipt_id: receiptId,
+    keyset_digest: boot.keysetDigest,
+    report: boot.report,
+    nonce: boot.nonce,
+    attested_at: BigInt(boot.attestedAt),
+    collateral: boot.collateral,
+    collateral_check: check === null ? null : { checked_at: BigInt(check.checkedAt), tcb_status: check.tcbStatus, advisory_ids: [...check.advisoryIds] },
+  };
+  const headers = new Headers(aciHeaders(keysetDigest));
+  headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("cache-control", "no-store");
+  return new Response(toJsonString(value), { status: 200, headers });
 }
 
 /** An attempt number as the outer events carry it: 1 to 2^31 − 1 in decimal, no sign or leading zero. */
@@ -73,7 +152,7 @@ function attemptNumber(text: string): number | null {
  * (`checkedInner`), null when it holds none and the outer receipt names none, `running` while it is still on the
  * attempt (registered or dialed), whose receipt it signs once the attempt is done.
  */
-export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: Pick<ReceiptRouteDeps, "receipts" | "keysetDigest" | "followUpMs" | "clock">): Promise<Uint8Array | null | "unavailable" | "running" | "mismatch"> {
+export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: Pick<ReceiptRouteDeps, "receipts" | "keysetDigest" | "followUpMs" | "clock" | "ctx">): Promise<Uint8Array | null | "unavailable" | "running" | "mismatch"> {
   const answer = await peer.fetchLate(deps.clock() + deps.followUpMs);
   if (answer === null) return "unavailable";
   if (answer.state === "registered" || answer.state === "dialed") return "running";
@@ -81,11 +160,13 @@ export async function late(entry: StoredReceipt, peer: StoredPeerAttempt, deps: 
   const bytes = await checkedInner(answer.receipt, { peer, receiptId: entry.receipt.receiptId, entryKeysetDigest: deps.keysetDigest });
   if (bytes === null) return "mismatch";
   deps.receipts.holdPeerReceipt(entry.receipt.receiptId, peer.n, bytes);
+  // The persisted copy gets it too, written behind this request rather than an unrelated later one.
+  if (deps.ctx !== undefined) persistReceipts(deps.receipts, deps.ctx);
   return bytes;
 }
 
 /** The 200 answer: the inner receipt as its JCS bytes, so its SHA-256 is the digest the outer receipt names. */
-function peerAnswer(peer: StoredPeerAttempt, receipt: Uint8Array | null, keysetDigest: string): Response {
+function peerAnswer(peer: Pick<StoredPeerAttempt, "n" | "attestation">, receipt: Uint8Array | null, keysetDigest: string): Response {
   const { report, nonce, tlsSpkiSha256, host, relayId } = peer.attestation;
   const attestation = toJsonString({ report, nonce, tls_spki_sha256: tlsSpkiSha256, host, relay_id: relayId } as unknown as Json);
   const body = `{"n":${peer.n},"attestation":${attestation},"receipt":${receipt === null ? "null" : new TextDecoder().decode(receipt)}}`;

@@ -51,7 +51,6 @@ import {
 import {
   STACK_ATTEMPT_CLASSES,
   PEER_GATE_REFUSED,
-  STACK_FAULT_WHYS,
   STACK_VENDOR_CODES,
   STACK_VIOLATION_BODY_FIELD_PATTERN,
   STACK_VIOLATION_HEADER_FIELD_PATTERN,
@@ -67,6 +66,7 @@ import type { StreamTimers } from "../client.ts";
 import { bytesBase64 } from "../crypto.ts";
 import type { StackRelayAppend, StackRelayConfig, StackRelayRoute, StackVendor, StackViolationFound } from "./stack-config.ts";
 import { StackDecodeError, stackDecodedBody } from "./stack-coding.ts";
+import { STACK_FAULT_OWNER, relayFaulted, stackFaultWhy, type FaultLike } from "./stack-fault.ts";
 import { STACK_CONVERSATION_HEADER, STACK_ROUTE_MODEL_HEADER } from "./stack-rewrite.ts";
 import { STACK_BODY_MAX_BYTES } from "./body-limits.ts";
 
@@ -184,16 +184,15 @@ export function upstreamAnswerRefused(why: string | null): ApiError {
 /**
  * The lane's own error for an attempt a stack fault ended, by the fault: `upstream_answer_refused` for an answer that
  * failed Gray's check, `lane_relay_failed` for any other fault of the relay's container or of egress's budget; null for
- * the vendor's own end and Gray's own bounds, which keep their codes. `fault` is the stack VM's (a peer attempt's `end`
- * trace) or the entry's own call's; `code` an `end.code` when no trace came with it (a stack VM before S43's traces).
+ * the vendor's own end and Gray's own bounds, which keep their codes (lane/stack-fault.ts, the fault matrix). `fault` is
+ * the stack VM's (a peer attempt's `end` trace) or the entry's own call's; `code` an `end.code` when no trace came with it
+ * (a stack VM before S43's traces, or one that could not build its trace), whose owner the word names (`STACK_FAULT_OWNER`).
  */
-export function laneFaultCode(fault: { readonly by: string; readonly why: string } | null, code: string | null = null): typeof UPSTREAM_ANSWER_REFUSED | typeof LANE_RELAY_FAILED | null {
-  const word = fault?.why ?? code;
-  const why = word !== null && (STACK_FAULT_WHYS as readonly string[]).includes(word) ? (word as StackFaultWhy) : null;
+export function laneFaultCode(fault: FaultLike | null, code: string | null = null): typeof UPSTREAM_ANSWER_REFUSED | typeof LANE_RELAY_FAILED | null {
+  const why = stackFaultWhy(fault?.why ?? code);
   if (why === null) return null;
   if (REFUSED_WHYS.has(why)) return UPSTREAM_ANSWER_REFUSED;
-  const by = fault?.by ?? (why === "egress_limit" ? "egress" : why.startsWith("relay_") || why === "feed_invalid" || why === "answer_too_large" ? "relay" : null);
-  return by === "relay" || by === "egress" ? LANE_RELAY_FAILED : null;
+  return relayFaulted(fault ?? { by: STACK_FAULT_OWNER[why], why }) ? LANE_RELAY_FAILED : null;
 }
 
 /** What `peerEndVerdict` reads of a peer attempt's end: the lane's own code, its trust gate's refusal, or nothing. */
@@ -210,7 +209,7 @@ export type PeerVerdict =
  * anything was released (`outcome` absent: a `relay_failed` outcome); anything else is no verdict, and the caller keeps
  * its own reading. `end` is null when none came.
  */
-export function peerEndVerdict(fault: { readonly by: string; readonly why: string } | null, end: { readonly outcome?: string; readonly code?: string | null } | null): PeerVerdict {
+export function peerEndVerdict(fault: FaultLike | null, end: { readonly outcome?: string; readonly code?: string | null } | null): PeerVerdict {
   const code = laneFaultCode(fault, end?.code ?? null);
   if (code !== null) return { kind: "lane", code };
   if (end !== null && end.code === PEER_GATE_REFUSED && (end.outcome === undefined || end.outcome === "cut")) return { kind: "gate" };
@@ -888,7 +887,8 @@ export interface StackFault {
    * end reason that is the vendor's, S32); `egress`: egress cut a vendor answer at its memory budget
    * (`egress_limit`), after which nothing of the request is released (S24, S26); `gray`: Gray's own
    * ending of the rid (`timeout`, `entry_closed`). `relay` and `egress` end the request with the lane's
-   * own `lane_relay_failed`; `gray` as Gray's own bound does.
+   * own `lane_relay_failed`; `gray` as Gray's own bound does. Each word's owner, and what the stack VM and
+   * the entry make of it, is lane/stack-fault.ts's fault matrix (`STACK_FAULT_OWNER`, `relayFaulted`).
    */
   readonly by: StackFaultBy;
   /** A closed, content-free word (`@gray/lane-wire` STACK_FAULT_WHYS, the trace's): what failed, never a value. */
@@ -1050,7 +1050,7 @@ export class StackCall {
   /** The container was sent the rid: from then on it may make vendor calls (S32). */
   #relayCalled = false;
   /** Why the entry ended the container's call before its answer (the queue bound, egress's budget, the end bound). */
-  #stopped: "queued_unrecorded" | "egress_limit" | "relay_end_bound" | null = null;
+  #stopped: StackStopWhy | null = null;
   /** The current attempt the feed shows ended, and when the container's answer must be over by (`#endBound`). */
   #ended: { readonly attempt: StackFeedAttempt; readonly by: number } | null = null;
   /** The current attempt the position counts in, and the position (S24). */
@@ -1132,7 +1132,7 @@ export class StackCall {
           const declined = DECLINE_CODES.has(response.status) && relayDeclined(response.status, await readAtMost(errorBody, DECLINE_READ_MAX_BYTES));
           await errorBody?.cancel().catch(() => {});
           if (!declined) this.relayStatus = response.status;
-          return { kind: "failed", outcome: await this.#failed({ by: "relay", why: declined ? RELAY_DECLINED : "relay_error_status" }) };
+          return { kind: "failed", outcome: await this.#failed(relayStatusFault(declined)) };
         }
         if (response.body === null) return { kind: "failed", outcome: await this.#failed({ by: "relay", why: "relay_no_body" }) };
         // S21b: every header the container answered with is ignored but its content coding (S20, `stack-coding.ts`);
@@ -1141,7 +1141,7 @@ export class StackCall {
       } catch (error) {
         await response?.body?.cancel().catch(() => {});
         if (input.signal.aborted) throw error;
-        if (this.#stopped !== null) return { kind: "failed", outcome: await this.#failed(this.#stopped === "egress_limit" ? null : { by: "relay", why: this.#stopped }) };
+        if (this.#stopped !== null) return { kind: "failed", outcome: await this.#failed(stoppedFault(this.#stopped)) };
         if (error instanceof StackFaultError) throw error;
         // The container's connection failed: what it did before is the feed's to say.
         return { kind: "failed", outcome: await this.#failed({ by: "relay", why: "relay_transport" }) };
@@ -1182,7 +1182,7 @@ export class StackCall {
   #queueBound(): () => void {
     const { timers, queueMs, clock } = this.#input;
     const watch = new AbortController();
-    const stop = (why: "queued_unrecorded" | "egress_limit" | "relay_end_bound"): void => {
+    const stop = (why: StackStopWhy): void => {
       this.#stopped ??= why;
       void this.close();
     };
@@ -1688,11 +1688,11 @@ export class StackCall {
       this.dropped.push({ seq, kind: "usage" });
       return "drop";
     };
-    const unmatched = (why: StackFaultWhy): never => {
+    const unmatched = (why: StackUnmatchedWhy): never => {
       this.dropped.push({ seq, kind: "unmatched" });
       // Where the stream stopped, for `violation` to hold against the whole record once the rid ended.
       if (why === "event_mismatch" || why === "event_unrecorded" || why === "event_hold_bound") this.#unmatched ??= { why, digest, attempt: this.#matching, position: this.#position, released: this.released };
-      throw new StackFaultError({ by: "relay", why });
+      throw new StackFaultError(unmatchedFault(why));
     };
     for (;;) {
       if (this.feed.broken) unmatched("feed_invalid");
@@ -1807,7 +1807,7 @@ export class StackCall {
  * (the container closed its egress call first) is the relay's; `timeout` and `entry_closed` are Gray's own
  * ending of the rid; `egress_limit` is egress's budget.
  */
-function endFault(reason: Exclude<StackEndReason, "eof">): StackFault {
+export function endFault(reason: Exclude<StackEndReason, "eof">): StackFault {
   switch (reason) {
     case "vendor_reset":
       return { by: "vendor", why: reason };
@@ -1822,6 +1822,35 @@ function endFault(reason: Exclude<StackEndReason, "eof">): StackFault {
       // The entry's own word for an end that never came: never on a feed record (`#take` refuses it).
       return { by: "gray", why: "entry_internal" };
   }
+}
+
+/** The container's own error status: its decline before any vendor call (`relayDeclined`), else any other status. */
+export function relayStatusFault(declined: boolean): StackFault {
+  return { by: "relay", why: declined ? RELAY_DECLINED : "relay_error_status" };
+}
+
+/**
+ * What stops a call before its answer (`StackCall`'s watch): no vendor dialed in the queue bound, egress's budget, the
+ * relay's end bound.
+ */
+export const STACK_STOP_WHYS = Object.freeze(["queued_unrecorded", "egress_limit", "relay_end_bound"] as const);
+export type StackStopWhy = (typeof STACK_STOP_WHYS)[number];
+
+/**
+ * The fault of a call stopped before its answer: none of its own at egress's budget, which the feed reports; else the
+ * relay's.
+ */
+export function stoppedFault(stopped: StackStopWhy): StackFault | null {
+  return stopped === "egress_limit" ? null : { by: "relay", why: stopped };
+}
+
+/** The words an event the feed does not hold at its position ends the answer with (`#match`). */
+export const STACK_UNMATCHED_WHYS = Object.freeze(["feed_invalid", "attempt_after_release", "event_mismatch", "event_unrecorded", "event_hold_bound"] as const);
+export type StackUnmatchedWhy = (typeof STACK_UNMATCHED_WHYS)[number];
+
+/** An event the container sent that the feed does not hold: the relay's fault. */
+export function unmatchedFault(why: StackUnmatchedWhy): StackFault {
+  return { by: "relay", why };
 }
 
 /** The decoder's own refusal (an unknown field, a line that is not UTF-8, a cut event) is the container's fault. */

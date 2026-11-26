@@ -350,10 +350,10 @@ export function chargeSidesMismatch(requestId: string, endpoint: string, sides: 
 }
 
 /**
- * The two sides of a charge priced from its evidence (apis.ts `settle`: @gray/ledger-keys `usageCost` of the evidence's
- * usage at its customer rates, which gives the sum alone): the same usage at the same rates through @gray/protocol's
- * copy of the arithmetic, which gives the parts. Null for a charge billed by units, which the evidence names, and for
- * an amount the ledger refuses.
+ * The two sides of a charge priced from its evidence (apis/settle.ts `settle`: @gray/ledger-keys `usageCost` of the
+ * evidence's usage at its customer rates, which gives the sum alone): the same usage at the same rates through
+ * @gray/protocol's copy of the arithmetic, which gives the parts. Null for a charge billed by units, which the evidence
+ * names, and for an amount the ledger refuses.
  */
 export function evidenceSides(evidence: FinalizationEvidence): TokenSides | null {
   const r = customerRates(evidence);

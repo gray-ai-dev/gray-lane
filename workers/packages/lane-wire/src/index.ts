@@ -9,7 +9,7 @@
  *   `stack.proxy_checks`, `stack.rules`, `stack.report`, `stack.tests`, `stack.debug_shares`, `stack.vault.get|put` (Gray's
  *   ciphertext copy of a VM's sealed records, stack-vault.ts), `stack.vault.share_nonce|share` (Gray's share of the
  *   record keys, H5), `stack.instance` (a VM's serving or draining role in a rollout, stack-instance.ts), `release.lists`, `attest.collateral`, with
- *   `lane.acme_failed`, `ticket.use` (a model-check ticket's one-time id, ticket.ts) and `acme.challenge` (an entry's DNS-01 challenge value, acme-challenge.ts) and `entry.role` (an entry replica's serving or draining role, entry-role.ts) and `endpoint.credential` (a provider endpoint's key sealed to the entry's one-time key, endpoint-credential.ts) and `video.put|get|update|due` (the entry's video job records and their due index, video-jobs.ts) and `continuation.pin|bind` (which endpoint issued a Responses reply, by the hash of its id, continuation.ts), with their paths, methods and target addresses; a relay stack's account-health words are the closed lists of
+ *   `lane.acme_failed`, `ticket.use` (a model-check ticket's one-time id, ticket.ts) and `acme.challenge` (an entry's DNS-01 challenge value, acme-challenge.ts) and `entry.role` (an entry replica's serving or draining role, entry-role.ts) and `endpoint.credential` (a provider endpoint's key sealed to the entry's one-time key, endpoint-credential.ts) and `video.put|get|update|due` (the entry's video job records and their due index, video-jobs.ts) and `continuation.pin|bind` (which endpoint issued a Responses reply, by the hash of its id, continuation.ts) and `receipts.put|get` (the entry's sealed receipt objects in R2, receipts.ts), with their paths, methods and target addresses; a relay stack's account-health words are the closed lists of
  *   `stack-health.ts` (S34); the two background reads a lane VM verifies a peer with are `background.ts`'s.
  * - **The peer hop** (`peer.ts`): the entry's signed envelope to a relay's stack VM, the stack VM's `head`/`data`/`end`
  *   frames and refusals, and the late-facts answer (docs/confidential-lane-stack-routing.md section 4.5); `peer-debug.ts`
@@ -63,6 +63,7 @@ export * from "./entry-role.ts";
 export * from "./endpoint-credential.ts";
 export * from "./video-jobs.ts";
 export * from "./continuation.ts";
+export * from "./receipts.ts";
 export * from "./ticket.ts";
 export * from "./peer.ts";
 export * from "./peer-debug.ts";

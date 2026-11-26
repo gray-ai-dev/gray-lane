@@ -396,10 +396,10 @@ export interface ReleaseInput {
 /**
  * How the gateway releases an attempt whose answer its client got free (an answer without usage under USAGE_MISSING
  * free, or a generated image its usage did not count apart under IMAGE_USAGE_UNSPLIT free; gateway inference.ts
- * `deliverFree`, apis.ts `settle`): its route's success, saying it was free (`freeNoUsage`), as the server closes it
- * (inference.rs `FreeDelivery::attempt_end`). Never a supplier failure: its rank key's circuit counts it as an answer,
- * which ends a run of first-call failures and is a served sample of the failure rate (`circuitSuccess`; the product
- * lead's item 21 of 2026-10-23; area `circuit`, op `delivered_free`).
+ * `deliverFree`, apis/settle.ts `settle`): its route's success, saying it was free (`freeNoUsage`), as the server
+ * closes it (inference.rs `FreeDelivery::attempt_end`). Never a supplier failure: its rank key's circuit counts it as
+ * an answer, which ends a run of first-call failures and is a served sample of the failure rate (`circuitSuccess`; the
+ * product lead's item 21 of 2026-10-23; area `circuit`, op `delivered_free`).
  */
 export const FREE_DELIVERY: { readonly outcome: Outcome; readonly freeNoUsage: true } = Object.freeze({ outcome: Object.freeze({ kind: "success" as const }), freeNoUsage: true as const });
 

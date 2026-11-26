@@ -127,6 +127,12 @@ export interface LaneEntryRoleOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   /** The bound of one step of the watch; WATCH_GONE_POLLS poll intervals by default. */
   readonly stepMaxMs?: number;
+  /**
+   * Receipts this replica announced and has not yet persisted (`ReceiptPersister` `pending`, docs/design/persisted-
+   * receipts.md section 5): after the stop, the sessions that hold workerd's drain are closed only once it is 0 too, so a
+   * planned stop never drops a receipt signed with 30 days of retention. 0 when absent.
+   */
+  readonly receiptsPending?: () => number;
 }
 
 /**
@@ -146,6 +152,8 @@ export interface EntryReplicaSummary {
   readonly stop_sent: boolean;
   readonly stop_answer: string | null;
   readonly sessions_closed: boolean;
+  /** Receipts announced and not yet persisted (`LaneEntryRoleOptions.receiptsPending`). */
+  readonly receipts_pending: number;
 }
 
 function codeOf(error: unknown): string {
@@ -298,6 +306,7 @@ export class LaneEntryRole {
       stop_sent: this.#stopSent,
       stop_answer: this.#stopAnswer,
       sessions_closed: this.#closed,
+      receipts_pending: this.#receiptsPending(),
     };
   }
 
@@ -425,8 +434,18 @@ export class LaneEntryRole {
     // After the stop workerd takes no new request, so the count only falls; `closeSessions` checks it again right
     // before its closes. The count holds each request's own end (its record, receipt and outcome report): the sessions
     // are what holds workerd's drain while that work runs.
-    if (this.#stopSent) return this.inFlight === 0 && (await this.#closeSessions());
+    if (this.#stopSent) return this.#idle() && (await this.#closeSessions());
     return this.#role === "serving";
+  }
+
+  /** Receipts announced and not yet persisted; 0 without a persister. */
+  #receiptsPending(): number {
+    return this.#options.receiptsPending?.() ?? 0;
+  }
+
+  /** Nothing in flight and no receipt left to persist: the sessions may close and workerd's drain end. */
+  #idle(): boolean {
+    return this.inFlight === 0 && this.#receiptsPending() === 0;
   }
 
   /** The entrypoint's stop; false (asked again at the next step) without a 200. */
@@ -457,7 +476,7 @@ export class LaneEntryRole {
     const index = this.#options.index;
     const close = this.#options.closeSessions;
     try {
-      const listed = close === undefined ? 0 : await close(() => this.inFlight === 0);
+      const listed = close === undefined ? 0 : await close(() => this.#idle());
       if (listed === null) {
         this.#log({ level: "warn", event: "lane_entry_sessions_close_failed", index, code: "peerlink_unavailable" });
         return false;

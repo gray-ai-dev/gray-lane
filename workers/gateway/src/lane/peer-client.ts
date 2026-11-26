@@ -1,7 +1,8 @@
 import { bytesToLowerHex, jcsBytes, peerCommitment, sha256BareHex, type PeerFailedCode } from "@gray/attest";
 import type { GatewayConfig } from "@gray/config";
 import { get, isObject, parseSerde, parseStrict, toJsonString, type Json } from "@gray/json";
-import { verifyPeerAttestation, type PeerReleaseList, type QuoteVerifier } from "@gray/lane-verify";
+import type { PeerReleaseList, QuoteVerifier } from "@gray/lane-verify";
+import { verifyPeerAttestation } from "@gray/lane-verify/peer";
 import {
   parsePeerAttemptsAnswer,
   parsePeerDebugAnswer,
