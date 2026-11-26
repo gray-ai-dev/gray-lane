@@ -6076,6 +6076,7 @@ export interface JobsConfig extends LedgerJobsConfig, DepositJobsConfig {
 export { LEDGER_JOBS_KEYS, type LedgerJobsConfig } from "./ledger.ts";
 export {
   DEPOSIT_LEDGER_CHAIN_ID,
+  DEPOSIT_CONTRACT_MAX_MICROUSD,
   DEPOSIT_MIN_MICROUSD,
   PRODUCTION_DEPOSIT_TOKENS,
   REFUSED_PRODUCTION_SOURCE_CHAINS,

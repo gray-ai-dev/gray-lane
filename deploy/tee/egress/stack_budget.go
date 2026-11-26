@@ -131,14 +131,17 @@ type stackSpare struct {
 	elem *list.Element // in the budget's spares while held; nil after
 }
 
-// takeSpare holds line as a debug copy if it fits without taking anything back; nil when it does not.
-func (b *stackBudget) takeSpare(line []byte) *stackSpare {
-	size := int64(cap(line))
+// takeSpare holds a debug copy's line of size bytes if it fits without taking anything back; nil when it does not.
+// Only then is the line made: fill appends it to a buffer of exactly size bytes' capacity, so a copy that does not
+// fit costs no allocation. fill runs under spareMu, so a take that needs the bytes back waits for the line instead of
+// failing while they are held but not yet a spare.
+func (b *stackBudget) takeSpare(size int64, fill func([]byte) []byte) *stackSpare {
 	b.spareMu.Lock()
 	defer b.spareMu.Unlock()
 	if !b.tryTake(size) {
 		return nil
 	}
+	line := fill(make([]byte, 0, size))
 	spare := &stackSpare{line: line, size: size}
 	spare.elem = b.spares.PushBack(spare)
 	b.spareBytes += size

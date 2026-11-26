@@ -52,7 +52,7 @@ export type { GenerationProtocol, Served, GatewayDeps } from "./inference/types.
  * nothing, and the record counts it against the key (docs/cloudflare-native.md 5.6).
  *
  * The steps are functions of the run in the modules under src/inference/, each of which loads, of
- * these, only those before it (test/inference-imports.test.ts): the body once read
+ * these, only those before it (test/run-imports.test.ts): the body once read
  * (request-body.ts), its tool-call ids (tool-call-ids.ts), the hold (hold.ts), the stack relays'
  * routes (stack-routes.ts), a lane relay's attempt (lane-attempt.ts), the lane's receipt
  * (lane-receipt.ts), an attempt (attempt.ts), the record and the refusals (record.ts), the client's

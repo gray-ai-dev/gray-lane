@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -394,9 +395,8 @@ func (req *stackRequest) recordForwarded(n int, body []byte) {
 	if req.feed.closed || req.feed.gone {
 		return
 	}
-	full, errFull := json.Marshal(feedForwarded{T: "forwarded", N: n, B64: base64.StdEncoding.EncodeToString(body), Bytes: len(body)})
-	omitted, errOmitted := json.Marshal(feedForwarded{T: "forwarded", N: n, Bytes: len(body), Omitted: true})
-	if errFull != nil || errOmitted != nil {
+	omitted, err := json.Marshal(feedForwarded{T: "forwarded", N: n, Bytes: len(body), Omitted: true})
+	if err != nil {
 		return // a struct of strings and numbers
 	}
 	omitted = append(omitted, '\n')
@@ -404,7 +404,51 @@ func (req *stackRequest) recordForwarded(n int, body []byte) {
 	if !req.budget.force(size) {
 		return
 	}
-	req.queueLocked([]feedItem{{line: omitted, spare: req.budget.takeSpare(append(full, '\n'))}}, size)
+	// The whole copy's line is sized from the body's length and reserved before it is encoded (forwardedLineSize).
+	spare := req.budget.takeSpare(forwardedLineSize(n, len(body)), func(line []byte) []byte {
+		return appendForwardedLine(line, n, body)
+	})
+	req.queueLocked([]feedItem{{line: omitted, spare: spare}}, size)
+}
+
+// The parts of a whole copy's line, `{"t":"forwarded","n":N,"b64":"…","bytes":L}` and a line feed: what json.Marshal
+// writes for feedForwarded with B64 set, since standard base64 has no byte JSON escapes. An empty body has no b64
+// member, as omitempty leaves it out.
+const (
+	forwardedLineHead  = `{"t":"forwarded","n":`
+	forwardedLineB64   = `,"b64":"`
+	forwardedLineB64To = `"`
+	forwardedLineBytes = `,"bytes":`
+	forwardedLineEnd   = "}\n"
+)
+
+// forwardedLineSize is the length of appendForwardedLine's line for call n and a body of bodyLen bytes.
+func forwardedLineSize(n, bodyLen int) int64 {
+	size := len(forwardedLineHead) + decimalLen(n) + len(forwardedLineBytes) + decimalLen(bodyLen) + len(forwardedLineEnd)
+	if bodyLen > 0 {
+		size += len(forwardedLineB64) + base64.StdEncoding.EncodedLen(bodyLen) + len(forwardedLineB64To)
+	}
+	return int64(size)
+}
+
+// appendForwardedLine appends the whole copy's line for call n to dst.
+func appendForwardedLine(dst []byte, n int, body []byte) []byte {
+	dst = strconv.AppendInt(append(dst, forwardedLineHead...), int64(n), 10)
+	if len(body) > 0 {
+		dst = base64.StdEncoding.AppendEncode(append(dst, forwardedLineB64...), body)
+		dst = append(dst, forwardedLineB64To...)
+	}
+	dst = strconv.AppendInt(append(dst, forwardedLineBytes...), int64(len(body)), 10)
+	return append(dst, forwardedLineEnd...)
+}
+
+// decimalLen is the length of a non-negative n in decimal.
+func decimalLen(n int) int {
+	size := 1
+	for ; n >= 10; n /= 10 {
+		size++
+	}
+	return size
 }
 
 // refused numbers a counted call and queues its refusal. It always reaches the entry: when the budget cannot

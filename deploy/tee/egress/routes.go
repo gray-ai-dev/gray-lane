@@ -82,7 +82,10 @@ func (rt route) target(r *http.Request) (*url.URL, bool) {
 	// `%00` stays `%00` and a literal NUL stays literal); tests that build a request directly
 	// fall back to RawPath/Path.
 	rawPath := rawPathOf(r)
-	if !validRawPath(rawPath) {
+	// A raw '#' would start a fragment for any parser that reads the target as a URL (D59); planTarget refuses it
+	// in the request-target already, and target refuses it here too, so the WHATWG comparison below never reads a
+	// path that a URL parser would have cut.
+	if !validRawPath(rawPath) || strings.Contains(rawPath, "#") {
 		return nil, false
 	}
 	if !strings.HasPrefix(rawPath, rt.prefix) {
@@ -90,7 +93,10 @@ func (rt route) target(r *http.Request) (*url.URL, bool) {
 	}
 	rest := strings.TrimPrefix(rawPath, rt.prefix)
 	upstreamPath := "/" + rest
-	if !strings.HasPrefix(upstreamPath, rt.vendorPath) {
+	// origin.ts compares the WHATWG pathname, where dot segments are resolved: `/v1/../x` is `/x` there. The same
+	// comparison here keeps egress from relying on the main lane alone for a path that climbs out of the prefix
+	// (LD-1/2); one that stays under it is still forwarded as received.
+	if !strings.HasPrefix(upstreamPath, rt.vendorPath) || !strings.HasPrefix(whatwgPathname(upstreamPath), rt.vendorPath) {
 		return nil, false
 	}
 	return &url.URL{
@@ -126,7 +132,8 @@ func rawPathOf(r *http.Request) string {
 // applied to the raw path this program received. The upstream host is a constant and the path
 // cannot leave it, so the sidecar-only traversal bans are gone: `%2F`, `%5C`, `%00` and literal or
 // encoded `..` are forwarded exactly as the main lane passed them (laneFetch slices the original
-// path, then this program carries it in URL.Opaque for the request line, D76). The two refusals
+// path, then this program carries it in URL.Opaque for the request line, D76), as long as the path
+// stays under the vendor prefix once its dot segments are resolved (target). The two refusals
 // that remain are the ones checkOfficialUpstream also makes anywhere in its URL: a literal
 // backslash (some readers treat it
 // as a separator, some as a host byte) and a raw space/control byte (the parser strips or
@@ -142,4 +149,37 @@ func validRawPath(raw string) bool {
 		}
 	}
 	return true
+}
+
+// whatwgPathname is the pathname the WHATWG URL parser makes of an https URL whose path is path (URL Standard, path
+// state), as far as a comparison with a vendor prefix can tell: each single-dot (`.`, `%2e`) and double-dot (`..`,
+// `.%2e`, `%2e.`, `%2e%2e`, either case) segment is resolved, a double dot dropping the segment before it, and a dot
+// segment at the end leaves the path ending in '/'. The parser's other changes cannot move a prefix match: it
+// percent-encodes no byte a vendor prefix holds, and the backslash it reads as a separator is refused before this
+// (validRawPath). As the parser does, it reads the path only up to a '?' or '#', where the query or fragment starts.
+func whatwgPathname(path string) string {
+	if end := strings.IndexAny(path, "?#"); end >= 0 {
+		path = path[:end]
+	}
+	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	out := make([]string, 0, len(segments))
+	for i, segment := range segments {
+		last := i == len(segments)-1
+		switch strings.ToLower(segment) {
+		case "..", ".%2e", "%2e.", "%2e%2e":
+			if len(out) > 0 {
+				out = out[:len(out)-1]
+			}
+			if last {
+				out = append(out, "")
+			}
+		case ".", "%2e":
+			if last {
+				out = append(out, "")
+			}
+		default:
+			out = append(out, segment)
+		}
+	}
+	return "/" + strings.Join(out, "/")
 }

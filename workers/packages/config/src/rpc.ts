@@ -82,7 +82,7 @@ export const RPC_SURFACES = {
     target: "RoundDO",
     kind: "object",
     callers: ["console", "jobs"],
-    calls: ["ensure", "wake", "status", "putStatistics", "debtMode", "view", "providerBalance", "grantsAvailable", "fundStatus", "handGrantToMinter", "runDue"],
+    calls: ["ensure", "wake", "status", "putStatistics", "debtMode", "view", "providerBalance", "grantsAvailable", "fundStatus", "handGrantToMinter", "runDue", "mintCaps"],
   },
   endpointRoot: {
     callee: "gateway",
@@ -122,6 +122,10 @@ export type RpcSurfaceId = keyof typeof RPC_SURFACES;
  * from workers/) that shows its callers' answer when an older callee lacks it. test/rpc.test.ts finds the test.
  */
 export const ADDED_CALLS: Readonly<Record<string, string>> = {
+  // An operator's credit of a held deposit (gray-console POST /api/v1/ops/deposits/{id}/resolve) reads GrayCredit's caps
+  // through the jobs' `chain` object first: a gray-jobs of a release before `mintCaps` throws, and the console answers
+  // 503 mint_caps_unavailable and changes nothing.
+  "round.mintCaps": "console/test/workerd/ops-deposits.test.ts > a gray-jobs of a release before mintCaps: 503 mint_caps_unavailable",
   // An operator's read of a workspace's account root (gray-console GET /api/v1/ops/credit/roots/{workspace}): a
   // gray-credit-api of a release before `opsView` throws, and the console answers 503 credit_unavailable.
   "accountRoot.opsView": "console/test/workerd/ops-credit-roots.test.ts > a root of a release before opsView answers that it has no such method: 503 credit_unavailable",

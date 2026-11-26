@@ -43,6 +43,14 @@ export interface DepositChain {
 /** Every deposit is credited from $1 (review §3.5): one rule on every chain, nothing below it is ever minted or summed. */
 export const DEPOSIT_MIN_MICROUSD = 1_000_000;
 
+/**
+ * The most one deposit is credited by: GrayCredit's single-mint cap `caps.maxMintAmount` as deployed
+ * (contracts/script/Deploy.s.sol defaultCaps, $10,000; gray-jobs' test/deposit-artifact.test.ts holds the two equal).
+ * A deposit's mint is the whole transfer and cannot be split, so the watcher holds a larger one (held_over_cap) instead
+ * of requesting a mint the contract refuses. DEPOSIT_MAX_MICROUSD may lower it, never raise it.
+ */
+export const DEPOSIT_CONTRACT_MAX_MICROUSD = 10_000_000_000;
+
 /** The credited amount of a transfer: micro-USD, rounded down (`rawAmount / 10^(decimals - 6)`). */
 export function depositMicrousd(rawAmount: bigint, decimals: number): bigint {
   if (!Number.isInteger(decimals) || decimals < 6 || decimals > 18) throw new Error(`token decimals ${decimals} are not 6 to 18`);
@@ -271,6 +279,22 @@ export function depositSettings(): readonly SettingSpec[] {
       source: `${DEPOSIT_SOURCE} Half an hour is many blocks on every deposit chain.`,
       doc: "How long a sent sweep may go without a receipt before the sweeper sends it again under the same nonce with fees at least 15% higher (at most DEPOSIT_SWEEP_MAX_FEE_GWEI); once the nonce is used by none of them, it gives them up.",
     },
+    {
+      name: "DEPOSIT_MAX_MICROUSD",
+      key: "depositMaxMicrousd",
+      workers: ["jobs"],
+      type: "int",
+      default: String(DEPOSIT_CONTRACT_MAX_MICROUSD),
+      min: 1_000_000,
+      max: DEPOSIT_CONTRACT_MAX_MICROUSD,
+      source:
+        `${DEPOSIT_SOURCE} GrayCredit refuses a mint above caps.maxMintAmount ($10,000 as deployed), and a deposit's mint is the whole ` +
+        "transfer (launch audit LB-1). The maximum is that cap: raising it needs the contract's cap raised first and this bound changed with it.",
+      doc:
+        "The largest deposit, in micro-USD, the deposit watcher requests a mint for. A final deposit above it is held (`held_over_cap`, alert " +
+        "`deposit_held_over_cap`) for an operator. At most GrayCredit's maxMintAmount: the watcher reads the contract's caps before it " +
+        "requests a mint and holds what they would refuse, with the alert `deposit_cap_mismatch` while this is above them.",
+    },
   ];
 }
 
@@ -339,6 +363,7 @@ export interface DepositJobsConfig extends DepositConfig {
   readonly depositSweepBatch: number;
   readonly depositSweepMaxFeeGwei: number;
   readonly depositSweepStuckSeconds: number;
+  readonly depositMaxMicrousd: number;
 }
 
 /** Whether deposits are on: tokens listed (the cross checks then require the factory and the hash). */

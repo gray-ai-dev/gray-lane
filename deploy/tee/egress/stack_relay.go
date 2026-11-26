@@ -195,19 +195,36 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		refuse(errStackHeaderRefused, "", refusedHeaderName(name))
 		return
 	}
+	// The body is read under the rid and the KMS lease: when either ends, the read stops then (its connection's read
+	// deadline is set to now, bodyReadCut), so a relay that sends slowly holds no body past the rid whose bytes went
+	// back with it.
+	readCtx, readDone := s.stack.lease.withContext(req.ctx)
+	cut := cutBodyReadOn(readCtx, controller.SetReadDeadline)
 	body, readBytes, err := readHeldBody(r, s.cfg.maxBodyBytes, &bodyStack, &bHold)
+	readCut := cut.finish()
+	readDone()
 	entry.RequestBytes = readBytes
+	if req.ctx.Err() != nil {
+		// The rid ended: its feed takes no record, as for a call that names it afterwards.
+		s.stack.health.requestUnknown.Add(1)
+		entry.Error = errStackRequestUnknown
+		writeRefusal(rec, errStackRequestUnknown)
+		return
+	}
+	// Re-check the KMS lease after reading the relay body, before accepting an attempt or dialing the vendor. A read
+	// the lease's end cut is refused for it, not for the body it cut, even when a renewal has come since: its expired
+	// read deadline is on the connection, so the call cannot go on (bodyReadCut). With the rid alive, only the lease's
+	// end cancels readCtx (stack_lease.go: onTimer, setUntil, withContext), readDone coming after finish.
+	if readCut || s.stack.leaseEnded() {
+		refuse(errStackCredentialUnknown, "", "")
+		return
+	}
 	if errors.Is(err, errStackBudget) || errors.Is(err, errBodyBudgetExceeded) {
 		refuse(errEgressLimit, "", "")
 		return
 	}
 	if code := bodyReadCode(err); code != "" {
 		refuse(code, "", "")
-		return
-	}
-	// Re-check the KMS lease after reading the relay body, before accepting an attempt or dialing the vendor.
-	if s.stack.leaseEnded() {
-		refuse(errStackCredentialUnknown, "", "")
 		return
 	}
 	answer, refusedPath, err := s.stack.check(req.protocol, req.received, body, req.rewrite)
@@ -295,6 +312,45 @@ func (s *server) relayCall(rec *responseRecorder, r *http.Request, entry *reques
 		// S38: a cooling entry this answer called for did not fit; the answer itself went through.
 		entry.Error = errStackCoolingFull
 	}
+}
+
+// bodyReadCut stops a relay call's body read when ctx ends (the rid's or the KMS lease's) by setting the connection's
+// read deadline to now, and never once the read has returned. context.AfterFunc's stop does not wait for a callback
+// that has already started, and a deadline set after the read would end the call: on HTTP/1 net/http starts its
+// background read when the body's last bytes are read (and clears the deadline then, so an earlier one does no harm),
+// and a deadline set after that fails the background read, which cancels the request's context and with it the
+// vendor call. fire and finish therefore share a lock: a cut that has not set the deadline when finish runs never
+// does, and finish reports one that has, so its call is refused.
+type bodyReadCut struct {
+	deadline func(time.Time) error
+	stop     func() bool
+	mu       sync.Mutex
+	done     bool
+	cut      bool
+}
+
+func cutBodyReadOn(ctx context.Context, deadline func(time.Time) error) *bodyReadCut {
+	c := &bodyReadCut{deadline: deadline}
+	c.stop = context.AfterFunc(ctx, c.fire)
+	return c
+}
+
+func (c *bodyReadCut) fire() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.cut = true
+		_ = c.deadline(time.Now())
+	}
+}
+
+// finish ends the watch once the read has returned; true when the read deadline was set.
+func (c *bodyReadCut) finish() bool {
+	c.stop()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.done = true
+	return c.cut
 }
 
 // stackCredential is S15's credential_sha256 of a relay call: SHA-256 of the exact value of its one auth
@@ -554,16 +610,36 @@ func (o *attemptObserver) observe(status int, header http.Header, body []byte, c
 }
 
 // failed is a call that got no response. D72's pre-connect codes mean the vendor was never reached, which is
-// what a `refused` record says; only egress_upstream_failed failed on an open vendor connection.
+// what a `refused` record says; only egress_upstream_failed failed on an open vendor connection. Both read as the
+// account's or its proxy's failure (S46), so a call cancelled before the answer head by an end that is neither's
+// says so instead, wherever the call was (the dial, the proxy's tunnel, the vendor's answer): the rid's end (whose
+// own `end` this one follows and is dropped with), the KMS lease's (Gray's own: timeout, class gray_ended), or the
+// relay going away (relay_closed). egress_internal is Gray's own whatever else ended.
 func (o *attemptObserver) failed(code string) {
 	n := o.attempt.n
 	o.hold.free()
+	if reason := o.cancelledBy(); reason != "" && code != errInternal {
+		o.req.finish(n, nil, reason, false)
+		return
+	}
 	if code == errUpstreamFailed {
 		o.req.finish(n, nil, endVendorReset, false)
 		return
 	}
 	o.req.finishRefused(n, feedRefused{T: "refused", N: n, AccountID: &o.account.id, ProxyID: o.account.proxyID, Code: code,
 		Class: stackRefusalClass(code, o.account.spec != nil)})
+}
+
+// cancelledBy is the `end` reason of an end that cancels the vendor call and is not the vendor's, the account's or
+// the proxy's, in the order attemptEndReason reads them; "" when none happened.
+func (o *attemptObserver) cancelledBy() string {
+	switch {
+	case o.req.ctx.Err() != nil, o.stack.leaseEnded():
+		return endTimeout
+	case o.relay.Err() != nil:
+		return endRelayClosed
+	}
+	return ""
 }
 
 // response takes the vendor's header block into the hold, decides how the answer is read, and queues the
@@ -726,7 +802,7 @@ func (o *attemptObserver) finished(code string) {
 			records = append(records, feedErrorBody{T: "error_body", N: n, B64: base64.StdEncoding.EncodeToString(o.held)})
 		}
 	default:
-		reason = attemptEndReason(code, o.req.ctx.Err() != nil, o.stopped != "", o.relay.Err() != nil)
+		reason = attemptEndReason(code, o.req.ctx.Err() != nil, o.stopped != "", o.stack.leaseEnded(), o.relay.Err() != nil)
 	}
 	// The held answer and the digester go now; the trailing records take their own bytes, and an `end` with
 	// egress_limit replaces them when the budget cannot hold them.
@@ -737,13 +813,15 @@ func (o *attemptObserver) finished(code string) {
 
 // attemptEndReason is the `end` reason of an attempt that did not end at a clean EOF, by code (forward's, or
 // response_read for a coded answer that did not decode), whether the rid had ended, whether the observer stopped the
-// answer for its coding, and whether the relay had closed its connection.
+// answer for its coding, whether the KMS lease had ended, and whether the relay had closed its connection. The
+// lease's end cancels the call as the rid's does and is Gray's own, not a vendor reset of the account: timeout, class
+// gray_ended.
 //
 // A coding failure is the vendor's whatever the relay did after: an answer cut inside its coding still reaches the
 // relay whole by its own framing, and the relay may close before the decoder's end is read. Checking the relay first
 // made that end relay_closed or vendor_reset by which came first (TestStackUndecodableAnswers, "gzip cut at its end",
 // failed once in CI on 2026-11-17).
-func attemptEndReason(code string, ridEnded, codingFailed, relayClosed bool) string {
+func attemptEndReason(code string, ridEnded, codingFailed, leaseEnded, relayClosed bool) string {
 	switch {
 	case code == errEgressLimit:
 		return endEgressLimit
@@ -755,6 +833,8 @@ func attemptEndReason(code string, ridEnded, codingFailed, relayClosed bool) str
 		return endTimeout
 	case codingFailed:
 		return endVendorReset
+	case leaseEnded:
+		return endTimeout
 	case relayClosed:
 		return endRelayClosed
 	default:

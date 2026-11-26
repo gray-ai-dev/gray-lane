@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"net/http"
 	"slices"
 
@@ -308,16 +309,30 @@ func (st *stack) tableIDs() []string {
 	return ids
 }
 
+// writeControlJSON writes a control answer (tokens, account state, health, ...) as json.Marshal writes it, its
+// Content-Length included, without a copy of the whole answer in memory (LD-4: the tokens and state answers grow with
+// the account table, about 5 MB at 4,096 accounts). The first pass counts the bytes, and finds a value that cannot be
+// encoded, answered egress_internal before anything is written; the second writes them as they are encoded, through
+// the encoder's bounded buffer. encoding/json/v2 with the v1 options writes json.Marshal's bytes. Every value is
+// built for its answer from values that are replaced and never changed in place, so both passes encode the same.
 func writeControlJSON(rec *responseRecorder, value any) {
-	payload, err := json.Marshal(value)
-	if err != nil {
+	var size byteCounter
+	if err := jsonv2.MarshalWrite(&size, value, json.DefaultOptionsV1()); err != nil {
 		writeRefusal(rec, errInternal)
 		return
 	}
 	rec.Header().Set("Content-Type", "application/json")
-	rec.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	rec.Header().Set("Content-Length", strconv.FormatInt(int64(size), 10))
 	rec.WriteHeader(http.StatusOK)
-	_, _ = rec.Write(payload)
+	_ = jsonv2.MarshalWrite(rec, value, json.DefaultOptionsV1())
+}
+
+// byteCounter is an io.Writer that keeps only the number of bytes written to it.
+type byteCounter int64
+
+func (c *byteCounter) Write(p []byte) (int, error) {
+	*c += byteCounter(len(p))
+	return len(p), nil
 }
 
 // serveHealth is GET /v1/stack/health (S37).
